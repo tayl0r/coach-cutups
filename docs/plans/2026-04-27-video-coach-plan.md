@@ -1450,7 +1450,7 @@ git commit -m "feat(app): keyboard shortcuts space/arrows/AD for transport"
 
 **Files:**
 - Modify: `App/ContentView.swift`
-- Modify: `App/Models/Workspace.swift` (add `reorderClips`, `previewPlayer(for:)` cache, `cachedTransportPlayer`)
+- Modify: `App/Models/Workspace.swift` (add `reorderClips`, `previewPlayer(for:)` cache, `_previewInflight` / `_previewFailed`, `invalidatePreviewCache(for:)`)
 - Create: `App/Views/ClipSidebar.swift`
 - Create: `App/Views/ClipInspector.swift`
 - Create: `App/Views/TransportBar.swift`

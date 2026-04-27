@@ -1,6 +1,6 @@
 # Video Coach — Design
 
-A native macOS app for building tagged compilations of clips from full-length soccer match videos. Each clip pairs a source-video segment with the user's webcam, voice commentary, and freehand drawings. Compilations are exported as one HEVC MP4 per selected tag.
+A native macOS app for building tagged compilations of clips from full-length soccer match videos. Each clip pairs a source-video segment with the user's webcam, voice commentary, and freehand drawings. Compilations are exported as one HEVC `.mov` per selected tag.
 
 ## Goals
 
@@ -379,7 +379,7 @@ Implements `AVVideoCompositing`:
   6. Wrap output buffer in a `CGContext`, flip Y to top-left origin (CG default for CVPixelBuffer is bottom-left).
   7. Draw the base buffer full-frame.
   8. Pull the webcam frame via `request.sourceFrame(byTrackID: instruction.webcamTrackID)`, scale to 22% of output width, place bottom-right with `0.022 × outputHeight` margin.
-  9. **Draw strokes**: walk `instruction.strokes` for this `recordTime`, build a `CGPath` per visible stroke (clipped at points whose `t ≤ recordTime − stroke.startedAtRecordTime`), stroke into the CG context at `lineWidth × outputHeight`.
+  9. **Draw strokes**: call `visibleStrokes(in: clip, atRecordTime: recordTime)` (the shared helper from plan Task 3.3), then for each returned `VisibleStroke` build a `CGPath` from `stroke.points` up to `drawnPointCount`, and stroke into the CG context at `vs.stroke.lineWidth × outputHeight`. The helper handles auto-clear, `.clearAll`, and partial-draw point counts uniformly.
   10. **Draw text bar via CoreText**: translucent black rect across the bottom 8%; `CTFramesetterCreateWithAttributedString` over `NSAttributedString("\(i+1)/N, \(name), \(tags joined by space)")` for proper emoji + RTL + CJK shaping. Plain `CGContext.draw(text:)` would mis-render emoji.
   11. `request.finish(withComposedVideoFrame: outputBuffer)`.
 
