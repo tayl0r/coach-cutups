@@ -37,4 +37,24 @@ final class ProjectStoreTests: XCTestCase {
         try ProjectStore.write(p2, to: tmp)
         XCTAssertEqual(try ProjectStore.read(from: tmp).name, "v2")
     }
+
+    /// Regression: encoder uses .iso8601 for dates; the decoder must match or
+    /// any saved Clip (which has a createdAt: Date) will fail to read back.
+    func test_projectWithClipCreatedAtRoundtrips() throws {
+        var p = Project(name: "WithClip")
+        let clip = Clip(
+            name: "c1",
+            sourceIndex: 0,
+            startSourceSeconds: 1.0,
+            recordingDuration: 2.0,
+            recordingFilename: "clip-x.mov",
+            sortIndex: 0,
+            createdAt: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+        p.clips.append(clip)
+        try ProjectStore.write(p, to: tmp)
+        let loaded = try ProjectStore.read(from: tmp)
+        XCTAssertEqual(loaded.clips.first?.createdAt.timeIntervalSince1970 ?? .nan,
+                       1_700_000_000, accuracy: 1.0)
+    }
 }

@@ -15,7 +15,9 @@ public enum ProjectStore {
             throw ProjectStoreError.missingProjectJSON
         }
         let data = try Data(contentsOf: url)
-        let project = try JSONDecoder().decode(Project.self, from: data)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let project = try decoder.decode(Project.self, from: data)
         if project.formatVersion != 1 {
             throw ProjectStoreError.unsupportedFormatVersion(project.formatVersion)
         }
