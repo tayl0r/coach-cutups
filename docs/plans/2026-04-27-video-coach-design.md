@@ -78,7 +78,7 @@ A native macOS app for building tagged compilations of clips from full-length so
   - `AVKit` — `AVPlayerView` for the scrubber surface.
   - `VideoToolbox` — H.265 hardware encode/decode (used implicitly through AVFoundation).
   - `Core Media` — `CMTime` for all time arithmetic.
-  - `Core Animation` — `AVVideoCompositionCoreAnimationTool` for stroke + text-bar overlays at export.
+  - `Core Animation` — `CAShapeLayer` for the live drawing overlay and Mode C stroke replay. Export draws strokes + text bar via Core Graphics + CoreText inside the custom compositor; we do **not** use `AVVideoCompositionCoreAnimationTool` (see Decision log).
 - **Persistence**: plain `Codable` + JSON. Single `project.json` per project folder. No SQLite for v1.
 - **Build**: Xcode project, single macOS app target. No third-party Swift packages required for v1.
 
@@ -231,17 +231,29 @@ On every input: split by comma, trim whitespace per fragment, lowercase per frag
 
 - Single `AVCaptureSession`, configured once at app launch.
 - Inputs: default video device (built-in camera or Continuity Camera if paired) + `default(for: .audio)`.
-- Output: one `AVCaptureMovieFileOutput` writing `.mov` (camera video + mic audio in one file).
-- **Format selection**: explicitly pick a deterministic `AVCaptureDevice.Format` via `device.lockForConfiguration()` then `device.activeFormat = ...`. Prefer 1280×720 @ 30fps when available; otherwise fall back to whatever 720p-or-lower 16:9 30fps the device exposes.
-- We do **not** rely on `sessionPreset = .high`. That preset is device-dependent; on Continuity Camera (iPhone-as-webcam) it resolves to 1920×1440 4:3, which would silently break the PiP aspect math.
-- The export pipeline reads the actual recorded width/height/frame-rate from each clip's recorded `.mov` at export time, so even if a future user switches cameras between clips the math remains correct.
+- Outputs:
+  - **`AVCaptureMovieFileOutput`** — writes the `.mov` (camera video + mic audio).
+  - **`AVCaptureVideoDataOutput`** companion — exists solely to deliver per-frame `CMSampleBuffer`s so we can capture the first frame's host-time PTS as the recording's `t = 0` anchor. Its sample-buffer delegate runs on a serial queue and discards every buffer except the first one after each `startRecording(to:)` call.
+- **Configuration sequence** (the canonical AVCam pattern — order matters):
+
+  1. `session.beginConfiguration()`
+  2. `session.sessionPreset = .inputPriority` (so the preset doesn't override our format selection).
+  3. Add the video input, audio input, movie output, and data output.
+  4. `device.lockForConfiguration()` → set `device.activeFormat`, `activeVideoMinFrameDuration`, `activeVideoMaxFrameDuration` → `unlockForConfiguration()`.
+  5. `session.commitConfiguration()`
+  6. `session.startRunning()`
+
+  Setting `activeFormat` *before* `addInput` would be silently undone by `addInput` resetting the device to the preset's default (notably 1920×1440 4:3 on Continuity Camera). Setting `activeFormat` *after* `commitConfiguration` would race with the session's startup. The `.inputPriority` preset preserves whatever format we then set on the device.
+- **Format choice**: prefer 1280×720 @ 30fps 16:9; otherwise the closest 720p-or-lower 16:9 30fps the device exposes.
+- The export pipeline reads the actual recorded width/height/frame-rate from each clip's `.mov` at export time, so even if the user switches cameras between clips the math remains correct.
 
 ### Time anchoring
 
-- `t = 0` is anchored at the moment `AVCaptureFileOutputRecordingDelegate.fileOutput(_:didStartRecordingTo:from:)` fires — i.e. when the capture pipeline has actually started writing samples. Camera warm-up between the `startRecording(to:)` call and the first sample is 80–300ms and varies per machine; anchoring at the delegate callback eliminates that drift.
-- After `t = 0`, all subsequent event timestamps use `CACurrentMediaTime()` deltas — sub-millisecond accuracy, monotonic, no NTP drift.
-- The R / space / arrow keys ignore presses until `didStartRecordingTo` has fired; this prevents a user from issuing skip/pause events before the recording actually begins.
-- Verification: a clap-sync clip (visible clap on webcam, audible on mic, with one mid-clip skip) is part of the manual integration checklist (Phase 10) — webcam visual and mic audio must align within one frame in the exported output.
+- `t = 0` is anchored at **the host-time PTS of the first `CMSampleBuffer` delivered by the `AVCaptureVideoDataOutput` companion after `startRecording(to:)` was called**. This is, by definition, the first frame written into the recording; our event log is therefore aligned with the recorded media to sub-frame accuracy.
+- `AVCaptureVideoDataOutput`'s sample buffer PTS is on the host time clock, which is the same clock as `CACurrentMediaTime()`. So subsequent event timestamps are computed as `CACurrentMediaTime() − t0Seconds` and stay monotonic.
+- We don't anchor at `fileOutput(_:didStartRecordingTo:from:)` because that callback fires when the file handle is opened, not when the first sample is captured — there's still 50–150ms of additional camera warm-up between those two events.
+- The R / space / arrow keys ignore presses until the first sample buffer has been observed (`recording.t0Seconds != nil`); this prevents the user from issuing events before the recording has any frames.
+- Verification: a clap-sync clip (visible clap on webcam + audible on mic + one mid-clip skip) is part of the manual integration checklist (Phase 10). Visual and audio claps must align within one frame.
 
 ### During recording
 
@@ -256,8 +268,9 @@ On every input: split by comma, trim whitespace per fragment, lowercase per frag
 - An `NSView` overlay (wrapped in `NSViewRepresentable`) sits on top of `AVPlayerLayer`.
 - `mouseDown:` opens a new in-memory `Stroke`. `mouseDragged:` may append a new `StrokePoint`. `mouseUp:` finalizes and emits the `.stroke(...)` event.
 - **60Hz capture cap, locked**: a new point is committed iff `now − lastPointTime ≥ 1/60s` AND the cursor has moved at least 1 device pixel from the last committed point. Worst-case storage is ~7KB for a 5-second stroke; typical clips total well under 100KB of stroke data.
-- AppKit's coordinate origin is bottom-left. We flip on capture: `ny = 1.0 − pointInView.y / bounds.height`, so the stored normalized origin is top-left — matching how the export compositor will denormalize for `CGContext` drawing. A single helper `denormalize(StrokePoint, into: CGSize) -> CGPoint` is shared between live overlay, Mode C preview, and export.
-- Coordinates stored as `(x/width, y/height)`; `lineWidth` is normalized to frame height. The live overlay multiplies by `window.backingScaleFactor` so the stroke appears at the same on-screen thickness as in the export.
+- AppKit's view origin is bottom-left. We flip on capture: `ny = 1.0 − pointInView.y / bounds.height`, so the stored normalized origin is top-left.
+- Both render call sites also draw with a top-left origin: `CAShapeLayer` in a normal AppKit view requires a Y flip, and the export compositor's `CGContext` (wrapping a `CVPixelBuffer`) defaults to a bottom-left origin and we flip via `CGContext.translateBy + scaleBy(1, -1)`. A shared helper `Denormalize.point(_:_:into:flipY:)` performs the conversion in both call sites with `flipY: true`.
+- Coordinates stored as `(x/width, y/height)`; `lineWidth` is normalized to frame height (e.g. `0.005`). The live overlay sets `CAShapeLayer.lineWidth = 0.005 × bounds.height` directly — `lineWidth` is in points and Core Animation handles the Retina backing-store upscale automatically. We do **not** multiply by `window.backingScaleFactor` (that would render at 2× thickness on Retina).
 - The live overlay renders each stroke as a dedicated `CAShapeLayer` whose `path` extends as new points are committed. This avoids `setNeedsDisplay(bounds)` repainting the entire overlay 60×/sec and lets Core Animation composite on the GPU.
 
 ### Stop & finalize
@@ -291,32 +304,73 @@ Why this shape and not the alternatives:
 - **vs. `AVVideoCompositionCoreAnimationTool` for the overlay (rejected as primary)**: the CA tool has known fragility in non-export-session pipelines (`beginTime` must be `AVCoreAnimationBeginTimeAtZero` not `0`; parent layer needs `isGeometryFlipped = true`; behavior with `AVAssetReader`-backed pipelines is undocumented). Drawing the strokes + text bar directly in the custom compositor uses Core Graphics with no surprises and renders perfectly into our output buffers.
 - **vs. raw `AVAssetReader`/`AVAssetWriter` pipeline (rejected as primary)**: ~3–5× the code, and we'd be re-implementing what `AVAssetExportSession` already gives us (progress, lifecycle, queue management). Reserve as the fallback if HEVC bitrate/profile control through the export session proves insufficient.
 
+### Track ID strategy
+
+`AVMutableComposition.addMutableTrack` returns the assigned `CMPersistentTrackID` after the call, so we never use `kCMPersistentTrackID_Invalid`. We instead pass explicit IDs and verify they came back unchanged:
+
+- **Source video** track ID: a stable `1` (one shared track; segments per clip).
+- **Source audio** track ID: a stable `2`.
+- **Webcam video** track IDs: `1000 + clipIndex` per clip (one webcam track per clip insertion — easier than re-using one shared track because the webcam content varies per clip and `requiredSourceTrackIDs` is per-instruction).
+- **Mic audio** track IDs: `2000 + clipIndex`.
+
+The compositor receives per-instruction metadata (clip index, segment list, stroke list, source/webcam track IDs, text bar string) via a **subclass** of `AVMutableVideoCompositionInstruction`:
+
+```swift
+final class CompilationInstruction: AVMutableVideoCompositionInstruction {
+    var clipIndex: Int = 0
+    var indexInOutput: Int = 0
+    var totalClips: Int = 0
+    var sourceTrackID: CMPersistentTrackID = 1
+    var webcamTrackID: CMPersistentTrackID = 1000
+    var clipCompositionStart: CMTime = .zero
+    var segments: [PlaybackSegment] = []
+    var strokes: [Stroke] = []
+    var textBarLine: String = ""
+}
+```
+
+AVFoundation passes our subclass through unchanged. The compositor casts `request.videoCompositionInstruction as? CompilationInstruction` to read the per-clip context.
+
 ### The custom compositor
 
 Implements `AVVideoCompositing`:
 
-- **Source registration**: at `renderContextChanged(_:)` we cache the render context (size, pixel format).
-- **Per output frame**: AVFoundation calls `startRequest(_ asyncRequest:)` once per output frame at the negotiated `frameDuration`. The request's `compositionTime` tells us where in the output timeline we are. We resolve which `Clip`/`PlaybackSegment` we're in via a precomputed `[CMTimeRange: CompositionEntry]` map (built from `playbackSegments`).
-- **Frame production**:
-  - For a `.play` segment: pull the source pixel buffer at the corresponding source time from the request's `sourceFrame(byTrackID:)` (the source video track is plumbed in for play segments only — see "Source video plumbing" below). Cache the most recent decoded buffer in case the next segment is a `.freeze`.
-  - For a `.freeze` segment: emit the cached pixel buffer directly. PTS comes from `compositionTime`; AVFoundation handles the pacing.
-  - **Composite the PiP**: read the webcam track via `sourceFrame(byTrackID:)` (always plumbed, since webcam runs continuously) and draw it scaled to ~22% of output width, bottom-right with a 2.2% margin.
-  - **Draw strokes**: walk live strokes for this clip's current `recordTime` (= `compositionTime − clipStart`), build a `CGPath` per live stroke (clipped at the current per-point `t`), stroke into a `CGContext` over the buffer.
-  - **Draw text bar**: translucent black rect across the bottom 8% with `"\(i+1)/N, \(clip.name), \(clip.tags.joined(separator: " "))"`.
-- All drawing happens into a writable `CVPixelBuffer` obtained from the context's pixel buffer pool. We do **not** use `AVVideoCompositionCoreAnimationTool` at all in the v1 path.
+- **Source registration**: at `renderContextChanged(_:)` we cache the render context (size, pixel format, pool).
+- **Per output frame**: AVFoundation calls `startRequest(_ asyncRequest:)` once per output frame. We:
+  1. Resolve the `CompilationInstruction` and the `compositionTime`.
+  2. Compute `recordTime = compositionTime − clipCompositionStart`.
+  3. **At every clip boundary, reset `lastSourceFrame = nil`** so a leading `.freeze` in clip N never displays clip N−1's last source frame.
+  4. Decide the **base buffer**:
+     - `.play` segment → call `request.sourceFrame(byTrackID: instruction.sourceTrackID)`. Cache it in `lastSourceFrame`.
+     - `.freeze` segment → use `lastSourceFrame` if set; otherwise emit a black frame (clip starts paused — rare).
+  5. Get an output `CVPixelBuffer` from `request.renderContext.newPixelBuffer()`.
+  6. Wrap output buffer in a `CGContext`, flip Y to top-left origin (CG default for CVPixelBuffer is bottom-left).
+  7. Draw the base buffer full-frame.
+  8. Pull the webcam frame via `request.sourceFrame(byTrackID: instruction.webcamTrackID)`, scale to 22% of output width, place bottom-right with `0.022 × outputHeight` margin.
+  9. **Draw strokes**: walk `instruction.strokes` for this `recordTime`, build a `CGPath` per visible stroke (clipped at points whose `t ≤ recordTime − stroke.startedAtRecordTime`), stroke into the CG context at `lineWidth × outputHeight`.
+  10. **Draw text bar via CoreText**: translucent black rect across the bottom 8%; `CTFramesetterCreateWithAttributedString` over `NSAttributedString("\(i+1)/N, \(name), \(tags joined by space)")` for proper emoji + RTL + CJK shaping. Plain `CGContext.draw(text:)` would mis-render emoji.
+  11. `request.finish(withComposedVideoFrame: outputBuffer)`.
+
+The compositor is the single source of truth for the export's per-frame visual. We do **not** use `AVVideoCompositionCoreAnimationTool` at all.
 
 ### Source video plumbing
 
-`AVMutableComposition` is still useful for the source video — it gives the compositor access to source frames at the right times. We do this:
+`AVMutableComposition` carries the source frames so the compositor can pull them via `sourceFrame(byTrackID:)`:
 
-- For each clip, walk `playbackSegments(sourceDuration:)`. For each `.play` segment, `insertTimeRange(...)` of the source video track into the composition at the right output offset. For each `.freeze` segment, **don't insert anything** — the compositor will emit cached frames into that range using only `compositionTime` (no source pull needed).
-- The compositor is given the precomputed segment map keyed by output `CMTimeRange`, so it knows whether to pull source or emit cached.
+- For each clip, walk `playbackSegments(sourceDuration:)`. For each `.play` segment, `insertTimeRange(...)` of the source video track into the composition at the right output offset. For each `.freeze` segment, **don't insert anything** — the compositor emits cached frames into that range from `lastSourceFrame`.
+- Each `CompilationInstruction` is built with `requiredSourceTrackIDs` listing the source track ID (covering only `.play` ranges) and the per-clip webcam track ID (always covering the whole clip range).
+- AVFoundation calls our compositor for **every** output frame — including ranges with no source coverage — as long as we add an instruction for that range. So we add one instruction per clip covering its full output range; the compositor handles `.freeze` from cache when the source pull returns nil.
 
-### Audio (unchanged in spirit)
+### Audio
 
-`AVMutableAudioMix` over `AVMutableComposition` with two audio tracks: source and mic. Volumes from `preferences.previewSourceVolume` and `preferences.previewCommentaryVolume`. Audio simply continues during `.freeze` segments — wait, actually no: source audio plays only during `.play` segments (it's only inserted there). Mic audio is one continuous insert per clip (it runs through pauses and skips, since the mic is always on). This matches the recording reality.
+`AVMutableAudioMix` over `AVMutableComposition`:
 
-**AAC priming note**: `AVCaptureMovieFileOutput`-produced `.mov` files include an edit list that compensates for AAC priming samples (~44ms at 48kHz). `AVMutableComposition.insertTimeRange` honors that edit list. To verify, the manual integration checklist includes a clap-sync test (Phase 10).
+- **Source audio**: inserted into the source-audio track (ID `2`) only during `.play` segments — gaps during `.freeze` ranges (intentional silence from the source side).
+- **Mic audio**: inserted continuously per clip into the per-clip mic track (ID `2000 + i`) — the mic runs through pauses and skips since the user is always talking.
+- Volumes from `preferences.previewSourceVolume` and `preferences.previewCommentaryVolume`.
+- **Boundary ramps**: at every transition between source-audio segments (i.e. each `.play → .freeze` and `.freeze → .play` boundary, plus clip starts and ends) we apply a **5ms volume ramp** via `AVMutableAudioMixInputParameters.setVolumeRamp(fromStartVolume:toEndVolume:timeRange:)`. This prevents AAC click artifacts at internal cut boundaries (priming samples don't exist for interior slices, so a hard cut at non-zero amplitude clicks).
+
+**AAC priming note**: `AVCaptureMovieFileOutput`-produced `.mov` files include an edit list compensating for the file-start AAC priming. `AVMutableComposition.insertTimeRange` honors the edit list at the file's start. The boundary-ramp strategy above handles the *interior* slicing concern, which is where priming compensation does not apply. The clap-sync manual test (Phase 10) verifies start-of-clip alignment; an additional "two pause boundaries inside one clip" check verifies no clicks at internal seams.
 
 ### Encode
 
@@ -339,8 +393,37 @@ Container: **`.mov`** (HEVC in `.mov` is Apple's documented preference and plays
 ### Filenames + progress
 
 - Output: `<outputFolder>/<tag> - <projectName>.mov`. The virtual tag becomes `all-clips - <projectName>.mov`.
-- Per-tag progress bar driven by `AVAssetExportSession.progress` (KVO-observed).
+- Per-tag progress driven by polling `AVAssetExportSession.progress` (a `Float`, exposed via `AsyncStream<Float>`) at 5Hz on a `Task`. KVO compliance for `progress` has historically been inconsistent across macOS versions; polling is reliable.
 - Tags export sequentially — keeps the UI responsive and avoids contention on the shared VideoToolbox encoder queue.
+
+## Mode C clip preview
+
+Preview must run at native 30fps, which the export compositor (Core Graphics + CoreText per frame) cannot sustain in real-time. Mode C uses a **layered preview** in the AppKit view hierarchy. It is intentionally not pixel-identical to the export — stroke widths and text rendering may differ slightly — but it plays at full rate.
+
+### Layer hierarchy (top to bottom)
+
+1. **Text bar** — a plain `NSTextField` (or SwiftUI `Text`) pinned to the bottom 8% of the player container. Updates per clip but is otherwise static.
+2. **Stroke replay** — a `CALayer` overlay containing one `CAShapeLayer` per "currently live" stroke. A periodic time observer on the player (60Hz via `AVPlayer.addPeriodicTimeObserver(forInterval:queue:using:)`) walks the clip's events at the current `recordTime`, adds/removes child layers as strokes appear and clear, and updates each layer's `path` for in-progress portions (matching the original drawing tempo).
+3. **AVPlayerLayer** — backing an `AVPlayer` that plays an `AVPlayerItem` of an `AVMutableComposition` carrying:
+   - The source video track (with `.play` segments only)
+   - The webcam track (continuous)
+   - Source audio (`.play` segments only) + mic audio (continuous), with the same boundary ramps as the export.
+   - An `AVMutableVideoComposition` that sets up:
+     - A **lightweight preview compositor** (separate class, much smaller than the export's): handles `.freeze` segments by re-emitting the cached pixel buffer. Does NOT draw strokes, text, or PiP.
+     - Built-in `AVMutableVideoCompositionLayerInstructions` for the PiP transform — geometry handled by AVFoundation's standard layer compositing, no per-frame CG code for the PiP.
+   - An `AVMutableAudioMix` reflecting the source/commentary volume sliders.
+
+### Volume slider live update
+
+When either volume slider changes, build a fresh `AVMutableAudioMix` and assign to `player.currentItem?.audioMix`. Mutating the parameters of an existing `audioMix` on a playing item does not take effect; reassignment does. Debounce slider changes at ~60Hz to avoid thrash.
+
+### Why this preview is NOT pixel-identical to export
+
+- **Strokes**: rendered as `CAShapeLayer`s at view-coordinate scale; the export draws via Core Graphics into the actual output buffer. Anti-aliasing and sub-pixel positioning differ.
+- **Text bar**: rendered by AppKit's text system in the view hierarchy; the export renders via CoreText into the buffer. Font metrics may differ by 1px.
+- **PiP**: rendered by AVFoundation's built-in layer instruction; the export composites in CG. Result is visually equivalent but path-different.
+
+This trade-off was made deliberately: the preview's job is "show me what this clip will be," not "show me an exact pixel preview." For the latter, the user exports and watches the result.
 
 ## Decision log
 
@@ -357,10 +440,21 @@ The non-obvious calls made during design, with their rationale.
 - **`AVAssetExportSession` first, `AVAssetReader`/`AVAssetWriter` only as fallback.** ExportSession + custom compositor + custom audio mix covers the bitrate range we need (6–24 Mbps HEVC) without the lifecycle complexity of a hand-driven reader/writer pipeline. Phase 9 includes a spike to confirm before committing.
 - **Volume sliders are global, not per-clip.** Tracks user intent — they tune source vs commentary balance once and want it applied across the project. Per-clip overrides can be added later if needed.
 - **HEVC in `.mov`, not `.mp4`.** Apple's documented recommendation. Avoids the `hvc1`/`hev1` sample-entry compatibility quirks that `.mp4` HEVC occasionally triggers. Plays everywhere we care about (QuickTime, Safari, VLC, iOS).
-- **Time anchor at `didStartRecordingTo` callback, not `startRecording(to:)` call.** Camera warm-up is 80–300ms and varies per machine; anchoring at the delegate callback eliminates the drift between event log and recorded media.
+- **Time anchor at the first `AVCaptureVideoDataOutput` sample buffer's PTS, not at the `didStartRecordingTo` callback.** The delegate callback fires when the file handle is opened (50–150ms before the first sample is actually captured); the data output's first sample buffer is, by definition, the first frame in the recorded file. Sub-frame accurate anchoring with no retroactive offset math.
+- **AVCaptureVideoDataOutput companion alongside AVCaptureMovieFileOutput.** Costs essentially nothing — its sample buffer delegate runs on a background queue and discards every buffer except the first one per recording. Worth it for the time anchor.
 - **Explicit `device.activeFormat`, not `sessionPreset = .high`.** `.high` resolves device-dependently (1920×1440 4:3 on Continuity Camera, 1280×720 16:9 on built-in FaceTime). Locking to a deterministic format keeps the PiP transform math stable.
 - **Plain bookmarks, not security-scoped.** Security-scoped bookmarks are a sandbox feature; for our non-sandboxed hardened-runtime app they have no effect and `startAccessingSecurityScopedResource()` returns `false`. Plain bookmarks still give us relink-on-move.
 - **Sequential tag export.** Avoids parallel-progress UI complexity; VideoToolbox saturates on one job anyway, so two in parallel wouldn't finish faster.
+- **Mode C clip preview is layered (separate `AVPlayerLayer` + `CAShapeLayer` overlay + text-bar view) rather than reusing the export's full compositor.** Per-frame Core Graphics + CoreText drawing inside an `AVPlayer` compositor would not sustain 30fps live playback. The preview compositor handles only freeze frames; strokes + text bar are AppKit overlays. Trade-off: preview is not pixel-identical to export, but it plays in real time at any clip duration.
+- **Track IDs explicit, per-instruction context via `CompilationInstruction` subclass.** `kCMPersistentTrackID_Invalid` returns AVFoundation-assigned IDs that aren't known to the compositor. Subclassing `AVMutableVideoCompositionInstruction` lets us thread per-clip metadata (segment list, strokes, track IDs, text bar string) through AVFoundation unchanged — the standard pattern for custom compositors.
+- **5ms volume ramps at every internal source-audio segment boundary.** AAC priming compensation only applies at file start; interior slices created by `insertTimeRange` produce hard cuts that click. A short fade-in/out via `setVolumeRamp` eliminates the artifacts.
+- **Text bar rendered via CoreText (`CTFramesetter`).** Tags + clip names may contain emoji (⚽ is plausible for soccer), CJK, or RTL text. CoreText handles glyph shaping; primitive `CGContext.draw(text:)` would mis-render.
+
+## Spike outcomes
+
+(populated as Phase 9.0 runs)
+
+- **AVAssetExportSession + custom compositor + custom audioMix + HEVC preset combination**: ☐ verified working / ☐ falling back to AVAssetReader/Writer (Task 9.6).
 
 ## Open items (post-v1)
 
