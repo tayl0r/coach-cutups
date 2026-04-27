@@ -1,6 +1,6 @@
 # Video Coach — Design
 
-A native macOS app for building tagged compilations of clips from full-length soccer match videos. Each clip pairs a source-video segment with the user's webcam, voice commentary, and freehand drawings. Compilations are exported as one HEVC `.mov` per selected tag.
+A native macOS app for building tagged compilations of clips from full-length soccer match videos. Each clip pairs a source-video segment with the user's webcam, voice commentary, and freehand drawings. Compilations are exported as one HEVC `.mp4` per selected tag, sized for direct YouTube upload.
 
 ## Goals
 
@@ -67,7 +67,7 @@ A native macOS app for building tagged compilations of clips from full-length so
    - `Select All` / `Select None` buttons.
    - `Resolution` dropdown: Source / 1080p / 720p.
    - `Quality` dropdown: Low / Medium / High → HEVC bitrate.
-2. Click `Export Selected Tags` → progress sheet. One `.mov` per checked row, written as `<tag> - <projectName>.mov`.
+2. Click `Export Selected Tags` → progress sheet. One `.mp4` per checked row, written as `<tag> - <projectName>.mp4`.
 
 ## Technology stack
 
@@ -305,7 +305,7 @@ On every input: split by comma, trim whitespace per fragment, lowercase per frag
 
 ## Export pipeline
 
-For each checked tag (plus the virtual `all-clips` row if checked) one HEVC `.mov` is produced. Tags export sequentially.
+For each checked tag (plus the virtual `all-clips` row if checked) one HEVC `.mp4` is produced. Tags export sequentially.
 
 ### Architecture: `AVAssetExportSession` + custom `AVVideoCompositing`
 
@@ -406,7 +406,7 @@ The compositor is the single source of truth for the export's per-frame visual. 
 
 ### Encode
 
-`AVAssetExportSession` with `presetName = AVAssetExportPresetHEVCHighestQuality` (or `.HEVC1920x1080` / `.HEVC3840x2160` if we want to clamp dimensions). For finer bitrate control we use `AVAssetExportSession.outputFileType = .mov` and `videoComposition = ourCustomComposition` and `audioMix = ourMix`.
+`AVAssetExportSession` with `presetName = AVAssetExportPresetHEVCHighestQuality` (or `.HEVC1920x1080` / `.HEVC3840x2160` if we want to clamp dimensions). For finer bitrate control we use `AVAssetExportSession.outputFileType = .mp4` and `videoComposition = ourCustomComposition` and `audioMix = ourMix`.
 
 If the export-session bitrate is too high or too low for our **Quality** dropdown, the **fallback** is a raw `AVAssetReader` → `AVAssetWriter` pipeline using the same custom compositor's output as the writer's input. We pick the right path based on a **Phase 9 spike** (Plan Task 9.0).
 
@@ -418,13 +418,13 @@ Bitrate target table (we'll match these via export-session preset selection or v
 | Medium  | 12 Mbps | 6 Mbps |
 | High    | 24 Mbps | 12 Mbps |
 
-Audio output: AAC, 192 kbps, stereo, 48 kHz.
+Audio output: AAC-LC, 384 kbps, stereo, 48 kHz (matches YouTube's recommended upload spec).
 
-Container: **`.mov`** (HEVC in `.mov` is Apple's documented preference and plays in QuickTime, Safari, VLC, iOS without the `hvc1`/`hev1` sample-entry confusion that `.mp4` HEVC sometimes triggers).
+Container: **`.mp4`** with `hvc1` sample entries (`AVAssetWriter`'s default HEVC sample-entry choice on macOS 14+). YouTube's recommended upload container is MP4; HEVC inside MP4 plays in QuickTime, Safari, iOS, and any modern HEVC-capable web player.
 
 ### Filenames + progress
 
-- Output: `<outputFolder>/<tag> - <projectName>.mov`. The virtual tag becomes `all-clips - <projectName>.mov`.
+- Output: `<outputFolder>/<tag> - <projectName>.mp4`. The virtual tag becomes `all-clips - <projectName>.mp4`.
 - Per-tag progress driven by polling `AVAssetExportSession.progress` (a `Float`, exposed via `AsyncStream<Float>`) at 5Hz on a `Task`. KVO compliance for `progress` has historically been inconsistent across macOS versions; polling is reliable.
 - Tags export sequentially — keeps the UI responsive and avoids contention on the shared VideoToolbox encoder queue.
 
@@ -471,7 +471,7 @@ The non-obvious calls made during design, with their rationale.
 - **Custom `AVVideoCompositing` compositor for both freeze frames and overlays.** Avoids the unreliable `AVMutableComposition.scaleTimeRange` freeze trick (time-mapping edit, not frame duplication — produces black/garbage on long-GOP HEVC) and avoids `AVVideoCompositionCoreAnimationTool`'s known fragility (`AVCoreAnimationBeginTimeAtZero` requirement, `isGeometryFlipped` requirement, undocumented behavior with reader-backed pipelines). Drawing strokes + text bar in a Core Graphics pass over each output buffer is simpler and predictable.
 - **`AVAssetExportSession` first, `AVAssetReader`/`AVAssetWriter` only as fallback.** ExportSession + custom compositor + custom audio mix covers the bitrate range we need (6–24 Mbps HEVC) without the lifecycle complexity of a hand-driven reader/writer pipeline. Phase 9 includes a spike to confirm before committing.
 - **Volume sliders are global, not per-clip.** Tracks user intent — they tune source vs commentary balance once and want it applied across the project. Per-clip overrides can be added later if needed.
-- **HEVC in `.mov`, not `.mp4`.** Apple's documented recommendation. Avoids the `hvc1`/`hev1` sample-entry compatibility quirks that `.mp4` HEVC occasionally triggers. Plays everywhere we care about (QuickTime, Safari, VLC, iOS).
+- **HEVC in `.mp4`, AAC-LC at 384 kbps.** The user's only export target is YouTube; YouTube's recommended upload spec is MP4 + AAC-LC 384 kbps stereo. AVAssetWriter's default HEVC sample-entry on macOS 14+ is `hvc1` which YouTube's ingest pipeline accepts and which plays correctly in QuickTime, Safari, iOS, and modern HEVC-capable web players. The earlier `.mov` rationale (Apple's editing-tool preference, `hvc1`/`hev1` web-streaming quirks) is irrelevant for YouTube file upload.
 - **Time anchor at the first `AVCaptureVideoDataOutput` sample buffer's PTS, not at the `didStartRecordingTo` callback.** The delegate callback fires when the file handle is opened (50–150ms before the first sample is actually captured); the data output's first sample buffer is, by definition, the first frame in the recorded file. Sub-frame accurate anchoring with no retroactive offset math.
 - **AVCaptureVideoDataOutput companion alongside AVCaptureMovieFileOutput.** Costs essentially nothing — its sample buffer delegate runs on a background queue and discards every buffer except the first one per recording. Worth it for the time anchor.
 - **Explicit `device.activeFormat`, not `sessionPreset = .high`.** `.high` resolves device-dependently (1920×1440 4:3 on Continuity Camera, 1280×720 16:9 on built-in FaceTime). Locking to a deterministic format keeps the PiP transform math stable.

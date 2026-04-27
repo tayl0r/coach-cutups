@@ -21,7 +21,7 @@
 
 ## Phase 1 — Repo + project scaffold
 
-> Adversarial-review fixes from two review passes are folded into this plan. Highlights: time anchor uses the first `AVCaptureVideoDataOutput` sample buffer's PTS (sub-frame accurate); freeze frames implemented via custom `AVVideoCompositing` (not `scaleTimeRange`); export uses `AVAssetExportSession` with a real spike (Task 9.0) that exercises a stub compositor + audio mix; HEVC container is `.mov`; bookmarks are non-security-scoped with stale-regen handling; capture format is explicit and configured *after* `addInput` (the canonical AVCam order); Workspace loader is properly async; per-instruction context flows via a `CompilationInstruction` subclass; Mode C clip preview is layered (separate AVPlayerLayer + CAShapeLayer overlay + text-bar view) instead of reusing the export's full compositor.
+> Adversarial-review fixes from six review passes are folded into this plan. Highlights: time anchor uses the first `AVCaptureVideoDataOutput` sample buffer's PTS (sub-frame accurate); freeze frames implemented via custom `AVVideoCompositing` (not `scaleTimeRange`); export uses `AVAssetExportSession` with a real spike (Task 9.0) that exercises a stub compositor + audio mix; HEVC export container is `.mp4` (YouTube upload target); recordings on disk are `.mov` (AVCaptureMovieFileOutput's native container); bookmarks are non-security-scoped with stale-regen handling; capture format is explicit and configured *after* `addInput` (the canonical AVCam order); Workspace loader is properly async; per-instruction context flows via a `CompilationInstruction` subclass; Mode C clip preview is layered (separate AVPlayerLayer + CAShapeLayer overlay + text-bar view) instead of reusing the export's full compositor.
 
 ### Task 1.1: Add `.gitignore` and `README.md`
 
@@ -2851,7 +2851,7 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 - Use `AVAssetWriter` to generate a synthetic 1-second 1080p source `.mov` of a solid green color.
 - Build a `CompilationInstruction` with **two strokes deliberately placed near the TOP of the frame (all points at normalized y ≈ 0.1)** and a `.clearAll` event between them — exercises both the orientation contract and the clearAll contract.
 - Wrap in an `AVMutableVideoComposition` with `customVideoCompositorClass = CompilationCompositor.self`, instructions = `[that one instruction with timeRange + requiredSourceTrackIDs set]`.
-- Run an `AVAssetExportSession` with HEVC preset, output to a temp `.mov`.
+- Run an `AVAssetExportSession` with HEVC preset, output to a temp `.mp4`.
 - Read back via `AVAssetImageGenerator.image(at:)` (async API, macOS 13+).
 - Sample three regions of the resulting `CGImage` (use a `CGContext`-backed bitmap and `CGImage.copyData()` to read pixels):
   - **Top strip** (y ≈ 0.1): expect mostly red pixels for the second stroke (post-clearAll, still visible). Asserts strokes draw at the TOP, not bottom — catches C2-class regressions.
@@ -2870,7 +2870,7 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 **Files:**
 - Create: `App/Export/CompilationExporter.swift`
 
-**Step 1:** Implement an actor that takes a `CompilationPlan` and produces one `.mov` via `AVAssetExportSession`:
+**Step 1:** Implement an actor that takes a `CompilationPlan` and produces one `.mp4` via `AVAssetExportSession`:
 
 1. Builds `AVMutableComposition` with explicit track IDs:
    - Source video: `addMutableTrack(withMediaType: .video, preferredTrackID: 1)`. Insert `.play` segments only.
@@ -2903,8 +2903,8 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
      ```
    - This eliminates AAC click artifacts at interior cuts (priming compensation only applies at file start; interior slices are hard cuts at non-zero amplitude).
 4. Configures `AVAssetExportSession`:
-   - `outputFileType = .mov`
-   - `outputURL = outputFolder/<tag> - <projectName>.mov`
+   - `outputFileType = .mp4`
+   - `outputURL = outputFolder/<tag> - <projectName>.mp4`
    - `videoComposition = ourVideoComposition`
    - `audioMix = ourAudioMix`
    - `presetName` chosen by `Quality` (subject to Task 9.0 spike outcome).
@@ -2929,7 +2929,7 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 - **Export button is disabled when zero rows are checked** OR when the output folder is unset. (Otherwise the user gets a no-op click.)
 - Export button → kicks off `CompilationExporter` per checked row sequentially, shows progress per tag.
 
-**Step 2:** Manual test the full path: open a project with several clips and varied tags → Export → pick output folder → run. Verify per-tag `.mov` files appear with the expected filenames and contents.
+**Step 2:** Manual test the full path: open a project with several clips and varied tags → Export → pick output folder → run. Verify per-tag `.mp4` files appear with the expected filenames and contents. Upload one to YouTube as a smoke test of the YouTube ingest pipeline.
 
 **Step 3:** Commit.
 
