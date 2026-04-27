@@ -2500,7 +2500,7 @@ final class ExportSpikeTests: XCTestCase {
     func test_AVAssetExportSession_honorsCustomCompositorAndAudioMix_underHEVCPreset() async throws {
         let tmp = FileManager.default.temporaryDirectory
         let sourceURL = tmp.appendingPathComponent("spike-source-\(UUID()).mov")
-        let outputURL = tmp.appendingPathComponent("spike-output-\(UUID()).mov")
+        let outputURL = tmp.appendingPathComponent("spike-output-\(UUID()).mp4")
         defer {
             try? FileManager.default.removeItem(at: sourceURL)
             try? FileManager.default.removeItem(at: outputURL)
@@ -2542,7 +2542,7 @@ final class ExportSpikeTests: XCTestCase {
             XCTFail("Could not create export session"); return
         }
         export.outputURL = outputURL
-        export.outputFileType = .mov
+        export.outputFileType = .mp4    // mirrors production CompilationExporter (Task 9.4)
         export.videoComposition = videoComp
         export.audioMix = audioMix
         await export.export()
