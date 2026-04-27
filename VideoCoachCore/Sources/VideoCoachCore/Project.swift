@@ -5,7 +5,7 @@ public enum Tag {
         var seen = Set<String>()
         var out: [String] = []
         for fragment in input.split(separator: ",") {
-            let trimmed = fragment.trimmingCharacters(in: .whitespaces).lowercased()
+            let trimmed = fragment.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
             guard !trimmed.isEmpty, !seen.contains(trimmed) else { continue }
             seen.insert(trimmed)
             out.append(trimmed)
