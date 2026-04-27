@@ -2260,14 +2260,18 @@ The design explicitly chooses a **custom `AVVideoCompositing` compositor** (hand
 
 ### Task 9.0: AVAssetExportSession spike — does the risky combination actually work?
 
-**Goal:** confirm `AVAssetExportSession` honors a `customVideoCompositorClass` AND a custom `audioMix` AND a non-default frame rate when paired with HEVC presets. Empty-composition tests don't exercise the risk; we need a stub compositor that proves the compositor is actually called, plus a non-1.0 audio mix that proves the mix is honored, plus bitrate measurement.
+**Goal:** confirm `AVAssetExportSession` honors a `customVideoCompositorClass` AND a custom `audioMix` when paired with HEVC presets. The whole Phase 9 architecture rides on this being true; if any piece doesn't compose, drop to `AVAssetReader`/`AVAssetWriter` (Task 9.6).
 
-**Tooling note**: the spike's verification commands use `ffprobe`/`ffmpeg`/`afinfo`. These are dev-only verification dependencies — `brew install ffmpeg`. Not a runtime dependency of the app.
+The spike is an **XCTest case** in `VideoCoachTests` — same toolchain as the rest of the project, runs via `swift test` (or `⌘U` in Xcode), no external tools required. Closed-loop verification: AVFoundation produces the file, AVFoundation reads it back.
 
 **Files:**
-- Create: `App/Export/ExportSpike.swift` (deletable scratch file)
+- Create: `VideoCoachTests/ExportSpikeTests.swift`
+- Create: `VideoCoachTests/Helpers/SyntheticAsset.swift`
+- Create: `VideoCoachTests/Helpers/PixelSampling.swift`
+- Create: `VideoCoachTests/Helpers/AudioRMS.swift`
+- Create: `App/Export/RedCompositor.swift` (kept; possibly reused in Task 9.3 smoke test)
 
-**Step 1:** Build a stub compositor that paints every frame solid red:
+**Step 1:** Implement `RedCompositor` — stub `AVVideoCompositing` that paints every frame solid red:
 
 ```swift
 final class RedCompositor: NSObject, AVVideoCompositing {
@@ -2285,47 +2289,208 @@ final class RedCompositor: NSObject, AVVideoCompositing {
         CVPixelBufferLockBaseAddress(pb, [])
         defer { CVPixelBufferUnlockBaseAddress(pb, []) }
         let cs = CGColorSpaceCreateDeviceRGB()
-        let bitmap = CGContext(data: CVPixelBufferGetBaseAddress(pb),
-                               width: CVPixelBufferGetWidth(pb),
-                               height: CVPixelBufferGetHeight(pb),
-                               bitsPerComponent: 8,
-                               bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
-                               space: cs,
-                               bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                                          | CGBitmapInfo.byteOrder32Little.rawValue)
-        bitmap?.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
-        bitmap?.fill(CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb)))
+        if let bitmap = CGContext(data: CVPixelBufferGetBaseAddress(pb),
+                                  width: CVPixelBufferGetWidth(pb),
+                                  height: CVPixelBufferGetHeight(pb),
+                                  bitsPerComponent: 8,
+                                  bytesPerRow: CVPixelBufferGetBytesPerRow(pb),
+                                  space: cs,
+                                  bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                                             | CGBitmapInfo.byteOrder32Little.rawValue) {
+            bitmap.setFillColor(red: 1, green: 0, blue: 0, alpha: 1)
+            bitmap.fill(CGRect(x: 0, y: 0, width: CVPixelBufferGetWidth(pb), height: CVPixelBufferGetHeight(pb)))
+        }
         request.finish(withComposedVideoFrame: pb)
     }
 }
 ```
 
-**Step 2:** Run an export with: a 10-second silent test `.mov` (`AVAssetWriter` from a green pixel buffer, plus 1kHz tone audio), `AVMutableVideoComposition.customVideoCompositorClass = RedCompositor.self`, `AVMutableAudioMix` with `setVolume(0.25, at: .zero)` on the audio track, `AVAssetExportPresetHEVC1920x1080`, output `.mov`.
+**Step 2:** Implement the test helpers.
 
-**Step 3:** Verify with `ffprobe` and `afinfo`:
-```bash
-# Video: HEVC at expected bitrate
-ffprobe -v error -select_streams v:0 -show_entries stream=codec_name,bit_rate,width,height output.mov
+`SyntheticAsset.swift` — writes a `.mov` of solid-colored frames + a sine-wave audio track, used as the spike's input source. Uses `AVAssetWriter` with `AVAssetWriterInputPixelBufferAdaptor` for video (one solid-color CVPixelBuffer appended `duration × 30` times with advancing PTS) and `AVAssetWriterInput` with PCM-encoded audio (sine samples from a Float32 buffer):
 
-# Spot-check frames are red, not green (proves compositor was called)
-ffmpeg -i output.mov -vf "select=eq(n\,30)" -vframes 1 -y frame30.png
-# Inspect frame30.png — should be solid red.
-
-# Audio: confirm 0.25 attenuation took effect (proves audio mix honored)
-ffmpeg -i output.mov -af "volumedetect" -f null - 2>&1 | grep mean_volume
-# Compare to source — should be ~12 dB lower (≈ 0.25 linear).
+```swift
+enum SyntheticAsset {
+    /// Writes a synthetic .mov of `duration` seconds: solid `videoColor` at 1080p30 + sine
+    /// wave at `audioFrequency` Hz with peak amplitude `audioAmplitude` (0.0–1.0).
+    static func write(to url: URL,
+                      duration: Double,
+                      videoColor: (r: Double, g: Double, b: Double),
+                      audioFrequency: Double,
+                      audioAmplitude: Double) async throws {
+        // ~80 lines: AVAssetWriter setup with video + audio inputs, generate solid-color
+        // CVPixelBuffer once, append for duration*30 frames; generate sine PCM samples,
+        // append in 1024-frame blocks. Wait on input.requestMediaDataWhenReady. finish().
+    }
+}
 ```
 
-**Step 4:** Decision matrix:
-- All three checks pass → ExportSession path is safe. Proceed with 9.1–9.5 as written. Skip 9.6.
-- Frames are green (compositor not called) → preset is taking a fast-path. Switch the entire export to `AVAssetReader`/`AVAssetWriter` (Task 9.6 promoted to mandatory).
-- Audio not attenuated (mix not honored) → same fallback.
-- HEVC bitrate too high or too low for 6/12/24 Mbps targets → switch to `AVAssetWriter` for video output settings control (9.6 mandatory) but consider keeping ExportSession for audio.
+`PixelSampling.swift` — read pixels from a `CGImage` and compute mean RGB over a normalized region:
 
-**Step 5:** Record the outcome in the design's **Spike outcomes** section (replace the empty checkbox). Delete the spike file:
+```swift
+enum PixelSampling {
+    struct AvgRGB { var r, g, b: Double }
+    static func averageRGB(in image: CGImage, normalizedRect: CGRect) -> AvgRGB {
+        let cs = CGColorSpaceCreateDeviceRGB()
+        let bytesPerRow = image.width * 4
+        var pixels = [UInt8](repeating: 0, count: image.height * bytesPerRow)
+        let ctx = CGContext(data: &pixels, width: image.width, height: image.height,
+                            bitsPerComponent: 8, bytesPerRow: bytesPerRow, space: cs,
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        ctx.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+        let xStart = Int(normalizedRect.minX * CGFloat(image.width))
+        let yStart = Int(normalizedRect.minY * CGFloat(image.height))
+        let xEnd = Int(normalizedRect.maxX * CGFloat(image.width))
+        let yEnd = Int(normalizedRect.maxY * CGFloat(image.height))
+        var sumR = 0.0, sumG = 0.0, sumB = 0.0, n = 0.0
+        for y in yStart..<yEnd {
+            for x in xStart..<xEnd {
+                let i = y * bytesPerRow + x * 4
+                sumR += Double(pixels[i])     / 255.0
+                sumG += Double(pixels[i + 1]) / 255.0
+                sumB += Double(pixels[i + 2]) / 255.0
+                n += 1
+            }
+        }
+        return .init(r: sumR / n, g: sumG / n, b: sumB / n)
+    }
+}
+```
+
+`AudioRMS.swift` — reads PCM samples through `AVAssetReader`, computes RMS amplitude:
+
+```swift
+enum AudioRMS {
+    static func measure(track: AVAssetTrack, in asset: AVAsset) async throws -> Double {
+        let reader = try AVAssetReader(asset: asset)
+        let settings: [String: Any] = [
+            AVFormatIDKey: kAudioFormatLinearPCM,
+            AVLinearPCMBitDepthKey: 32,
+            AVLinearPCMIsFloatKey: true,
+            AVLinearPCMIsBigEndianKey: false,
+            AVLinearPCMIsNonInterleaved: false,
+        ]
+        let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
+        reader.add(output)
+        reader.startReading()
+        var sumSq = 0.0
+        var count = 0.0
+        while let buf = output.copyNextSampleBuffer() {
+            guard let block = CMSampleBufferGetDataBuffer(buf) else { continue }
+            var length = 0
+            var dataPointer: UnsafeMutablePointer<Int8>?
+            CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil,
+                                        totalLengthOut: &length, dataPointerOut: &dataPointer)
+            guard let p = dataPointer else { continue }
+            let floats = UnsafeBufferPointer<Float32>(
+                start: UnsafeRawPointer(p).assumingMemoryBound(to: Float32.self),
+                count: length / MemoryLayout<Float32>.size)
+            for s in floats { sumSq += Double(s) * Double(s); count += 1 }
+        }
+        return sqrt(sumSq / max(1, count))
+    }
+}
+```
+
+**Step 3:** Write the spike test.
+
+```swift
+final class ExportSpikeTests: XCTestCase {
+    func test_AVAssetExportSession_honorsCustomCompositorAndAudioMix_underHEVCPreset() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+        let sourceURL = tmp.appendingPathComponent("spike-source-\(UUID()).mov")
+        let outputURL = tmp.appendingPathComponent("spike-output-\(UUID()).mov")
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+
+        // Source: 10s of solid green at 1080p + 1kHz sine at amplitude 0.5.
+        try await SyntheticAsset.write(
+            to: sourceURL, duration: 10.0,
+            videoColor: (r: 0, g: 1, b: 0),
+            audioFrequency: 1000, audioAmplitude: 0.5)
+        let sourceAsset = AVURLAsset(url: sourceURL)
+        let sourceDuration = try await sourceAsset.load(.duration)
+        let sourceVideo = try await sourceAsset.loadTracks(withMediaType: .video).first!
+        let sourceAudio = try await sourceAsset.loadTracks(withMediaType: .audio).first!
+
+        // Composition wraps the source.
+        let comp = AVMutableComposition()
+        let v = comp.addMutableTrack(withMediaType: .video, preferredTrackID: 1)!
+        let a = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: 2)!
+        try v.insertTimeRange(.init(start: .zero, duration: sourceDuration), of: sourceVideo, at: .zero)
+        try a.insertTimeRange(.init(start: .zero, duration: sourceDuration), of: sourceAudio, at: .zero)
+
+        // Custom compositor + 0.25 audio mix.
+        let videoComp = AVMutableVideoComposition()
+        videoComp.customVideoCompositorClass = RedCompositor.self
+        videoComp.renderSize = CGSize(width: 1920, height: 1080)
+        videoComp.frameDuration = CMTime(value: 1, timescale: 30)
+        let inst = AVMutableVideoCompositionInstruction()
+        inst.timeRange = CMTimeRange(start: .zero, duration: sourceDuration)
+        videoComp.instructions = [inst]
+
+        let audioMix = AVMutableAudioMix()
+        let params = AVMutableAudioMixInputParameters(track: a)
+        params.setVolume(0.25, at: .zero)
+        audioMix.inputParameters = [params]
+
+        // Export.
+        guard let export = AVAssetExportSession(asset: comp, presetName: AVAssetExportPresetHEVC1920x1080) else {
+            XCTFail("Could not create export session"); return
+        }
+        export.outputURL = outputURL
+        export.outputFileType = .mov
+        export.videoComposition = videoComp
+        export.audioMix = audioMix
+        await export.export()
+        XCTAssertEqual(export.status, .completed,
+                       "Export failed: \(export.error?.localizedDescription ?? "unknown")")
+
+        // ─── Verification 1: HEVC at a sane bitrate. ───
+        let outAsset = AVURLAsset(url: outputURL)
+        let outVideo = try await outAsset.loadTracks(withMediaType: .video).first!
+        let formats = try await outVideo.load(.formatDescriptions)
+        let codec = formats.first.map { CMFormatDescriptionGetMediaSubType($0) }
+        XCTAssertEqual(codec, kCMVideoCodecType_HEVC, "Output is not HEVC")
+        let bitrate = try await outVideo.load(.estimatedDataRate)
+        XCTAssertGreaterThan(bitrate, 1_000_000, "Bitrate suspiciously low — preset may have skipped encode")
+        XCTAssertLessThan(bitrate, 50_000_000, "Bitrate suspiciously high")
+
+        // ─── Verification 2: Frame at t=1s is RED, not green. ───
+        // Proves the custom compositor was actually invoked by the HEVC preset path.
+        let gen = AVAssetImageGenerator(asset: outAsset)
+        gen.appliesPreferredTrackTransform = true
+        let (cgImage, _) = try await gen.image(at: CMTime(seconds: 1.0, preferredTimescale: 600))
+        let center = PixelSampling.averageRGB(in: cgImage,
+                                              normalizedRect: CGRect(x: 0.4, y: 0.4, width: 0.2, height: 0.2))
+        XCTAssertGreaterThan(center.r, 0.8, "Frame is not red — compositor was bypassed (preset fast-path)")
+        XCTAssertLessThan(center.g, 0.2, "Frame still has green — compositor was not honored")
+
+        // ─── Verification 3: Audio is ~0.25× original RMS. ───
+        // Proves the AVMutableAudioMix was honored by the export pipeline.
+        let outAudio = try await outAsset.loadTracks(withMediaType: .audio).first!
+        let outRMS = try await AudioRMS.measure(track: outAudio, in: outAsset)
+        let sourceRMS = try await AudioRMS.measure(track: sourceAudio, in: sourceAsset)
+        XCTAssertEqual(outRMS / sourceRMS, 0.25, accuracy: 0.05,
+                       "Audio mix was not honored — output amplitude is \(outRMS / sourceRMS)× source")
+    }
+}
+```
+
+**Step 4:** Run with `swift test --filter ExportSpikeTests`. Decision matrix:
+
+- All three assertions pass → ExportSession path is safe. Proceed with Tasks 9.1–9.5 as written. Skip 9.6.
+- Verification 2 fails (frames are green) → preset is bypassing the compositor. Switch the entire export to `AVAssetReader`/`AVAssetWriter` (Task 9.6 promoted to mandatory).
+- Verification 3 fails → audio mix not honored. Same fallback.
+- Verification 1's bitrate is outside our 6–24 Mbps targets at the preset → switch to `AVAssetWriter` for explicit video output settings (9.6 mandatory) but consider keeping ExportSession for audio.
+
+**Step 5:** Record the outcome in the design's **Spike outcomes** section (check the boxes and note the actual bitrate value). Keep the test as a regression check (don't delete) — it costs <2s to run and protects against future macOS regressions of the same combination. Commit:
+
 ```bash
-git rm App/Export/ExportSpike.swift
-git commit -m "chore: spike AVAssetExportSession + custom compositor + audio mix (outcome recorded in design)"
+git add VideoCoachTests/ExportSpikeTests.swift VideoCoachTests/Helpers/ App/Export/RedCompositor.swift
+git commit -m "test: spike AVAssetExportSession + custom compositor + audio mix"
 ```
 
 ---
