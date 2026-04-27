@@ -781,6 +781,61 @@ git commit -m "feat(core): playbackSegments builder for export compositing"
 
 ---
 
+### Task 3.3: `visibleStrokes(in:atRecordTime:)` shared replay helper (TDD)
+
+The export compositor and Mode C stroke-replay layer must agree on which strokes are visible at any given record-time and how many of each stroke's points have been "drawn" by then. Single source of truth = pure function in core.
+
+**Files:**
+- Create: `VideoCoachCore/Sources/VideoCoachCore/StrokeReplay.swift`
+- Create: `VideoCoachCore/Tests/VideoCoachCoreTests/StrokeReplayTests.swift`
+
+**Step 1:** Write tests covering:
+- A stroke is invisible before its `firstPointRecordTime`.
+- A stroke is partially visible (correct `drawnPointCount`) mid-draw.
+- A stroke with `autoClearAfterSeconds = 5` is invisible after `firstPointRecordTime + 5`.
+- A `.clearAll` event clears strokes drawn before it but not after.
+- Multiple strokes interleaved with `.clearAll` and auto-clear behave correctly.
+
+**Step 2:** Implement:
+
+```swift
+public struct VisibleStroke: Equatable {
+    public let stroke: Stroke
+    public let firstPointRecordTime: Double
+    public let drawnPointCount: Int
+}
+
+public func visibleStrokes(in clip: Clip, atRecordTime t: Double) -> [VisibleStroke] {
+    var out: [VisibleStroke] = []
+    var lastClearAllTime: Double = -.infinity
+    for ev in clip.events {
+        switch ev.kind {
+        case .clearAll:
+            lastClearAllTime = ev.recordTime
+        case .stroke(let s):
+            let firstT = ev.recordTime - (s.points.last?.t ?? 0)
+            // Cleared by .clearAll between first-point and now?
+            if lastClearAllTime > firstT && lastClearAllTime <= t { continue }
+            // Auto-clear elapsed?
+            if let auto = s.autoClearAfterSeconds, t >= firstT + auto { continue }
+            // Not started yet?
+            if t < firstT { continue }
+            // Partial point count: largest k such that points[k-1].t <= (t - firstT).
+            let elapsed = t - firstT
+            let k = s.points.firstIndex(where: { $0.t > elapsed }) ?? s.points.count
+            out.append(.init(stroke: s, firstPointRecordTime: firstT, drawnPointCount: k))
+        case .play, .pause, .skip:
+            break
+        }
+    }
+    return out
+}
+```
+
+**Step 3:** Run, expect pass. Commit.
+
+---
+
 ## Phase 4 — Project file IO (TDD)
 
 ### Task 4.1: `ProjectStore.read` / `ProjectStore.write` with atomic write
@@ -1218,7 +1273,7 @@ struct ContentView: View {
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
-            try? workspace.openProject(folder: url)
+            Task { try? await workspace.openProject(folder: url) }
         }
     }
 }
@@ -1373,18 +1428,101 @@ git commit -m "feat(app): keyboard shortcuts space/arrows/AD for transport"
 - Create: `App/Views/ClipInspector.swift`
 - Create: `App/Models/AppMode.swift`
 
-**Step 1:** Implement `AppMode`:
+**Step 1:** Implement `AppMode` (the `recordingStarting` state from Task 7.4 lives here too):
 
 ```swift
 import Foundation
-enum AppMode: Equatable { case scanning, recording, previewClip(Clip.ID) }
+import VideoCoachCore
+
+enum AppMode: Equatable {
+    case scanning
+    case recordingStarting
+    case recording
+    case previewClip(Clip.ID)
+}
 ```
 
-**Step 2:** Implement empty `ClipSidebar`/`ClipInspector` placeholders that read from `Workspace`. Switch `ContentView` to a three-pane `NavigationSplitView` with the player surface in the detail column.
+**Step 2:** Replace `ContentView` with the three-pane layout. The `selectedClipID` binding drives `appMode`: nil → `.scanning`, set → `.previewClip(id)`. Recording state is owned separately and overrides the mode while active.
 
-(Skipping verbatim UI Swift here — straightforward NavigationSplitView + List(workspace.project.clips).)
+```swift
+import SwiftUI
+import VideoCoachCore
 
-**Step 3:** Run. Verify 3-pane layout shows project name top-left, empty clip list, player center, empty inspector right. Commit.
+struct ContentView: View {
+    @State private var workspace = Workspace()
+    @State private var selectedClipID: Clip.ID?
+    @State private var appMode: AppMode = .scanning
+
+    var body: some View {
+        NavigationSplitView {
+            ClipSidebar(workspace: $workspace, selectedClipID: $selectedClipID)
+                .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
+        } content: {
+            VStack(spacing: 0) {
+                ZStack {
+                    PlayerSurface(player: currentPlayer)
+                    KeyCommandView(
+                        player: currentPlayer,
+                        onSkip: handleSkip,
+                        onTogglePlay: handleTogglePlay
+                    )
+                }
+                TransportBar(workspace: $workspace, appMode: $appMode)
+                    .frame(height: 56)
+            }
+        } detail: {
+            ClipInspector(workspace: $workspace, selectedClipID: $selectedClipID)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
+        }
+        .toolbar { /* New Project, Open Project, Add Source, Export… */ }
+        .onChange(of: selectedClipID) { _, newID in
+            appMode = newID.map { .previewClip($0) } ?? .scanning
+        }
+    }
+
+    private var currentPlayer: AVPlayer? {
+        switch appMode {
+        case .previewClip(let id): return workspace.previewPlayer(for: id)
+        default:                   return workspace.virtualPlayer
+        }
+    }
+    // ... handleSkip / handleTogglePlay route through workspace + RecordingController.
+}
+```
+
+**Step 3:** Implement `ClipSidebar` — project-name editor at the top, then a `List` of clips supporting drag-to-reorder (`onMove`) and `Cmd-Delete` to remove. List rows show name + duration. Selection binding goes to `selectedClipID`.
+
+```swift
+struct ClipSidebar: View {
+    @Binding var workspace: Workspace
+    @Binding var selectedClipID: Clip.ID?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            TextField("Project name", text: $workspace.project.name)
+                .textFieldStyle(.plain)
+                .font(.headline)
+                .padding(8)
+                .onSubmit { try? workspace.saveProject() }
+
+            List(selection: $selectedClipID) {
+                ForEach(workspace.project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })) { clip in
+                    HStack {
+                        Text(clip.name).lineLimit(1)
+                        Spacer()
+                        Text(formatDuration(clip.recordingDuration)).font(.caption).foregroundStyle(.secondary)
+                    }.tag(clip.id)
+                }
+                .onMove { indices, dest in workspace.reorderClips(from: indices, to: dest) }
+            }
+        }
+    }
+}
+```
+
+**Step 4:** Implement `ClipInspector` placeholder — reads the selected clip and shows its `name`, `notes`, `tags`. Tag editing comes in Task 6.2; for now plain `TextField`s wired with `.onSubmit { try? workspace.saveProject() }`.
+
+**Step 5:** Run. Verify project name editable, empty clip list, player center, empty inspector when no clip selected. Add a stub clip programmatically to verify selection updates the inspector. Commit.
 
 ---
 
@@ -1431,6 +1569,9 @@ enum CaptureError: Error {
     case noAudioDevice
     case noSuitableFormat
     case permissionDenied(media: AVMediaType)
+    case alreadyRecording
+    case firstSampleTimeout
+    case unsynchronizedClock     // synchronizationClock differs from host clock — refusing to start
 }
 
 @Observable
@@ -1446,11 +1587,14 @@ final class CaptureSessionController: NSObject,
     private let dataOutput = AVCaptureVideoDataOutput()
     private let dataQueue = DispatchQueue(label: "videoCoach.capture.data")
 
-    /// Resumed with the host-time PTS (in seconds) of the first sample buffer
-    /// delivered after the most recent startRecording call. nil between recordings.
+    /// Resumed with the host-time PTS (in seconds) of the first sample buffer that lands
+    /// AFTER the file output has opened the recording. nil between recordings.
+    /// All access to these three fields is on dataQueue.
     private var t0Continuation: CheckedContinuation<Double, Error>?
-    private var stopContinuation: CheckedContinuation<Double, Error>?
     private var awaitingFirstSample = false
+    private var firstSampleTimeoutTask: Task<Void, Never>?
+
+    private var stopContinuation: CheckedContinuation<Double, Error>?
     private var videoDevice: AVCaptureDevice?
 
     func configure() async throws {
@@ -1513,14 +1657,47 @@ final class CaptureSessionController: NSObject,
 
     /// Returns the host-time PTS (seconds) of the first frame that lands in the recorded file.
     /// This is our event-log t = 0.
+    ///
+    /// Implementation notes:
+    /// - We arm the continuation on dataQueue BEFORE calling startRecording, but we only flip
+    ///   `awaitingFirstSample` AFTER `didStartRecordingTo` confirms the file is open.
+    ///   Otherwise we'd anchor to a buffer captured before the file actually started,
+    ///   producing a t0 that's earlier than the first frame in the recording.
+    /// - 2-second timeout protects the UI from hanging forever if the camera fails.
+    /// - Refuses re-entry if a recording is already pending or running.
     func startRecording(to url: URL) async throws -> Double {
+        try checkSessionClock()
+        try dataQueue.sync {
+            guard t0Continuation == nil, !isRecording else { throw CaptureError.alreadyRecording }
+        }
         return try await withCheckedThrowingContinuation { cont in
-            dataQueue.async {
-                self.awaitingFirstSample = true
+            dataQueue.sync {
                 self.t0Continuation = cont
+                self.awaitingFirstSample = false   // armed in didStartRecordingTo
             }
             movieOutput.startRecording(to: url, recordingDelegate: self)
             isRecording = true
+            firstSampleTimeoutTask = Task { [weak self] in
+                try? await Task.sleep(nanoseconds: 2_000_000_000)
+                self?.dataQueue.async {
+                    guard let self, let cont = self.t0Continuation else { return }
+                    self.t0Continuation = nil
+                    self.awaitingFirstSample = false
+                    cont.resume(throwing: CaptureError.firstSampleTimeout)
+                    self.movieOutput.stopRecording()
+                }
+            }
+        }
+    }
+
+    /// AVCaptureSession's master clock is normally CMClockGetHostTimeClock(), matching CACurrentMediaTime().
+    /// On certain Continuity Camera or external pro-capture paths it's a device-derived clock; we
+    /// refuse to record in that case rather than silently producing misaligned timestamps.
+    /// (A future v2 can convert PTS via CMSyncConvertTime instead of refusing.)
+    private func checkSessionClock() throws {
+        let clock: CMClock? = session.synchronizationClock
+        if let c = clock, c !== CMClockGetHostTimeClock() {
+            throw CaptureError.unsynchronizedClock
         }
     }
 
@@ -1541,6 +1718,8 @@ final class CaptureSessionController: NSObject,
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         awaitingFirstSample = false
         t0Continuation = nil
+        firstSampleTimeoutTask?.cancel()
+        firstSampleTimeoutTask = nil
         cont.resume(returning: pts.seconds)   // host-time clock; same as CACurrentMediaTime()
     }
 
@@ -1549,8 +1728,13 @@ final class CaptureSessionController: NSObject,
     func fileOutput(_ output: AVCaptureFileOutput,
                     didStartRecordingTo fileURL: URL,
                     from connections: [AVCaptureConnection]) {
-        // We don't anchor t=0 here — see captureOutput above. This delegate just signals
-        // that the file handle is open; the first sample lands ~50-150ms later.
+        // The file is now open. Arm the data-output sample-buffer delegate to capture the
+        // FIRST buffer that arrives AFTER this point (any buffers in flight before this
+        // are pre-recording and must be ignored). We dispatch to dataQueue so the flag
+        // flip is serialized against the delegate's reads.
+        dataQueue.async { [weak self] in
+            self?.awaitingFirstSample = true
+        }
     }
 
     func fileOutput(_ output: AVCaptureFileOutput,
@@ -1560,11 +1744,21 @@ final class CaptureSessionController: NSObject,
         isRecording = false
         if let error {
             stopContinuation?.resume(throwing: error)
-        } else {
-            let asset = AVURLAsset(url: outputFileURL)
-            stopContinuation?.resume(returning: asset.duration.seconds)
+            stopContinuation = nil
+            return
         }
+        let cont = stopContinuation
         stopContinuation = nil
+        Task {
+            // .duration is async-only on the latest macOS; load it off the delegate thread.
+            let asset = AVURLAsset(url: outputFileURL)
+            do {
+                let dur = try await asset.load(.duration)
+                cont?.resume(returning: dur.seconds)
+            } catch {
+                cont?.resume(throwing: error)
+            }
+        }
     }
 }
 ```
@@ -1629,6 +1823,7 @@ final class DrawingOverlayView: NSView {
         var lastTime: TimeInterval
         var lastPxPoint: NSPoint
         var layer: CAShapeLayer
+        var path: CGMutablePath        // grown incrementally with addLine(to:); never re-walked
     }
 
     private var inProgress: InProgress?
@@ -1645,6 +1840,12 @@ final class DrawingOverlayView: NSView {
     required init?(coder: NSCoder) { fatalError() }
 
     override func mouseDown(with event: NSEvent) {
+        // Defensive: discard any abandoned in-progress stroke (e.g. from a synthesized
+        // mouseDown during a window resize). Otherwise its CAShapeLayer leaks.
+        if let prior = inProgress {
+            prior.layer.removeFromSuperlayer()
+            inProgress = nil
+        }
         let p = convert(event.locationInWindow, from: nil)
         let now = CACurrentMediaTime()
         let layer = CAShapeLayer()
@@ -1657,14 +1858,18 @@ final class DrawingOverlayView: NSView {
         layer.lineCap = .round
         layer.lineJoin = .round
         self.layer?.addSublayer(layer)
+        let path = CGMutablePath()
+        let firstSP = pointFromView(p, sinceStart: 0)
+        path.move(to: Denormalize.point(firstSP.x, firstSP.y, into: bounds.size, flipY: true))
+        layer.path = path
         inProgress = InProgress(
             startedAt: now,
-            points: [pointFromView(p, sinceStart: 0)],
+            points: [firstSP],
             lastTime: now,
             lastPxPoint: p,
-            layer: layer
+            layer: layer,
+            path: path
         )
-        rebuildPath(for: inProgress!)
     }
 
     override func mouseDragged(with event: NSEvent) {
@@ -1674,11 +1879,14 @@ final class DrawingOverlayView: NSView {
         if now - ip.lastTime < minDt { return }
         if hypot(p.x - ip.lastPxPoint.x, p.y - ip.lastPxPoint.y) < minPx { return }
         let strokeT = now - ip.startedAt
-        ip.points.append(pointFromView(p, sinceStart: strokeT))
+        let newSP = pointFromView(p, sinceStart: strokeT)
+        ip.points.append(newSP)
         ip.lastTime = now
         ip.lastPxPoint = p
+        // O(1) path growth — no re-walk of all prior points.
+        ip.path.addLine(to: Denormalize.point(newSP.x, newSP.y, into: bounds.size, flipY: true))
+        ip.layer.path = ip.path
         inProgress = ip
-        rebuildPath(for: ip)
     }
 
     override func mouseUp(with event: NSEvent) {
@@ -1708,14 +1916,7 @@ final class DrawingOverlayView: NSView {
         )
     }
 
-    private func rebuildPath(for ip: InProgress) {
-        let path = CGMutablePath()
-        for (i, sp) in ip.points.enumerated() {
-            let cg = Denormalize.point(sp.x, sp.y, into: bounds.size, flipY: true)
-            if i == 0 { path.move(to: cg) } else { path.addLine(to: cg) }
-        }
-        ip.layer.path = path
-    }
+    // (Path is now grown incrementally in mouseDragged; no rebuild-on-every-event needed.)
 }
 ```
 
@@ -1785,7 +1986,11 @@ This means the preview is intentionally NOT pixel-identical to the export. Strok
 - Create: `App/Preview/StrokeReplayLayer.swift`
 - Modify: `App/ContentView.swift`
 
-**Step 1:** Implement `PreviewCompositor` — minimal `AVVideoCompositing` that handles ONLY freeze segments. For `.play` segments, return the source frame from `request.sourceFrame(byTrackID:)`. For `.freeze` segments, return the cached last-source-frame. Reset cache per clip boundary. Does NOT draw strokes, text, or PiP — those are handled in the view hierarchy or by built-in layer instructions.
+**Step 1:** Implement `PreviewCompositor` — minimal `AVVideoCompositing` that handles ONLY freeze segments.
+
+**Backward-scrub correctness.** AVPlayer can call `startRequest` out of temporal order (during seeks, scrubbing, reverse playback). A naive `lastSourceFrame` updated only on forward `.play` requests would display a *future* frame during a freeze if the user scrubs backward. The fix: at composition build time, **pre-decode** one source frame per `.freeze` segment — the source-time at the END of the immediately preceding `.play` segment — and stash these `[FreezeSegmentKey: CVPixelBuffer]` on the instruction (reachable from the compositor via `request.videoCompositionInstruction as? PreviewInstruction`). At render time, freeze frames come from this map by key, never from a runtime cache.
+
+For `.play` segments: return the source frame from `request.sourceFrame(byTrackID:)` directly. The compositor does NOT draw strokes, text, or PiP — those are handled in the view hierarchy or by AVFoundation's built-in layer instructions.
 
 ```swift
 import AVFoundation
@@ -1798,8 +2003,6 @@ final class PreviewCompositor: NSObject, AVVideoCompositing {
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
     ]
     private var renderContext: AVVideoCompositionRenderContext?
-    private var lastSourceFrame: CVPixelBuffer?
-    private var lastClipIndex: Int = -1
 
     func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
         renderContext = newRenderContext
@@ -1807,33 +2010,29 @@ final class PreviewCompositor: NSObject, AVVideoCompositing {
 
     func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
         guard let inst = request.videoCompositionInstruction as? PreviewInstruction else {
-            request.finish(with: NSError(domain: "Preview", code: 1))
-            return
-        }
-        if inst.clipIndex != lastClipIndex {
-            lastClipIndex = inst.clipIndex
-            lastSourceFrame = nil
+            fatalError("PreviewCompositor received a non-PreviewInstruction")
         }
         let recordTime = (request.compositionTime - inst.clipCompositionStart).seconds
-        let isFreeze = inst.isFreezeAt(recordTime: recordTime)
+        let segIndex = inst.segmentIndex(forRecordTime: recordTime)
+        let segment = inst.segments[segIndex]
+
         let buf: CVPixelBuffer?
-        if isFreeze {
-            buf = lastSourceFrame
-        } else if let frame = request.sourceFrame(byTrackID: inst.sourceTrackID) {
-            lastSourceFrame = frame
-            buf = frame
+        if segment.kind == .freeze {
+            // Pre-decoded frozen frame keyed by segment index. Survives backward seeks.
+            buf = inst.frozenFrames[segIndex]
+        } else if let live = request.sourceFrame(byTrackID: inst.sourceTrackID) {
+            buf = live
         } else {
-            buf = lastSourceFrame
+            buf = nil   // gap before first sample — render black
         }
+
         if let buf {
             request.finish(withComposedVideoFrame: buf)
+        } else if let pb = renderContext?.newPixelBuffer() {
+            // Black: pixelBufferPool buffers are zero-initialized when freshly created from BGRA pool.
+            request.finish(withComposedVideoFrame: pb)
         } else {
-            // No source yet — emit a black frame.
-            if let pb = renderContext?.newPixelBuffer() {
-                request.finish(withComposedVideoFrame: pb)
-            } else {
-                request.finishCancelledRequest()
-            }
+            request.finishCancelledRequest()
         }
     }
 
@@ -1845,17 +2044,24 @@ final class PreviewInstruction: AVMutableVideoCompositionInstruction {
     var sourceTrackID: CMPersistentTrackID = 1
     var clipCompositionStart: CMTime = .zero
     var segments: [PlaybackSegment] = []
-    func isFreezeAt(recordTime: Double) -> Bool {
+    /// Pre-decoded frozen frame per segment index where segments[i].kind == .freeze.
+    /// Built once at composition build time; never mutated at render time, so it's safe under
+    /// backward scrubbing or out-of-order render requests.
+    var frozenFrames: [Int: CVPixelBuffer] = [:]
+
+    func segmentIndex(forRecordTime t: Double) -> Int {
         var elapsed = 0.0
-        for seg in segments {
+        for (i, seg) in segments.enumerated() {
             let next = elapsed + seg.outDuration
-            if recordTime < next { return seg.kind == .freeze }
+            if t < next { return i }
             elapsed = next
         }
-        return false
+        return max(0, segments.count - 1)
     }
 }
 ```
+
+The `frozenFrames` map is populated at composition build time by `ClipPreviewBuilder` using `AVAssetImageGenerator.copyCGImage(at: sourceTimeAtEndOfPriorPlay)` → `CGImage` → `CVPixelBuffer`. One generation per freeze segment per clip, off the render thread, before playback starts. The same approach can be applied to the export's `CompilationCompositor` if any user reports incorrect freeze frames during forward export (the export pipeline calls in temporal order so the runtime cache happens to work, but pre-decode is safer).
 
 **Step 2:** Implement `ClipPreviewBuilder` — produces an `AVPlayerItem` for a single clip:
 
@@ -1882,11 +2088,11 @@ func buildPreviewItem(for clip: Clip, project: Project) async throws -> AVPlayer
 
 **Step 3:** Implement `StrokeReplayLayer` — a `CALayer` overlay that observes player time at 60Hz via `AVPlayer.addPeriodicTimeObserver` and maintains one `CAShapeLayer` per visible stroke:
 
-- On each tick, compute `recordTime` relative to clip start.
-- For each stroke, decide visibility: `startedAt ≤ recordTime ∧ (cleared == nil ∨ cleared > recordTime)`.
-- Add a `CAShapeLayer` for newly visible strokes; remove for newly hidden.
-- For visible strokes mid-draw (`recordTime - startedAt < strokeDuration`), update `path` to include only points whose `t ≤ recordTime - startedAt`.
-- Handle scrubbing: when the player seeks backwards, layers may need to be removed/re-added correctly. Simplest: rebuild from scratch on every tick (cheap — usually <10 strokes per clip).
+- On each tick, compute `recordTime = playerTime - clipCompositionStart`.
+- Call `visibleStrokes(in: clip, atRecordTime: recordTime)` (the shared helper from Task 3.3).
+- Diff the result against the currently-displayed `[strokeID: CAShapeLayer]`: add layers for newly visible strokes, remove layers for now-hidden ones, update `path` for partially-drawn strokes whose `drawnPointCount` changed.
+- **Wrap every layer mutation in `CATransaction.begin(); CATransaction.setDisableActions(true); ...; CATransaction.commit()`** so adding/removing a `CAShapeLayer` doesn't trigger the implicit `kCAOnOrderIn` fade animation (strokes should pop in/out instantly, not fade).
+- Handles scrubbing correctly because diff-against-current works for both forward play and backward seek.
 
 **Step 4:** ContentView wiring — when `appMode == .previewClip(id)`, swap `PlayerSurface` for a `ZStack` containing:
 - `PlayerSurface(player: previewPlayer)` (built from `buildPreviewItem`)
@@ -2053,7 +2259,7 @@ public extension AVAsset {
 
 The compositor is registered via `customVideoCompositorClass` and instantiated by AVFoundation — we cannot pass per-clip context through `init`. The standard pattern is to **subclass `AVMutableVideoCompositionInstruction`** and thread the per-clip data on the subclass; the compositor casts on the way in.
 
-**Step 1:** Define `CompilationInstruction` (one per clip in the output composition):
+**Step 1:** Define `CompilationInstruction` (one per clip in the output composition). Note: every instance MUST have `timeRange` set to the clip's compositional range, AND `requiredSourceTrackIDs` set with `NSNumber`-boxed track IDs.
 
 ```swift
 import AVFoundation
@@ -2069,6 +2275,38 @@ final class CompilationInstruction: AVMutableVideoCompositionInstruction {
     var segments: [PlaybackSegment] = []   // walked playback segments (.play / .freeze)
     var strokes: [Stroke] = []              // strokes from the clip's events
     var textBarLine: String = ""            // "i/N, name, tags joined by space"
+
+    /// Builder helper. Always use this rather than the bare initializer to ensure timeRange
+    /// + requiredSourceTrackIDs are populated.
+    static func make(
+        clipIndex: Int,
+        indexInOutput: Int,
+        totalClips: Int,
+        compositionStart: CMTime,
+        clipDuration: CMTime,
+        sourceTrackID: CMPersistentTrackID = 1,
+        webcamTrackID: CMPersistentTrackID,
+        segments: [PlaybackSegment],
+        strokes: [Stroke],
+        textBarLine: String
+    ) -> CompilationInstruction {
+        let i = CompilationInstruction()
+        i.timeRange = CMTimeRange(start: compositionStart, duration: clipDuration)
+        i.requiredSourceTrackIDs = [
+            NSNumber(value: sourceTrackID),
+            NSNumber(value: webcamTrackID)
+        ]
+        i.clipIndex = clipIndex
+        i.indexInOutput = indexInOutput
+        i.totalClips = totalClips
+        i.sourceTrackID = sourceTrackID
+        i.webcamTrackID = webcamTrackID
+        i.clipCompositionStart = compositionStart
+        i.segments = segments
+        i.strokes = strokes
+        i.textBarLine = textBarLine
+        return i
+    }
 }
 ```
 
@@ -2094,7 +2332,9 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 
     func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
         guard let inst = request.videoCompositionInstruction as? CompilationInstruction else {
-            request.finish(with: NSError(domain: "VC", code: 1)); return
+            // The subclass-passthrough is documented behavior; failing here would mean a
+            // future macOS regressed it. Crash visibly rather than silently render black.
+            fatalError("CompilationCompositor received a non-CompilationInstruction")
         }
         if inst.clipIndex != lastClipIndex {
             lastClipIndex = inst.clipIndex
@@ -2128,10 +2368,14 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
             bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
                        | CGBitmapInfo.byteOrder32Little.rawValue
         ) else { request.finishCancelledRequest(); return }
+        // newPixelBuffer() doesn't guarantee zeroed memory. Clear to black before drawing
+        // so a missing base (e.g. clip starts paused with no cached frame) renders cleanly.
+        cg.setFillColor(CGColor(gray: 0, alpha: 1))
+        cg.fill(CGRect(x: 0, y: 0, width: w, height: h))
         cg.translateBy(x: 0, y: CGFloat(h))
         cg.scaleBy(x: 1, y: -1)
 
-        // 3. Draw base full-frame.
+        // 3. Draw base full-frame (only if we have one — otherwise the black fill remains).
         if let base, let img = makeCGImage(base) {
             cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
         }

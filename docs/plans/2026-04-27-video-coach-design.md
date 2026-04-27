@@ -196,6 +196,17 @@ struct Preferences {
 
 JSON uses `Double` seconds for portability. In-memory the app converts to `CMTime` (`preferredTimescale: 600`, divisible by 24/25/30/60 fps) at boundaries. All composition math uses `CMTime`.
 
+### Stroke timing semantics
+
+The `.stroke(_)` event is emitted at `mouseUp` (end of drawing); its `recordTime` is the END of the stroke, not the start. Per-point `t` is relative to `mouseDown`. So:
+
+- **`firstPointRecordTime` = `event.recordTime − stroke.points.last.t`** (record-time of the first point).
+- A point P is **visible at output recordTime `R`** iff `firstPointRecordTime + p.t ≤ R`.
+- A stroke is **visible at `R`** iff `firstPointRecordTime ≤ R` AND (`stroke.autoClearAfterSeconds == nil` OR `R < firstPointRecordTime + autoClearAfterSeconds`) AND no `.clearAll` event lies in `(firstPointRecordTime, R)`.
+- A `.clearAll` at record-time `C` clears every stroke whose `firstPointRecordTime < C` and whose auto-clear (if set) hasn't already fired by `C`.
+
+The export compositor (Section "The custom compositor") and Mode C `StrokeReplayLayer` both use these formulas — implement them once in `VideoCoachCore` as a pure function `func visibleStrokes(in clip: Clip, atRecordTime: Double) -> [(Stroke, drawnPointCount: Int)]` and call it from both sites.
+
 ### Source-time reconstruction
 
 At any `recordTime` `t`, the source-time the user was looking at:
@@ -249,10 +260,11 @@ On every input: split by comma, trim whitespace per fragment, lowercase per frag
 
 ### Time anchoring
 
-- `t = 0` is anchored at **the host-time PTS of the first `CMSampleBuffer` delivered by the `AVCaptureVideoDataOutput` companion after `startRecording(to:)` was called**. This is, by definition, the first frame written into the recording; our event log is therefore aligned with the recorded media to sub-frame accuracy.
-- `AVCaptureVideoDataOutput`'s sample buffer PTS is on the host time clock, which is the same clock as `CACurrentMediaTime()`. So subsequent event timestamps are computed as `CACurrentMediaTime() − t0Seconds` and stay monotonic.
-- We don't anchor at `fileOutput(_:didStartRecordingTo:from:)` because that callback fires when the file handle is opened, not when the first sample is captured — there's still 50–150ms of additional camera warm-up between those two events.
-- The R / space / arrow keys ignore presses until the first sample buffer has been observed (`recording.t0Seconds != nil`); this prevents the user from issuing events before the recording has any frames.
+- `t = 0` is anchored at **the host-time PTS of the first `CMSampleBuffer` delivered by the `AVCaptureVideoDataOutput` companion AFTER `fileOutput(_:didStartRecordingTo:from:)` has fired**. Two-stage gating is required: (a) the `t0` continuation is registered on the data-output queue *before* `startRecording(to:)` is called, but (b) `awaitingFirstSample` only flips to `true` inside `didStartRecordingTo`, so any sample buffers in flight from before the file actually opened are correctly ignored. The first buffer that lands after both conditions is, by definition, the first frame in the recorded file.
+- `AVCaptureSession.synchronizationClock` is asserted to equal `CMClockGetHostTimeClock()` before recording starts. On the standard built-in / Continuity Camera path this is the case; if a future external capture device produces a different master clock, `startRecording` throws `CaptureError.unsynchronizedClock` rather than silently producing misaligned timestamps. (v2 can convert via `CMSyncConvertTime` instead of refusing.)
+- After `t = 0`, subsequent event timestamps are `CACurrentMediaTime() − t0Seconds` — sub-millisecond, monotonic.
+- A 2-second timeout protects the UI from hanging forever if the camera fails (e.g. another app holds exclusive access). On timeout, `startRecording` throws `CaptureError.firstSampleTimeout`, the data output is disarmed, and the UI returns to scanning mode.
+- The R / space / arrow keys ignore presses until the first sample buffer has been observed (the `RecordingController` doesn't exist yet) AND the controller refuses re-entry (`alreadyRecording`) if a recording is pending.
 - Verification: a clap-sync clip (visible clap on webcam + audible on mic + one mid-clip skip) is part of the manual integration checklist (Phase 10). Visual and audio claps must align within one frame.
 
 ### During recording
@@ -329,7 +341,22 @@ final class CompilationInstruction: AVMutableVideoCompositionInstruction {
 }
 ```
 
-AVFoundation passes our subclass through unchanged. The compositor casts `request.videoCompositionInstruction as? CompilationInstruction` to read the per-clip context.
+**Critical setup per instruction**: every instruction MUST have its `timeRange` set to the clip's compositional range, otherwise AVFoundation rejects the composition (default value is `kCMTimeRangeInvalid`):
+
+```swift
+let inst = CompilationInstruction()
+inst.timeRange = CMTimeRange(start: clipCompositionStart, duration: clipDuration)
+inst.requiredSourceTrackIDs = [
+    NSNumber(value: inst.sourceTrackID),
+    NSNumber(value: inst.webcamTrackID)
+]
+```
+
+`requiredSourceTrackIDs` is `[NSValue]`-typed (`NSNumber` is the conventional boxing for `CMPersistentTrackID`) — passing raw `Int32`s won't compile.
+
+**Source track without coverage during freeze segments**: a clip's source-video track has gaps inside the instruction's range (the freeze segments). Listing the source track in `requiredSourceTrackIDs` does NOT prevent the compositor from being called over those ranges — AVFoundation provides whatever segments exist and `request.sourceFrame(byTrackID: sourceTrackID)` simply returns nil during a freeze. The compositor's `lastSourceFrame` cache fills in.
+
+AVFoundation passes our subclass through unchanged. The compositor casts `request.videoCompositionInstruction as? CompilationInstruction` and `fatalError`s on cast failure (the cast can only fail if a future macOS regresses subclass-passthrough — better to crash visibly than to silently render black).
 
 ### The custom compositor
 
