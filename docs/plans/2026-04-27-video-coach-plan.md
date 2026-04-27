@@ -1137,9 +1137,20 @@ final class Workspace {
 
     func openProject(folder: URL) async throws {
         self.folder = folder
-        let p = (try? ProjectStore.read(from: folder)) ?? Project(name: folder.lastPathComponent)
+        // Distinguish "folder is empty" (create new project) from "project.json exists but
+        // is unreadable" (refuse to overwrite — surface to UI). The naive
+        // `try? ProjectStore.read(...) ?? Project(...)` would silently destroy a corrupt
+        // project file by writing a fresh empty one over it.
+        let p: Project
+        do {
+            p = try ProjectStore.read(from: folder)
+        } catch ProjectStoreError.missingProjectJSON {
+            p = Project(name: folder.lastPathComponent)
+            try ProjectStore.write(p, to: folder)
+        }
+        // Other errors (corrupt JSON, unsupported format version) propagate to the caller,
+        // which surfaces a "Couldn't open project" alert without overwriting the file.
         self.project = p
-        try ProjectStore.write(p, to: folder)
         try await rebuildVirtualPlayer()
     }
 
@@ -1273,15 +1284,24 @@ struct ContentView: View {
         .padding()
     }
 
+    @State private var openProjectError: String?
+
     private func openProjectFolder() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
         panel.canChooseDirectories = true
         panel.canCreateDirectories = true
         if panel.runModal() == .OK, let url = panel.url {
-            Task { try? await workspace.openProject(folder: url) }
+            Task {
+                do {
+                    try await workspace.openProject(folder: url)
+                } catch {
+                    openProjectError = "Couldn't open project: \(error.localizedDescription)\n\nIf project.json is corrupted, restore it from a backup before retrying."
+                }
+            }
         }
     }
+    // ContentView body wires this up: .alert("Open Project Failed", isPresented: .constant(openProjectError != nil), presenting: openProjectError) { _ in Button("OK") { openProjectError = nil } } message: { Text($0) }
 }
 ```
 
@@ -1485,14 +1505,36 @@ struct ContentView: View {
         }
         .toolbar { /* New Project, Open Project, Add Source, Export… */ }
         .onChange(of: selectedClipID) { _, newID in
-            appMode = newID.map { .previewClip($0) } ?? .scanning
+            guard let newID else { appMode = .scanning; return }
+            // If the preview player is already cached (return from this clip), go straight
+            // to .previewClip. Otherwise show the loading state until the cache populates.
+            if workspace.previewPlayer(for: newID) != nil {
+                appMode = .previewClip(newID)
+            } else {
+                appMode = .previewLoading(newID)
+                Task {
+                    // Small polling loop: the cache populates from a background Task that
+                    // pre-decodes freeze frames. ~50ms tick keeps the UI honest.
+                    while workspace.previewPlayer(for: newID) == nil,
+                          case .previewLoading(let pid) = appMode, pid == newID {
+                        try? await Task.sleep(nanoseconds: 50_000_000)
+                    }
+                    if case .previewLoading(let pid) = appMode, pid == newID {
+                        appMode = .previewClip(newID)
+                    }
+                }
+            }
         }
     }
 
     private var currentPlayer: AVPlayer? {
         switch appMode {
-        case .previewClip(let id): return workspace.previewPlayer(for: id)
-        default:                   return workspace.virtualPlayer
+        case .scanning, .recordingStarting, .recording:
+            return workspace.virtualPlayer
+        case .previewLoading:
+            return nil   // ContentView shows a "Preparing preview…" placeholder over the player area
+        case .previewClip(let id):
+            return workspace.previewPlayer(for: id)
         }
     }
     // ... handleSkip / handleTogglePlay route through workspace + RecordingController.
@@ -1547,18 +1589,24 @@ extension Workspace {
         try? saveProject()
     }
 
-    /// Cached preview player per clip. SwiftUI computed properties may rebuild many times per
-    /// second, so we never build a fresh AVPlayer on the hot path. Returns nil while the
-    /// pre-decode of freeze frames is in flight; UI surfaces "Preparing preview…" via appMode.
-    private var previewPlayerCache: [Clip.ID: AVPlayer] {
-        get { _previewCache }
-        set { _previewCache = newValue }
-    }
-    private var _previewCache: [Clip.ID: AVPlayer] = [:]   // backing store
+    /// Cached preview player per clip. SwiftUI computed properties rebuild on every
+    /// state change, so we never build a fresh AVPlayer on the hot path. Returns nil
+    /// while the pre-decode of freeze frames is in flight; UI surfaces
+    /// "Preparing preview…" via AppMode.previewLoading.
+    private var _previewCache: [Clip.ID: AVPlayer] = [:]
+    /// Tracks clips whose preview build is in flight, preventing the SwiftUI
+    /// thundering-herd: without this, `currentPlayer` is queried 10–100×/sec on
+    /// state changes, each cache miss kicks off a duplicate Task.
+    private var _previewInflight: Set<Clip.ID> = []
 
     func previewPlayer(for id: Clip.ID) -> AVPlayer? {
         if let cached = _previewCache[id] { return cached }
-        Task { try? await self.preparePreviewPlayer(for: id) }
+        guard !_previewInflight.contains(id) else { return nil }
+        _previewInflight.insert(id)
+        Task { [weak self] in
+            defer { Task { @MainActor [weak self] in self?._previewInflight.remove(id) } }
+            try? await self?.preparePreviewPlayer(for: id)
+        }
         return nil
     }
 
@@ -1568,8 +1616,10 @@ extension Workspace {
         _previewCache[id] = AVPlayer(playerItem: item)
     }
 
-    /// Invalidate cached preview player when its clip's events change (e.g. drawing
-    /// re-record in v2, or simply after recording finishes for that clip).
+    /// Invalidate the cached preview player. Call when a clip's events change
+    /// (e.g. metadata-only edits don't matter, but the clip's recordingDuration or
+    /// events list does). For v1 the only mutator is recording stop, which assigns
+    /// a brand-new clip — no existing cache entry to invalidate.
     func invalidatePreviewCache(for id: Clip.ID) {
         _previewCache.removeValue(forKey: id)
     }
@@ -1590,6 +1640,8 @@ struct TransportBar: View {
                 ScanningTransport(workspace: $workspace)
             case .recordingStarting, .recording:
                 RecordingTransport(workspace: $workspace, appMode: $appMode)
+            case .previewLoading:
+                ProgressView("Preparing preview…")
             case .previewClip(let id):
                 PreviewTransport(workspace: $workspace, clipID: id)
             }
@@ -1914,7 +1966,7 @@ final class DrawingOverlayView: NSView {
     }
 
     private var inProgress: InProgress?
-    private var liveLayers: [CAShapeLayer] = []
+    private var liveLayers: [UUID: CAShapeLayer] = [:]
     private let minDt: TimeInterval = 1.0 / 60.0
     private let minPx: CGFloat = 1.0
 
@@ -1978,21 +2030,44 @@ final class DrawingOverlayView: NSView {
 
     override func mouseUp(with event: NSEvent) {
         guard let ip = inProgress else { return }
+        let strokeID = UUID()
         let stroke = Stroke(
-            id: UUID(),
+            id: strokeID,
             color: .red,
             lineWidth: 0.005,
             points: ip.points,
             autoClearAfterSeconds: autoClearAfterSeconds
         )
         onStrokeFinished(stroke)
-        liveLayers.append(ip.layer)
+        liveLayers[strokeID] = ip.layer
         inProgress = nil
-        // Caller handles auto-clear timing for the layer (mirroring the export-side logic).
+
+        // Schedule auto-clear so the recording overlay matches what the export will replay.
+        // If autoClearAfterSeconds is nil, the layer persists until clearAll() is called.
+        if let auto = autoClearAfterSeconds {
+            let id = strokeID
+            DispatchQueue.main.asyncAfter(deadline: .now() + auto) { [weak self] in
+                guard let self, let layer = self.liveLayers[id] else { return }
+                CATransaction.begin()
+                CATransaction.setDisableActions(true)
+                layer.removeFromSuperlayer()
+                CATransaction.commit()
+                self.liveLayers.removeValue(forKey: id)
+            }
+        }
     }
 
     func clearAll() {
-        for layer in liveLayers { layer.removeFromSuperlayer() }
+        // Abort any in-progress stroke too, otherwise its layer becomes orphaned on mouseUp
+        // (it gets re-added to liveLayers right after we just emptied liveLayers).
+        if let ip = inProgress {
+            ip.layer.removeFromSuperlayer()
+            inProgress = nil
+        }
+        CATransaction.begin()
+        CATransaction.setDisableActions(true)
+        for layer in liveLayers.values { layer.removeFromSuperlayer() }
+        CATransaction.commit()
         liveLayers.removeAll()
     }
 
@@ -2020,16 +2095,7 @@ final class DrawingOverlayView: NSView {
 - Modify: `App/Views/KeyCommandView.swift`
 - Modify: `App/Models/AppMode.swift`
 
-**Step 1:** Extend `AppMode` to include the in-flight state:
-
-```swift
-enum AppMode: Equatable {
-    case scanning
-    case recordingStarting    // R pressed; awaiting first sample buffer
-    case recording
-    case previewClip(Clip.ID)
-}
-```
+**Step 1:** `AppMode` is already defined in Task 6.1 with all five cases — `scanning`, `recordingStarting`, `recording`, `previewLoading(Clip.ID)`, `previewClip(Clip.ID)`. No additions here; this step is a reminder to confirm the imports.
 
 **Step 2:** When `R` is pressed in Mode A:
 - Set `appMode = .recordingStarting` immediately. Disable subsequent R/space/arrow inputs and show a subtle "preparing recording…" indicator (REC dot in yellow).
@@ -2176,7 +2242,8 @@ gen.maximumSize = CGSize(width: 1280, height: 720)     // preview-resolution; ex
 
 for (i, seg) in segments.enumerated() where seg.kind == .freeze {
     let priorPlayEnd = sourceTimeAtEndOfPlay(precedingSegment: i)
-    let cgImage = try gen.copyCGImage(at: CMTime(seconds: priorPlayEnd, preferredTimescale: 600), actualTime: nil)
+    // Async API on macOS 13+; copyCGImage is deprecated.
+    let (cgImage, _) = try await gen.image(at: CMTime(seconds: priorPlayEnd, preferredTimescale: 600))
     instruction.frozenFrames[i] = try cgImageToBGRAPixelBuffer(cgImage)
 }
 
@@ -2206,7 +2273,7 @@ func cgImageToBGRAPixelBuffer(_ image: CGImage) throws -> CVPixelBuffer {
 }
 ```
 
-**Build time and UI state**: on long-GOP HEVC sources, `copyCGImage` for a non-IDR time can take 100–800ms depending on GOP placement. A 10-clip preview with several freeze segments per clip can stall 3–20 seconds.
+**Build time and UI state**: on long-GOP HEVC sources, `gen.image(at:)` for a non-IDR time can take 100–800ms depending on GOP placement. A 10-clip preview with several freeze segments per clip can stall 3–20 seconds.
 
 To keep the UI honest, we add a transient `AppMode.previewLoading(Clip.ID)` state. The flow is: user clicks a clip → `appMode = .previewLoading(id)` (sidebar shows a spinner next to the row, player area shows "Preparing preview…") → `Task { try await preparePreviewPlayer(for: id); appMode = .previewClip(id) }`. The cached `_previewCache[id]` keeps subsequent selections of the same clip instant.
 
@@ -2235,13 +2302,15 @@ func buildPreviewItem(for clip: Clip, project: Project) async throws -> AVPlayer
 }
 ```
 
-**Step 3:** Implement `StrokeReplayLayer` — a `CALayer` overlay that observes player time at 60Hz via `AVPlayer.addPeriodicTimeObserver` and maintains one `CAShapeLayer` per visible stroke:
+**Step 3:** Implement `StrokeReplayLayer` — an `NSView` (so it sits in the AppKit hierarchy alongside the AVPlayerLayer) backed by a `CALayer` overlay. Maintains one `CAShapeLayer` per visible stroke and observes player time at 60Hz via `AVPlayer.addPeriodicTimeObserver`:
 
+- The overlay is a non-flipped `NSView` (`isFlipped = false`, AppKit default), so it has bottom-left origin. Strokes are stored top-left. Path coordinates use **`Denormalize.point(_, _, into: bounds.size, flipY: true)`** — same as the live drawing overlay, opposite of the export compositor.
 - On each tick, compute `recordTime = playerTime - clipCompositionStart`.
 - Call `visibleStrokes(in: clip, atRecordTime: recordTime)` (the shared helper from Task 3.3).
-- Diff the result against the currently-displayed `[strokeID: CAShapeLayer]`: add layers for newly visible strokes, remove layers for now-hidden ones, update `path` for partially-drawn strokes whose `drawnPointCount` changed.
-- **Wrap every layer mutation in `CATransaction.begin(); CATransaction.setDisableActions(true); ...; CATransaction.commit()`** so adding/removing a `CAShapeLayer` doesn't trigger the implicit `kCAOnOrderIn` fade animation (strokes should pop in/out instantly, not fade).
-- Handles scrubbing correctly because diff-against-current works for both forward play and backward seek.
+- Diff the result against the currently-displayed `[Stroke.ID: CAShapeLayer]`: add layers for newly visible strokes, remove layers for now-hidden ones, update `path` for partially-drawn strokes whose `drawnPointCount` changed.
+- **Wrap every layer mutation in `CATransaction.begin(); CATransaction.setDisableActions(true); ...; CATransaction.commit()`** so adding/removing a `CAShapeLayer` doesn't trigger the implicit `kCAOnOrderIn` fade animation.
+- Handles scrubbing correctly because diff-against-current works for both forward play and backward seek. The periodic observer also fires on seeks (including while paused — verified per Apple's `addPeriodicTimeObserver` docs).
+- **Observer lifecycle**: store the token returned from `addPeriodicTimeObserver` in a stored property. Call `player.removeTimeObserver(token)` in `deinit` (or whenever the player swaps via `setPlayer(_:)`). Otherwise the closure retains the player and leaks across clip switches.
 
 **Step 4:** ContentView wiring — when `appMode == .previewClip(id)`, swap `PlayerSurface` for a `ZStack` containing:
 - `PlayerSurface(player: previewPlayer)` (built from `buildPreviewItem`)
@@ -2721,6 +2790,15 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
         request.finish(withComposedVideoFrame: out)
     }
 
+    // Shared CIContext for CVPixelBuffer → CGImage conversions in makeCGImage.
+    // Allocate once per compositor instance — one allocation per export, not per frame.
+    // Pin working color space to deviceRGB so the CG draw matches our output buffer's
+    // colorspace (avoids subtle color-shifts in the export).
+    private lazy var ciContext: CIContext = CIContext(options: [
+        .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
+        .outputColorSpace: CGColorSpaceCreateDeviceRGB(),
+    ])
+
     // ... helpers:
     //   currentSegmentIsFreeze(inst, recordTime)
     //   drawStroke(_ vs: VisibleStroke, into cg: CGContext, size: CGSize):
@@ -2728,7 +2806,9 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
     //       Denormalize.point(p.x, p.y, into: size, flipY: false), then strokes it
     //       with vs.stroke.color and vs.stroke.lineWidth × size.height.
     //   drawTextBar (CTFramesetterCreateWithAttributedString + CTFrameDraw)
-    //   makeCGImage(_ buffer: CVPixelBuffer): CIImage roundtrip via CIContext.createCGImage.
+    //   makeCGImage(_ buffer: CVPixelBuffer) -> CGImage?:
+    //       let ci = CIImage(cvPixelBuffer: buffer)
+    //       return self.ciContext.createCGImage(ci, from: ci.extent)
 }
 ```
 
@@ -2737,7 +2817,7 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 - Build a `CompilationInstruction` with **two strokes deliberately placed near the TOP of the frame (all points at normalized y ≈ 0.1)** and a `.clearAll` event between them — exercises both the orientation contract and the clearAll contract.
 - Wrap in an `AVMutableVideoComposition` with `customVideoCompositorClass = CompilationCompositor.self`, instructions = `[that one instruction with timeRange + requiredSourceTrackIDs set]`.
 - Run an `AVAssetExportSession` with HEVC preset, output to a temp `.mov`.
-- Read back via `AVAssetImageGenerator.copyCGImage(at: CMTime(seconds: 0.5, ...))`.
+- Read back via `AVAssetImageGenerator.image(at:)` (async API, macOS 13+).
 - Sample three regions of the resulting `CGImage` (use a `CGContext`-backed bitmap and `CGImage.copyData()` to read pixels):
   - **Top strip** (y ≈ 0.1): expect mostly red pixels for the second stroke (post-clearAll, still visible). Asserts strokes draw at the TOP, not bottom — catches C2-class regressions.
   - **Top strip same x as first stroke**: expect green (no red), proving the first stroke was correctly cleared. Catches C1-class regressions.
