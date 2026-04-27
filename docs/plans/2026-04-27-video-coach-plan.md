@@ -21,6 +21,8 @@
 
 ## Phase 1 — Repo + project scaffold
 
+> Adversarial-review fixes from `2026-04-27-review` are folded into this plan. Highlights: time anchor moved to `didStartRecordingTo`, freeze frames implemented via custom `AVVideoCompositing` (not `scaleTimeRange`), export uses `AVAssetExportSession` first (Phase 9 spike), HEVC container is `.mov`, bookmarks are non-security-scoped, capture format is explicit (not `.high`), Workspace loader is properly async.
+
 ### Task 1.1: Add `.gitignore` and `README.md`
 
 **Files:**
@@ -235,6 +237,55 @@ git commit -m "feat: scaffold VideoCoach app target via XcodeGen"
 
 ---
 
+### Task 1.4: Codesigning + first-launch permission preflight
+
+Hardened-runtime apps with camera + mic entitlements pop two TCC dialogs on first launch. If the user denies either, capture initialization throws. We need a stable signing identity (so permission grants survive relaunch) and a UI that explains what to do on denial.
+
+**Files:**
+- Create: `scripts/sign.sh`
+- Modify: `App/ContentView.swift`
+
+**Step 1:** Write `scripts/sign.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+APP="${1:-build/Debug/VideoCoach.app}"
+IDENTITY="${VIDEO_COACH_IDENTITY:-Apple Development}"
+codesign --force --deep --options runtime \
+  --entitlements App/VideoCoach.entitlements \
+  --sign "$IDENTITY" "$APP"
+codesign -dv --verbose=4 "$APP" 2>&1 | head -10
+```
+
+```bash
+chmod +x scripts/sign.sh
+```
+
+**Step 2:** Document expected first-launch flow in `README.md`:
+
+> First launch will pop two macOS permission dialogs (camera, microphone). Approve both. If denied, you can re-grant via System Settings → Privacy & Security → Camera / Microphone → Video Coach. Stable codesigning (any "Apple Development" identity from Xcode) keeps grants across rebuilds; ad-hoc signed builds may revoke permissions on each launch.
+
+**Step 3:** Add a permission-denied empty state to `ContentView`. When the workspace's `CaptureSessionController.configure()` throws with `.permissionDenied`, display:
+
+```swift
+VStack {
+    Text("Video Coach needs camera and microphone access.")
+    Text("Open System Settings → Privacy & Security to grant permission, then relaunch.")
+    Button("Open System Settings") {
+        NSWorkspace.shared.open(URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Camera")!)
+    }
+}
+```
+
+**Step 4:** Commit:
+```bash
+git add scripts/sign.sh README.md App/ContentView.swift
+git commit -m "feat: codesigning helper and permission-denied empty state"
+```
+
+---
+
 ## Phase 2 — Core data models (TDD)
 
 All work in this phase happens inside `VideoCoachCore/`. Run tests with:
@@ -403,10 +454,10 @@ import XCTest
 @testable import VideoCoachCore
 
 final class ProjectTests: XCTestCase {
-    func test_normalizeTags_lowercasesAndTrimsAndDropsCommas() {
+    func test_normalizeTags_splitsOnCommaTrimsAndLowercases() {
         XCTAssertEqual(
             Tag.normalize(input: " Attacking-Chance, transitions , set,piece "),
-            ["attacking-chance", "transitions", "setpiece"]
+            ["attacking-chance", "transitions", "set", "piece"]
         )
     }
 
@@ -446,7 +497,7 @@ public enum Tag {
     public static func normalize(input: String) -> [String] {
         input
             .split(separator: ",")
-            .map { $0.trimmingCharacters(in: .whitespaces).lowercased().replacingOccurrences(of: ",", with: "") }
+            .map { $0.trimmingCharacters(in: .whitespaces).lowercased() }
             .filter { !$0.isEmpty }
     }
 }
@@ -989,7 +1040,7 @@ This phase wires `AVPlayer` and the virtual-concat composition into the app. Tes
 **Files:**
 - Create: `App/Models/Workspace.swift`
 
-**Step 1:** Write the workspace observable model:
+**Step 1:** Write the workspace observable model. The asset loaders are properly async (the legacy synchronous `asset.duration` accessors are deprecated on macOS 13+ and removed on the latest macOS).
 
 ```swift
 import Foundation
@@ -997,19 +1048,25 @@ import VideoCoachCore
 import AVFoundation
 import Observation
 
+enum WorkspaceError: Error {
+    case noVideoTrack(URL)
+    case bookmarkResolutionFailed(displayName: String)
+}
+
 @Observable
+@MainActor
 final class Workspace {
     var folder: URL?
     var project: Project = Project(name: "Untitled")
     var virtualPlayer: AVPlayer?
     var virtualComposition: AVMutableComposition?
 
-    func openProject(folder: URL) throws {
+    func openProject(folder: URL) async throws {
         self.folder = folder
         let p = (try? ProjectStore.read(from: folder)) ?? Project(name: folder.lastPathComponent)
         self.project = p
         try ProjectStore.write(p, to: folder)
-        try rebuildVirtualPlayer()
+        try await rebuildVirtualPlayer()
     }
 
     func saveProject() throws {
@@ -1017,48 +1074,66 @@ final class Workspace {
         try ProjectStore.write(project, to: folder)
     }
 
-    func rebuildVirtualPlayer() throws {
+    func rebuildVirtualPlayer() async throws {
         guard !project.sourceVideos.isEmpty else { virtualPlayer = nil; return }
-        let urls = try project.sourceVideos.map { try resolveBookmark($0.bookmark) }
         let comp = AVMutableComposition()
-        let v = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)!
-        let a = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!
+        guard let v = comp.addMutableTrack(withMediaType: .video,
+                                           preferredTrackID: kCMPersistentTrackID_Invalid),
+              let a = comp.addMutableTrack(withMediaType: .audio,
+                                           preferredTrackID: kCMPersistentTrackID_Invalid)
+        else { return }
+
         var cursor = CMTime.zero
-        for url in urls {
+        for ref in project.sourceVideos {
+            let url = try resolveBookmark(ref.bookmark, displayName: ref.displayName)
             let asset = AVURLAsset(url: url)
-            let dur = try await? asset.load(.duration)
-            let tr = try await? asset.load(.tracks).first { $0.mediaType == .video }
-            // Simpler synchronous path for v1: use legacy API
-            let videoTrack = asset.tracks(withMediaType: .video).first!
-            let audioTrack = asset.tracks(withMediaType: .audio).first
-            let range = CMTimeRange(start: .zero, duration: asset.duration)
+            let duration = try await asset.load(.duration)
+            let tracks = try await asset.load(.tracks)
+            guard let videoTrack = tracks.first(where: { $0.mediaType == .video }) else {
+                throw WorkspaceError.noVideoTrack(url)
+            }
+            let audioTrack = tracks.first(where: { $0.mediaType == .audio })
+            let range = CMTimeRange(start: .zero, duration: duration)
             try v.insertTimeRange(range, of: videoTrack, at: cursor)
             if let audioTrack { try? a.insertTimeRange(range, of: audioTrack, at: cursor) }
-            cursor = cursor + asset.duration
+            cursor = cursor + duration
         }
-        let item = AVPlayerItem(asset: comp)
         self.virtualComposition = comp
-        self.virtualPlayer = AVPlayer(playerItem: item)
+        self.virtualPlayer = AVPlayer(playerItem: AVPlayerItem(asset: comp))
     }
 
-    private func resolveBookmark(_ data: Data) throws -> URL {
+    private func resolveBookmark(_ data: Data, displayName: String) throws -> URL {
         var stale = false
-        let url = try URL(resolvingBookmarkData: data,
-                          options: [.withSecurityScope],
-                          relativeTo: nil,
-                          bookmarkDataIsStale: &stale)
-        _ = url.startAccessingSecurityScopedResource()
-        return url
+        // Plain (non-security-scoped) bookmarks: we run unsandboxed under hardened runtime.
+        do {
+            return try URL(resolvingBookmarkData: data,
+                           options: [],
+                           relativeTo: nil,
+                           bookmarkDataIsStale: &stale)
+        } catch {
+            throw WorkspaceError.bookmarkResolutionFailed(displayName: displayName)
+        }
     }
 }
 ```
 
-(Note: simplified synchronous AVAsset API is fine for v1; revisit async loading for performance later.)
+**Step 2:** SwiftUI call sites bridge to async via `Task { }`:
 
-**Step 2:** Build the app target (`⌘B` in Xcode). Expected: succeeds. Commit:
+```swift
+Button("Open Project Folder…") {
+    let panel = NSOpenPanel()
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    if panel.runModal() == .OK, let url = panel.url {
+        Task { try? await workspace.openProject(folder: url) }
+    }
+}
+```
+
+**Step 3:** Build the app target (`⌘B` in Xcode). Expected: succeeds with no warnings. Commit:
 ```bash
 git add App/Models/Workspace.swift
-git commit -m "feat(app): Workspace observable model + virtual concat builder"
+git commit -m "feat(app): async Workspace with virtual concat builder"
 ```
 
 ---
@@ -1136,19 +1211,19 @@ git commit -m "feat(app): PlayerSurface SwiftUI wrapper + open-project command"
 - Modify: `App/Models/Workspace.swift`
 - Modify: `App/ContentView.swift`
 
-**Step 1:** Add to `Workspace`:
+**Step 1:** Add to `Workspace` (note `async throws` and plain bookmark options):
 
 ```swift
-func addSourceVideo(url: URL) throws {
-    let bookmark = try url.bookmarkData(options: .withSecurityScope)
+func addSourceVideo(url: URL) async throws {
+    let bookmark = try url.bookmarkData(options: [])  // plain — we're unsandboxed
     let asset = AVURLAsset(url: url)
-    let dur = asset.duration.seconds
+    let duration = try await asset.load(.duration)
     project.sourceVideos.append(.init(
         bookmark: bookmark,
         displayName: url.lastPathComponent,
-        durationSeconds: dur))
+        durationSeconds: duration.seconds))
     try saveProject()
-    try rebuildVirtualPlayer()
+    try await rebuildVirtualPlayer()
 }
 ```
 
@@ -1160,7 +1235,7 @@ Button("Add Source Video…") {
     panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
     panel.allowsMultipleSelection = false
     if panel.runModal() == .OK, let url = panel.url {
-        try? workspace.addSourceVideo(url: url)
+        Task { try? await workspace.addSourceVideo(url: url) }
     }
 }.disabled(workspace.folder == nil)
 ```
@@ -1210,12 +1285,18 @@ final class KeyCatchingView: NSView {
         window?.makeFirstResponder(self)
     }
 
+    private enum KeyCode {
+        static let leftArrow: UInt16 = 0x7B
+        static let rightArrow: UInt16 = 0x7C
+        static let space: UInt16 = 0x31
+    }
+
     override func keyDown(with event: NSEvent) {
         let chars = event.charactersIgnoringModifiers ?? ""
         switch (event.keyCode, chars) {
-        case (123 /* ← */, _), (_, "a"): onSkip(-3)
-        case (124 /* → */, _), (_, "d"): onSkip(+3)
-        case (49  /* space */, _):       onTogglePlay()
+        case (KeyCode.leftArrow, _), (_, "a"):  onSkip(-3)
+        case (KeyCode.rightArrow, _), (_, "d"): onSkip(+3)
+        case (KeyCode.space, _):                onTogglePlay()
         default: super.keyDown(with: event)
         }
     }
@@ -1299,29 +1380,137 @@ enum AppMode: Equatable { case scanning, recording, previewClip(Clip.ID) }
 **Files:**
 - Create: `App/Capture/CaptureSessionController.swift`
 
-**Step 1:** Implement a class wrapping `AVCaptureSession` + `AVCaptureMovieFileOutput`. It exposes:
+Key behaviors:
+- Pick a deterministic `AVCaptureDevice.Format` via `lockForConfiguration()`. Prefer 1280×720 @ 30fps; fall back to the closest 720p-or-lower 16:9 30fps format the device exposes. Do **not** rely on `sessionPreset = .high`.
+- The *wall-clock anchor* `t = 0` is exposed via the `recordingStartedAt: AsyncStream<CFTimeInterval>` produced when `fileOutput(_:didStartRecordingTo:from:)` fires (not when `startRecording(to:)` is called). The `RecordingController` (Task 7.2) waits on this stream before accepting any event.
+
+**Step 1:** Implement the controller:
 
 ```swift
+import AVFoundation
+import Observation
+
+enum CaptureError: Error {
+    case noVideoDevice
+    case noAudioDevice
+    case noSuitableFormat
+    case permissionDenied(media: AVMediaType)
+}
+
 @Observable
-final class CaptureSessionController {
+final class CaptureSessionController: NSObject, AVCaptureFileOutputRecordingDelegate {
     private(set) var isReady = false
     private(set) var isRecording = false
-    let session: AVCaptureSession
-    private let output = AVCaptureMovieFileOutput()
-    private var delegate: Delegate?
 
-    init() {
-        session = AVCaptureSession()
-        session.sessionPreset = .high
+    let session = AVCaptureSession()
+    private let output = AVCaptureMovieFileOutput()
+    private var startContinuation: CheckedContinuation<CFTimeInterval, Error>?
+    private var stopContinuation: CheckedContinuation<Double, Error>?
+    private var startURL: URL?
+
+    func configure() async throws {
+        try await ensurePermission(.video)
+        try await ensurePermission(.audio)
+
+        guard let videoDevice = AVCaptureDevice.default(for: .video) else {
+            throw CaptureError.noVideoDevice
+        }
+        guard let audioDevice = AVCaptureDevice.default(for: .audio) else {
+            throw CaptureError.noAudioDevice
+        }
+        try setPreferredFormat(on: videoDevice)
+
+        let videoInput = try AVCaptureDeviceInput(device: videoDevice)
+        let audioInput = try AVCaptureDeviceInput(device: audioDevice)
+        session.beginConfiguration()
+        // No sessionPreset — we set the device.activeFormat explicitly above.
+        session.sessionPreset = .inputPriority
+        if session.canAddInput(videoInput) { session.addInput(videoInput) }
+        if session.canAddInput(audioInput) { session.addInput(audioInput) }
+        if session.canAddOutput(output) { session.addOutput(output) }
+        session.commitConfiguration()
+        session.startRunning()
+        isReady = true
     }
 
-    func configure() async throws { /* request perms, add inputs, add output */ }
-    func startRecording(to url: URL) async throws -> Date { /* returns wall-clock start */ }
-    func stopRecording() async throws -> Double { /* returns recording duration seconds */ }
+    private func ensurePermission(_ media: AVMediaType) async throws {
+        switch AVCaptureDevice.authorizationStatus(for: media) {
+        case .authorized: return
+        case .notDetermined:
+            let granted = await AVCaptureDevice.requestAccess(for: media)
+            if !granted { throw CaptureError.permissionDenied(media: media) }
+        default:
+            throw CaptureError.permissionDenied(media: media)
+        }
+    }
+
+    private func setPreferredFormat(on device: AVCaptureDevice) throws {
+        // Prefer 1280x720 @ 30fps 16:9; fall back to closest match.
+        let candidates = device.formats.filter { format in
+            let dims = CMVideoFormatDescriptionGetDimensions(format.formatDescription)
+            let aspect = Double(dims.width) / Double(max(dims.height, 1))
+            return abs(aspect - 16.0/9.0) < 0.01
+                && dims.width <= 1280
+                && format.videoSupportedFrameRateRanges.contains(where: { $0.minFrameRate <= 30 && $0.maxFrameRate >= 30 })
+        }
+        let best = candidates.max(by: { a, b in
+            let da = CMVideoFormatDescriptionGetDimensions(a.formatDescription).width
+            let db = CMVideoFormatDescriptionGetDimensions(b.formatDescription).width
+            return da < db
+        })
+        guard let chosen = best else { throw CaptureError.noSuitableFormat }
+        try device.lockForConfiguration()
+        device.activeFormat = chosen
+        device.activeVideoMinFrameDuration = CMTime(value: 1, timescale: 30)
+        device.activeVideoMaxFrameDuration = CMTime(value: 1, timescale: 30)
+        device.unlockForConfiguration()
+    }
+
+    func startRecording(to url: URL) async throws -> CFTimeInterval {
+        startURL = url
+        return try await withCheckedThrowingContinuation { cont in
+            self.startContinuation = cont
+            output.startRecording(to: url, recordingDelegate: self)
+        }
+    }
+
+    func stopRecording() async throws -> Double {
+        try await withCheckedThrowingContinuation { cont in
+            self.stopContinuation = cont
+            output.stopRecording()
+        }
+    }
+
+    // MARK: AVCaptureFileOutputRecordingDelegate
+
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didStartRecordingTo fileURL: URL,
+                    from connections: [AVCaptureConnection]) {
+        isRecording = true
+        startContinuation?.resume(returning: CACurrentMediaTime())
+        startContinuation = nil
+    }
+
+    func fileOutput(_ output: AVCaptureFileOutput,
+                    didFinishRecordingTo outputFileURL: URL,
+                    from connections: [AVCaptureConnection],
+                    error: Error?) {
+        isRecording = false
+        if let error {
+            stopContinuation?.resume(throwing: error)
+        } else {
+            let asset = AVURLAsset(url: outputFileURL)
+            // Sync `duration` is acceptable here on a fully-written file:
+            stopContinuation?.resume(returning: asset.duration.seconds)
+        }
+        stopContinuation = nil
+    }
 }
 ```
 
-**Step 2:** Call `configure()` from the app on first launch. Add a debug "Test Capture" button that records 3 seconds to a temp `.mov` and prints duration. Commit.
+**Step 2:** Call `configure()` from the app on first launch. Add a debug "Test Capture" button that records 3 seconds to a temp `.mov`, prints the wall-clock anchor returned from `startRecording`, and prints the resulting duration. Verify the anchor lags the button press by ~80–300ms (this is the camera warm-up — what we're explicitly accounting for).
+
+**Step 3:** Commit.
 
 ---
 
@@ -1332,11 +1521,12 @@ final class CaptureSessionController {
 
 **Step 1:** Implement an observable that:
 - Owns an `events: [CommentaryEvent]` array.
-- Tracks `startTime: CFTimeInterval = CACurrentMediaTime()` set on `start()`.
-- Has methods: `appendPlay()`, `appendPause()`, `appendSkip(delta:)`, `appendStroke(Stroke)`, `appendClearAll()` — each computes `recordTime = CACurrentMediaTime() - startTime` and appends.
+- Receives the wall-clock anchor `startedAt: CFTimeInterval` returned by `CaptureSessionController.startRecording(to:)` (i.e. anchored at `didStartRecordingTo`, not at the call site). It's a `let`, set once in the initializer of a per-recording controller — never mutated. A new recording = a new `RecordingController` instance.
+- Has methods: `appendPlay()`, `appendPause()`, `appendSkip(delta:)`, `appendStroke(Stroke)`, `appendClearAll()` — each computes `recordTime = CACurrentMediaTime() - startedAt` and appends.
+- The R / space / arrow keys ignore presses until the controller exists (i.e. until `didStartRecordingTo` has fired). The UI key handler observes `recording != nil` to decide whether events are being collected.
 - On `finish()`, returns the events array for assembly into a `Clip`.
 
-**Step 2:** Add minimal unit tests in the app target's test bundle: simulate a sequence of calls, verify `recordTime` is monotonically increasing. Commit.
+**Step 2:** Add minimal unit tests in the app target's test bundle: instantiate a controller with `startedAt = CACurrentMediaTime() - 1.0`, append a few events, verify timestamps are monotonically increasing and within the expected ~1.0+ second range. Commit.
 
 ---
 
@@ -1344,33 +1534,128 @@ final class CaptureSessionController {
 
 **Files:**
 - Create: `App/Drawing/DrawingOverlayView.swift`
+- Create: `App/Drawing/Denormalize.swift`
 
-**Step 1:** `NSView` subclass over the AVPlayerLayer. On `mouseDown:` start a stroke; on `mouseDragged:` consider committing a new point; on `mouseUp:` emit the stroke through a callback.
+**Step 1:** Implement the shared coordinate helper used by overlay, Mode C preview, and export compositor:
 
-Throttle:
 ```swift
-private var lastPointTime: TimeInterval = 0
-private var lastPointPx: NSPoint = .zero
-private let minDt: TimeInterval = 1.0 / 60.0
-private let minPx: CGFloat = 1.0
+import CoreGraphics
 
-override func mouseDragged(with event: NSEvent) {
-    let p = convert(event.locationInWindow, from: nil)
-    let now = CACurrentMediaTime()
-    if now - lastPointTime < minDt { return }
-    if hypot(p.x - lastPointPx.x, p.y - lastPointPx.y) < minPx { return }
-    let nx = p.x / bounds.width
-    let ny = 1.0 - p.y / bounds.height   // flip Y so 0 = top
-    let stroke_t = now - strokeStartTime
-    inProgressPoints.append(.init(x: nx, y: ny, t: stroke_t))
-    lastPointTime = now; lastPointPx = p
-    setNeedsDisplay(bounds)
+enum Denormalize {
+    /// Converts a normalized StrokePoint (origin top-left) to a CGPoint in the given size,
+    /// accounting for AppKit's bottom-left coordinate system.
+    static func point(_ x: Double, _ y: Double, into size: CGSize, flippedForAppKit: Bool) -> CGPoint {
+        let px = CGFloat(x) * size.width
+        let py = CGFloat(y) * size.height
+        return flippedForAppKit ? CGPoint(x: px, y: size.height - py) : CGPoint(x: px, y: py)
+    }
 }
 ```
 
-**Step 2:** Render in-progress stroke + finished strokes via `draw(_:)` using NSBezierPath converted from normalized points.
+**Step 2:** `NSView` subclass over the AVPlayerLayer. The overlay uses one `CAShapeLayer` per stroke — appending to its `path` directly, so Core Animation composites on the GPU and there's no whole-overlay repaint per drag event.
 
-**Step 3:** Run. Toggle a debug "drawing mode" and verify strokes draw smoothly and survive when toggled off. Commit.
+```swift
+import AppKit
+import VideoCoachCore
+
+final class DrawingOverlayView: NSView {
+    var onStrokeFinished: (Stroke) -> Void = { _ in }
+    var autoClearAfterSeconds: Double? = 5.0
+
+    private struct InProgress {
+        var startedAt: TimeInterval
+        var points: [StrokePoint]
+        var lastTime: TimeInterval
+        var lastPxPoint: NSPoint
+        var layer: CAShapeLayer
+    }
+
+    private var inProgress: InProgress?
+    private var liveLayers: [CAShapeLayer] = []
+    private let minDt: TimeInterval = 1.0 / 60.0
+    private let minPx: CGFloat = 1.0
+
+    override var isFlipped: Bool { false }    // bottom-left origin (default AppKit)
+
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+    }
+    required init?(coder: NSCoder) { fatalError() }
+
+    override func mouseDown(with event: NSEvent) {
+        let p = convert(event.locationInWindow, from: nil)
+        let now = CACurrentMediaTime()
+        let layer = CAShapeLayer()
+        layer.strokeColor = NSColor.systemRed.cgColor
+        layer.fillColor = nil
+        layer.lineWidth = 0.005 * bounds.height * (window?.backingScaleFactor ?? 2.0)
+        layer.lineCap = .round
+        layer.lineJoin = .round
+        self.layer?.addSublayer(layer)
+        inProgress = InProgress(
+            startedAt: now,
+            points: [pointFromView(p, sinceStart: 0)],
+            lastTime: now,
+            lastPxPoint: p,
+            layer: layer
+        )
+        rebuildPath(for: inProgress!)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard var ip = inProgress else { return }
+        let p = convert(event.locationInWindow, from: nil)
+        let now = CACurrentMediaTime()
+        if now - ip.lastTime < minDt { return }
+        if hypot(p.x - ip.lastPxPoint.x, p.y - ip.lastPxPoint.y) < minPx { return }
+        let strokeT = now - ip.startedAt
+        ip.points.append(pointFromView(p, sinceStart: strokeT))
+        ip.lastTime = now
+        ip.lastPxPoint = p
+        inProgress = ip
+        rebuildPath(for: ip)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        guard let ip = inProgress else { return }
+        let stroke = Stroke(
+            color: .red,
+            lineWidth: 0.005,
+            points: ip.points,
+            autoClearAfterSeconds: autoClearAfterSeconds
+        )
+        onStrokeFinished(stroke)
+        liveLayers.append(ip.layer)
+        inProgress = nil
+        // Caller handles auto-clear timing for the layer (mirroring the export-side logic).
+    }
+
+    func clearAll() {
+        for layer in liveLayers { layer.removeFromSuperlayer() }
+        liveLayers.removeAll()
+    }
+
+    private func pointFromView(_ p: NSPoint, sinceStart strokeT: Double) -> StrokePoint {
+        StrokePoint(
+            x: p.x / bounds.width,
+            y: 1.0 - p.y / bounds.height,    // flip Y so 0 = top
+            t: strokeT
+        )
+    }
+
+    private func rebuildPath(for ip: InProgress) {
+        let path = CGMutablePath()
+        for (i, sp) in ip.points.enumerated() {
+            let cg = Denormalize.point(sp.x, sp.y, into: bounds.size, flippedForAppKit: true)
+            if i == 0 { path.move(to: cg) } else { path.addLine(to: cg) }
+        }
+        ip.layer.path = path
+    }
+}
+```
+
+**Step 3:** Run. Toggle a debug "drawing mode" and verify strokes draw smoothly. Verify GPU compositing by checking that `Quartz Debug → Show Beam Sync` doesn't show overlay-wide repaints during drags. Commit.
 
 ---
 
@@ -1417,28 +1702,55 @@ override func mouseDragged(with event: NSEvent) {
 **Files:**
 - Create: `App/Preview/ClipPreviewBuilder.swift`
 
-**Step 1:** Implement a function `func buildPreviewItem(for clip: Clip, project: Project) throws -> AVPlayerItem` that:
-- Uses the same `playbackSegments(sourceDuration:)` logic from `VideoCoachCore`.
-- Builds `AVMutableComposition` with source-video segments + freeze segments + webcam PiP video track + source audio + mic audio.
-- Builds `AVMutableVideoComposition` with PiP transform.
-- Builds `AVMutableAudioMix` reflecting `preferences.previewSourceVolume` + `preferences.previewCommentaryVolume`.
-- Adds a `Core Animation` overlay layer for strokes (reuse builder from Phase 9).
+The preview reuses the **same `CompilationCompositor`** built in Phase 9 — single source of truth for "what does a clip look like composited" — with a single-clip plan.
 
-**Step 2:** When a clip is selected in the sidebar, replace the player's `AVPlayerItem` with the preview item.
+**Step 1:** Implement a function `func buildPreviewItem(for clip: Clip, project: Project) async throws -> AVPlayerItem` that:
+- Constructs a one-clip `CompilationPlan`.
+- Builds the same `AVMutableComposition` + `AVMutableVideoComposition` (with `customVideoCompositorClass = CompilationCompositor.self`) + `AVMutableAudioMix` that the exporter would build, but at preview render size (e.g. 1280×720 for performance).
+- Wraps in an `AVPlayerItem`.
 
-**Step 3:** Run. Click a recorded clip. Verify it plays back as composited. Toggle volume sliders → live mix updates. Commit.
+**Step 2:** When a clip is selected in the sidebar, replace the player's `AVPlayerItem` with the preview item via `AVPlayer.replaceCurrentItem(with:)`. Wire the source/commentary volume sliders to update the player's `audioMix` mix parameters live.
+
+**Step 3:** Run. Click a recorded clip. Verify it plays back as composited (source + freeze frames + PiP + strokes + text bar) using the same compositor as the export pipeline. Toggle volume sliders → live mix updates. Commit.
 
 ---
 
 ## Phase 9 — Export pipeline
 
-### Task 9.1: `CompilationBuilder` for one tag (TDD on the math)
+The design explicitly chooses a **custom `AVVideoCompositing` compositor** (handles freeze frames + PiP + strokes + text bar in one place) inside an **`AVAssetExportSession`** pipeline. The freeze-frame work is done by re-emitting the last decoded `CVPixelBuffer` for the duration of the freeze segment — not by `scaleTimeRange`.
+
+### Task 9.0: AVAssetExportSession spike — bitrate sufficient?
+
+**Goal:** confirm `AVAssetExportSession` with a custom `videoComposition` and `audioMix` produces HEVC at our target bitrates (6 / 12 / 24 Mbps for Low / Medium / High at 1080p). If yes, we keep the simpler ExportSession path. If no — bitrate clamps too tightly or quality is unacceptable — we drop to the `AVAssetReader`/`AVAssetWriter` fallback documented at the end of this phase.
+
+**Files:**
+- Create: `App/Export/ExportSpike.swift` (deletable scratch file)
+
+**Step 1:** Build a minimal exporter that takes any 10-second `AVAsset` plus an empty custom `AVMutableVideoComposition` and writes via `AVAssetExportPresetHEVC1920x1080`. Inspect bitrate of the output via:
+```bash
+ffprobe -v error -select_streams v:0 -show_entries stream=bit_rate output.mov
+```
+**Step 2:** Repeat for `AVAssetExportPresetHEVCHighestQuality`. Note actual bitrate.
+
+**Step 3:** Decision:
+- If the achievable bitrates bracket our 6 / 12 / 24 Mbps targets adequately, proceed with Tasks 9.1–9.4 using `AVAssetExportSession`.
+- If not, add Task 9.5 (Reader/Writer fallback) and use the same custom compositor inside that pipeline.
+
+**Step 4:** Delete the spike file. Commit:
+```bash
+git rm App/Export/ExportSpike.swift
+git commit -m "chore: spike AVAssetExportSession HEVC bitrate (decision recorded in plan)"
+```
+
+---
+
+### Task 9.1: `CompilationPlan` — pure-logic plan builder (TDD)
 
 **Files:**
 - Create: `VideoCoachCore/Sources/VideoCoachCore/CompilationPlan.swift`
 - Create: `VideoCoachCore/Tests/VideoCoachCoreTests/CompilationPlanTests.swift`
 
-**Step 1:** Define an in-memory plan describing the output composition (clip ranges, segment lists, total duration). Pure data, no AVFoundation.
+**Step 1:** Define an in-memory plan describing the output composition. Pure data, no AVFoundation.
 
 ```swift
 public struct CompilationPlan: Equatable, Sendable {
@@ -1454,51 +1766,140 @@ public struct CompilationPlan: Equatable, Sendable {
 }
 
 public extension Project {
-    func compilationPlan(for tag: String, sourceDurations: [Int: Double]) -> CompilationPlan { /*…*/ }
-    func allClipsCompilationPlan(sourceDurations: [Int: Double]) -> CompilationPlan { /*…*/ }
+    func compilationPlan(for tag: String, sourceDurations: [Int: Double]) -> CompilationPlan
+    func allClipsCompilationPlan(sourceDurations: [Int: Double]) -> CompilationPlan
 }
 ```
 
-**Step 2:** Write tests covering: filtering by tag, sort order, accumulating compositionStart, all-clips ordering. Implement to make them pass.
+**Step 2:** Write tests covering: filtering by tag, sort order, accumulating `compositionStart`, all-clips ordering by `sortIndex`, empty-tag handling. Implement to make them pass.
 
 **Step 3:** Commit.
 
 ---
 
-### Task 9.2: `AVAssetWriter` exporter
+### Task 9.2: Primary-track helper (defensive asset access)
+
+**Files:**
+- Create: `VideoCoachCore/Sources/VideoCoachCore/AssetTracks.swift`
+- Create: `VideoCoachCore/Tests/VideoCoachCoreTests/AssetTracksTests.swift`
+
+This helper lets the compositor handle multi-track or no-audio assets without force-unwrapping.
+
+**Step 1:** Implement:
+
+```swift
+import AVFoundation
+
+public enum AssetTrackError: Error {
+    case noVideoTrack(URL)
+}
+
+public extension AVAsset {
+    func primaryVideoTrack() async throws -> AVAssetTrack {
+        let tracks = try await loadTracks(withMediaType: .video)
+        if let first = tracks.first(where: { $0.isEnabled }) ?? tracks.first {
+            return first
+        }
+        throw AssetTrackError.noVideoTrack((self as? AVURLAsset)?.url ?? URL(fileURLWithPath: "/"))
+    }
+
+    func optionalAudioTrack() async throws -> AVAssetTrack? {
+        let tracks = try await loadTracks(withMediaType: .audio)
+        return tracks.first(where: { $0.isEnabled }) ?? tracks.first
+    }
+}
+```
+
+**Step 2:** Write integration tests using a tiny fixture asset bundled in the test resources (a 1-second silent MOV plus a 1-second video-only MOV without audio). Verify the helpers find video and gracefully handle missing audio.
+
+**Step 3:** Commit.
+
+---
+
+### Task 9.3: Custom `AVVideoCompositing` compositor
+
+**Files:**
+- Create: `App/Export/CompilationCompositor.swift`
+
+**Step 1:** Implement the compositor protocol. The compositor is constructed with a `CompilationPlan` and the per-clip recording asset URLs/strokes; it owns:
+- A `[CMTimeRange: SegmentInfo]` map keyed by output composition time.
+- A `lastSourceFrame: CVPixelBuffer?` cache (for freeze segments).
+- The denormalize helper from M3.
+
+For each `startRequest(_ asyncRequest: AVAsynchronousVideoCompositionRequest)`:
+1. Resolve the output `compositionTime` to a `(clipIndex, segment, recordTime)`.
+2. Decide the **base buffer**:
+   - `.play` segment → take the source video pixel buffer from `asyncRequest.sourceFrame(byTrackID: sourceTrackID)`. Cache it in `lastSourceFrame`.
+   - `.freeze` segment → use `lastSourceFrame` (or a black buffer if unset, e.g. clip starts paused).
+3. Get an output `CVPixelBuffer` from `asyncRequest.renderContext.newPixelBuffer()`.
+4. Lock the output buffer, wrap it in a `CGContext`, draw:
+   - The base buffer (CIImage → CGImage, or a CV pixel-transfer-session for speed) full-frame.
+   - The webcam PiP from `asyncRequest.sourceFrame(byTrackID: webcamTrackID)`, scaled to 22% of width, bottom-right with 2.2% margin.
+   - Live strokes for `recordTime`: walk each stroke whose `[start, cleared)` window contains `recordTime`, build a `CGPath` from points up to the per-point `t ≤ (recordTime - strokeStart)`, stroke into the CGContext at `lineWidth × outputHeight` (with `window.backingScaleFactor` consideration during preview only — at export we draw at native pixels).
+   - The text bar: black rect at bottom 8%, white text `"\(i+1)/N, \(name), \(tags joined by space)"`.
+5. `asyncRequest.finish(withComposedVideoFrame: outputBuffer)`.
+
+**Step 2:** Write a 1-second smoke test that:
+- Constructs a synthetic `AVMutableComposition` of a 1-second blue solid (generated via `AVAssetWriter` from a `CVPixelBuffer`).
+- Wraps it in an `AVMutableVideoComposition` whose `customVideoCompositorClass = CompilationCompositor.self`.
+- Renders to a `.mov` via `AVAssetExportSession`.
+- Reads back the output via `AVAssetReader`, asserts the resulting frames are non-blue at the expected stroke + text bar regions (use `CIAreaAverage` on a region of interest).
+
+**Step 3:** Commit.
+
+---
+
+### Task 9.4: `CompilationExporter` actor
 
 **Files:**
 - Create: `App/Export/CompilationExporter.swift`
 
-**Step 1:** Implement an actor that takes a `CompilationPlan` and:
-1. Builds `AVMutableComposition` per the plan (using `playbackSegments`, including the time-stretched freeze trick).
-2. Builds `AVMutableVideoComposition` with PiP transform per entry.
-3. Builds `AVMutableAudioMix`.
-4. Builds the Core Animation layer hierarchy with stroke `CAShapeLayer`s + per-clip text bar.
-5. Configures `AVAssetWriter` with HEVC settings from `ExportSettings.bitrate` and `ExportSettings.pixelSize`.
-6. Drives `AVAssetReader` → `AVAssetWriter` pipeline. Reports progress via an `AsyncStream<Double>`.
+**Step 1:** Implement an actor that takes a `CompilationPlan` and produces one `.mov` via `AVAssetExportSession`:
 
-**Step 2:** Smoke test by exporting a single 5-second compilation manually. Inspect the output in QuickTime: verify source plays, PiP webcam shows bottom-right, audio mixes correctly, text bar renders, strokes animate at the same speed they were drawn.
+1. Builds `AVMutableComposition` carrying:
+   - Source-video track segments (only for `.play` segments — `.freeze` segments are emitted by the compositor from cache).
+   - Source-audio track segments (only for `.play` segments — silence during `.freeze`).
+   - One continuous webcam-video track per clip's recording (passed to compositor).
+   - One continuous mic-audio track per clip's recording.
+2. Builds `AVMutableVideoComposition` with `customVideoCompositorClass = CompilationCompositor.self`. Sets `renderSize` from `ExportSettings.pixelSize(...)` and `frameDuration = CMTime(value: 1, timescale: 30)` (the export frame rate, independent of source/recording rates — the compositor handles the rate mismatch).
+3. Builds `AVMutableAudioMix` with source volume + commentary volume.
+4. Configures `AVAssetExportSession` with:
+   - `outputFileType = .mov`
+   - `outputURL = outputFolder/<tag> - <projectName>.mov`
+   - `videoComposition = ourVideoComposition`
+   - `audioMix = ourAudioMix`
+   - `presetName` chosen by `Quality` (e.g. `AVAssetExportPresetHEVCHighestQuality` for High, etc., subject to Task 9.0 spike outcome).
+5. KVO-observes `progress`, exposes via `AsyncStream<Double>`.
+
+**Step 2:** Smoke test — export a small project with one clip containing one play segment + one pause + one stroke + one skip. Inspect in QuickTime: verify source plays, freeze holds the right frame, PiP webcam bottom-right, audio mix balances, text bar renders, stroke replays at natural tempo.
 
 **Step 3:** Commit.
 
 ---
 
-### Task 9.3: Export sheet UI
+### Task 9.5: Export sheet UI
 
 **Files:**
 - Create: `App/Export/ExportSheet.swift`
 
 **Step 1:** Build a SwiftUI sheet that:
 - Reads `TagAggregation.aggregate(project:)` for rows.
-- Adds a synthetic "all-clips" row at top.
+- Adds a synthetic `all-clips` row at top.
 - Shows checkboxes, Select All / None, Resolution + Quality dropdowns.
-- Project name field (prefilled), output folder picker.
-- Export button → kicks off `CompilationExporter` per checked row, shows progress.
+- Project name field (prefilled from folder name), output folder picker.
+- Export button → kicks off `CompilationExporter` per checked row sequentially, shows progress per tag.
 
-**Step 2:** Manual test the full path: open a project with several clips and varied tags → Export → pick output folder → run. Verify per-tag MP4s appear with the expected filenames and contents.
+**Step 2:** Manual test the full path: open a project with several clips and varied tags → Export → pick output folder → run. Verify per-tag `.mov` files appear with the expected filenames and contents.
 
 **Step 3:** Commit.
+
+---
+
+### Task 9.6 (conditional, only if 9.0 says so): Reader/Writer fallback
+
+If the spike (Task 9.0) shows `AVAssetExportSession` cannot deliver the bitrate range we want, replace the export-session call in `CompilationExporter` with an `AVAssetReader` → `AVAssetWriter` pipeline. Reuses the same custom compositor (the writer's `AVAssetWriterInput.requestMediaDataWhenReady(on:)` pull loop reads from an `AVAssetReaderVideoCompositionOutput` configured with our compositor). Audio uses a parallel `AVAssetReaderAudioMixOutput` → `AVAssetWriterInput`. Progress is computed from the latest appended PTS divided by the plan's `totalDurationSeconds`.
+
+Skip this task if 9.0 confirms ExportSession is sufficient.
 
 ---
 
@@ -1530,6 +1931,9 @@ End-to-end smoke test, including:
 - Auto-clear toggle behavior during recording.
 - Export at every Resolution × Quality combo.
 - Reopen project after restart, edit metadata, re-export.
+- **Clap-sync test for A/V alignment**: record one clip with a visible+audible clap mid-clip, plus a `.skip(+3)` later in the recording. After export, single-frame-step the result and confirm visual clap and audio clap align within one frame, and that the skip event correctly jumps the source video without desyncing the webcam PiP from the mic audio.
+- **Continuity Camera path**: pair an iPhone via Continuity Camera, record one clip, verify capture format and the resulting PiP geometry in the export. (Confirms the explicit `device.activeFormat` selection from Task 7.1 actually yielded a 16:9 720p capture rather than a 4:3 1440p Continuity default.)
+- **Permission denial path**: revoke camera or microphone in System Settings, relaunch, verify the empty state from Task 1.4 shows correctly.
 
 Each item gets a verification commit message.
 
