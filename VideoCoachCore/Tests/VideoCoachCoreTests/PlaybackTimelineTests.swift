@@ -36,6 +36,35 @@ final class PlaybackTimelineTests: XCTestCase {
         XCTAssertEqual(clip.sourceTime(atRecordTime: 3.0), 103, accuracy: 1e-9)
     }
 
+    func test_segments_simpleClip_oneSegmentEntireDuration() {
+        let clip = makeClip(start: 10, events: [])
+        let segs = clip.playbackSegments(sourceDuration: 1000)
+        XCTAssertEqual(segs.count, 1)
+        XCTAssertEqual(segs[0].kind, .play)
+        XCTAssertEqual(segs[0].sourceStart, 10)
+        XCTAssertEqual(segs[0].outDuration, 10) // recordingDuration
+    }
+
+    func test_segments_pauseProducesFreezeAndPlaySegments() {
+        let clip = makeClip(start: 10, events: [
+            .init(recordTime: 2, kind: .pause),
+            .init(recordTime: 4, kind: .play),
+        ])
+        let segs = clip.playbackSegments(sourceDuration: 1000)
+        XCTAssertEqual(segs.map(\.kind), [.play, .freeze, .play])
+        XCTAssertEqual(segs[0].outDuration, 2)
+        XCTAssertEqual(segs[1].outDuration, 2)
+        XCTAssertEqual(segs[2].outDuration, 6)
+    }
+
+    func test_segments_clampSourceToBounds_onSkip() {
+        let clip = makeClip(start: 998, events: [
+            .init(recordTime: 1, kind: .skip(delta: 100)),
+        ])
+        let segs = clip.playbackSegments(sourceDuration: 1000)
+        XCTAssertEqual(segs[1].sourceStart, 1000) // clamped at end
+    }
+
     private func makeClip(start: Double, events: [CommentaryEvent]) -> Clip {
         Clip(name: "t", sourceIndex: 0, startSourceSeconds: start,
              recordingDuration: 10, recordingFilename: "t.mov",
