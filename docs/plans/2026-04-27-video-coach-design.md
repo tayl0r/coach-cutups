@@ -486,7 +486,7 @@ The non-obvious calls made during design, with their rationale.
 
 (populated as Phase 9.0 runs)
 
-- **AVAssetExportSession + custom compositor + custom audioMix + HEVC preset combination**: ☐ verified working / ☐ falling back to AVAssetReader/Writer (Task 9.6).
+- **AVAssetExportSession + custom compositor + custom audioMix + HEVC preset combination**: ☑ verified working / ☐ falling back to AVAssetReader/Writer (Task 9.6).
 
 ## Open items (post-v1)
 
