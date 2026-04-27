@@ -1,6 +1,6 @@
 import Foundation
 
-public struct VisibleStroke: Equatable {
+public struct VisibleStroke: Equatable, Sendable {
     public let stroke: Stroke
     public let firstPointRecordTime: Double
     public let drawnPointCount: Int
