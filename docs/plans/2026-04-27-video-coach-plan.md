@@ -1484,7 +1484,7 @@ struct ContentView: View {
 
     var body: some View {
         NavigationSplitView {
-            ClipSidebar(workspace: $workspace, selectedClipID: $selectedClipID)
+            ClipSidebar(workspace: $workspace, selectedClipID: $selectedClipID, appMode: appMode)
                 .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
         } content: {
             VStack(spacing: 0) {
@@ -1547,6 +1547,7 @@ struct ContentView: View {
 struct ClipSidebar: View {
     @Binding var workspace: Workspace
     @Binding var selectedClipID: Clip.ID?
+    let appMode: AppMode    // disable selection while recording so users can't switch modes mid-capture
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1566,6 +1567,7 @@ struct ClipSidebar: View {
                 }
                 .onMove { indices, dest in workspace.reorderClips(from: indices, to: dest) }
             }
+            .disabled(appMode == .recording || appMode == .recordingStarting)
         }
     }
 }
@@ -1573,7 +1575,31 @@ struct ClipSidebar: View {
 
 **Step 4:** Implement `ClipInspector` placeholder — reads the selected clip and shows its `name`, `notes`, `tags`. Tag editing comes in Task 6.2; for now plain `TextField`s wired with `.onSubmit { try? workspace.saveProject() }`.
 
-**Step 5:** Add the missing Workspace methods. Three small additions:
+**Step 5:** Add the missing Workspace state and methods. Stored properties must live inside the primary `class Workspace` declaration (Swift forbids stored properties in `extension`s of classes). Add to the class body in Task 5.1:
+
+```swift
+@Observable
+@MainActor
+final class Workspace {
+    // ... existing fields (folder, project, virtualPlayer, virtualComposition) ...
+
+    // Cached preview player per clip. SwiftUI computed properties rebuild on every
+    // state change, so we never build a fresh AVPlayer on the hot path. Returns nil
+    // while the pre-decode of freeze frames is in flight; UI surfaces
+    // "Preparing preview…" via AppMode.previewLoading.
+    private var _previewCache: [Clip.ID: AVPlayer] = [:]
+    // Tracks clips whose preview build is in flight, preventing the SwiftUI
+    // thundering herd: without this, currentPlayer is queried 10-100x/sec on state
+    // changes, each cache miss kicking off a duplicate Task.
+    private var _previewInflight: Set<Clip.ID> = []
+    // Tracks clips whose last preview build threw. previewPlayer(for:) refuses to
+    // re-spawn a Task for a known-failed id; the polling loop in ContentView
+    // observes this and transitions to .scanning + an error alert.
+    private(set) var _previewFailed: [Clip.ID: Error] = [:]
+}
+```
+
+Methods can live in an extension (Swift allows that):
 
 ```swift
 extension Workspace {
@@ -1581,47 +1607,39 @@ extension Workspace {
     func reorderClips(from offsets: IndexSet, to destination: Int) {
         var clips = project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
         clips.move(fromOffsets: offsets, toOffset: destination)
-        for (i, var clip) in clips.enumerated() {
-            clip.sortIndex = i
-            clips[i] = clip
-        }
+        for i in clips.indices { clips[i].sortIndex = i }
         project.clips = clips
         try? saveProject()
     }
 
-    /// Cached preview player per clip. SwiftUI computed properties rebuild on every
-    /// state change, so we never build a fresh AVPlayer on the hot path. Returns nil
-    /// while the pre-decode of freeze frames is in flight; UI surfaces
-    /// "Preparing preview…" via AppMode.previewLoading.
-    private var _previewCache: [Clip.ID: AVPlayer] = [:]
-    /// Tracks clips whose preview build is in flight, preventing the SwiftUI
-    /// thundering-herd: without this, `currentPlayer` is queried 10–100×/sec on
-    /// state changes, each cache miss kicks off a duplicate Task.
-    private var _previewInflight: Set<Clip.ID> = []
-
     func previewPlayer(for id: Clip.ID) -> AVPlayer? {
         if let cached = _previewCache[id] { return cached }
+        if _previewFailed[id] != nil { return nil }   // don't spin on persistent failure
         guard !_previewInflight.contains(id) else { return nil }
         _previewInflight.insert(id)
         Task { [weak self] in
-            defer { Task { @MainActor [weak self] in self?._previewInflight.remove(id) } }
-            try? await self?.preparePreviewPlayer(for: id)
+            do { try await self?.preparePreviewPlayer(for: id) }
+            catch { await MainActor.run { self?._previewFailed[id] = error } }
+            await MainActor.run { self?._previewInflight.remove(id) }
         }
         return nil
     }
 
     private func preparePreviewPlayer(for id: Clip.ID) async throws {
         guard let clip = project.clips.first(where: { $0.id == id }) else { return }
+        // ClipPreviewBuilder is `nonisolated` (see Task 8.1) so the heavy pre-decode
+        // (AVAssetImageGenerator.image(at:) per freeze segment, can take 100-800ms each)
+        // runs OFF the main actor. Without this, the UI freezes during preview build.
         let item = try await ClipPreviewBuilder.buildPreviewItem(for: clip, project: project)
         _previewCache[id] = AVPlayer(playerItem: item)
     }
 
     /// Invalidate the cached preview player. Call when a clip's events change
-    /// (e.g. metadata-only edits don't matter, but the clip's recordingDuration or
-    /// events list does). For v1 the only mutator is recording stop, which assigns
-    /// a brand-new clip — no existing cache entry to invalidate.
+    /// (in v1, the only mutator is recording stop, which assigns a brand-new clip
+    /// — no existing cache entry to invalidate).
     func invalidatePreviewCache(for id: Clip.ID) {
         _previewCache.removeValue(forKey: id)
+        _previewFailed.removeValue(forKey: id)
     }
 }
 ```
@@ -1930,7 +1948,15 @@ final class CaptureSessionController: NSObject,
 - Create: `App/Drawing/DrawingOverlayView.swift`
 - Create: `App/Drawing/Denormalize.swift`
 
-**Step 1:** Implement the shared coordinate helper used by overlay, Mode C preview, and export compositor. Strokes are stored with a top-left origin (we flip Y on capture). Both render call sites also use top-left: `CAShapeLayer` in a normal AppKit view requires a Y flip from the bottom-left view origin, and the export compositor's `CGContext` (wrapping a `CVPixelBuffer`) defaults to bottom-left and the compositor flips via `translateBy + scaleBy(1, -1)`. So both call sites pass `flipY: true`.
+**Step 1:** Implement the shared coordinate helper used by overlay, Mode C preview, and export compositor. Strokes are stored with a top-left origin (we flip Y on capture). The three call sites pass **different** `flipY` values — see the design's `Drawing capture` section for the full rationale and the explicit "Misuse warning":
+
+| Call site | Coordinate system | `flipY` |
+|---|---|---|
+| Live drawing overlay (`DrawingOverlayView`, an `NSView` with `isFlipped = false`) | bottom-left | `true` |
+| Mode C `StrokeReplayLayer` (also an `NSView` with default `isFlipped = false`) | bottom-left | `true` |
+| Export compositor (`CompilationCompositor`) | top-left, established by `cg.translateBy(0, h); cg.scaleBy(1, -1)` BEFORE drawing | `false` |
+
+Passing `flipY: true` from the export compositor double-flips and renders strokes upside-down. Passing `flipY: false` from either AppKit overlay renders strokes mirrored vertically.
 
 ```swift
 import CoreGraphics
@@ -2279,10 +2305,11 @@ To keep the UI honest, we add a transient `AppMode.previewLoading(Clip.ID)` stat
 
 The same pre-decode approach can be applied to the export's `CompilationCompositor` if any user reports incorrect freeze frames during forward export (the export pipeline calls in temporal order so the runtime cache happens to work, but pre-decode is safer).
 
-**Step 2:** Implement `ClipPreviewBuilder` — produces an `AVPlayerItem` for a single clip:
+**Step 2:** Implement `ClipPreviewBuilder` as a `nonisolated` enum with static methods. This is critical: `Workspace` is `@MainActor` and calls `buildPreviewItem` from `preparePreviewPlayer` — without `nonisolated`, the entire build (including N × `AVAssetImageGenerator.image(at:)` calls that each take 100–800ms) runs on the main thread and freezes the UI. The `nonisolated` annotation lets Swift move the work to the cooperative thread pool while the MainActor-isolated caller awaits.
 
 ```swift
-func buildPreviewItem(for clip: Clip, project: Project) async throws -> AVPlayerItem {
+enum ClipPreviewBuilder {
+    nonisolated static func buildPreviewItem(for clip: Clip, project: Project) async throws -> AVPlayerItem {
     let comp = AVMutableComposition()
     let srcVideoTrackID: CMPersistentTrackID = 1
     let webcamTrackID: CMPersistentTrackID  = 1000
@@ -2295,10 +2322,11 @@ func buildPreviewItem(for clip: Clip, project: Project) async throws -> AVPlayer
     videoComp.frameDuration = CMTime(value: 1, timescale: 30)
     // build [PreviewInstruction] with built-in layer instructions for the PiP transform
     // ... layerInstructions: source full-frame + webcam transformed to 22% bottom-right
-    let item = AVPlayerItem(asset: comp)
-    item.videoComposition = videoComp
-    item.audioMix = buildAudioMix(...)
-    return item
+        let item = AVPlayerItem(asset: comp)
+        item.videoComposition = videoComp
+        item.audioMix = buildAudioMix(...)
+        return item
+    }
 }
 ```
 
@@ -2429,6 +2457,8 @@ enum PixelSampling {
 `AudioRMS.swift` — reads PCM samples through `AVAssetReader`, computes RMS amplitude:
 
 ```swift
+enum AudioRMSError: Error { case startReadingFailed(Error?) }
+
 enum AudioRMS {
     static func measure(track: AVAssetTrack, in asset: AVAsset) async throws -> Double {
         let reader = try AVAssetReader(asset: asset)
@@ -2441,7 +2471,9 @@ enum AudioRMS {
         ]
         let output = AVAssetReaderTrackOutput(track: track, outputSettings: settings)
         reader.add(output)
-        reader.startReading()
+        guard reader.startReading() else {
+            throw AudioRMSError.startReadingFailed(reader.error)
+        }
         var sumSq = 0.0
         var count = 0.0
         while let buf = output.copyNextSampleBuffer() {
@@ -2791,10 +2823,13 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
     }
 
     // Shared CIContext for CVPixelBuffer → CGImage conversions in makeCGImage.
-    // Allocate once per compositor instance — one allocation per export, not per frame.
+    // Allocate once per compositor instance (one allocation per export, not per frame).
     // Pin working color space to deviceRGB so the CG draw matches our output buffer's
     // colorspace (avoids subtle color-shifts in the export).
-    private lazy var ciContext: CIContext = CIContext(options: [
+    // Eager init (not lazy var) — `lazy var` is not thread-safe, and AVFoundation may
+    // call startRequest from a private dispatch queue without a documented serialization
+    // guarantee. Eager init dodges the race entirely.
+    private let ciContext: CIContext = CIContext(options: [
         .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
         .outputColorSpace: CGColorSpaceCreateDeviceRGB(),
     ])
