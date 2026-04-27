@@ -170,7 +170,9 @@ struct CommentaryEvent: Codable {
     }
 }
 
-struct Stroke: Codable {
+struct Stroke: Codable, Identifiable {
+    var id: UUID                            // assigned at mouseDown; identifies the stroke
+                                            // across replay diffs in StrokeReplayLayer
     var color: RGBA                         // fixed for v1; pickable later
     var lineWidth: Double                   // normalized to frame height
     var points: [StrokePoint]
@@ -281,7 +283,10 @@ On every input: split by comma, trim whitespace per fragment, lowercase per frag
 - `mouseDown:` opens a new in-memory `Stroke`. `mouseDragged:` may append a new `StrokePoint`. `mouseUp:` finalizes and emits the `.stroke(...)` event.
 - **60Hz capture cap, locked**: a new point is committed iff `now − lastPointTime ≥ 1/60s` AND the cursor has moved at least 1 device pixel from the last committed point. Worst-case storage is ~7KB for a 5-second stroke; typical clips total well under 100KB of stroke data.
 - AppKit's view origin is bottom-left. We flip on capture: `ny = 1.0 − pointInView.y / bounds.height`, so the stored normalized origin is top-left.
-- Both render call sites also draw with a top-left origin: `CAShapeLayer` in a normal AppKit view requires a Y flip, and the export compositor's `CGContext` (wrapping a `CVPixelBuffer`) defaults to a bottom-left origin and we flip via `CGContext.translateBy + scaleBy(1, -1)`. A shared helper `Denormalize.point(_:_:into:flipY:)` performs the conversion in both call sites with `flipY: true`.
+- The two render call sites have **different** coordinate systems and therefore pass different `flipY` values to the shared `Denormalize.point(_:_:into:flipY:)` helper:
+  - **Live overlay** (`NSView` with `isFlipped = false`): the view has bottom-left origin. Drawing a top-left-stored stroke point requires `flipY: true` (converts top-left → bottom-left).
+  - **Export compositor** (`CGContext` over `CVPixelBuffer`): the compositor applies `cg.translateBy(0, h); cg.scaleBy(1, -1)` BEFORE drawing — this transform makes user-space `(0, 0)` correspond to the top-left of the image (it's the standard CV/CG cookbook fix that lets `cg.draw(img, in:)` render the source CGImage right-side-up). After this transform the user-space is **already** top-left. So drawing a top-left-stored stroke point uses the stored coordinates directly: `flipY: false`.
+- **Misuse warning**: passing `flipY: true` in the export compositor double-flips the stroke and renders it upside-down. The Phase 9.0 spike includes a vertically-asymmetric stroke check (one stroke at `y ≈ 0.1`) — if it appears at the bottom of the export, this is the regression to suspect.
 - Coordinates stored as `(x/width, y/height)`; `lineWidth` is normalized to frame height (e.g. `0.005`). The live overlay sets `CAShapeLayer.lineWidth = 0.005 × bounds.height` directly — `lineWidth` is in points and Core Animation handles the Retina backing-store upscale automatically. We do **not** multiply by `window.backingScaleFactor` (that would render at 2× thickness on Retina).
 - The live overlay renders each stroke as a dedicated `CAShapeLayer` whose `path` extends as new points are committed. This avoids `setNeedsDisplay(bounds)` repainting the entire overlay 60×/sec and lets Core Animation composite on the GPU.
 
@@ -395,7 +400,7 @@ The compositor is the single source of truth for the export's per-frame visual. 
 - **Source audio**: inserted into the source-audio track (ID `2`) only during `.play` segments — gaps during `.freeze` ranges (intentional silence from the source side).
 - **Mic audio**: inserted continuously per clip into the per-clip mic track (ID `2000 + i`) — the mic runs through pauses and skips since the user is always talking.
 - Volumes from `preferences.previewSourceVolume` and `preferences.previewCommentaryVolume`.
-- **Boundary ramps**: at every transition between source-audio segments (i.e. each `.play → .freeze` and `.freeze → .play` boundary, plus clip starts and ends) we apply a **5ms volume ramp** via `AVMutableAudioMixInputParameters.setVolumeRamp(fromStartVolume:toEndVolume:timeRange:)`. This prevents AAC click artifacts at internal cut boundaries (priming samples don't exist for interior slices, so a hard cut at non-zero amplitude clicks).
+- **Boundary ramps**: at every transition between source-audio segments (i.e. each `.play → .freeze` and `.freeze → .play` boundary, plus clip starts and ends) we apply a **5ms volume ramp** via `AVMutableAudioMixInputParameters.setVolumeRamp(fromStartVolume:toEndVolume:timeRange:)`. This prevents AAC click artifacts at internal cut boundaries (priming samples don't exist for interior slices, so a hard cut at non-zero amplitude clicks). **Clamp the ramp start at zero** — if a boundary is within 5ms of zero (clip starts with a near-instant freeze), the unclamped start would go negative, which AVFoundation handles inconsistently across macOS versions. If the clamped duration is non-positive, skip the ramp.
 
 **AAC priming note**: `AVCaptureMovieFileOutput`-produced `.mov` files include an edit list compensating for the file-start AAC priming. `AVMutableComposition.insertTimeRange` honors the edit list at the file's start. The boundary-ramp strategy above handles the *interior* slicing concern, which is where priming compensation does not apply. The clap-sync manual test (Phase 10) verifies start-of-clip alignment; an additional "two pause boundaries inside one clip" check verifies no clicks at internal seams.
 

@@ -361,12 +361,18 @@ public struct StrokePoint: Codable, Hashable, Sendable {
     }
 }
 
-public struct Stroke: Codable, Hashable, Sendable {
+public struct Stroke: Codable, Hashable, Identifiable, Sendable {
+    public var id: UUID
     public var color: RGBA
     public var lineWidth: Double                    // normalized to frame height
     public var points: [StrokePoint]
     public var autoClearAfterSeconds: Double?       // nil = persist
-    public init(color: RGBA, lineWidth: Double, points: [StrokePoint], autoClearAfterSeconds: Double?) {
+    public init(id: UUID = UUID(),
+                color: RGBA,
+                lineWidth: Double,
+                points: [StrokePoint],
+                autoClearAfterSeconds: Double?) {
+        self.id = id
         self.color = color
         self.lineWidth = lineWidth
         self.points = points
@@ -794,9 +800,9 @@ The export compositor and Mode C stroke-replay layer must agree on which strokes
 - A stroke is partially visible (correct `drawnPointCount`) mid-draw.
 - A stroke with `autoClearAfterSeconds = 5` is invisible after `firstPointRecordTime + 5`.
 - A `.clearAll` event clears strokes drawn before it but not after.
-- Multiple strokes interleaved with `.clearAll` and auto-clear behave correctly.
+- **The "later-clearAll" case**: stroke A drawn at recordTime 1, stroke B at 3, `.clearAll` at 4, stroke C at 5; query at t=6 → only C visible. (This is the case the naive forward-walk misses; A and B are added to `out` BEFORE `.clearAll` is encountered.)
 
-**Step 2:** Implement:
+**Step 2:** Implement. The algorithm pre-collects clearAll times so it has full knowledge regardless of event order:
 
 ```swift
 public struct VisibleStroke: Equatable {
@@ -806,27 +812,24 @@ public struct VisibleStroke: Equatable {
 }
 
 public func visibleStrokes(in clip: Clip, atRecordTime t: Double) -> [VisibleStroke] {
+    // Pre-pass: collect every clearAll's recordTime that is at or before `t`.
+    let clearAllTimes: [Double] = clip.events.compactMap {
+        guard case .clearAll = $0.kind, $0.recordTime <= t else { return nil }
+        return $0.recordTime
+    }
+
     var out: [VisibleStroke] = []
-    var lastClearAllTime: Double = -.infinity
     for ev in clip.events {
-        switch ev.kind {
-        case .clearAll:
-            lastClearAllTime = ev.recordTime
-        case .stroke(let s):
-            let firstT = ev.recordTime - (s.points.last?.t ?? 0)
-            // Cleared by .clearAll between first-point and now?
-            if lastClearAllTime > firstT && lastClearAllTime <= t { continue }
-            // Auto-clear elapsed?
-            if let auto = s.autoClearAfterSeconds, t >= firstT + auto { continue }
-            // Not started yet?
-            if t < firstT { continue }
-            // Partial point count: largest k such that points[k-1].t <= (t - firstT).
-            let elapsed = t - firstT
-            let k = s.points.firstIndex(where: { $0.t > elapsed }) ?? s.points.count
-            out.append(.init(stroke: s, firstPointRecordTime: firstT, drawnPointCount: k))
-        case .play, .pause, .skip:
-            break
-        }
+        guard case .stroke(let s) = ev.kind else { continue }
+        let firstT = ev.recordTime - (s.points.last?.t ?? 0)
+        if t < firstT { continue }                                              // not started
+        if let auto = s.autoClearAfterSeconds, t >= firstT + auto { continue }  // auto-cleared
+        // Cleared by any clearAll that happened after this stroke started but at-or-before t?
+        if clearAllTimes.contains(where: { $0 > firstT && $0 <= t }) { continue }
+
+        let elapsed = t - firstT
+        let k = s.points.firstIndex(where: { $0.t > elapsed }) ?? s.points.count
+        out.append(.init(stroke: s, firstPointRecordTime: firstT, drawnPointCount: k))
     }
     return out
 }
@@ -1148,6 +1151,9 @@ final class Workspace {
     func rebuildVirtualPlayer() async throws {
         guard !project.sourceVideos.isEmpty else { virtualPlayer = nil; return }
         let comp = AVMutableComposition()
+        // The virtual-concat composition has no custom compositor reading by track ID,
+        // so kCMPersistentTrackID_Invalid (auto-assigned IDs) is fine here. The strict
+        // explicit-track-ID rule from the design applies only to the export composition.
         guard let v = comp.addMutableTrack(withMediaType: .video,
                                            preferredTrackID: kCMPersistentTrackID_Invalid),
               let a = comp.addMutableTrack(withMediaType: .audio,
@@ -1424,8 +1430,10 @@ git commit -m "feat(app): keyboard shortcuts space/arrows/AD for transport"
 
 **Files:**
 - Modify: `App/ContentView.swift`
+- Modify: `App/Models/Workspace.swift` (add `reorderClips`, `previewPlayer(for:)` cache, `cachedTransportPlayer`)
 - Create: `App/Views/ClipSidebar.swift`
 - Create: `App/Views/ClipInspector.swift`
+- Create: `App/Views/TransportBar.swift`
 - Create: `App/Models/AppMode.swift`
 
 **Step 1:** Implement `AppMode` (the `recordingStarting` state from Task 7.4 lives here too):
@@ -1436,8 +1444,9 @@ import VideoCoachCore
 
 enum AppMode: Equatable {
     case scanning
-    case recordingStarting
+    case recordingStarting        // R pressed; awaiting first sample buffer
     case recording
+    case previewLoading(Clip.ID)  // building AVPlayer + pre-decoding freeze frames
     case previewClip(Clip.ID)
 }
 ```
@@ -1522,7 +1531,81 @@ struct ClipSidebar: View {
 
 **Step 4:** Implement `ClipInspector` placeholder — reads the selected clip and shows its `name`, `notes`, `tags`. Tag editing comes in Task 6.2; for now plain `TextField`s wired with `.onSubmit { try? workspace.saveProject() }`.
 
-**Step 5:** Run. Verify project name editable, empty clip list, player center, empty inspector when no clip selected. Add a stub clip programmatically to verify selection updates the inspector. Commit.
+**Step 5:** Add the missing Workspace methods. Three small additions:
+
+```swift
+extension Workspace {
+    /// Drag-to-reorder the sidebar clip list. Persists immediately.
+    func reorderClips(from offsets: IndexSet, to destination: Int) {
+        var clips = project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
+        clips.move(fromOffsets: offsets, toOffset: destination)
+        for (i, var clip) in clips.enumerated() {
+            clip.sortIndex = i
+            clips[i] = clip
+        }
+        project.clips = clips
+        try? saveProject()
+    }
+
+    /// Cached preview player per clip. SwiftUI computed properties may rebuild many times per
+    /// second, so we never build a fresh AVPlayer on the hot path. Returns nil while the
+    /// pre-decode of freeze frames is in flight; UI surfaces "Preparing preview…" via appMode.
+    private var previewPlayerCache: [Clip.ID: AVPlayer] {
+        get { _previewCache }
+        set { _previewCache = newValue }
+    }
+    private var _previewCache: [Clip.ID: AVPlayer] = [:]   // backing store
+
+    func previewPlayer(for id: Clip.ID) -> AVPlayer? {
+        if let cached = _previewCache[id] { return cached }
+        Task { try? await self.preparePreviewPlayer(for: id) }
+        return nil
+    }
+
+    private func preparePreviewPlayer(for id: Clip.ID) async throws {
+        guard let clip = project.clips.first(where: { $0.id == id }) else { return }
+        let item = try await ClipPreviewBuilder.buildPreviewItem(for: clip, project: project)
+        _previewCache[id] = AVPlayer(playerItem: item)
+    }
+
+    /// Invalidate cached preview player when its clip's events change (e.g. drawing
+    /// re-record in v2, or simply after recording finishes for that clip).
+    func invalidatePreviewCache(for id: Clip.ID) {
+        _previewCache.removeValue(forKey: id)
+    }
+}
+```
+
+**Step 6:** Add `App/Views/TransportBar.swift` — the bar under the player. Routes to the right player based on `appMode`:
+
+```swift
+struct TransportBar: View {
+    @Binding var workspace: Workspace
+    @Binding var appMode: AppMode
+
+    var body: some View {
+        HStack(spacing: 12) {
+            switch appMode {
+            case .scanning:
+                ScanningTransport(workspace: $workspace)
+            case .recordingStarting, .recording:
+                RecordingTransport(workspace: $workspace, appMode: $appMode)
+            case .previewClip(let id):
+                PreviewTransport(workspace: $workspace, clipID: id)
+            }
+        }.padding(.horizontal, 12)
+    }
+}
+
+// ScanningTransport: play/pause button, scrubber, timecode, scan-volume slider.
+// RecordingTransport: yellow REC dot during .recordingStarting, red during .recording, big Stop.
+// PreviewTransport: play/pause, scrubber, source-volume slider, commentary-volume slider.
+//   Sliders use .onEditingChanged: { editing in if !editing { try? workspace.saveProject() } }
+//   so we persist on slider release, not on every drag tick. Live audio mix updates by
+//   rebuilding AVMutableAudioMix and assigning to player.currentItem?.audioMix.
+```
+
+**Step 7:** Run. Verify project name editable, empty clip list, player center, empty inspector when no clip selected. Add a stub clip programmatically to verify selection updates the inspector. Commit.
 
 ---
 
@@ -1716,6 +1799,10 @@ final class CaptureSessionController: NSObject,
         // Runs on dataQueue.
         guard awaitingFirstSample, let cont = t0Continuation else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        // Some external capture devices occasionally emit invalid/NaN PTS during clock
+        // resets. Discard and wait for the next sample; the 2s timeout still protects
+        // against pathological cases.
+        guard pts.flags.contains(.valid), pts.seconds.isFinite else { return }
         awaitingFirstSample = false
         t0Continuation = nil
         firstSampleTimeoutTask?.cancel()
@@ -1892,6 +1979,7 @@ final class DrawingOverlayView: NSView {
     override func mouseUp(with event: NSEvent) {
         guard let ip = inProgress else { return }
         let stroke = Stroke(
+            id: UUID(),
             color: .red,
             lineWidth: 0.005,
             points: ip.points,
@@ -1956,12 +2044,28 @@ enum AppMode: Equatable {
 
 While `appMode == .recordingStarting`, the key handler ignores all keys (no events captured before t=0).
 
-**Step 4:** On stop:
-- `stopRecording()` → returns duration.
-- Build `Clip` from RecordingController's events + capture metadata. Set `recordingFilename` to `"clip-\(id).mov"`.
-- `workspace.project.clips.append(clip)`.
-- `saveProject()`.
-- Return to Mode A.
+**Step 4:** On stop. The `stopRecording` continuation is resumed off-main-actor (from a `Task` inside `didFinishRecordingTo`), so the model mutation must hop back to the main actor explicitly:
+
+```swift
+let duration = try await capture.stopRecording()
+let events = recordingController.finish()
+let id = UUID()
+let clip = Clip(
+    id: id,
+    name: "Clip \(workspace.project.clips.count + 1)",
+    sourceIndex: currentSourceIndex,
+    startSourceSeconds: clipStartSourceSeconds,
+    recordingDuration: duration,
+    recordingFilename: "clip-\(id).mov",
+    events: events,
+    sortIndex: workspace.project.clips.count
+)
+await MainActor.run {
+    workspace.project.clips.append(clip)
+    try? workspace.saveProject()
+    appMode = .scanning
+}
+```
 
 **Step 4:** Run a full manual test:
 - Open project, add source video, press play, scrub, press R, talk for 5s with one pause + one skip + one drawing, press R.
@@ -2061,7 +2165,52 @@ final class PreviewInstruction: AVMutableVideoCompositionInstruction {
 }
 ```
 
-The `frozenFrames` map is populated at composition build time by `ClipPreviewBuilder` using `AVAssetImageGenerator.copyCGImage(at: sourceTimeAtEndOfPriorPlay)` → `CGImage` → `CVPixelBuffer`. One generation per freeze segment per clip, off the render thread, before playback starts. The same approach can be applied to the export's `CompilationCompositor` if any user reports incorrect freeze frames during forward export (the export pipeline calls in temporal order so the runtime cache happens to work, but pre-decode is safer).
+The `frozenFrames` map is populated at composition build time by `ClipPreviewBuilder` using `AVAssetImageGenerator`. For each freeze segment, we copy a CGImage at the source-time corresponding to the END of the immediately preceding `.play` segment, then convert to CVPixelBuffer:
+
+```swift
+let gen = AVAssetImageGenerator(asset: srcAsset)
+gen.appliesPreferredTrackTransform = true
+gen.requestedTimeToleranceBefore = .positiveInfinity   // snap to nearest keyframe — fine for a freeze hint
+gen.requestedTimeToleranceAfter  = .positiveInfinity
+gen.maximumSize = CGSize(width: 1280, height: 720)     // preview-resolution; export decodes at native size
+
+for (i, seg) in segments.enumerated() where seg.kind == .freeze {
+    let priorPlayEnd = sourceTimeAtEndOfPlay(precedingSegment: i)
+    let cgImage = try gen.copyCGImage(at: CMTime(seconds: priorPlayEnd, preferredTimescale: 600), actualTime: nil)
+    instruction.frozenFrames[i] = try cgImageToBGRAPixelBuffer(cgImage)
+}
+
+func cgImageToBGRAPixelBuffer(_ image: CGImage) throws -> CVPixelBuffer {
+    var pb: CVPixelBuffer?
+    let attrs: [CFString: Any] = [
+        kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
+        kCVPixelBufferCGImageCompatibilityKey: true,
+        kCVPixelBufferCGBitmapContextCompatibilityKey: true,
+    ]
+    CVPixelBufferCreate(kCFAllocatorDefault, image.width, image.height,
+                        kCVPixelFormatType_32BGRA,
+                        attrs as CFDictionary, &pb)
+    guard let buf = pb else { throw CompilationError.pixelBufferAllocFailed }
+    CVPixelBufferLockBaseAddress(buf, [])
+    defer { CVPixelBufferUnlockBaseAddress(buf, []) }
+    let cs = CGColorSpaceCreateDeviceRGB()
+    let ctx = CGContext(
+        data: CVPixelBufferGetBaseAddress(buf),
+        width: image.width, height: image.height, bitsPerComponent: 8,
+        bytesPerRow: CVPixelBufferGetBytesPerRow(buf), space: cs,
+        bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                   | CGBitmapInfo.byteOrder32Little.rawValue
+    )
+    ctx?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
+    return buf
+}
+```
+
+**Build time and UI state**: on long-GOP HEVC sources, `copyCGImage` for a non-IDR time can take 100–800ms depending on GOP placement. A 10-clip preview with several freeze segments per clip can stall 3–20 seconds.
+
+To keep the UI honest, we add a transient `AppMode.previewLoading(Clip.ID)` state. The flow is: user clicks a clip → `appMode = .previewLoading(id)` (sidebar shows a spinner next to the row, player area shows "Preparing preview…") → `Task { try await preparePreviewPlayer(for: id); appMode = .previewClip(id) }`. The cached `_previewCache[id]` keeps subsequent selections of the same clip instant.
+
+The same pre-decode approach can be applied to the export's `CompilationCompositor` if any user reports incorrect freeze frames during forward export (the export pipeline calls in temporal order so the runtime cache happens to work, but pre-decode is safer).
 
 **Step 2:** Implement `ClipPreviewBuilder` — produces an `AVPlayerItem` for a single clip:
 
@@ -2112,6 +2261,8 @@ The design explicitly chooses a **custom `AVVideoCompositing` compositor** (hand
 ### Task 9.0: AVAssetExportSession spike — does the risky combination actually work?
 
 **Goal:** confirm `AVAssetExportSession` honors a `customVideoCompositorClass` AND a custom `audioMix` AND a non-default frame rate when paired with HEVC presets. Empty-composition tests don't exercise the risk; we need a stub compositor that proves the compositor is actually called, plus a non-1.0 audio mix that proves the mix is honored, plus bitrate measurement.
+
+**Tooling note**: the spike's verification commands use `ffprobe`/`ffmpeg`/`afinfo`. These are dev-only verification dependencies — `brew install ffmpeg`. Not a runtime dependency of the app.
 
 **Files:**
 - Create: `App/Export/ExportSpike.swift` (deletable scratch file)
@@ -2392,9 +2543,11 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
             cg.draw(wImg, in: rect)
         }
 
-        // 5. Strokes.
-        for stroke in inst.strokes where strokeIsVisible(stroke, atRecordTime: recordTime) {
-            drawStroke(stroke, atRecordTime: recordTime, into: cg, size: CGSize(width: w, height: h))
+        // 5. Strokes. Note flipY: false — the cg.translateBy + scaleBy already established
+        // a top-left user-space, so stored top-left stroke points pass through directly.
+        // (flipY: true would double-flip and render strokes upside-down.)
+        for vs in visibleStrokes(in: clipForInst(inst), atRecordTime: recordTime) {
+            drawStroke(vs, into: cg, size: CGSize(width: w, height: h))
         }
 
         // 6. Text bar via CoreText (handles emoji/RTL/CJK correctly; CGContext.draw(text:) doesn't).
@@ -2403,19 +2556,30 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
         request.finish(withComposedVideoFrame: out)
     }
 
-    // ... helpers: currentSegmentIsFreeze, strokeIsVisible, drawStroke (CGPath via Denormalize, flipY: true),
-    // drawTextBar (CTFramesetterCreateWithAttributedString + CTFrameDraw), makeCGImage (CIImage roundtrip).
+    // ... helpers:
+    //   currentSegmentIsFreeze(inst, recordTime)
+    //   drawStroke(_ vs: VisibleStroke, into cg: CGContext, size: CGSize):
+    //       walks vs.stroke.points up to vs.drawnPointCount, building a CGPath via
+    //       Denormalize.point(p.x, p.y, into: size, flipY: false), then strokes it
+    //       with vs.stroke.color and vs.stroke.lineWidth × size.height.
+    //   drawTextBar (CTFramesetterCreateWithAttributedString + CTFrameDraw)
+    //   makeCGImage(_ buffer: CVPixelBuffer): CIImage roundtrip via CIContext.createCGImage.
 }
 ```
 
-**Step 3:** Write a 1-second smoke test:
+**Step 3:** Write a 1-second smoke test that catches both the visibleStrokes algorithm bug and the coordinate-flip bug if either regresses:
 - Use `AVAssetWriter` to generate a synthetic 1-second 1080p source `.mov` of a solid green color.
-- Build a `CompilationInstruction` with one stroke and a known text-bar string.
-- Wrap in an `AVMutableVideoComposition` with `customVideoCompositorClass = CompilationCompositor.self`, instructions = `[that one instruction]`.
+- Build a `CompilationInstruction` with **two strokes deliberately placed near the TOP of the frame (all points at normalized y ≈ 0.1)** and a `.clearAll` event between them — exercises both the orientation contract and the clearAll contract.
+- Wrap in an `AVMutableVideoComposition` with `customVideoCompositorClass = CompilationCompositor.self`, instructions = `[that one instruction with timeRange + requiredSourceTrackIDs set]`.
 - Run an `AVAssetExportSession` with HEVC preset, output to a temp `.mov`.
-- Read back via `AVAssetReader` → for frame N, wrap in `CIImage(cvPixelBuffer:)`, run `CIAreaAverage` on a sample region inside the stroke's bounding box, render via `CIContext.render(_:toBitmap:...)` to inspect a 4-byte RGBA value. Assert R > 200 (red stroke) within tolerance.
-- Sample another region inside the text bar's bounding box; assert the average is darker than green (text bar's translucent black darkens the source).
-- Tolerance ~10/255 to absorb HEVC compression noise.
+- Read back via `AVAssetImageGenerator.copyCGImage(at: CMTime(seconds: 0.5, ...))`.
+- Sample three regions of the resulting `CGImage` (use a `CGContext`-backed bitmap and `CGImage.copyData()` to read pixels):
+  - **Top strip** (y ≈ 0.1): expect mostly red pixels for the second stroke (post-clearAll, still visible). Asserts strokes draw at the TOP, not bottom — catches C2-class regressions.
+  - **Top strip same x as first stroke**: expect green (no red), proving the first stroke was correctly cleared. Catches C1-class regressions.
+  - **Bottom strip** (y ≈ 0.96): expect darkened green (text bar overlay).
+- Tolerance ~10/255 per channel to absorb HEVC compression noise.
+
+(Using `AVAssetImageGenerator + CGImage` is simpler than `AVAssetReader + CIImage + CIContext.render` and gives well-defined sRGB pixels we can compare directly.)
 
 **Step 4:** Commit.
 
@@ -2443,14 +2607,19 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 3. Builds `AVMutableAudioMix` with `inputParameters` per audio track:
    - Source audio (track `2`): `setVolume(prefs.previewSourceVolume, at: .zero)`.
    - Each per-clip mic audio: `setVolume(prefs.previewCommentaryVolume, at: .zero)`.
-   - **5ms volume ramps at every internal source-audio segment boundary**: for each clip's `playbackSegments`, every time we hit a `.play → .freeze` or `.freeze → .play` boundary at output time `T`, call:
+   - **5ms volume ramps at every internal source-audio segment boundary**: for each clip's `playbackSegments`, every time we hit a `.play → .freeze` or `.freeze → .play` boundary at output time `T`, apply a fade-out then fade-in with a 5ms duration each. Clamp the start at zero to handle near-zero boundaries:
      ```swift
-     params.setVolumeRamp(fromStartVolume: prefs.previewSourceVolume,
-                          toEndVolume: 0,
-                          timeRange: CMTimeRange(start: T - 0.005s, duration: 0.005s))
+     let rampDur = CMTime(seconds: 0.005, preferredTimescale: 600)
+     let preStart = CMTimeMaximum(.zero, T - rampDur)
+     let preDur   = T - preStart
+     if preDur > .zero {
+         params.setVolumeRamp(fromStartVolume: prefs.previewSourceVolume,
+                              toEndVolume: 0,
+                              timeRange: CMTimeRange(start: preStart, duration: preDur))
+     }
      params.setVolumeRamp(fromStartVolume: 0,
                           toEndVolume: prefs.previewSourceVolume,
-                          timeRange: CMTimeRange(start: T, duration: 0.005s))
+                          timeRange: CMTimeRange(start: T, duration: rampDur))
      ```
    - This eliminates AAC click artifacts at interior cuts (priming compensation only applies at file start; interior slices are hard cuts at non-zero amplitude).
 4. Configures `AVAssetExportSession`:
@@ -2477,6 +2646,7 @@ final class CompilationCompositor: NSObject, AVVideoCompositing {
 - Adds a synthetic `all-clips` row at top.
 - Shows checkboxes, Select All / None, Resolution + Quality dropdowns.
 - Project name field (prefilled from folder name), output folder picker.
+- **Export button is disabled when zero rows are checked** OR when the output folder is unset. (Otherwise the user gets a no-op click.)
 - Export button → kicks off `CompilationExporter` per checked row sequentially, shows progress per tag.
 
 **Step 2:** Manual test the full path: open a project with several clips and varied tags → Export → pick output folder → run. Verify per-tag `.mov` files appear with the expected filenames and contents.
