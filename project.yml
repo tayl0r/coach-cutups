@@ -1,0 +1,32 @@
+name: VideoCoach
+options:
+  bundleIdPrefix: com.videocoach
+  deploymentTarget:
+    macOS: "14.0"
+  developmentLanguage: en
+packages:
+  VideoCoachCore:
+    path: VideoCoachCore
+targets:
+  VideoCoach:
+    type: application
+    platform: macOS
+    sources:
+      - App
+    dependencies:
+      - package: VideoCoachCore
+    info:
+      path: App/Info.plist
+      properties:
+        NSCameraUsageDescription: Video Coach uses your camera to record commentary on match clips.
+        NSMicrophoneUsageDescription: Video Coach uses your microphone to record commentary on match clips.
+        CFBundleDisplayName: Video Coach
+        LSMinimumSystemVersion: "14.0"
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: App/VideoCoach.entitlements
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_VERSION: 5.9
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
