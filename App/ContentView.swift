@@ -99,31 +99,11 @@ struct ContentView: View {
             appMode = .previewClip(newID)
             return
         }
-        appMode = .previewLoading(newID)
-        // TODO(Phase 8): triggered when ClipPreviewBuilder lands. The cache is
-        // populated off-main-actor by the builder; this loop polls for the
-        // player to appear and flips into `.previewClip`. Without the builder
-        // the cache never populates, so we cap the wait at 2 seconds and fall
-        // back to `.scanning` to keep Phase 6 testable in isolation.
-        Task {
-            let deadline = Date().addingTimeInterval(2.0)
-            while Date() < deadline {
-                if workspace.previewPlayer(for: newID) != nil { break }
-                // If selection moved on (or was cleared) while we were waiting,
-                // stop polling — a fresh handler is already running.
-                guard case .previewLoading(let pid) = appMode, pid == newID else { return }
-                try? await Task.sleep(nanoseconds: 50_000_000)
-            }
-            guard case .previewLoading(let pid) = appMode, pid == newID else { return }
-            if workspace.previewPlayer(for: newID) != nil {
-                appMode = .previewClip(newID)
-            } else {
-                // Builder never delivered — drop selection and revert to scanning
-                // so the UI doesn't get stuck on the loading overlay.
-                selectedClipID = nil
-                appMode = .scanning
-            }
-        }
+        // TODO(Phase 8): kick off ClipPreviewBuilder and transition to
+        // .previewLoading → .previewClip when the cache populates. Until then,
+        // stay on .scanning so the player keeps showing the virtual concat
+        // and the inspector keeps the clip selected for metadata editing.
+        appMode = .scanning
     }
 
     // MARK: - Keyboard handling
