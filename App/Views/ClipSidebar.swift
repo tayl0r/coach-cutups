@@ -43,17 +43,22 @@ struct ClipSidebar: View {
                             .monospacedDigit()
                     }
                     .tag(clip.id)
-                    .contextMenu {
-                        Button(role: .destructive) {
-                            onRequestDeleteClip(clip.id)
-                        } label: {
-                            Label("Delete Clip…", systemImage: "trash")
-                        }
-                        .disabled(isRecording)
-                    }
                 }
                 .onMove { indices, dest in
                     workspace.reorderClips(from: indices, to: dest)
+                }
+            }
+            // macOS 13+ selection-aware context menu. Handles right-click on
+            // an unselected row (briefly selects it for the action) and
+            // doesn't depend on per-row hit-target tricks like .contentShape.
+            .contextMenu(forSelectionType: Clip.ID.self) { ids in
+                if let id = ids.first {
+                    Button(role: .destructive) {
+                        onRequestDeleteClip(id)
+                    } label: {
+                        Label("Delete Clip…", systemImage: "trash")
+                    }
+                    .disabled(isRecording)
                 }
             }
             .disabled(isRecording)
