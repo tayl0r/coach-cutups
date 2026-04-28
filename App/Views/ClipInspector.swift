@@ -82,6 +82,10 @@ private struct EditorView: View {
                 TextField("Clip name", text: $clip.name)
                     .textFieldStyle(.roundedBorder)
                     .onSubmit { try? workspace.saveProject() }
+                    // Persist on every keystroke so a quick Escape-to-exit
+                    // doesn't lose an in-flight rename. Cheap — ProjectStore
+                    // writes a small JSON blob.
+                    .onChange(of: clip.name) { _, _ in try? workspace.saveProject() }
             }
 
             Group {
