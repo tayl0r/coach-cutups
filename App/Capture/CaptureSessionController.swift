@@ -58,12 +58,6 @@ final class CaptureSessionController: NSObject,
     private var stopContinuation: CheckedContinuation<Double, Error>?
     private var videoDevice: AVCaptureDevice?
 
-    /// Captured at `startRecording(to:)` time. Sample buffers from the data
-    /// output have PTS in this clock's time base; we convert to host time
-    /// before resuming `t0Continuation` so callers always see host-time
-    /// seconds (matching `CACurrentMediaTime()`).
-    private var sessionClock: CMClock = CMClockGetHostTimeClock()
-
     func configure(
         preferredCameraID: String? = nil,
         preferredMicID: String? = nil
@@ -175,12 +169,11 @@ final class CaptureSessionController: NSObject,
     /// 2-second timeout protects against camera failure (e.g. another app
     /// holding exclusive access). Refuses re-entry if a recording is pending.
     func startRecording(to url: URL) async throws -> Double {
-        // Capture the session's clock now so the data-output delegate can
-        // convert sample-buffer PTS into host-time seconds. On modern macOS
-        // even the built-in MacBook camera exposes a device-specific clock
-        // (not the host clock), so conversion is the rule, not the exception.
-        sessionClock = session.synchronizationClock ?? CMClockGetHostTimeClock()
-
+        // The data-output delegate reads `session.synchronizationClock`
+        // fresh per-sample (see `captureOutput` below) — capturing it here
+        // would race the cold-session window where the clock hasn't yet
+        // calibrated against host time, producing a CMSyncConvertTime
+        // failure on the first frame.
         try dataQueue.sync {
             guard t0Continuation == nil, !isRecording else {
                 throw CaptureError.alreadyRecording
@@ -244,25 +237,25 @@ final class CaptureSessionController: NSObject,
         // timeout still protects against pathological cases.
         guard pts.flags.contains(.valid), pts.seconds.isFinite else { return }
 
-        // PTS is in `sessionClock`'s time base. Convert to host time so the
-        // returned t0Seconds matches `CACurrentMediaTime()` — that's the
-        // contract `RecordingController` relies on for `recordTime` math.
+        // Re-read the session clock per-sample. With deferred-capture the
+        // session has only been running for tens of milliseconds when the
+        // first frame arrives, so `synchronizationClock` may have been nil
+        // (or still calibrating against host time) at startRecording-time.
+        // Reading fresh here picks up the device clock as soon as it lands.
         let hostClock = CMClockGetHostTimeClock()
+        let currentSessionClock = session.synchronizationClock ?? hostClock
         let hostTime: CMTime
-        if sessionClock === hostClock {
+        if currentSessionClock === hostClock {
             hostTime = pts
         } else {
-            hostTime = CMSyncConvertTime(pts, from: sessionClock, to: hostClock)
+            hostTime = CMSyncConvertTime(pts, from: currentSessionClock, to: hostClock)
         }
         guard hostTime.flags.contains(.valid), hostTime.seconds.isFinite else {
-            // Conversion failed (clocks not synchronizable). Tear down so the
-            // UI surfaces the error rather than anchoring to garbage.
-            awaitingFirstSample = false
-            t0Continuation = nil
-            firstSampleTimeoutTask?.cancel()
-            firstSampleTimeoutTask = nil
-            cont.resume(throwing: CaptureError.clockConversionFailed)
-            movieOutput.stopRecording()
+            // Conversion failed — typical on a cold session before the device
+            // clock has been calibrated against host time. Discard this frame
+            // and let the next one try; the 2s `firstSampleTimeout` catches
+            // genuinely-unsynchronizable devices (which surfaces a clearer
+            // error than clockConversionFailed anyway).
             return
         }
 
