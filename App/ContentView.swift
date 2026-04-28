@@ -537,9 +537,10 @@ struct ContentView: View {
                 // Lazy configure: the capture session is paused (stopRunning)
                 // between recordings so the indicator light is off while the
                 // user is just scanning. prepareForRecording configures on
-                // first call and re-runs the session on subsequent resumes;
-                // serial-queue ordering on sessionQueue ensures
-                // movieOutput.startRecording sees a running session.
+                // first call, restarts the session on resumes, and waits for
+                // the data output to actually deliver a frame before we kick
+                // off movieOutput.startRecording — otherwise the file output
+                // races a session that hasn't fully spun up yet.
                 try await capture.prepareForRecording(
                     preferredCameraID: preferredCameraID,
                     preferredMicID: preferredMicID
