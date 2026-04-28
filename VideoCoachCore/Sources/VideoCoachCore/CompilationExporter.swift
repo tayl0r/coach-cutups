@@ -60,31 +60,41 @@ public actor CompilationExporter {
         sourceVolume: Double,
         commentaryVolume: Double
     ) async throws {
-        // ── Step 1: Build the AVMutableComposition with explicit track IDs.
+        // ── Step 1: Build the AVMutableComposition.
+        //
+        // We let AVFoundation auto-assign track IDs via
+        // `kCMPersistentTrackID_Invalid` and capture the actual `trackID`
+        // each call returns. Explicit `preferredTrackID:` values used to work
+        // (the design doc spec'd 1, 2, 1000+i, 2000+i) but on macOS 26
+        // `addMutableTrack` returns nil for some explicit-ID calls — same
+        // family of regression we hit with `requiredSourceTrackIDs`. Threading
+        // the *assigned* IDs through is the modern Apple-recommended pattern
+        // and dodges the issue entirely.
         let comp = AVMutableComposition()
 
-        // Source video — single shared track at ID 1; we insert only `.play`
-        // segments so freezes are a gap (the compositor fills from cache).
         guard let sourceVideoTrack = comp.addMutableTrack(
             withMediaType: .video,
-            preferredTrackID: 1
+            preferredTrackID: kCMPersistentTrackID_Invalid
         ) else {
             throw CompilationExportError.noVideoTrackAdded
         }
-        // Source audio — single shared track at ID 2; same `.play`-only insert.
-        // (The mic audio per clip lives on its own track at 2000+i.)
+        let sourceVideoTrackID = sourceVideoTrack.trackID
+
         guard let sourceAudioTrack = comp.addMutableTrack(
             withMediaType: .audio,
-            preferredTrackID: 2
+            preferredTrackID: kCMPersistentTrackID_Invalid
         ) else {
             throw CompilationExportError.noAudioTrackAdded
         }
+        let sourceAudioTrackID = sourceAudioTrack.trackID
 
-        // Per-clip webcam video + mic audio track holders, built lazily.
-        // Track IDs follow the design doc: 1000+i for webcam video,
-        // 2000+i for mic audio.
+        // Per-clip webcam video + mic audio. Tracks-by-entry-index plus their
+        // assigned IDs (so we can wire the AVMutableAudioMixInputParameters
+        // and the CompilationInstruction with the real IDs).
         var webcamTracksByEntry: [Int: AVMutableCompositionTrack] = [:]
+        var webcamTrackIDByEntry: [Int: CMPersistentTrackID] = [:]
         var micTracksByEntry: [Int: AVMutableCompositionTrack] = [:]
+        var micTrackIDByEntry: [Int: CMPersistentTrackID] = [:]
 
         // Tracks the per-track existence so we know whether to produce
         // AVMutableAudioMixInputParameters for the mic track. (If the webcam
@@ -135,14 +145,14 @@ public actor CompilationExporter {
             let webcamVideoSrc = try await webcamAsset.primaryVideoTrack()
             let webcamAudioSrc = try await webcamAsset.optionalAudioTrack()
 
-            let webcamID = CMPersistentTrackID(1000 + entry.indexInOutput)
             guard let webcamTrack = comp.addMutableTrack(
                 withMediaType: .video,
-                preferredTrackID: webcamID
+                preferredTrackID: kCMPersistentTrackID_Invalid
             ) else {
                 throw CompilationExportError.noVideoTrackAdded
             }
             webcamTracksByEntry[entry.indexInOutput] = webcamTrack
+            webcamTrackIDByEntry[entry.indexInOutput] = webcamTrack.trackID
 
             let clipDuration = CMTime(seconds: entry.recordingDuration, preferredTimescale: 600)
             let clipStart = CMTime(seconds: entry.compositionStart, preferredTimescale: 600)
@@ -158,14 +168,14 @@ public actor CompilationExporter {
             )
 
             if let webcamAudioSrc {
-                let micID = CMPersistentTrackID(2000 + entry.indexInOutput)
                 guard let micTrack = comp.addMutableTrack(
                     withMediaType: .audio,
-                    preferredTrackID: micID
+                    preferredTrackID: kCMPersistentTrackID_Invalid
                 ) else {
                     throw CompilationExportError.noAudioTrackAdded
                 }
                 micTracksByEntry[entry.indexInOutput] = micTrack
+                micTrackIDByEntry[entry.indexInOutput] = micTrack.trackID
                 try micTrack.insertTimeRange(
                     CMTimeRange(start: .zero, duration: webcamReadDuration),
                     of: webcamAudioSrc,
@@ -203,14 +213,20 @@ public actor CompilationExporter {
                 }
             }
             let textBarLine = "\(entry.indexInOutput + 1)/\(plan.entries.count), \(clip.name), \(clip.tags.joined(separator: " "))"
+            // Use the AVFoundation-assigned trackIDs captured above. The
+            // webcam ID may be missing if some pathological per-clip flow
+            // ran without inserting a webcam track — fall back to the
+            // assigned source ID so the compositor's `requiredSourceTrackIDs`
+            // doesn't reference a nonexistent track.
+            let webcamID = webcamTrackIDByEntry[entry.indexInOutput] ?? sourceVideoTrackID
             let inst = CompilationInstruction.make(
                 clipIndex: entry.indexInOutput,
                 indexInOutput: entry.indexInOutput,
                 totalClips: plan.entries.count,
                 compositionStart: CMTime(seconds: entry.compositionStart, preferredTimescale: 600),
                 clipDuration: CMTime(seconds: entry.recordingDuration, preferredTimescale: 600),
-                sourceTrackID: 1,
-                webcamTrackID: CMPersistentTrackID(1000 + entry.indexInOutput),
+                sourceTrackID: sourceVideoTrackID,
+                webcamTrackID: webcamID,
                 segments: entry.segments,
                 strokes: strokes,
                 events: drawingEvents,
@@ -226,7 +242,7 @@ public actor CompilationExporter {
 
         if hasSourceAudioInsert {
             let sourceParams = AVMutableAudioMixInputParameters(track: sourceAudioTrack)
-            sourceParams.trackID = 2
+            sourceParams.trackID = sourceAudioTrackID
             sourceParams.setVolume(Float(sourceVolume), at: .zero)
 
             // Boundary ramps: at every interior `.play↔.freeze` transition,
@@ -268,7 +284,7 @@ public actor CompilationExporter {
         // Per-clip mic audio: flat volume, no ramps (mic plays continuously).
         for (entryIndex, micTrack) in micTracksByEntry {
             let micParams = AVMutableAudioMixInputParameters(track: micTrack)
-            micParams.trackID = CMPersistentTrackID(2000 + entryIndex)
+            micParams.trackID = micTrackIDByEntry[entryIndex] ?? micTrack.trackID
             micParams.setVolume(Float(commentaryVolume), at: .zero)
             inputParameters.append(micParams)
         }
