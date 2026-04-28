@@ -80,7 +80,11 @@ A native macOS app for building tagged compilations of clips from full-length so
   - `Core Media` — `CMTime` for all time arithmetic.
   - `Core Animation` — `CAShapeLayer` for the live drawing overlay and Mode C stroke replay. Export draws strokes + text bar via Core Graphics + CoreText inside the custom compositor; we do **not** use `AVVideoCompositionCoreAnimationTool` (see Decision log).
 - **Persistence**: plain `Codable` + JSON. Single `project.json` per project folder. No SQLite for v1.
-- **Build**: Xcode project, single macOS app target. No third-party Swift packages required for v1.
+- **Build**: XcodeGen-generated Xcode project (the `.xcodeproj` is gitignored; regenerate via `xcodegen generate`). Two modules:
+  - **`VideoCoachCore`** — local Swift Package, the bulk of the codebase. Contains the data model, source-time reconstruction, stroke replay algorithm, project file IO, tag aggregation, and the entire export pipeline (custom `AVVideoCompositing` compositor, `CompilationInstruction` subclass, `CompilationExporter` actor, `Denormalize` helper). Anything that doesn't depend on AppKit lives here, including the AVFoundation-touching code, since AVFoundation is available to SwiftPM on macOS without extra wiring. This keeps the headless `swift test` loop fast (~9s for the full suite, including real HEVC export smoke tests) and keeps the export pipeline reusable from any future host (CLI tool, headless service, future iOS port).
+  - **`VideoCoach`** app target — thin SwiftUI shell that imports `VideoCoachCore`. AppKit-bound code only: `NSViewRepresentable` wrappers around `AVPlayerLayer` and the drawing-overlay `NSView`, the `AVCaptureSession` controller (TCC-gated), the SwiftUI views, and the export sheet UI.
+  No third-party Swift packages required for v1.
+- **Tests**: `swift test` against `VideoCoachCore` runs the full suite (data model, timeline, stroke replay, project IO, tag aggregation, export-session spike, compositor smoke tests, exporter smoke tests). The app target carries no XCTest bundle — its surface is verified manually against the Phase 10 integration checklist. Open `VideoCoachCore/Package.swift` directly in Xcode if you want `⌘U`-driven test runs with breakpoints.
 
 Things explicitly *not* used: FFmpeg, GStreamer, Tauri, Electron, Rust, Metal shaders, Core Image filters.
 
