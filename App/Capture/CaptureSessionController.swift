@@ -13,6 +13,11 @@ enum CaptureError: Error {
     /// on the standard built-in camera / Continuity Camera path; would only
     /// fire on a pathological external pro-capture device.
     case clockConversionFailed
+    /// User picked a device by `uniqueID` (via the Devices menu) that has
+    /// since vanished — typically a USB camera unplugged between menu open
+    /// and click. Surfaced via the menu's onChange so the UI reverts the
+    /// selection back to whatever the session is actually using.
+    case deviceUnavailable(String)
 }
 
 /// Owns the single `AVCaptureSession` for the app. Two outputs:
@@ -32,6 +37,11 @@ final class CaptureSessionController: NSObject,
 {
     private(set) var isReady = false
     private(set) var isRecording = false
+    /// Set by `configure(...)` when a preferred device ID was supplied but
+    /// the device wasn't found at launch — the session falls back to the
+    /// system default and the UI surfaces this as a non-fatal alert. Cleared
+    /// by every successful `switchVideoDevice` / `switchAudioDevice` call.
+    private(set) var lastFallbackReason: String?
 
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
@@ -54,17 +64,40 @@ final class CaptureSessionController: NSObject,
     /// seconds (matching `CACurrentMediaTime()`).
     private var sessionClock: CMClock = CMClockGetHostTimeClock()
 
-    func configure() async throws {
+    func configure(
+        preferredCameraID: String? = nil,
+        preferredMicID: String? = nil
+    ) async throws {
         try await ensurePermission(.video)
         try await ensurePermission(.audio)
 
-        guard let video = AVCaptureDevice.default(for: .video) else {
-            throw CaptureError.noVideoDevice
-        }
-        guard let audio = AVCaptureDevice.default(for: .audio) else {
-            throw CaptureError.noAudioDevice
-        }
+        // Resolve preferred-or-default for each media type. If the user has a
+        // saved preference but the device isn't present (unplugged USB cam,
+        // a different host machine, etc.), we silently fall back to the
+        // system default and stash a reason for the UI to alert on. We do
+        // NOT throw — a missing preferred device is a recoverable condition,
+        // not a configuration failure.
+        var fallbackMessages: [String] = []
+        let video = Self.resolveDevice(
+            preferredID: preferredCameraID,
+            mediaType: .video,
+            fallbackMessages: &fallbackMessages,
+            kind: "Camera"
+        )
+        guard let video else { throw CaptureError.noVideoDevice }
+
+        let audio = Self.resolveDevice(
+            preferredID: preferredMicID,
+            mediaType: .audio,
+            fallbackMessages: &fallbackMessages,
+            kind: "Microphone"
+        )
+        guard let audio else { throw CaptureError.noAudioDevice }
+
         self.videoDevice = video
+        self.lastFallbackReason = fallbackMessages.isEmpty
+            ? nil
+            : fallbackMessages.joined(separator: "\n")
 
         let videoInput = try AVCaptureDeviceInput(device: video)
         let audioInput = try AVCaptureDeviceInput(device: audio)
@@ -260,5 +293,162 @@ final class CaptureSessionController: NSObject,
                 cont?.resume(throwing: error)
             }
         }
+    }
+
+    /// `uniqueID` of the live video input, or nil if the session has no
+    /// video input (shouldn't normally happen). Used by the UI to revert a
+    /// failed menu selection back to the live device's checkmark.
+    var videoDeviceUniqueID: String? {
+        for input in session.inputs {
+            guard let deviceInput = input as? AVCaptureDeviceInput,
+                  deviceInput.device.hasMediaType(.video)
+            else { continue }
+            return deviceInput.device.uniqueID
+        }
+        return nil
+    }
+
+    /// Same as `videoDeviceUniqueID` for the audio input.
+    var audioDeviceUniqueID: String? {
+        for input in session.inputs {
+            guard let deviceInput = input as? AVCaptureDeviceInput,
+                  deviceInput.device.hasMediaType(.audio)
+            else { continue }
+            return deviceInput.device.uniqueID
+        }
+        return nil
+    }
+
+    // MARK: - Device discovery
+
+    /// All cameras the app can currently see. Includes the built-in wide
+    /// angle, any externals (USB capture devices), Continuity Camera (iPhone
+    /// over Wi-Fi), and Desk View.
+    static func availableCameras() -> [AVCaptureDevice] {
+        let types: [AVCaptureDevice.DeviceType] = [
+            .builtInWideAngleCamera,
+            .external,
+            .continuityCamera,
+            .deskViewCamera,
+        ]
+        return AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: .video,
+            position: .unspecified
+        ).devices
+    }
+
+    /// All microphones the app can currently see — built-in and any external
+    /// USB / aggregate audio devices.
+    static func availableMicrophones() -> [AVCaptureDevice] {
+        let types: [AVCaptureDevice.DeviceType] = [
+            .microphone,
+            .external,
+        ]
+        return AVCaptureDevice.DiscoverySession(
+            deviceTypes: types,
+            mediaType: .audio,
+            position: .unspecified
+        ).devices
+    }
+
+    // MARK: - Live device swap
+
+    /// Swap the session's video input. `nil` means "system default."
+    /// Refuses while a recording is in progress — the UI must disable the
+    /// menu items in that state, but we double-check here so a stale event
+    /// can't corrupt the file. Re-runs `setPreferredFormat` after the swap
+    /// since `addInput` resets the device's `activeFormat` (canonical AVCam
+    /// rule, same as `configure()`).
+    func switchVideoDevice(uniqueID: String?) async throws {
+        guard !isRecording else { throw CaptureError.alreadyRecording }
+        let newDevice: AVCaptureDevice
+        if let uniqueID {
+            guard let dev = AVCaptureDevice(uniqueID: uniqueID) else {
+                throw CaptureError.deviceUnavailable(uniqueID)
+            }
+            newDevice = dev
+        } else {
+            guard let dev = AVCaptureDevice.default(for: .video) else {
+                throw CaptureError.noVideoDevice
+            }
+            newDevice = dev
+        }
+        let newInput = try AVCaptureDeviceInput(device: newDevice)
+
+        session.beginConfiguration()
+        for input in session.inputs {
+            guard let deviceInput = input as? AVCaptureDeviceInput,
+                  deviceInput.device.hasMediaType(.video)
+            else { continue }
+            session.removeInput(deviceInput)
+        }
+        if session.canAddInput(newInput) { session.addInput(newInput) }
+        // Same canonical ordering as `configure()` — addInput resets
+        // activeFormat, so the explicit format selection MUST follow it.
+        try setPreferredFormat(on: newDevice)
+        session.commitConfiguration()
+        self.videoDevice = newDevice
+        self.lastFallbackReason = nil
+    }
+
+    /// Swap the session's audio input. `nil` means "system default." Same
+    /// recording-guard and configuration-bracket pattern as the video swap;
+    /// no `setPreferredFormat` step (audio inputs negotiate format inside
+    /// AVCaptureSession).
+    func switchAudioDevice(uniqueID: String?) async throws {
+        guard !isRecording else { throw CaptureError.alreadyRecording }
+        let newDevice: AVCaptureDevice
+        if let uniqueID {
+            guard let dev = AVCaptureDevice(uniqueID: uniqueID) else {
+                throw CaptureError.deviceUnavailable(uniqueID)
+            }
+            newDevice = dev
+        } else {
+            guard let dev = AVCaptureDevice.default(for: .audio) else {
+                throw CaptureError.noAudioDevice
+            }
+            newDevice = dev
+        }
+        let newInput = try AVCaptureDeviceInput(device: newDevice)
+
+        session.beginConfiguration()
+        for input in session.inputs {
+            guard let deviceInput = input as? AVCaptureDeviceInput,
+                  deviceInput.device.hasMediaType(.audio)
+            else { continue }
+            session.removeInput(deviceInput)
+        }
+        if session.canAddInput(newInput) { session.addInput(newInput) }
+        session.commitConfiguration()
+        self.lastFallbackReason = nil
+    }
+
+    /// Resolve a preferred-or-default device for `configure()`. If a
+    /// preferred ID is supplied but the device isn't present, append a
+    /// human-readable fallback message and return the system default — the
+    /// app stays usable; the UI surfaces the message via
+    /// `lastFallbackReason`.
+    private static func resolveDevice(
+        preferredID: String?,
+        mediaType: AVMediaType,
+        fallbackMessages: inout [String],
+        kind: String
+    ) -> AVCaptureDevice? {
+        if let preferredID, let dev = AVCaptureDevice(uniqueID: preferredID) {
+            return dev
+        }
+        let defaultDevice = AVCaptureDevice.default(for: mediaType)
+        if preferredID != nil {
+            // We had a saved preference but couldn't find it. Build a
+            // friendly message — we don't know the device's localizedName
+            // anymore (it's gone) so reference it by the saved ID with a
+            // short prefix so the user has at least a clue.
+            let shortID = String(preferredID!.prefix(12))
+            fallbackMessages.append(
+                "Saved \(kind.lowercased()) (\(shortID)…) was unavailable; using the system default."
+            )
+        }
+        return defaultDevice
     }
 }
