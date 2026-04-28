@@ -314,11 +314,42 @@ public actor CompilationExporter {
         await exportSession.export()
 
         if exportSession.status != .completed {
+            // The default `localizedDescription` on AVFoundation export errors
+            // is "Operation Stopped" — useless. Dig into the underlying NSError
+            // for the real cause: domain + code + userInfo (often contains
+            // NSUnderlyingError with a deeper FigError code).
+            let detail = Self.describe(exportSession.error)
             throw CompilationExportError.exportFailed(
                 status: exportSession.status,
-                message: exportSession.error?.localizedDescription ?? "unknown"
+                message: detail
             )
         }
+    }
+
+    /// Walks an `NSError`'s userInfo + underlying-error chain to produce a
+    /// debuggable string. AVFoundation's top-level `localizedDescription` is
+    /// usually generic ("Operation Stopped"); the real cause lives in
+    /// `NSUnderlyingError`'s domain/code (commonly `NSOSStatusErrorDomain`
+    /// with a four-char code) and userInfo keys like `NSDebugDescription`.
+    private static func describe(_ error: Error?) -> String {
+        guard let error else { return "no error attached to session" }
+        let ns = error as NSError
+        var parts: [String] = []
+        parts.append("\(ns.domain) \(ns.code)")
+        parts.append(ns.localizedDescription)
+        if let debug = ns.userInfo[NSDebugDescriptionErrorKey] as? String {
+            parts.append("debug=\(debug)")
+        }
+        if let failureReason = ns.userInfo[NSLocalizedFailureReasonErrorKey] as? String {
+            parts.append("reason=\(failureReason)")
+        }
+        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+            parts.append("underlying=[\(underlying.domain) \(underlying.code): \(underlying.localizedDescription)]")
+            if let debug = underlying.userInfo[NSDebugDescriptionErrorKey] as? String {
+                parts.append("underlying.debug=\(debug)")
+            }
+        }
+        return parts.joined(separator: " | ")
     }
 
     /// Polls the given session's `progress` at 5Hz and emits the values to
