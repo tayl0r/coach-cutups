@@ -534,13 +534,12 @@ struct ContentView: View {
 
         Task {
             do {
-                // Lazy configure + warmup: the capture session is paused
-                // (stopRunning) between recordings so the indicator light is
-                // off while the user is just scanning. prepareForRecording
-                // configures on first call and waits for the first sample
-                // buffer on every subsequent resume — without that warmup
-                // step, movieOutput.startRecording races a session that
-                // hasn't produced any frames yet and times out.
+                // Lazy configure: the capture session is paused (stopRunning)
+                // between recordings so the indicator light is off while the
+                // user is just scanning. prepareForRecording configures on
+                // first call and re-runs the session on subsequent resumes;
+                // serial-queue ordering on sessionQueue ensures
+                // movieOutput.startRecording sees a running session.
                 try await capture.prepareForRecording(
                     preferredCameraID: preferredCameraID,
                     preferredMicID: preferredMicID
