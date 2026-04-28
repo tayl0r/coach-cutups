@@ -3,17 +3,27 @@ import AVFoundation
 
 struct KeyCommandView: NSViewRepresentable {
     let player: AVPlayer?
+    let appMode: AppMode
     let onSkip: (Double) -> Void
     let onTogglePlay: () -> Void
+    /// Invoked for R or Esc. Whether this starts a new recording, stops an
+    /// active one, or is ignored is decided here based on `appMode`.
+    let onToggleRecord: () -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
-        v.onSkip = onSkip
-        v.onTogglePlay = onTogglePlay
+        apply(to: v)
         return v
     }
     func updateNSView(_ v: KeyCatchingView, context: Context) {
-        v.onSkip = onSkip; v.onTogglePlay = onTogglePlay
+        apply(to: v)
+    }
+
+    private func apply(to v: KeyCatchingView) {
+        v.appMode = appMode
+        v.onSkip = onSkip
+        v.onTogglePlay = onTogglePlay
+        v.onToggleRecord = onToggleRecord
     }
 }
 
@@ -24,14 +34,18 @@ struct KeyCommandView: NSViewRepresentable {
 private enum KeyCode {
     static let a: UInt16 = 0x00          // kVK_ANSI_A
     static let d: UInt16 = 0x02          // kVK_ANSI_D
+    static let r: UInt16 = 0x0F          // kVK_ANSI_R
     static let leftArrow: UInt16 = 0x7B  // kVK_LeftArrow
     static let rightArrow: UInt16 = 0x7C // kVK_RightArrow
     static let space: UInt16 = 0x31      // kVK_Space
+    static let escape: UInt16 = 0x35     // kVK_Escape
 }
 
 final class KeyCatchingView: NSView {
+    var appMode: AppMode = .scanning
     var onSkip: (Double) -> Void = { _ in }
     var onTogglePlay: () -> Void = {}
+    var onToggleRecord: () -> Void = {}
 
     private var monitor: Any?
 
@@ -51,7 +65,32 @@ final class KeyCatchingView: NSView {
             // into a name/tag/notes field would silently trigger video transport
             // commands instead of inserting characters.
             if window.firstResponder is NSText { return event }
+
+            // While the recording is being prepared (waiting for the first
+            // sample buffer), ignore every shortcut. Recording any event in
+            // this window would anchor it to a t < 0 once t0 lands.
+            if self.appMode == .recordingStarting { return nil }
+
             switch event.keyCode {
+            case KeyCode.r:
+                // R toggles recording in scanning and recording modes; preview
+                // modes ignore it (the user may still want to flip back via Esc/Cmd).
+                switch self.appMode {
+                case .scanning, .recording:
+                    self.onToggleRecord()
+                    return nil
+                default:
+                    return event
+                }
+            case KeyCode.escape:
+                // Esc only stops an active recording. Outside recording it's
+                // passed through so AppKit's normal Esc handling (close popover,
+                // dismiss sheet, etc.) keeps working.
+                if self.appMode == .recording {
+                    self.onToggleRecord()
+                    return nil
+                }
+                return event
             case KeyCode.leftArrow, KeyCode.a:  self.onSkip(-3); return nil
             case KeyCode.rightArrow, KeyCode.d: self.onSkip(+3); return nil
             case KeyCode.space:                 self.onTogglePlay(); return nil

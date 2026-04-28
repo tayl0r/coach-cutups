@@ -148,29 +148,46 @@ final class Workspace {
         try? saveProject()
     }
 
-    // MARK: - Debug helpers
+    // MARK: - Recording (Mode B) helpers
 
-    #if DEBUG
-    // TODO(Phase 7): remove once real recording lands. Lets us exercise the
-    // sidebar/inspector/reorder UI before CaptureSessionController exists.
-    private static let stubTagPool = ["attacking-chance", "transitions", "set-piece"]
+    /// Maps a virtual-concat composition time (the value returned by
+    /// `virtualPlayer.currentTime()`) back to the source video that contains
+    /// it and the local offset within that source. Walks the cumulative
+    /// source durations in order — the same order `rebuildVirtualPlayer`
+    /// uses to build the concat. Returns `(0, 0)` if there are no sources.
+    func sourceTime(at globalSeconds: Double) -> (sourceIndex: Int, sourceLocalSeconds: Double) {
+        guard !project.sourceVideos.isEmpty else { return (0, 0) }
+        var cumulative: Double = 0
+        for (i, src) in project.sourceVideos.enumerated() {
+            let next = cumulative + src.durationSeconds
+            if globalSeconds < next {
+                return (i, max(0, globalSeconds - cumulative))
+            }
+            cumulative = next
+        }
+        // Past the end of the concat — clamp to the end of the last source.
+        let last = project.sourceVideos.count - 1
+        return (last, project.sourceVideos[last].durationSeconds)
+    }
 
-    func addStubClip() {
-        let count = project.clips.count
-        let tagPool = Self.stubTagPool
-        let pickCount = Int.random(in: 0...tagPool.count)
-        let tags = Array(tagPool.shuffled().prefix(pickCount))
-        let clip = Clip(
-            name: "Stub \(count + 1)",
-            tags: tags,
-            sourceIndex: 0,
-            startSourceSeconds: 0,
-            recordingDuration: 5.0,
-            recordingFilename: "stub-\(UUID().uuidString).mov",
-            sortIndex: count
-        )
+    /// Absolute URL of a clip's `.mov` file. The clip stores only the
+    /// basename; the full path is `<projectFolder>/recordings/<filename>`.
+    func recordingURL(for filename: String) -> URL? {
+        guard let folder else { return nil }
+        return ProjectStore.recordingsDir(in: folder).appendingPathComponent(filename)
+    }
+
+    /// The directory under which new clip recordings are written. Returns
+    /// nil if the project hasn't been opened yet (no folder).
+    var recordingsDir: URL? {
+        guard let folder else { return nil }
+        return ProjectStore.recordingsDir(in: folder)
+    }
+
+    /// Appends a finished clip to the project and persists. Called by
+    /// ContentView after `CaptureSessionController.stopRecording` resolves.
+    func addClip(_ clip: Clip) {
         project.clips.append(clip)
         try? saveProject()
     }
-    #endif
 }

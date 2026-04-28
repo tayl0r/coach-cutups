@@ -10,6 +10,9 @@ struct TransportBar: View {
     @Bindable var workspace: Workspace
     @Binding var appMode: AppMode
     @Binding var openProjectError: String?
+    /// Invoked when the user clicks the Stop button during `.recording`.
+    /// Wired by `ContentView` to the same handler as the R/Esc key path.
+    var onStopRecording: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -20,7 +23,11 @@ struct TransportBar: View {
                     openProjectError: $openProjectError
                 )
             case .recordingStarting, .recording:
-                RecordingTransport(workspace: workspace, appMode: $appMode)
+                RecordingTransport(
+                    workspace: workspace,
+                    appMode: $appMode,
+                    onStop: onStopRecording
+                )
             case .previewLoading:
                 ProgressView("Preparing preview…")
                     .controlSize(.small)
@@ -119,20 +126,47 @@ struct ScanningTransport: View {
     }
 }
 
-// MARK: - Recording (placeholder)
+// MARK: - Recording
 
-/// Phase 7 wires this to `RecordingController`. For Phase 6.1 we ship a
-/// placeholder so the switch above type-checks and the layout slots are
-/// visible during manual UI exploration.
+/// Mode B controls. While `appMode == .recordingStarting`, the REC dot is
+/// yellow and the Stop button is disabled (we're still waiting for the first
+/// sample buffer — see `CaptureSessionController.startRecording`). Once the
+/// first sample lands and `appMode` flips to `.recording`, the dot turns red
+/// and the Stop button is enabled.
 struct RecordingTransport: View {
     @Bindable var workspace: Workspace
     @Binding var appMode: AppMode
+    var onStop: () -> Void
+
+    private var isStarting: Bool { appMode == .recordingStarting }
 
     var body: some View {
-        HStack {
-            Text("Recording (Phase 7)")
-                .foregroundStyle(.secondary)
+        HStack(spacing: 12) {
+            Circle()
+                .fill(isStarting ? Color.yellow : Color.red)
+                .frame(width: 12, height: 12)
+                .overlay(
+                    // Subtle outer ring while starting so the user reads
+                    // "preparing" rather than "recording".
+                    Circle()
+                        .stroke(Color.primary.opacity(0.2), lineWidth: 1)
+                )
+            Text(isStarting ? "Preparing recording…" : "Recording")
+                .font(.subheadline)
+                .foregroundStyle(.primary)
+                .monospacedDigit()
+
             Spacer()
+
+            Button(action: onStop) {
+                HStack(spacing: 4) {
+                    Image(systemName: "stop.fill")
+                    Text("Stop")
+                }
+            }
+            .keyboardShortcut(.escape, modifiers: [])
+            .disabled(isStarting)
+            .help("Stop recording (R or Esc)")
         }
     }
 }
