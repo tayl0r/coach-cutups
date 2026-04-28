@@ -68,6 +68,13 @@ final class CaptureSessionController: NSObject,
     private let dataOutput = AVCaptureVideoDataOutput()
     private let dataQueue = DispatchQueue(label: "videoCoach.capture.data")
 
+    /// Flips to true the first time the data-output delegate receives a
+    /// valid sample buffer after the session starts running. `waitForWarmup`
+    /// polls this; cleared in `pauseSession` so the next resume waits for a
+    /// fresh frame rather than reading a stale flag from the prior session.
+    /// All access serialized on `dataQueue`.
+    private var hasProducedSampleSinceStart = false
+
     /// Resumed with the host-time PTS (in seconds) of the first sample buffer
     /// that lands AFTER the file output has opened. nil between recordings.
     /// All access to the next three fields happens on `dataQueue`.
@@ -242,6 +249,56 @@ final class CaptureSessionController: NSObject,
         videoDevice = nil
         lastFallbackReason = nil
         isReady = false
+        dataQueue.sync { hasProducedSampleSinceStart = false }
+    }
+
+    /// Stops the session running so the indicator light goes off, but keeps
+    /// the configuration intact (inputs, outputs, format). The next
+    /// `prepareForRecording` just calls `startRunning` again, which is much
+    /// faster than a full reconfigure. Refuses while recording is active.
+    func pauseSession() {
+        guard !isRecording else { return }
+        if session.isRunning { session.stopRunning() }
+        // Clear so the next warmup waits for a fresh frame rather than
+        // accepting the stale-true from the previous session run.
+        dataQueue.sync { hasProducedSampleSinceStart = false }
+    }
+
+    /// Brings the session up to "ready to record" state: configures it on
+    /// first call, ensures it's running, then waits for the data output to
+    /// actually deliver a frame so we know the camera is producing. Calling
+    /// `movieOutput.startRecording` against a session that hasn't produced
+    /// a frame yet leads to `didStartRecordingTo` never firing — the
+    /// underlying AVFoundation file output appears to wait for input.
+    /// Idempotent.
+    func prepareForRecording(
+        preferredCameraID: String? = nil,
+        preferredMicID: String? = nil,
+        timeout: TimeInterval = 5.0
+    ) async throws {
+        if !isReady {
+            try await configure(
+                preferredCameraID: preferredCameraID,
+                preferredMicID: preferredMicID
+            )
+        }
+        if !session.isRunning { session.startRunning() }
+        try await waitForWarmup(timeout: timeout)
+    }
+
+    /// Polls `hasProducedSampleSinceStart` until a frame lands or the timeout
+    /// expires. Polling at 50ms granularity is plenty fast for the ~1s warmup
+    /// we expect — and is far simpler than wiring a continuation through the
+    /// data-output delegate, since the delegate already has a separate
+    /// continuation for the recording-time first-sample handshake.
+    private func waitForWarmup(timeout: TimeInterval) async throws {
+        let start = Date()
+        while !dataQueue.sync(execute: { hasProducedSampleSinceStart }) {
+            if Date().timeIntervalSince(start) > timeout {
+                throw CaptureError.firstSampleTimeout
+            }
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
     }
 
     // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
@@ -250,6 +307,16 @@ final class CaptureSessionController: NSObject,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         // Runs on `dataQueue`.
+        // Always note that frames are flowing — `waitForWarmup` polls this
+        // before we kick off `movieOutput.startRecording`, which prevents the
+        // file output from racing a session that hasn't fully spun up.
+        if !hasProducedSampleSinceStart {
+            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+            if pts.flags.contains(.valid), pts.seconds.isFinite {
+                hasProducedSampleSinceStart = true
+            }
+        }
+
         guard awaitingFirstSample, let cont = t0Continuation else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         // Some external capture devices occasionally emit invalid/NaN PTS

@@ -534,17 +534,17 @@ struct ContentView: View {
 
         Task {
             do {
-                // Lazy configure: the capture session is torn down between
-                // recordings so the camera/mic indicator light is off while
-                // the user is just scanning. First-time configure also
-                // triggers the OS permission prompt — deferring that to the
-                // user's first record press matches the privacy expectation.
-                if !capture.isReady {
-                    try await capture.configure(
-                        preferredCameraID: preferredCameraID,
-                        preferredMicID: preferredMicID
-                    )
-                }
+                // Lazy configure + warmup: the capture session is paused
+                // (stopRunning) between recordings so the indicator light is
+                // off while the user is just scanning. prepareForRecording
+                // configures on first call and waits for the first sample
+                // buffer on every subsequent resume — without that warmup
+                // step, movieOutput.startRecording races a session that
+                // hasn't produced any frames yet and times out.
+                try await capture.prepareForRecording(
+                    preferredCameraID: preferredCameraID,
+                    preferredMicID: preferredMicID
+                )
                 let t0 = try await capture.startRecording(to: url)
                 let fallback = capture.lastFallbackReason
                 await MainActor.run {
@@ -571,7 +571,7 @@ struct ContentView: View {
                 }
             } catch CaptureError.permissionDenied(let media) {
                 await MainActor.run {
-                    capture.teardown()
+                    capture.pauseSession()
                     self.appMode = .scanning
                     self.pendingRecording = nil
                     let kind = media == .video ? "camera" : "microphone"
@@ -581,7 +581,7 @@ struct ContentView: View {
                 }
             } catch {
                 await MainActor.run {
-                    capture.teardown()
+                    capture.pauseSession()
                     self.appMode = .scanning
                     self.pendingRecording = nil
                     self.recordingError = "Couldn't start recording: \(error.localizedDescription)"
@@ -624,7 +624,7 @@ struct ContentView: View {
                     self.recordingStartedAtHostTime = nil
                     // Free the camera/mic so the indicator light goes off
                     // between recordings. Next record reconfigures lazily.
-                    capture.teardown()
+                    capture.pauseSession()
                 }
             } catch {
                 await MainActor.run {
@@ -633,7 +633,7 @@ struct ContentView: View {
                     self.appMode = .scanning
                     self.recordingStartedAtHostTime = nil
                     self.recordingError = "Recording finished with an error: \(error.localizedDescription)"
-                    capture.teardown()
+                    capture.pauseSession()
                 }
             }
         }
