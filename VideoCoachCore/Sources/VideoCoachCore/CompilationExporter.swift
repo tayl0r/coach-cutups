@@ -3,26 +3,30 @@ import CoreMedia
 import Foundation
 
 /// Errors raised by ``CompilationExporter``.
-public enum CompilationExportError: Error, CustomStringConvertible {
+public enum CompilationExportError: Error, CustomStringConvertible, LocalizedError {
     case missingClip(UUID)
     case missingSourceAsset(Int)
     case missingWebcamAsset(UUID)
-    case noVideoTrackAdded
-    case noAudioTrackAdded
+    case noVideoTrackAdded(site: String)
+    case noAudioTrackAdded(site: String)
     case exportSessionInitFailed(String)
     case exportFailed(status: AVAssetExportSession.Status, message: String)
 
     public var description: String {
         switch self {
-        case .missingClip(let id):           return "missing clip for plan entry \(id)"
-        case .missingSourceAsset(let i):     return "missing source asset for sourceIndex \(i)"
-        case .missingWebcamAsset(let id):    return "missing webcam asset for clip \(id)"
-        case .noVideoTrackAdded:             return "AVMutableComposition.addMutableTrack returned nil for video"
-        case .noAudioTrackAdded:             return "AVMutableComposition.addMutableTrack returned nil for audio"
-        case .exportSessionInitFailed(let m): return "AVAssetExportSession init failed: \(m)"
-        case .exportFailed(let s, let m):    return "AVAssetExportSession failed (status=\(s.rawValue)): \(m)"
+        case .missingClip(let id):              return "missing clip for plan entry \(id)"
+        case .missingSourceAsset(let i):        return "missing source asset for sourceIndex \(i)"
+        case .missingWebcamAsset(let id):       return "missing webcam asset for clip \(id)"
+        case .noVideoTrackAdded(let site):      return "AVMutableComposition.addMutableTrack returned nil for video (\(site))"
+        case .noAudioTrackAdded(let site):      return "AVMutableComposition.addMutableTrack returned nil for audio (\(site))"
+        case .exportSessionInitFailed(let m):   return "AVAssetExportSession init failed: \(m)"
+        case .exportFailed(let s, let m):       return "AVAssetExportSession failed (status=\(s.rawValue)): \(m)"
         }
     }
+
+    // LocalizedError makes `error.localizedDescription` show the message above
+    // instead of the cryptic "CompilationExportError error N".
+    public var errorDescription: String? { description }
 }
 
 /// Drives a single end-to-end HEVC export from a ``CompilationPlan``.
@@ -76,7 +80,7 @@ public actor CompilationExporter {
             withMediaType: .video,
             preferredTrackID: kCMPersistentTrackID_Invalid
         ) else {
-            throw CompilationExportError.noVideoTrackAdded
+            throw CompilationExportError.noVideoTrackAdded(site: "source video")
         }
         let sourceVideoTrackID = sourceVideoTrack.trackID
 
@@ -84,7 +88,7 @@ public actor CompilationExporter {
             withMediaType: .audio,
             preferredTrackID: kCMPersistentTrackID_Invalid
         ) else {
-            throw CompilationExportError.noAudioTrackAdded
+            throw CompilationExportError.noAudioTrackAdded(site: "source audio")
         }
         let sourceAudioTrackID = sourceAudioTrack.trackID
 
@@ -149,7 +153,9 @@ public actor CompilationExporter {
                 withMediaType: .video,
                 preferredTrackID: kCMPersistentTrackID_Invalid
             ) else {
-                throw CompilationExportError.noVideoTrackAdded
+                throw CompilationExportError.noVideoTrackAdded(
+                    site: "webcam clip \(entry.indexInOutput)"
+                )
             }
             webcamTracksByEntry[entry.indexInOutput] = webcamTrack
             webcamTrackIDByEntry[entry.indexInOutput] = webcamTrack.trackID
@@ -172,7 +178,9 @@ public actor CompilationExporter {
                     withMediaType: .audio,
                     preferredTrackID: kCMPersistentTrackID_Invalid
                 ) else {
-                    throw CompilationExportError.noAudioTrackAdded
+                    throw CompilationExportError.noAudioTrackAdded(
+                        site: "mic clip \(entry.indexInOutput)"
+                    )
                 }
                 micTracksByEntry[entry.indexInOutput] = micTrack
                 micTrackIDByEntry[entry.indexInOutput] = micTrack.trackID
