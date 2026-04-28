@@ -110,6 +110,20 @@ public actor CompilationExporter {
         // nothing.)
         var hasSourceAudioInsert = false
 
+        // Single CMTime cursor across ALL entries. The plan's
+        // `entry.compositionStart` is a Double cumulative sum; converting it
+        // per-entry to CMTime introduces sub-millisecond drift between the
+        // previous entry's actual end-of-segments cursor and the next entry's
+        // declared start, leaving phantom empty inter-clip segments that
+        // AVFoundation rejects ("video could not be composed"). We track the
+        // cursor in CMTime end-to-end so source video, webcam, and instruction
+        // boundaries all land at the exact same composition time.
+        var compositionCursor = CMTime.zero
+        // Per-entry actual CMTime [start, duration] — used by Step 2 (instruction
+        // build) and Step 3 (audio mix ramps) so they reference the same exact
+        // boundaries the source video track sees.
+        var entryRangesCMTime: [Int: CMTimeRange] = [:]
+
         for entry in plan.entries {
             guard let clip = clipsByID[entry.clipID] else {
                 throw CompilationExportError.missingClip(entry.clipID)
@@ -128,22 +142,23 @@ public actor CompilationExporter {
             // matching slice of source video (and audio if present) at the
             // segment's output offset. Skip `.freeze` segments — the
             // compositor renders those from cache.
-            var outCursor = entry.compositionStart
+            let entryStart = compositionCursor
             for segment in entry.segments {
-                let outDur = segment.outDuration
-                defer { outCursor += outDur }
+                let segDur = CMTime(seconds: segment.outDuration, preferredTimescale: 600)
+                defer { compositionCursor = compositionCursor + segDur }
                 guard segment.kind == .play else { continue }
                 let srcRange = CMTimeRange(
                     start: CMTime(seconds: segment.sourceStart, preferredTimescale: 600),
-                    duration: CMTime(seconds: outDur, preferredTimescale: 600)
+                    duration: segDur
                 )
-                let outStart = CMTime(seconds: outCursor, preferredTimescale: 600)
-                try sourceVideoTrack.insertTimeRange(srcRange, of: sourceVideoSrc, at: outStart)
+                try sourceVideoTrack.insertTimeRange(srcRange, of: sourceVideoSrc, at: compositionCursor)
                 if let sourceAudioSrc {
-                    try sourceAudioTrack.insertTimeRange(srcRange, of: sourceAudioSrc, at: outStart)
+                    try sourceAudioTrack.insertTimeRange(srcRange, of: sourceAudioSrc, at: compositionCursor)
                     hasSourceAudioInsert = true
                 }
             }
+            let entryDuration = compositionCursor - entryStart
+            entryRangesCMTime[entry.indexInOutput] = CMTimeRange(start: entryStart, duration: entryDuration)
 
             // Per-clip webcam: continuous insert from t=0 of the webcam asset
             // for the full clip's recording duration, placed at the clip's
@@ -164,8 +179,12 @@ public actor CompilationExporter {
             webcamTrackIDByEntry[entry.indexInOutput] = webcamTrack.trackID
             Log.export.info("entry \(entry.indexInOutput): webcam track \(webcamTrack.trackID) (segments=\(entry.segments.count) recordingDur=\(entry.recordingDuration, format: .fixed(precision: 2))s)")
 
-            let clipDuration = CMTime(seconds: entry.recordingDuration, preferredTimescale: 600)
-            let clipStart = CMTime(seconds: entry.compositionStart, preferredTimescale: 600)
+            // Use the same CMTime range we computed from the source-video
+            // inserts so the webcam track's range is identical — no
+            // sub-millisecond mismatch between video and webcam tracks.
+            let clipRange = entryRangesCMTime[entry.indexInOutput]!
+            let clipStart = clipRange.start
+            let clipDuration = clipRange.duration
             // Clamp the webcam read range to the actual webcam asset duration
             // — guards against a recording that ended slightly short of
             // `recordingDuration` (e.g. capture stopped a frame early).
@@ -236,12 +255,16 @@ public actor CompilationExporter {
             // assigned source ID so the compositor's `requiredSourceTrackIDs`
             // doesn't reference a nonexistent track.
             let webcamID = webcamTrackIDByEntry[entry.indexInOutput] ?? sourceVideoTrackID
+            // Reuse the exact CMTime range we computed during the source-video
+            // insertion so the instruction's timeRange aligns with the
+            // underlying tracks at the bit level — no Double-conversion drift.
+            let entryRange = entryRangesCMTime[entry.indexInOutput]!
             let inst = CompilationInstruction.make(
                 clipIndex: entry.indexInOutput,
                 indexInOutput: entry.indexInOutput,
                 totalClips: plan.entries.count,
-                compositionStart: CMTime(seconds: entry.compositionStart, preferredTimescale: 600),
-                clipDuration: CMTime(seconds: entry.recordingDuration, preferredTimescale: 600),
+                compositionStart: entryRange.start,
+                clipDuration: entryRange.duration,
                 sourceTrackID: sourceVideoTrackID,
                 webcamTrackID: webcamID,
                 segments: entry.segments,
@@ -270,11 +293,16 @@ public actor CompilationExporter {
             // handles inconsistently across macOS versions.
             let rampDur = CMTime(seconds: 0.005, preferredTimescale: 600)
             for entry in plan.entries {
-                var outCursor = entry.compositionStart
+                // Start each entry's segment walk from the SAME CMTime the
+                // source-video insertion used (entryRangesCMTime[i].start),
+                // so ramp boundaries land exactly on segment edges.
+                var outCursor = entryRangesCMTime[entry.indexInOutput]?.start
+                    ?? CMTime(seconds: entry.compositionStart, preferredTimescale: 600)
                 for (i, segment) in entry.segments.enumerated() {
+                    let segDur = CMTime(seconds: segment.outDuration, preferredTimescale: 600)
                     if i > 0 {
                         // Boundary at outCursor (the start of this segment).
-                        let T = CMTime(seconds: outCursor, preferredTimescale: 600)
+                        let T = outCursor
                         let preStart = CMTimeMaximum(.zero, T - rampDur)
                         let preDur = T - preStart
                         if preDur > .zero {
@@ -292,7 +320,7 @@ public actor CompilationExporter {
                             )
                         }
                     }
-                    outCursor += segment.outDuration
+                    outCursor = outCursor + segDur
                 }
             }
 

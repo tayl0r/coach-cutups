@@ -194,6 +194,149 @@ final class CompilationExporterTests: XCTestCase {
         XCTAssertEqual(outDuration, 4.5, accuracy: 0.2)
     }
 
+    /// Repros the user's actual failure path using their on-disk files. Only
+    /// runs when the fixture path exists (i.e. on the user's machine) — CI
+    /// and other developers skip silently.
+    func test_exporter_realProjectFiles() async throws {
+        let sourcePath = "/Users/taylor/Downloads/VID_20260418_095633_01_01.mp4"
+        let recordingsDir = "/Users/taylor/coach-cutups/2026-spring/week-2/recordings"
+        let projectJSON = "/Users/taylor/coach-cutups/2026-spring/week-2/project.json"
+        guard FileManager.default.fileExists(atPath: sourcePath),
+              FileManager.default.fileExists(atPath: projectJSON) else {
+            throw XCTSkip("Real-project fixture not present on this machine")
+        }
+
+        let project = try ProjectStore.read(
+            from: URL(fileURLWithPath: "/Users/taylor/coach-cutups/2026-spring/week-2")
+        )
+        // Filter to clips tagged "highlights" (the simplest case the user could
+        // hit — one of the user's actual tags). Adjust as needed to repro.
+        let plan = project.compilationPlan(for: "highlights", sourceDurations: [
+            0: project.sourceVideos[0].durationSeconds,
+        ])
+        XCTAssertGreaterThan(plan.entries.count, 0, "no clips matched 'highlights' tag")
+        print("[real-repro] plan entries: \(plan.entries.count)")
+        for e in plan.entries {
+            print("[real-repro]   entry indexInOutput=\(e.indexInOutput) clipID=\(e.clipID) recDur=\(e.recordingDuration)s segments=\(e.segments.count) compStart=\(e.compositionStart)s")
+        }
+
+        let sourceAsset = AVURLAsset(url: URL(fileURLWithPath: sourcePath))
+        var clipsByID: [UUID: Clip] = [:]
+        var clipWebcamAssets: [UUID: AVURLAsset] = [:]
+        for clip in project.clips {
+            clipsByID[clip.id] = clip
+            let url = URL(fileURLWithPath: recordingsDir).appendingPathComponent(clip.recordingFilename)
+            clipWebcamAssets[clip.id] = AVURLAsset(url: url)
+        }
+
+        let outputURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("real-repro-\(UUID()).mp4")
+        defer { try? FileManager.default.removeItem(at: outputURL) }
+
+        // Diagnostic: build the same composition the exporter would, dump
+        // its tracks + instructions, THEN try the export. If invalid, we
+        // see exactly what AVFoundation rejected.
+        try await dumpCompositionDetails(
+            plan: plan, clipsByID: clipsByID,
+            sourceAsset: sourceAsset,
+            clipWebcamAssets: clipWebcamAssets
+        )
+
+        let exporter = CompilationExporter()
+        try await exporter.export(
+            plan: plan,
+            clipsByID: clipsByID,
+            sourceAssets: [0: sourceAsset],
+            clipWebcamAssets: clipWebcamAssets,
+            outputURL: outputURL,
+            resolution: .source,
+            quality: .medium,
+            sourceVolume: 1.0,
+            commentaryVolume: 1.0
+        )
+        // Verify the output exists and is a non-trivial HEVC file. This case
+        // is now a regression check for the inter-clip cursor drift bug
+        // (sub-millisecond gaps between clips that AVFoundation rejects).
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+        let outAsset = AVURLAsset(url: outputURL)
+        let outDuration = try await outAsset.load(.duration).seconds
+        let expectedDuration = plan.entries.reduce(0.0) { $0 + $1.recordingDuration }
+        XCTAssertEqual(outDuration, expectedDuration, accuracy: 0.5,
+                       "output duration far from sum of clip durations")
+        print("[real-repro] SUCCESS: \(plan.entries.count) clips → \(String(format: "%.2f", outDuration))s output")
+    }
+
+    /// Inspects the composition the way the exporter builds it and prints
+    /// per-track timeline. Run as a no-op preflight to surface bad shapes.
+    private func dumpCompositionDetails(
+        plan: CompilationPlan,
+        clipsByID: [UUID: Clip],
+        sourceAsset: AVURLAsset,
+        clipWebcamAssets: [UUID: AVURLAsset]
+    ) async throws {
+        let comp = AVMutableComposition()
+        let sourceVideoTrack = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)!
+        let sourceAudioTrack = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!
+        print("[dump] sourceVideo trackID=\(sourceVideoTrack.trackID), sourceAudio trackID=\(sourceAudioTrack.trackID)")
+
+        let sourceVideoSrc = try await sourceAsset.primaryVideoTrack()
+        let sourceAudioSrc = try await sourceAsset.optionalAudioTrack()
+        print("[dump] source asset: video=\(sourceVideoSrc.trackID) audio=\(sourceAudioSrc?.trackID ?? -1)")
+
+        for entry in plan.entries {
+            let clip = clipsByID[entry.clipID]!
+            print("[dump] --- entry \(entry.indexInOutput) clip=\(clip.name) compStart=\(entry.compositionStart)s recDur=\(entry.recordingDuration)s segments=\(entry.segments.count)")
+            // Mirror the post-fix CompilationExporter: cursor stays in CMTime
+            // so it lands exactly where the previous insert ended.
+            var outCursor = CMTime(seconds: entry.compositionStart, preferredTimescale: 600)
+            var playCount = 0
+            for seg in entry.segments {
+                let segDur = CMTime(seconds: seg.outDuration, preferredTimescale: 600)
+                if seg.kind == .play {
+                    playCount += 1
+                    let srcRange = CMTimeRange(start: CMTime(seconds: seg.sourceStart, preferredTimescale: 600),
+                                               duration: segDur)
+                    do {
+                        try sourceVideoTrack.insertTimeRange(srcRange, of: sourceVideoSrc, at: outCursor)
+                        if let sourceAudioSrc {
+                            try sourceAudioTrack.insertTimeRange(srcRange, of: sourceAudioSrc, at: outCursor)
+                        }
+                    } catch {
+                        print("[dump]   insertTimeRange threw at outCursor=\(outCursor.seconds): \(error)")
+                    }
+                }
+                outCursor = outCursor + segDur
+            }
+            print("[dump]   inserted \(playCount) play segments")
+
+            let webcamAsset = clipWebcamAssets[clip.id]!
+            let webcamVideoSrc = try await webcamAsset.primaryVideoTrack()
+            let webcamAudioSrc = try await webcamAsset.optionalAudioTrack()
+            let webcamTrack = comp.addMutableTrack(withMediaType: .video, preferredTrackID: kCMPersistentTrackID_Invalid)!
+            let clipDuration = CMTime(seconds: entry.recordingDuration, preferredTimescale: 600)
+            let clipStart = CMTime(seconds: entry.compositionStart, preferredTimescale: 600)
+            let webcamAvailable = try await webcamAsset.load(.duration)
+            let webcamReadDuration = CMTimeMinimum(clipDuration, webcamAvailable)
+            try webcamTrack.insertTimeRange(CMTimeRange(start: .zero, duration: webcamReadDuration),
+                                            of: webcamVideoSrc, at: clipStart)
+            print("[dump]   webcam track \(webcamTrack.trackID) inserted [\(clipStart.seconds)..\((clipStart + webcamReadDuration).seconds)] webcamAvailable=\(webcamAvailable.seconds)s")
+            if let webcamAudioSrc {
+                let micTrack = comp.addMutableTrack(withMediaType: .audio, preferredTrackID: kCMPersistentTrackID_Invalid)!
+                try micTrack.insertTimeRange(CMTimeRange(start: .zero, duration: webcamReadDuration),
+                                             of: webcamAudioSrc, at: clipStart)
+                print("[dump]   mic track \(micTrack.trackID)")
+            }
+        }
+        print("[dump] composition.duration = \(comp.duration.seconds)s, totalTracks=\(comp.tracks.count)")
+        print("[dump] sourceVideoTrack timeRanges: \(sourceVideoTrack.segments.count) segments")
+        for (i, s) in sourceVideoTrack.segments.enumerated().prefix(8) {
+            print("[dump]   seg[\(i)]: target=\(s.timeMapping.target.start.seconds)..\((s.timeMapping.target.start + s.timeMapping.target.duration).seconds) source=\(s.timeMapping.source.start.seconds)..\((s.timeMapping.source.start + s.timeMapping.source.duration).seconds) empty=\(s.isEmpty)")
+        }
+        if sourceVideoTrack.segments.count > 8 {
+            print("[dump]   ... (\(sourceVideoTrack.segments.count - 8) more)")
+        }
+    }
+
     /// FourCC stringifier for log output: `1752589105 → "hvc1"`.
     private func fourCC(_ code: FourCharCode) -> String {
         let bytes: [UInt8] = [
