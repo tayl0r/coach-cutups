@@ -325,6 +325,16 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
 
     private func makeCGImage(_ buffer: CVPixelBuffer) -> CGImage? {
         let ci = CIImage(cvPixelBuffer: buffer)
-        return ciContext.createCGImage(ci, from: ci.extent)
+        // CIImage's native coordinate convention is bottom-left origin, but
+        // a CVPixelBuffer's pixel rows are top-down. `createCGImage` produces
+        // a CGImage whose row 0 corresponds to CIImage y=0 (the BOTTOM of
+        // the source image). When that CGImage is drawn into our top-left
+        // CGContext (flipped above), the image lands upside-down. Apply a
+        // vertical flip to the CIImage so its row 0 = TOP of source, then
+        // the CGImage we hand to cg.draw is naturally right-side-up.
+        let flipped = ci
+            .transformed(by: CGAffineTransform(scaleX: 1, y: -1))
+            .transformed(by: CGAffineTransform(translationX: 0, y: ci.extent.height))
+        return ciContext.createCGImage(flipped, from: flipped.extent)
     }
 }

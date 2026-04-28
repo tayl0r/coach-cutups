@@ -229,9 +229,9 @@ final class CompilationExporterTests: XCTestCase {
             clipWebcamAssets[clip.id] = AVURLAsset(url: url)
         }
 
-        let outputURL = FileManager.default.temporaryDirectory
-            .appendingPathComponent("real-repro-\(UUID()).mp4")
-        defer { try? FileManager.default.removeItem(at: outputURL) }
+        let outputURL = URL(fileURLWithPath: "/tmp/real-repro-output.mp4")
+        try? FileManager.default.removeItem(at: outputURL)
+        // Don't delete on exit — we want to inspect orientation manually.
 
         // Diagnostic: build the same composition the exporter would, dump
         // its tracks + instructions, THEN try the export. If invalid, we
