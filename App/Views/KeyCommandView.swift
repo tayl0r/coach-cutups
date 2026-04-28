@@ -12,6 +12,9 @@ struct KeyCommandView: NSViewRepresentable {
     /// Invoked for Esc when in a preview mode. Wired to clear the clip
     /// selection so the player returns to the source virtual concat.
     let onClosePreview: () -> Void
+    /// Invoked for Cmd+Delete when a clip is selected and we're not
+    /// recording. Pops the destructive confirm alert.
+    let onRequestDeleteSelectedClip: () -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
@@ -28,6 +31,7 @@ struct KeyCommandView: NSViewRepresentable {
         v.onTogglePlay = onTogglePlay
         v.onToggleRecord = onToggleRecord
         v.onClosePreview = onClosePreview
+        v.onRequestDeleteSelectedClip = onRequestDeleteSelectedClip
     }
 }
 
@@ -43,6 +47,7 @@ private enum KeyCode {
     static let rightArrow: UInt16 = 0x7C // kVK_RightArrow
     static let space: UInt16 = 0x31      // kVK_Space
     static let escape: UInt16 = 0x35     // kVK_Escape
+    static let delete: UInt16 = 0x33     // kVK_Delete (Backspace)
 }
 
 final class KeyCatchingView: NSView {
@@ -51,6 +56,7 @@ final class KeyCatchingView: NSView {
     var onTogglePlay: () -> Void = {}
     var onToggleRecord: () -> Void = {}
     var onClosePreview: () -> Void = {}
+    var onRequestDeleteSelectedClip: () -> Void = {}
 
     private var monitor: Any?
 
@@ -75,6 +81,18 @@ final class KeyCatchingView: NSView {
             // sample buffer), ignore every shortcut. Recording any event in
             // this window would anchor it to a t < 0 once t0 lands.
             if self.appMode == .recordingStarting { return nil }
+
+            // Cmd+Delete (Backspace) requests destructive removal of the
+            // selected clip. Only fires when not recording — the parent
+            // handler also re-checks selection and recording state, but
+            // gating here avoids spurious alerts.
+            if event.keyCode == KeyCode.delete,
+               event.modifierFlags.contains(.command),
+               self.appMode != .recording,
+               self.appMode != .recordingStarting {
+                self.onRequestDeleteSelectedClip()
+                return nil
+            }
 
             switch event.keyCode {
             case KeyCode.r:

@@ -161,6 +161,27 @@ final class Workspace {
         _previewFailed.removeValue(forKey: id)
     }
 
+    /// Permanently removes a clip from the project: drops the in-memory entry,
+    /// deletes the underlying `clip-<uuid>.mov` recording, invalidates the
+    /// preview cache, and persists. The clip's `sortIndex` gap is left as-is
+    /// — `reorderClips(from:to:)` re-numbers on next reorder, and the sidebar
+    /// sorts by `sortIndex`-ascending so a gap is invisible.
+    func deleteClip(id: Clip.ID) throws {
+        guard let idx = project.clips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = project.clips[idx]
+        invalidatePreviewCache(for: id)
+        if let folder {
+            let url = ProjectStore.recordingsDir(in: folder)
+                .appendingPathComponent(clip.recordingFilename)
+            // Best-effort: a missing recording file isn't a fatal error
+            // (could be a project from an earlier session whose recording was
+            // already cleaned up). The metadata removal still proceeds.
+            try? FileManager.default.removeItem(at: url)
+        }
+        project.clips.remove(at: idx)
+        try saveProject()
+    }
+
     private func preparePreviewPlayer(for id: Clip.ID) async throws {
         guard let clip = project.clips.first(where: { $0.id == id }),
               let folder = self.folder else { return }

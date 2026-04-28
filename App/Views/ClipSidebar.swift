@@ -9,6 +9,9 @@ struct ClipSidebar: View {
     @Bindable var workspace: Workspace
     @Binding var selectedClipID: Clip.ID?
     let appMode: AppMode
+    /// Pops the destructive confirm alert. Owned by ContentView so the alert
+    /// has access to the workspace + selection state.
+    var onRequestDeleteClip: (Clip.ID) -> Void
 
     private var sortedClips: [Clip] {
         workspace.project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
@@ -40,6 +43,14 @@ struct ClipSidebar: View {
                             .monospacedDigit()
                     }
                     .tag(clip.id)
+                    .contextMenu {
+                        Button(role: .destructive) {
+                            onRequestDeleteClip(clip.id)
+                        } label: {
+                            Label("Delete Clip…", systemImage: "trash")
+                        }
+                        .disabled(isRecording)
+                    }
                 }
                 .onMove { indices, dest in
                     workspace.reorderClips(from: indices, to: dest)
