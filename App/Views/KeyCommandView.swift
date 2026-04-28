@@ -102,8 +102,14 @@ final class KeyCatchingView: NSView {
                 default:
                     return event
                 }
-            case KeyCode.leftArrow, KeyCode.a:  self.onSkip(-3); return nil
-            case KeyCode.rightArrow, KeyCode.d: self.onSkip(+3); return nil
+            case KeyCode.leftArrow, KeyCode.a:
+                let delta: Double = event.modifierFlags.contains(.shift) ? -10 : -3
+                self.onSkip(delta)
+                return nil
+            case KeyCode.rightArrow, KeyCode.d:
+                let delta: Double = event.modifierFlags.contains(.shift) ? +10 : +3
+                self.onSkip(delta)
+                return nil
             case KeyCode.space:                 self.onTogglePlay(); return nil
             default: return event
             }
