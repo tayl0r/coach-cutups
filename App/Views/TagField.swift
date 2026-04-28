@@ -14,6 +14,8 @@ struct TagField: View {
 
     @State private var text: String = ""
     @State private var didInitialize = false
+    @State private var highlightedIndex: Int? = nil
+    @State private var popoverManuallyDismissed = false
     @FocusState private var isFocused: Bool
 
     private var currentFragment: String {
@@ -55,25 +57,64 @@ struct TagField: View {
             }
             .onSubmit { commit() }
             .onChange(of: isFocused) { _, focused in
-                if !focused { commit() }
+                if !focused {
+                    commit()
+                    highlightedIndex = nil
+                    popoverManuallyDismissed = false
+                }
+            }
+            .onChange(of: text) { _, _ in
+                // Typing invalidates any prior highlight + un-dismisses an
+                // escape-dismissed popover so the user gets fresh suggestions.
+                highlightedIndex = nil
+                popoverManuallyDismissed = false
             }
             // Catches the case where the parent EditorView is being torn down
             // (e.g. user clicked a different clip) while focus loss hasn't fired
             // — without this the in-flight text is dropped.
             .onDisappear { commit() }
-            // Tab accepts the top suggestion when the popover is visible. When
-            // there's no suggestion to take, .ignored lets Tab do its normal
-            // focus-advance thing.
+            // ↓ advances the highlight (nil → 0 → 1 → ... clamped at last suggestion).
+            .onKeyPress(.downArrow) {
+                guard popoverIsVisible else { return .ignored }
+                let next = (highlightedIndex ?? -1) + 1
+                highlightedIndex = min(next, matchingSuggestions.count - 1)
+                return .handled
+            }
+            // ↑ retreats (... → 1 → 0 → nil), then falls through so the user
+            // can keep going past the top of the list to deselect.
+            .onKeyPress(.upArrow) {
+                guard popoverIsVisible, let cur = highlightedIndex else { return .ignored }
+                highlightedIndex = cur == 0 ? nil : cur - 1
+                return .handled
+            }
+            // Tab takes the highlighted suggestion if one is highlighted,
+            // otherwise the top one. .ignored lets Tab do its normal
+            // focus-advance thing when there's nothing to take.
             .onKeyPress(.tab) {
-                if let top = matchingSuggestions.first {
-                    applySuggestion(top)
+                if let suggestion = suggestionToTake {
+                    applySuggestion(suggestion)
                     return .handled
                 }
                 return .ignored
             }
+            // Enter accepts the highlighted suggestion when one is highlighted;
+            // otherwise .ignored lets .onSubmit fire commit() on the raw text.
+            .onKeyPress(.return) {
+                guard let idx = highlightedIndex,
+                      idx < matchingSuggestions.count else { return .ignored }
+                applySuggestion(matchingSuggestions[idx])
+                return .handled
+            }
+            // Esc dismisses the popover without losing focus or committing.
+            .onKeyPress(.escape) {
+                guard popoverIsVisible else { return .ignored }
+                popoverManuallyDismissed = true
+                highlightedIndex = nil
+                return .handled
+            }
             .popover(
                 isPresented: Binding(
-                    get: { isFocused && !matchingSuggestions.isEmpty },
+                    get: { popoverIsVisible },
                     set: { _ in }
                 ),
                 attachmentAnchor: .rect(.bounds),
@@ -87,7 +128,7 @@ struct TagField: View {
                             HStack {
                                 Text(suggestion)
                                 Spacer()
-                                if idx == 0 {
+                                if idx == effectiveTakeIndex {
                                     Text("⇥ tab").font(.caption2).foregroundStyle(.secondary)
                                 }
                             }
@@ -95,6 +136,7 @@ struct TagField: View {
                             .contentShape(Rectangle())
                             .padding(.vertical, 4)
                             .padding(.horizontal, 8)
+                            .background(idx == highlightedIndex ? Color.accentColor.opacity(0.18) : Color.clear)
                         }
                         .buttonStyle(.plain)
                     }
@@ -102,6 +144,25 @@ struct TagField: View {
                 .frame(minWidth: 160)
                 .padding(.vertical, 4)
             }
+    }
+
+    private var popoverIsVisible: Bool {
+        isFocused && !matchingSuggestions.isEmpty && !popoverManuallyDismissed
+    }
+
+    /// The suggestion Tab will take. Highlighted one if there is one,
+    /// otherwise the top of the list.
+    private var suggestionToTake: String? {
+        if let idx = highlightedIndex, idx < matchingSuggestions.count {
+            return matchingSuggestions[idx]
+        }
+        return matchingSuggestions.first
+    }
+
+    /// Where to render the "⇥ tab" hint — on the highlighted row if there is one,
+    /// otherwise the top row.
+    private var effectiveTakeIndex: Int {
+        highlightedIndex ?? 0
     }
 
     private func commit() {
