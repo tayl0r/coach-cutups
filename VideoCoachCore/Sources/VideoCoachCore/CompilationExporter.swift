@@ -64,6 +64,8 @@ public actor CompilationExporter {
         sourceVolume: Double,
         commentaryVolume: Double
     ) async throws {
+        Log.export.info("export start: entries=\(plan.entries.count) total=\(plan.totalDurationSeconds, format: .fixed(precision: 2))s resolution=\(resolution.rawValue) quality=\(quality.rawValue) output=\(outputURL.lastPathComponent)")
+
         // ── Step 1: Build the AVMutableComposition.
         //
         // We let AVFoundation auto-assign track IDs via
@@ -91,6 +93,7 @@ public actor CompilationExporter {
             throw CompilationExportError.noAudioTrackAdded(site: "source audio")
         }
         let sourceAudioTrackID = sourceAudioTrack.trackID
+        Log.export.info("composition tracks added: sourceVideo=\(sourceVideoTrackID) sourceAudio=\(sourceAudioTrackID)")
 
         // Per-clip webcam video + mic audio. Tracks-by-entry-index plus their
         // assigned IDs (so we can wire the AVMutableAudioMixInputParameters
@@ -159,6 +162,7 @@ public actor CompilationExporter {
             }
             webcamTracksByEntry[entry.indexInOutput] = webcamTrack
             webcamTrackIDByEntry[entry.indexInOutput] = webcamTrack.trackID
+            Log.export.info("entry \(entry.indexInOutput): webcam track \(webcamTrack.trackID) (segments=\(entry.segments.count) recordingDur=\(entry.recordingDuration, format: .fixed(precision: 2))s)")
 
             let clipDuration = CMTime(seconds: entry.recordingDuration, preferredTimescale: 600)
             let clipStart = CMTime(seconds: entry.compositionStart, preferredTimescale: 600)
@@ -184,6 +188,7 @@ public actor CompilationExporter {
                 }
                 micTracksByEntry[entry.indexInOutput] = micTrack
                 micTrackIDByEntry[entry.indexInOutput] = micTrack.trackID
+                Log.export.info("entry \(entry.indexInOutput): mic track \(micTrack.trackID)")
                 try micTrack.insertTimeRange(
                     CMTimeRange(start: .zero, duration: webcamReadDuration),
                     of: webcamAudioSrc,
@@ -193,6 +198,9 @@ public actor CompilationExporter {
         }
 
         // ── Step 2: Build the AVMutableVideoComposition.
+        let compDuration = comp.duration
+        Log.export.info("composition built: duration=\(compDuration.seconds, format: .fixed(precision: 3))s tracks=\(comp.tracks.count)")
+
         let videoComp = AVMutableVideoComposition()
         videoComp.customVideoCompositorClass = CompilationCompositor.self
         videoComp.renderSize = try await Self.renderSize(
@@ -200,6 +208,7 @@ public actor CompilationExporter {
             sourceAssets: sourceAssets
         )
         videoComp.frameDuration = CMTime(value: 1, timescale: 30)
+        Log.export.info("video composition: renderSize=\(videoComp.renderSize.width, format: .fixed(precision: 0))x\(videoComp.renderSize.height, format: .fixed(precision: 0)) frameDuration=\(videoComp.frameDuration.seconds, format: .fixed(precision: 4))s")
 
         var instructions: [CompilationInstruction] = []
         instructions.reserveCapacity(plan.entries.count)
@@ -241,6 +250,7 @@ public actor CompilationExporter {
                 textBarLine: textBarLine
             )
             instructions.append(inst)
+            Log.export.info("instruction \(entry.indexInOutput): timeRange=[\(inst.timeRange.start.seconds, format: .fixed(precision: 3))..\((inst.timeRange.start + inst.timeRange.duration).seconds, format: .fixed(precision: 3))] required=[\(sourceVideoTrackID), \(webcamID)]")
         }
         videoComp.instructions = instructions
 
@@ -311,6 +321,7 @@ public actor CompilationExporter {
         exportSession.videoComposition = videoComp
         exportSession.audioMix = audioMix
 
+        Log.export.info("starting AVAssetExportSession (preset=\(presetName), fileType=mp4)")
         await exportSession.export()
 
         if exportSession.status != .completed {
@@ -319,11 +330,13 @@ public actor CompilationExporter {
             // for the real cause: domain + code + userInfo (often contains
             // NSUnderlyingError with a deeper FigError code).
             let detail = Self.describe(exportSession.error)
+            Log.export.error("export failed: status=\(exportSession.status.rawValue) detail=\(detail)")
             throw CompilationExportError.exportFailed(
                 status: exportSession.status,
                 message: detail
             )
         }
+        Log.export.info("export completed successfully")
     }
 
     /// Walks an `NSError`'s userInfo + underlying-error chain to produce a

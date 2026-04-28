@@ -117,6 +117,83 @@ final class CompilationExporterTests: XCTestCase {
         XCTAssertEqual(codec, kCMVideoCodecType_HEVC, "output is not HEVC")
     }
 
+    /// Reproduces the user-reported "Operation Stopped" / -11841 failure
+    /// path: multi-clip export at the resolution the export sheet defaults
+    /// to (.r1080), with each clip having its own webcam recording. If this
+    /// passes the bug is content-specific (e.g. real HEVC source); if it
+    /// fails we have a local repro to iterate on.
+    func test_exporter_multiClipAt1080p() async throws {
+        let tmp = FileManager.default.temporaryDirectory
+        let sourceURL = tmp.appendingPathComponent("multi-source-\(UUID()).mov")
+        let webcam0URL = tmp.appendingPathComponent("multi-webcam0-\(UUID()).mov")
+        let webcam1URL = tmp.appendingPathComponent("multi-webcam1-\(UUID()).mov")
+        let outputURL = tmp.appendingPathComponent("multi-output-\(UUID()).mp4")
+        defer {
+            try? FileManager.default.removeItem(at: sourceURL)
+            try? FileManager.default.removeItem(at: webcam0URL)
+            try? FileManager.default.removeItem(at: webcam1URL)
+            try? FileManager.default.removeItem(at: outputURL)
+        }
+
+        try SyntheticAsset.write(to: sourceURL, duration: 10.0, hasAudio: true,
+                                 width: 320, height: 240,
+                                 videoColor: (r: 0, g: 0xFF, b: 0))
+        try SyntheticAsset.write(to: webcam0URL, duration: 2.0, hasAudio: true,
+                                 width: 320, height: 240,
+                                 videoColor: (r: 0, g: 0, b: 0xFF))
+        try SyntheticAsset.write(to: webcam1URL, duration: 2.5, hasAudio: true,
+                                 width: 320, height: 240,
+                                 videoColor: (r: 0xFF, g: 0, b: 0xFF))
+
+        let sourceAsset = AVURLAsset(url: sourceURL)
+        let webcam0Asset = AVURLAsset(url: webcam0URL)
+        let webcam1Asset = AVURLAsset(url: webcam1URL)
+
+        let clip0 = Clip(
+            name: "first", tags: ["test"],
+            sourceIndex: 0, startSourceSeconds: 0,
+            recordingDuration: 2.0, recordingFilename: webcam0URL.lastPathComponent,
+            events: [CommentaryEvent(recordTime: 0, kind: .play)],
+            sortIndex: 0
+        )
+        let clip1 = Clip(
+            name: "second", tags: ["test"],
+            sourceIndex: 0, startSourceSeconds: 5.0,
+            recordingDuration: 2.5, recordingFilename: webcam1URL.lastPathComponent,
+            events: [CommentaryEvent(recordTime: 0, kind: .play)],
+            sortIndex: 1
+        )
+        var project = Project(name: "multi-clip-smoke")
+        project.clips = [clip0, clip1]
+
+        let plan = project.compilationPlan(for: "test", sourceDurations: [0: 10.0])
+        XCTAssertEqual(plan.entries.count, 2)
+
+        let exporter = CompilationExporter()
+        do {
+            try await exporter.export(
+                plan: plan,
+                clipsByID: [clip0.id: clip0, clip1.id: clip1],
+                sourceAssets: [0: sourceAsset],
+                clipWebcamAssets: [clip0.id: webcam0Asset, clip1.id: webcam1Asset],
+                outputURL: outputURL,
+                resolution: .r1080,
+                quality: .medium,
+                sourceVolume: 1.0,
+                commentaryVolume: 1.0
+            )
+        } catch {
+            XCTFail("multi-clip export threw: \(error)")
+            return
+        }
+
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outputURL.path))
+        let outAsset = AVURLAsset(url: outputURL)
+        let outDuration = try await outAsset.load(.duration).seconds
+        // Two clips: 2.0 + 2.5 = 4.5s
+        XCTAssertEqual(outDuration, 4.5, accuracy: 0.2)
+    }
+
     /// FourCC stringifier for log output: `1752589105 → "hvc1"`.
     private func fourCC(_ code: FourCharCode) -> String {
         let bytes: [UInt8] = [
