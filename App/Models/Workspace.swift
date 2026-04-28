@@ -15,6 +15,13 @@ final class Workspace {
     var project: Project = Project(name: "Untitled")
     var virtualPlayer: AVPlayer?
     var virtualComposition: AVMutableComposition?
+    /// Indices into `project.sourceVideos` whose bookmark failed to resolve
+    /// (file moved/renamed/deleted). Recomputed every `rebuildVirtualPlayer`.
+    /// When non-empty, `virtualPlayer` is intentionally `nil` so the UI can
+    /// surface a Relink banner — playback would be confusing if we played
+    /// only the surviving sources, since clip `sourceIndex`es would no
+    /// longer line up with the concat.
+    var missingSourceIndices: Set<Int> = []
 
     /// Cached AVPlayer per clip for Mode C preview. Populated by a background
     /// preparation Task that hands off finished `AVPlayerItem`s built by
@@ -71,7 +78,30 @@ final class Workspace {
     }
 
     func rebuildVirtualPlayer() async throws {
-        guard !project.sourceVideos.isEmpty else { virtualPlayer = nil; return }
+        // First pass — try to resolve every bookmark. Tolerant of failures so
+        // a moved file produces a Relink banner instead of a thrown error
+        // that the user can't recover from.
+        var resolved: [(index: Int, url: URL)] = []
+        var missing: Set<Int> = []
+        for index in project.sourceVideos.indices {
+            do {
+                let url = try resolveAndRefreshBookmark(&project.sourceVideos[index])
+                resolved.append((index, url))
+            } catch {
+                missing.insert(index)
+            }
+        }
+        self.missingSourceIndices = missing
+
+        // No sources at all, or any source missing — clear the player. We
+        // refuse to play a partial concat because clip `sourceIndex`es
+        // wouldn't line up with the surviving sources' positions.
+        guard !project.sourceVideos.isEmpty, missing.isEmpty else {
+            virtualPlayer = nil
+            virtualComposition = nil
+            return
+        }
+
         let comp = AVMutableComposition()
         // The virtual-concat composition has no custom compositor reading by track ID,
         // so kCMPersistentTrackID_Invalid (auto-assigned IDs) is fine here. The strict
@@ -83,8 +113,7 @@ final class Workspace {
         else { return }
 
         var cursor = CMTime.zero
-        for index in project.sourceVideos.indices {
-            let url = try resolveAndRefreshBookmark(&project.sourceVideos[index])
+        for (_, url) in resolved {
             let asset = AVURLAsset(url: url)
             let duration = try await asset.load(.duration)
             let tracks = try await asset.load(.tracks)
@@ -99,6 +128,25 @@ final class Workspace {
         }
         self.virtualComposition = comp
         self.virtualPlayer = AVPlayer(playerItem: AVPlayerItem(asset: comp))
+    }
+
+    /// Replaces the bookmark + display name + duration for a specific source
+    /// with a freshly-picked file, then rebuilds the virtual concat. Used by
+    /// the Relink banner that appears when a source's bookmark fails to
+    /// resolve. Caller is responsible for showing an `NSOpenPanel` and
+    /// passing the user-picked URL.
+    func relinkSource(at index: Int, to url: URL) async throws {
+        guard project.sourceVideos.indices.contains(index) else { return }
+        let bookmark = try url.bookmarkData(options: [])
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        project.sourceVideos[index] = .init(
+            bookmark: bookmark,
+            displayName: url.lastPathComponent,
+            durationSeconds: duration.seconds
+        )
+        try saveProject()
+        try await rebuildVirtualPlayer()
     }
 
     private func resolveBookmark(_ data: Data, displayName: String) throws -> (URL, isStale: Bool) {

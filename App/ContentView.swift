@@ -297,6 +297,11 @@ struct ContentView: View {
                             .tint(.white)
                             .foregroundStyle(.white)
                     }
+                    // Empty / error states cover the player area when there's
+                    // nothing meaningful to show. They sit ON TOP of preview
+                    // overlays intentionally — if a source goes missing
+                    // mid-session, the relink banner trumps the playhead.
+                    playerEmptyStateOverlay
                 }
                 .frame(minWidth: 640, minHeight: 360)
 
@@ -643,6 +648,117 @@ struct ContentView: View {
                     self.appMode = .scanning
                     self.recordingError = "Recording finished with an error: \(error.localizedDescription)"
                 }
+            }
+        }
+    }
+
+    // MARK: - Empty / error state overlays
+
+    /// Returns the appropriate centered "blocker" view for the player area
+    /// when the user can't actually use the player yet (no project, no
+    /// source, or one or more sources are missing). Returns `EmptyView` when
+    /// playback is fine. Always rendered on top of the player ZStack.
+    @ViewBuilder
+    private var playerEmptyStateOverlay: some View {
+        if workspace.folder == nil {
+            emptyStateCard(
+                icon: "folder.badge.plus",
+                title: "No project open",
+                message: "Open a folder to start tagging match footage. " +
+                    "Coach Cutups stores its project file (project.json) and " +
+                    "your recorded commentary clips inside the folder.",
+                primary: ("Open Project Folder…", openProjectFolderPanel)
+            )
+        } else if workspace.project.sourceVideos.isEmpty {
+            emptyStateCard(
+                icon: "video.badge.plus",
+                title: "No source video added",
+                message: "Add the match video you want to commentate on. " +
+                    "You can add up to two sources (e.g., two halves) per project.",
+                primary: ("Add Source Video…", addSourceVideoPanel)
+            )
+        } else if let missingIndex = workspace.missingSourceIndices.sorted().first {
+            // Only the first missing source is offered for relink at a time —
+            // after the user picks a replacement we rebuild and re-evaluate.
+            // If multiple sources are still missing, the banner reappears
+            // for the next one.
+            let name = workspace.project.sourceVideos[missingIndex].displayName
+            emptyStateCard(
+                icon: "exclamationmark.triangle.fill",
+                title: "Source video is missing",
+                message: "Coach Cutups can't find “\(name)”. It may have been " +
+                    "moved, renamed, or deleted. Pick its current location to " +
+                    "continue.",
+                primary: ("Relink…", { relinkSourcePanel(at: missingIndex) })
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func emptyStateCard(
+        icon: String,
+        title: String,
+        message: String,
+        primary: (label: String, action: () -> Void)
+    ) -> some View {
+        ZStack {
+            Color.black
+            VStack(spacing: 16) {
+                Image(systemName: icon)
+                    .font(.system(size: 48, weight: .light))
+                    .foregroundStyle(.white.opacity(0.7))
+                Text(title)
+                    .font(.title2.weight(.semibold))
+                    .foregroundStyle(.white)
+                Text(message)
+                    .multilineTextAlignment(.center)
+                    .foregroundStyle(.white.opacity(0.7))
+                    .frame(maxWidth: 420)
+                Button(primary.label, action: primary.action)
+                    .controlSize(.large)
+                    .keyboardShortcut(.defaultAction)
+                    .padding(.top, 4)
+            }
+            .padding(40)
+        }
+    }
+
+    private func openProjectFolderPanel() {
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                try await workspace.openProject(folder: url)
+            } catch {
+                openProjectError = "Couldn't open project: \(error.localizedDescription)\n\nIf project.json is corrupted, restore it from a backup before retrying."
+            }
+        }
+    }
+
+    private func addSourceVideoPanel() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task { try? await workspace.addSourceVideo(url: url) }
+    }
+
+    private func relinkSourcePanel(at index: Int) {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        panel.allowsMultipleSelection = false
+        // Hint the user with the original filename so they know what to find.
+        panel.message = "Locate the original file (or a replacement) for " +
+            "“\(workspace.project.sourceVideos[index].displayName)”."
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        Task {
+            do {
+                try await workspace.relinkSource(at: index, to: url)
+            } catch {
+                openProjectError = "Couldn't relink source: \(error.localizedDescription)"
             }
         }
     }
