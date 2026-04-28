@@ -213,6 +213,24 @@ final class CaptureSessionController: NSObject,
         }
     }
 
+    /// Tears the session down so the OS frees the camera/mic — turns off the
+    /// recording-indicator light. Called after `stopRecording` returns (or
+    /// after a failed `configure`) so the camera isn't held while the user is
+    /// just scanning footage. Calls to `configure` after `teardown` are
+    /// expected to succeed: this restores the controller to its initial
+    /// state. Refuses while a recording is still in flight.
+    func teardown() {
+        guard !isRecording else { return }
+        if session.isRunning { session.stopRunning() }
+        session.beginConfiguration()
+        for input in session.inputs { session.removeInput(input) }
+        for output in session.outputs { session.removeOutput(output) }
+        session.commitConfiguration()
+        videoDevice = nil
+        lastFallbackReason = nil
+        isReady = false
+    }
+
     // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
 
     func captureOutput(_ output: AVCaptureOutput,
