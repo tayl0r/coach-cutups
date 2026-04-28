@@ -9,6 +9,9 @@ struct KeyCommandView: NSViewRepresentable {
     /// Invoked for R or Esc. Whether this starts a new recording, stops an
     /// active one, or is ignored is decided here based on `appMode`.
     let onToggleRecord: () -> Void
+    /// Invoked for Esc when in a preview mode. Wired to clear the clip
+    /// selection so the player returns to the source virtual concat.
+    let onClosePreview: () -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
@@ -24,6 +27,7 @@ struct KeyCommandView: NSViewRepresentable {
         v.onSkip = onSkip
         v.onTogglePlay = onTogglePlay
         v.onToggleRecord = onToggleRecord
+        v.onClosePreview = onClosePreview
     }
 }
 
@@ -46,6 +50,7 @@ final class KeyCatchingView: NSView {
     var onSkip: (Double) -> Void = { _ in }
     var onTogglePlay: () -> Void = {}
     var onToggleRecord: () -> Void = {}
+    var onClosePreview: () -> Void = {}
 
     private var monitor: Any?
 
@@ -83,14 +88,20 @@ final class KeyCatchingView: NSView {
                     return event
                 }
             case KeyCode.escape:
-                // Esc only stops an active recording. Outside recording it's
-                // passed through so AppKit's normal Esc handling (close popover,
-                // dismiss sheet, etc.) keeps working.
-                if self.appMode == .recording {
+                // Esc handles "exit current mode": stop recording during
+                // .recording, close clip preview during .previewClip /
+                // .previewLoading. Outside those modes it falls through so
+                // AppKit's normal Esc (close popover, dismiss sheet) works.
+                switch self.appMode {
+                case .recording:
                     self.onToggleRecord()
                     return nil
+                case .previewClip, .previewLoading:
+                    self.onClosePreview()
+                    return nil
+                default:
+                    return event
                 }
-                return event
             case KeyCode.leftArrow, KeyCode.a:  self.onSkip(-3); return nil
             case KeyCode.rightArrow, KeyCode.d: self.onSkip(+3); return nil
             case KeyCode.space:                 self.onTogglePlay(); return nil

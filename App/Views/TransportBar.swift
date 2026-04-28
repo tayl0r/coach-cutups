@@ -13,6 +13,10 @@ struct TransportBar: View {
     /// Invoked when the user clicks the Stop button during `.recording`.
     /// Wired by `ContentView` to the same handler as the R/Esc key path.
     var onStopRecording: () -> Void
+    /// Invoked when the user clicks the Close button during `.previewClip`.
+    /// Wired by `ContentView` to clear `selectedClipID`, which deselects the
+    /// sidebar row and routes `appMode` back to `.scanning`.
+    var onClosePreview: () -> Void
 
     var body: some View {
         HStack(spacing: 12) {
@@ -32,8 +36,17 @@ struct TransportBar: View {
                 ProgressView("Preparing preview…")
                     .controlSize(.small)
                 Spacer()
+                Button(action: onClosePreview) {
+                    Image(systemName: "xmark")
+                }
+                .buttonStyle(.borderless)
+                .help("Cancel and return to source (Esc)")
             case .previewClip(let id):
-                PreviewTransport(workspace: workspace, clipID: id)
+                PreviewTransport(
+                    workspace: workspace,
+                    clipID: id,
+                    onClose: onClosePreview
+                )
             }
         }
         .padding(.horizontal, 12)
@@ -179,6 +192,7 @@ struct RecordingTransport: View {
 struct PreviewTransport: View {
     @Bindable var workspace: Workspace
     let clipID: Clip.ID
+    var onClose: () -> Void
     @State private var currentTime: Double = 0
     @State private var duration: Double = 0
     @State private var isPlaying: Bool = false
@@ -188,6 +202,15 @@ struct PreviewTransport: View {
 
     var body: some View {
         HStack(spacing: 12) {
+            Button(action: onClose) {
+                Image(systemName: "chevron.left")
+                Text("Source")
+            }
+            .buttonStyle(.borderless)
+            .help("Close clip preview and return to source (Esc)")
+
+            Divider().frame(height: 20)
+
             Button(action: togglePlay) {
                 Image(systemName: isPlaying ? "pause.fill" : "play.fill")
                     .frame(width: 18)

@@ -272,7 +272,8 @@ struct ContentView: View {
                         appMode: appMode,
                         onSkip: handleSkip,
                         onTogglePlay: handleTogglePlay,
-                        onToggleRecord: handleToggleRecord
+                        onToggleRecord: handleToggleRecord,
+                        onClosePreview: handleClosePreview
                     )
                     if case .previewLoading = appMode {
                         // Cover the player surface while we wait for the preview
@@ -298,7 +299,8 @@ struct ContentView: View {
                     workspace: workspace,
                     appMode: $appMode,
                     openProjectError: $openProjectError,
-                    onStopRecording: handleToggleRecord
+                    onStopRecording: handleToggleRecord,
+                    onClosePreview: handleClosePreview
                 )
                 .frame(minHeight: 44)
             }
@@ -457,6 +459,16 @@ struct ContentView: View {
         default:
             break    // ignored — gating is also enforced in KeyCommandView
         }
+    }
+
+    /// Deselect the current clip and route the player back to the source
+    /// virtual concat. Wired to the Source button in `PreviewTransport` and
+    /// to the Esc key when `appMode` is a preview state.
+    private func handleClosePreview() {
+        // Pause the preview player so audio doesn't keep playing if AVPlayer
+        // somehow holds a reference past the swap.
+        workspace.previewPlayer(for: selectedClipID ?? UUID())?.pause()
+        selectedClipID = nil
     }
 
     // MARK: - Recording flow
