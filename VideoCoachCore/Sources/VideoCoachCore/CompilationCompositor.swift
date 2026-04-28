@@ -283,7 +283,12 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
 
         guard !line.isEmpty else { return }
 
-        let fontSize = size.height * 0.05
+        // Font size has to be small enough for one line of text + ascender +
+        // descender to fit inside the inset text rect. CoreText line height
+        // ≈ 1.2 × point size; if that exceeds the available height the
+        // framesetter silently draws nothing. Targeting ~50% of barH leaves
+        // comfortable vertical headroom.
+        let fontSize = barH * 0.5
         let font = CTFontCreateUIFontForLanguage(.system, fontSize, nil)
             ?? CTFontCreateWithName("Helvetica" as CFString, fontSize, nil)
         let attrs: [CFString: Any] = [

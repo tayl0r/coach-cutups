@@ -370,10 +370,14 @@ struct ContentView: View {
         }
     }
 
+    /// Mirrors the export's compositor text bar exactly so what the user
+    /// sees in preview matches what they'll see in the exported file.
+    /// Position is "1 / 1" in preview (single-clip context); export shows
+    /// the real clip-in-compilation index.
     private func textBarLine(for clip: Clip) -> String {
-        var parts: [String] = ["1/1", clip.name]
-        if !clip.tags.isEmpty { parts.append(clip.tags.joined(separator: " ")) }
-        return parts.joined(separator: ", ")
+        let position = "1 / 1"
+        if clip.tags.isEmpty { return position }
+        return "\(position) | \(clip.tags.joined(separator: ", "))"
     }
 
     private var drawingToolbar: some View {
