@@ -16,6 +16,13 @@ final class Workspace {
     var virtualPlayer: AVPlayer?
     var virtualComposition: AVMutableComposition?
 
+    /// Cached AVPlayer per clip for Mode C preview. Populated by a background
+    /// preparation Task that hands off finished `AVPlayerItem`s built by
+    /// `ClipPreviewBuilder` (Phase 8.1). Phase 6.1 keeps this dict empty —
+    /// `previewPlayer(for:)` always returns nil and the UI's polling loop
+    /// times out after 2 seconds back to `.scanning`.
+    private var _previewCache: [Clip.ID: AVPlayer] = [:]
+
     func openProject(folder: URL) async throws {
         self.folder = folder
         // Distinguish "folder is empty" (create new project) from "project.json exists but
@@ -106,4 +113,64 @@ final class Workspace {
         }
         return url
     }
+
+    // MARK: - Preview cache (Mode C)
+
+    /// Returns a cached preview player for the given clip, or nil if the cache
+    /// hasn't been populated yet. Phase 6.1 ships the simple cache lookup only;
+    /// Phase 8.1 introduces `ClipPreviewBuilder` and the inflight/failure
+    /// tracking that prevents duplicate Tasks from a SwiftUI thundering herd.
+    func previewPlayer(for id: Clip.ID) -> AVPlayer? {
+        // TODO(Phase 8): wire ClipPreviewBuilder. When the cache is empty, kick
+        // off a Task that calls `ClipPreviewBuilder.buildPreviewItem(for:project:)`
+        // off the main actor, then assigns the resulting AVPlayer into
+        // `_previewCache[id]`. Add `_previewInflight` / `_previewFailed` state
+        // at the same time so SwiftUI re-queries don't spawn duplicate Tasks.
+        return _previewCache[id]
+    }
+
+    /// Drops the cached preview player for a clip. Call when the clip's events
+    /// or source mapping change so the next access rebuilds with fresh content.
+    func invalidatePreviewCache(for id: Clip.ID) {
+        _previewCache.removeValue(forKey: id)
+    }
+
+    // MARK: - Clip ordering
+
+    /// Drag-to-reorder support for the sidebar list. Resorts by current
+    /// `sortIndex`, applies the SwiftUI move, then rewrites `sortIndex` to
+    /// match the new ordering and persists.
+    func reorderClips(from offsets: IndexSet, to destination: Int) {
+        var clips = project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
+        clips.move(fromOffsets: offsets, toOffset: destination)
+        for i in clips.indices { clips[i].sortIndex = i }
+        project.clips = clips
+        try? saveProject()
+    }
+
+    // MARK: - Debug helpers
+
+    #if DEBUG
+    // TODO(Phase 7): remove once real recording lands. Lets us exercise the
+    // sidebar/inspector/reorder UI before CaptureSessionController exists.
+    private static let stubTagPool = ["attacking-chance", "transitions", "set-piece"]
+
+    func addStubClip() {
+        let count = project.clips.count
+        let tagPool = Self.stubTagPool
+        let pickCount = Int.random(in: 0...tagPool.count)
+        let tags = Array(tagPool.shuffled().prefix(pickCount))
+        let clip = Clip(
+            name: "Stub \(count + 1)",
+            tags: tags,
+            sourceIndex: 0,
+            startSourceSeconds: 0,
+            recordingDuration: 5.0,
+            recordingFilename: "stub-\(UUID().uuidString).mov",
+            sortIndex: count
+        )
+        project.clips.append(clip)
+        try? saveProject()
+    }
+    #endif
 }
