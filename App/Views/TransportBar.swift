@@ -217,6 +217,12 @@ struct PreviewTransport: View {
             .disabled(player == nil)
 
             // Scrubber. Bound to currentTime; on edit-end we seek the player.
+            // Tolerance is `.positiveInfinity` (snap to nearest keyframe) —
+            // exact-frame seek (.zero / .zero) on long-GOP HEVC requires
+            // decoding back to the nearest IDR (often 1-2s away on match
+            // footage), and during that decode window the compositor renders
+            // black. For preview scrubbing the user can't perceive the
+            // few-frame snap; instant response wins.
             Slider(
                 value: $currentTime,
                 in: 0...max(duration, 0.001),
@@ -224,8 +230,8 @@ struct PreviewTransport: View {
                     guard !editing, let player else { return }
                     player.seek(
                         to: CMTime(seconds: currentTime, preferredTimescale: 600),
-                        toleranceBefore: .zero,
-                        toleranceAfter: .zero
+                        toleranceBefore: .positiveInfinity,
+                        toleranceAfter: .positiveInfinity
                     )
                 }
             )
