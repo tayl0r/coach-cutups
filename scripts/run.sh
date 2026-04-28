@@ -38,5 +38,8 @@ if pkill -x VideoCoach 2>/dev/null; then
   sleep 0.4
 fi
 
+SHA=$(git rev-parse --short HEAD)
+SUBJECT=$(git log -1 --pretty=%s)
 echo "==> launching $APP"
+echo "    commit: $SHA  $SUBJECT"
 open "$APP"
