@@ -1,7 +1,7 @@
 import AVFoundation
 import Observation
 
-enum CaptureError: Error {
+enum CaptureError: Error, LocalizedError {
     case noVideoDevice
     case noAudioDevice
     case noSuitableFormat
@@ -18,6 +18,26 @@ enum CaptureError: Error {
     /// and click. Surfaced via the menu's onChange so the UI reverts the
     /// selection back to whatever the session is actually using.
     case deviceUnavailable(String)
+
+    /// Without LocalizedError, NSError surfaces these as "VideoCoach.CaptureError
+    /// error N" — useless to diagnose. The case name + a short hint is enough
+    /// to identify which path failed without round-tripping to source.
+    var errorDescription: String? {
+        switch self {
+        case .noVideoDevice: return "No camera available."
+        case .noAudioDevice: return "No microphone available."
+        case .noSuitableFormat: return "Camera doesn't support a 16:9 ≤720p 30fps format."
+        case .permissionDenied(let media):
+            return "Permission denied for \(media == .video ? "camera" : "microphone")."
+        case .alreadyRecording: return "A recording is already in progress."
+        case .firstSampleTimeout:
+            return "Capture timed out waiting for the first frame from the camera (2s)."
+        case .clockConversionFailed:
+            return "Camera/host clock relationship couldn't be established."
+        case .deviceUnavailable(let id):
+            return "Selected device (\(String(id.prefix(12)))…) is unavailable."
+        }
+    }
 }
 
 /// Owns the single `AVCaptureSession` for the app. Two outputs:
@@ -233,15 +253,19 @@ final class CaptureSessionController: NSObject,
         guard awaitingFirstSample, let cont = t0Continuation else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         // Some external capture devices occasionally emit invalid/NaN PTS
-        // during clock resets. Discard and wait for the next sample; the 2s
-        // timeout still protects against pathological cases.
+        // during clock resets. Discard and wait for the next sample.
         guard pts.flags.contains(.valid), pts.seconds.isFinite else { return }
 
-        // Re-read the session clock per-sample. With deferred-capture the
-        // session has only been running for tens of milliseconds when the
-        // first frame arrives, so `synchronizationClock` may have been nil
-        // (or still calibrating against host time) at startRecording-time.
-        // Reading fresh here picks up the device clock as soon as it lands.
+        // Try precise device-clock → host-clock conversion first (sub-frame
+        // accurate). On a cold session — particularly the very first record
+        // after launch — the device clock hasn't had time to calibrate
+        // against host time, and CMSyncConvertTime returns kCMTimeInvalid
+        // for several seconds. We fall back to CACurrentMediaTime() at
+        // delivery, which is at most one frame (~33ms at 30fps) later than
+        // true capture time. That latency bias is shared by all user-input
+        // events we'll later anchor with CACurrentMediaTime() too, so the
+        // relative timing within the recording stays self-consistent.
+        let t0Seconds: Double
         let hostClock = CMClockGetHostTimeClock()
         let currentSessionClock = session.synchronizationClock ?? hostClock
         let hostTime: CMTime
@@ -250,20 +274,17 @@ final class CaptureSessionController: NSObject,
         } else {
             hostTime = CMSyncConvertTime(pts, from: currentSessionClock, to: hostClock)
         }
-        guard hostTime.flags.contains(.valid), hostTime.seconds.isFinite else {
-            // Conversion failed — typical on a cold session before the device
-            // clock has been calibrated against host time. Discard this frame
-            // and let the next one try; the 2s `firstSampleTimeout` catches
-            // genuinely-unsynchronizable devices (which surfaces a clearer
-            // error than clockConversionFailed anyway).
-            return
+        if hostTime.flags.contains(.valid), hostTime.seconds.isFinite {
+            t0Seconds = hostTime.seconds
+        } else {
+            t0Seconds = CACurrentMediaTime()
         }
 
         awaitingFirstSample = false
         t0Continuation = nil
         firstSampleTimeoutTask?.cancel()
         firstSampleTimeoutTask = nil
-        cont.resume(returning: hostTime.seconds)
+        cont.resume(returning: t0Seconds)
     }
 
     // MARK: AVCaptureFileOutputRecordingDelegate

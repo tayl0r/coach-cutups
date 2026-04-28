@@ -32,7 +32,11 @@ APP=$(xcodebuild \
   | awk -F' = ' '/^[[:space:]]+BUILT_PRODUCTS_DIR =/ {print $2; exit}')/VideoCoach.app
 
 # Kill any existing instance so we definitely launch the new build.
-pkill -x VideoCoach 2>/dev/null || true
+# Brief sleep gives macOS a moment to release the camera/mic + finalize
+# the shutdown — `open` racing pkill produces error -600.
+if pkill -x VideoCoach 2>/dev/null; then
+  sleep 0.4
+fi
 
 echo "==> launching $APP"
 open "$APP"
