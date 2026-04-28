@@ -566,7 +566,7 @@ final class CaptureSessionController: NSObject,
     /// `movieOutput.startRecording(...)` all run there. The serial queue's
     /// FIFO ordering replaces the polling-based warmup wait — by the time
     /// a later block runs, every prior session op has fully returned.
-    private func runOnSessionQueue<T>(
+    private func runOnSessionQueue<T: Sendable>(
         _ work: @Sendable @escaping () throws -> T
     ) async throws -> T {
         try await withCheckedThrowingContinuation { cont in
