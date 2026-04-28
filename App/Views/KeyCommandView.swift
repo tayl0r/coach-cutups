@@ -45,7 +45,12 @@ final class KeyCatchingView: NSView {
         if let monitor { NSEvent.removeMonitor(monitor); self.monitor = nil }
         guard window != nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
-            guard let self, self.window?.isKeyWindow == true else { return event }
+            guard let self, let window = self.window, window.isKeyWindow else { return event }
+            // If a text editor (TextField field editor or TextEditor) currently has
+            // focus, let the keystroke through. Otherwise typing "space", "a", "d"
+            // into a name/tag/notes field would silently trigger video transport
+            // commands instead of inserting characters.
+            if window.firstResponder is NSText { return event }
             switch event.keyCode {
             case KeyCode.leftArrow, KeyCode.a:  self.onSkip(-3); return nil
             case KeyCode.rightArrow, KeyCode.d: self.onSkip(+3); return nil

@@ -10,12 +10,18 @@ struct ClipInspector: View {
 
     var body: some View {
         Group {
-            if let binding = clipBinding {
+            if let id = selectedClipID, let binding = clipBinding(for: id) {
                 EditorView(
                     workspace: workspace,
                     clip: binding,
                     suggestions: tagSuggestions
                 )
+                // Force teardown when selection changes so the OLD EditorView's
+                // TagField runs its onDisappear-commit through its OLD binding
+                // (which still resolves to the old clip by ID). Without this,
+                // the binding migrates to the new clip first and the in-flight
+                // tag edit lands on the wrong clip.
+                .id(id)
             } else {
                 placeholder
             }
@@ -32,18 +38,30 @@ struct ClipInspector: View {
         }
     }
 
-    /// Direct binding into `workspace.project.clips[idx]`. Returns nil when no
-    /// clip is selected (or the selected clip was deleted out from under us);
-    /// the inspector falls back to the placeholder in that case.
-    private var clipBinding: Binding<Clip>? {
-        guard let id = selectedClipID,
-              let idx = workspace.project.clips.firstIndex(where: { $0.id == id })
-        else { return nil }
+    /// Binding into the clip with the given id, resolved on every read/write.
+    /// We look up by ID rather than by captured index so the binding stays
+    /// correct across reorders AND so an in-flight edit on the OLD inspector
+    /// (during selection-change teardown) writes to the right clip even after
+    /// `selectedClipID` has moved on.
+    private func clipBinding(for id: Clip.ID) -> Binding<Clip>? {
+        guard workspace.project.clips.contains(where: { $0.id == id }) else { return nil }
         return Binding(
-            get: { workspace.project.clips[idx] },
-            set: { workspace.project.clips[idx] = $0 }
+            get: {
+                // Defensive: clip may have been deleted between renders.
+                workspace.project.clips.first(where: { $0.id == id }) ?? Self.placeholderClip
+            },
+            set: { newValue in
+                if let i = workspace.project.clips.firstIndex(where: { $0.id == id }) {
+                    workspace.project.clips[i] = newValue
+                }
+            }
         )
     }
+
+    private static let placeholderClip = Clip(
+        name: "", sourceIndex: 0, startSourceSeconds: 0,
+        recordingDuration: 0, recordingFilename: "", sortIndex: 0
+    )
 
     private var tagSuggestions: Set<String> {
         Set(workspace.project.clips.flatMap(\.tags))

@@ -57,6 +57,10 @@ struct TagField: View {
             .onChange(of: isFocused) { _, focused in
                 if !focused { commit() }
             }
+            // Catches the case where the parent EditorView is being torn down
+            // (e.g. user clicked a different clip) while focus loss hasn't fired
+            // — without this the in-flight text is dropped.
+            .onDisappear { commit() }
             .popover(
                 isPresented: Binding(
                     get: { isFocused && !matchingSuggestions.isEmpty },
