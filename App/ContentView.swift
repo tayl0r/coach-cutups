@@ -47,6 +47,13 @@ struct ContentView: View {
     /// at most once per change.
     @State private var drawingClearToken = 0
     @State private var recordingError: String?
+    /// Bumped on each successful recording start so an overlay can briefly
+    /// flash to confirm the transition. Animation owned in the player ZStack.
+    @State private var recordingFlashToken: Int = 0
+    /// Host time (`CACurrentMediaTime()`) of `t = 0` for the active
+    /// recording. nil between recordings. The transport bar reads this to
+    /// render the live elapsed counter.
+    @State private var recordingStartedAtHostTime: Double?
 
     private struct PendingRecording {
         var clipID: UUID
@@ -229,6 +236,11 @@ struct ContentView: View {
                     // overlays intentionally — if a source goes missing
                     // mid-session, the relink banner trumps the playhead.
                     playerEmptyStateOverlay
+                    // Brief red flash to confirm "recording started." Token
+                    // increments on each successful start; the modifier
+                    // animates 0 → 0.45 → 0 over ~400ms then idles.
+                    RecordingStartFlash(trigger: recordingFlashToken)
+                        .allowsHitTesting(false)
                 }
                 .frame(minWidth: 640, minHeight: 360)
 
@@ -243,6 +255,7 @@ struct ContentView: View {
                     workspace: workspace,
                     appMode: $appMode,
                     openProjectError: $openProjectError,
+                    recordingStartedAtHostTime: recordingStartedAtHostTime,
                     onStopRecording: handleToggleRecord,
                     onClosePreview: handleClosePreview
                 )
@@ -536,14 +549,22 @@ struct ContentView: View {
                 let fallback = capture.lastFallbackReason
                 await MainActor.run {
                     let controller = RecordingController(t0Seconds: t0)
-                    // Start the source playing AFTER constructing the
-                    // controller, BEFORE appending the .play event — so the
-                    // event's recordTime is computed against the same t0
-                    // and ordered before the user's first space/skip.
-                    workspace.virtualPlayer?.play()
-                    controller.appendPlay()
+                    // Don't change the source-video play state — preserve
+                    // whatever the user had. Source-time reconstruction
+                    // (PlaybackTimeline) defaults `rate = 1.0` for an empty
+                    // event log, so we must append the actual current state
+                    // at t=0 to keep the log honest. Space/skip later
+                    // append additional events as the user changes state.
+                    let isPlaying = (workspace.virtualPlayer?.rate ?? 0) != 0
+                    if isPlaying {
+                        controller.appendPlay()
+                    } else {
+                        controller.appendPause()
+                    }
                     self.recordingController = controller
                     self.appMode = .recording
+                    self.recordingStartedAtHostTime = t0
+                    self.recordingFlashToken &+= 1
                     if let fallback {
                         self.deviceFallbackAlert = fallback
                     }
@@ -571,9 +592,10 @@ struct ContentView: View {
 
     private func stopRecording() {
         guard let pending = pendingRecording, let controller = recordingController else { return }
-        // Pre-emptively pause and reset live drawing so the UI returns to
-        // a clean scanning state regardless of how the stop call resolves.
-        workspace.virtualPlayer?.pause()
+        // Reset the live drawing overlay so the next recording starts clean.
+        // Source-video playback state is intentionally NOT touched — the
+        // user's pre-record play/pause state is preserved across the whole
+        // recording flow.
         drawingClearToken &+= 1
 
         Task {
@@ -584,7 +606,10 @@ struct ContentView: View {
                     let count = workspace.project.clips.count
                     let clip = Clip(
                         id: pending.clipID,
-                        name: "Clip \(count + 1)",
+                        name: Self.defaultClipName(
+                            sourceIndex: pending.sourceIndex,
+                            startSourceSeconds: pending.startSourceSeconds
+                        ),
                         sourceIndex: pending.sourceIndex,
                         startSourceSeconds: pending.startSourceSeconds,
                         recordingDuration: duration,
@@ -596,6 +621,7 @@ struct ContentView: View {
                     self.recordingController = nil
                     self.pendingRecording = nil
                     self.appMode = .scanning
+                    self.recordingStartedAtHostTime = nil
                     // Free the camera/mic so the indicator light goes off
                     // between recordings. Next record reconfigures lazily.
                     capture.teardown()
@@ -605,11 +631,25 @@ struct ContentView: View {
                     self.recordingController = nil
                     self.pendingRecording = nil
                     self.appMode = .scanning
+                    self.recordingStartedAtHostTime = nil
                     self.recordingError = "Recording finished with an error: \(error.localizedDescription)"
                     capture.teardown()
                 }
             }
         }
+    }
+
+    /// Default clip name format: `<sourceIndex+1>-HH:MM:SS` where the time
+    /// is the playhead within the source at R-press. Lets users scan their
+    /// clip list and immediately know where each clip came from in the
+    /// match. They can rename in the inspector when they want a tag-style
+    /// label.
+    static func defaultClipName(sourceIndex: Int, startSourceSeconds: Double) -> String {
+        let total = max(0, Int(startSourceSeconds.rounded(.down)))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        return String(format: "%d-%02d:%02d:%02d", sourceIndex + 1, h, m, s)
     }
 
     // MARK: - Empty / error state overlays
@@ -723,6 +763,27 @@ struct ContentView: View {
         }
     }
 
+}
+
+/// Brief red-flash overlay used to confirm "recording started." The
+/// `trigger` is a token bumped by ContentView each time a recording
+/// successfully starts; on change we run a short animation from
+/// 0 → 0.45 → 0 over ~400ms. Self-contained so the parent ZStack doesn't
+/// need any animation plumbing.
+private struct RecordingStartFlash: View {
+    let trigger: Int
+    @State private var opacity: Double = 0
+
+    var body: some View {
+        Color.red
+            .opacity(opacity)
+            .onChange(of: trigger) { _, _ in
+                withAnimation(.easeOut(duration: 0.18)) { opacity = 0.45 }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.18) {
+                    withAnimation(.easeIn(duration: 0.22)) { opacity = 0 }
+                }
+            }
+    }
 }
 
 /// Bundles the three string-bound alerts so the body's modifier chain stays

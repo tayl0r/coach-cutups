@@ -10,6 +10,10 @@ struct TransportBar: View {
     @Bindable var workspace: Workspace
     @Binding var appMode: AppMode
     @Binding var openProjectError: String?
+    /// Host time (`CACurrentMediaTime()`) when the active recording's t=0
+    /// landed. Drives the live elapsed counter in `RecordingTransport`.
+    /// nil when not recording.
+    var recordingStartedAtHostTime: Double?
     /// Invoked when the user clicks the Stop button during `.recording`.
     /// Wired by `ContentView` to the same handler as the R/Esc key path.
     var onStopRecording: () -> Void
@@ -30,6 +34,7 @@ struct TransportBar: View {
                 RecordingTransport(
                     workspace: workspace,
                     appMode: $appMode,
+                    startedAtHostTime: recordingStartedAtHostTime,
                     onStop: onStopRecording
                 )
             case .previewLoading:
@@ -149,6 +154,9 @@ struct ScanningTransport: View {
 struct RecordingTransport: View {
     @Bindable var workspace: Workspace
     @Binding var appMode: AppMode
+    /// Host time of t=0 for the active recording. Used to derive elapsed
+    /// time. nil while `.recordingStarting`.
+    var startedAtHostTime: Double?
     var onStop: () -> Void
 
     private var isStarting: Bool { appMode == .recordingStarting }
@@ -169,6 +177,18 @@ struct RecordingTransport: View {
                 .foregroundStyle(.primary)
                 .monospacedDigit()
 
+            // Live elapsed counter. TimelineView ticks at 1Hz so the digits
+            // only redraw once per second — cheaper than a 30Hz redraw and
+            // matches the seconds resolution we're displaying.
+            if !isStarting, let startedAt = startedAtHostTime {
+                TimelineView(.periodic(from: .now, by: 1)) { _ in
+                    let elapsed = max(0, CACurrentMediaTime() - startedAt)
+                    Text(formatElapsed(elapsed))
+                        .font(.subheadline.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             Spacer()
 
             Button(action: onStop) {
@@ -181,6 +201,17 @@ struct RecordingTransport: View {
             .disabled(isStarting)
             .help("Stop recording (R or Esc)")
         }
+    }
+
+    private func formatElapsed(_ seconds: Double) -> String {
+        let total = Int(seconds.rounded(.down))
+        let h = total / 3600
+        let m = (total % 3600) / 60
+        let s = total % 60
+        if h > 0 {
+            return String(format: "%d:%02d:%02d", h, m, s)
+        }
+        return String(format: "%d:%02d", m, s)
     }
 }
 
