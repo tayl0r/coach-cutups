@@ -56,29 +56,46 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
     public func cancelAllPendingVideoCompositionRequests() {}
 
     public func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
-        // Subclass-passthrough is documented behavior; failing here would
-        // mean a future macOS regressed it. Crash visibly rather than
-        // silently render black for the entire export.
-        guard let inst = request.videoCompositionInstruction as? CompilationInstruction else {
-            fatalError("CompilationCompositor received a non-CompilationInstruction")
+        // macOS 26 strips the AVMutableVideoCompositionInstruction subclass
+        // on at least the playback path (PreviewCompositor saw this) and
+        // appears to do the same on the export path under some conditions
+        // ("AVAssetExportSession failed: Operation Stopped" was traced to
+        // this fatalError firing inside the export pipeline). Recover
+        // gracefully: when the cast misses, fall back to a "no per-clip
+        // context" path that still emits a frame so the export completes.
+        let inst = request.videoCompositionInstruction as? CompilationInstruction
+
+        if let inst {
+            // Reset cached source frame at every clip boundary so a leading
+            // .freeze in clip N never displays clip N-1's last source frame.
+            if inst.clipIndex != lastClipIndex {
+                lastClipIndex = inst.clipIndex
+                lastSourceFrame = nil
+            }
         }
 
-        // Reset cached source frame at every clip boundary so a leading
-        // .freeze in clip N never displays clip N-1's last source frame.
-        if inst.clipIndex != lastClipIndex {
-            lastClipIndex = inst.clipIndex
-            lastSourceFrame = nil
-        }
-
-        let recordTime = (request.compositionTime - inst.clipCompositionStart).seconds
-        let isFreeze = currentSegmentIsFreeze(inst: inst, recordTime: recordTime)
+        let recordTime = inst.map { (request.compositionTime - $0.clipCompositionStart).seconds } ?? 0
+        let isFreeze = inst.map { currentSegmentIsFreeze(inst: $0, recordTime: recordTime) } ?? false
 
         // 1. Base buffer: live source for .play, cached for .freeze, cached
-        //    fallback if the live pull returned nil.
+        //    fallback if the live pull returned nil. When the subclass is
+        //    stripped, we don't know the source track ID — try the
+        //    instruction's `requiredSourceTrackIDs` (set on the parent class)
+        //    in declaration order; the first one is by convention the source.
+        let sourceTrackID: CMPersistentTrackID
+        if let inst {
+            sourceTrackID = inst.sourceTrackID
+        } else if let firstRequiredID = request.videoCompositionInstruction
+                    .requiredSourceTrackIDs?.first as? CMPersistentTrackID {
+            sourceTrackID = firstRequiredID
+        } else {
+            sourceTrackID = kCMPersistentTrackID_Invalid
+        }
+
         var base: CVPixelBuffer?
         if isFreeze {
             base = lastSourceFrame
-        } else if let sf = request.sourceFrame(byTrackID: inst.sourceTrackID) {
+        } else if let sf = request.sourceFrame(byTrackID: sourceTrackID) {
             lastSourceFrame = sf
             base = sf
         } else {
@@ -131,8 +148,20 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
             cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
         }
 
-        // 4. Webcam PiP, bottom-right at 22% width with 2.2% margin.
-        if let webcam = request.sourceFrame(byTrackID: inst.webcamTrackID),
+        // 4. Webcam PiP, bottom-right at 22% width with 2.2% margin. With a
+        //    missing subclass we fall back to the second declared required
+        //    track ID (convention: source first, webcam second).
+        let webcamTrackID: CMPersistentTrackID
+        if let inst {
+            webcamTrackID = inst.webcamTrackID
+        } else if let required = request.videoCompositionInstruction.requiredSourceTrackIDs,
+                  required.count >= 2,
+                  let second = required[1] as? CMPersistentTrackID {
+            webcamTrackID = second
+        } else {
+            webcamTrackID = kCMPersistentTrackID_Invalid
+        }
+        if let webcam = request.sourceFrame(byTrackID: webcamTrackID),
            let wImg = makeCGImage(webcam) {
             let pipW = CGFloat(w) * 0.22
             let webcamH = CVPixelBufferGetHeight(webcam)
@@ -148,26 +177,24 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
             cg.draw(wImg, in: rect)
         }
 
-        // 5. Strokes — synthesize a throwaway Clip carrying the events list
-        //    so we can call the shared replay helper unchanged. The Clip's
-        //    other fields (sourceIndex, recordingFilename, etc.) are unused
-        //    by visibleStrokes(in:atRecordTime:).
-        let synthClip = Clip(
-            name: "_compositorReplay",
-            sourceIndex: 0,
-            startSourceSeconds: 0,
-            recordingDuration: max(recordTime, 0) + 1,
-            recordingFilename: "",
-            events: inst.events,
-            sortIndex: 0
-        )
-        for vs in visibleStrokes(in: synthClip, atRecordTime: recordTime) {
-            drawStroke(vs, into: cg, size: size)
+        // 5. Strokes + 6. text bar — only available when the per-clip
+        //    instruction context survived. When stripped, we still emit the
+        //    base frame + PiP, just without strokes / text bar.
+        if let inst {
+            let synthClip = Clip(
+                name: "_compositorReplay",
+                sourceIndex: 0,
+                startSourceSeconds: 0,
+                recordingDuration: max(recordTime, 0) + 1,
+                recordingFilename: "",
+                events: inst.events,
+                sortIndex: 0
+            )
+            for vs in visibleStrokes(in: synthClip, atRecordTime: recordTime) {
+                drawStroke(vs, into: cg, size: size)
+            }
+            drawTextBar(inst.textBarLine, into: cg, size: size)
         }
-
-        // 6. Text bar via CoreText (handles emoji / RTL / CJK correctly,
-        //    unlike CGContext's deprecated text APIs).
-        drawTextBar(inst.textBarLine, into: cg, size: size)
 
         request.finish(withComposedVideoFrame: out)
     }
