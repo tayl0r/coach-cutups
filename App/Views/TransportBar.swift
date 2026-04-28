@@ -217,17 +217,22 @@ struct PreviewTransport: View {
 
             Divider().frame(height: 20)
 
-            // TODO(Phase 8): debounce + live audio mix update. Rebuild
-            // AVMutableAudioMix from the new volume and assign to
-            // player.currentItem?.audioMix on slider release.
+            // Live audio mix update — rebuild AVMutableAudioMix on every
+            // slider tick (cheap; ~2 microseconds per build) and reassign to
+            // `currentItem.audioMix`. Mutating an existing mix in place
+            // doesn't take effect on a playing item, only reassignment does.
+            // Persistence is debounced via `onCommit` (slider release) to
+            // avoid write amplification on `project.json`.
             VolumeSlider(
                 label: "Source",
                 value: Bindable(workspace).project.preferences.previewSourceVolume,
+                onChange: { _ in workspace.updatePreviewVolumes(for: clipID) },
                 onCommit: { try? workspace.saveProject() }
             )
             VolumeSlider(
                 label: "Commentary",
                 value: Bindable(workspace).project.preferences.previewCommentaryVolume,
+                onChange: { _ in workspace.updatePreviewVolumes(for: clipID) },
                 onCommit: { try? workspace.saveProject() }
             )
 
@@ -275,6 +280,10 @@ struct PreviewTransport: View {
 private struct VolumeSlider: View {
     let label: String
     @Binding var value: Double
+    /// Fires on every value change (slider drag). Used by Mode C to live-
+    /// rebuild the player's `AVMutableAudioMix` so volume changes take
+    /// effect during playback.
+    var onChange: ((Double) -> Void)? = nil
     let onCommit: () -> Void
 
     var body: some View {
@@ -286,6 +295,7 @@ private struct VolumeSlider: View {
                 onEditingChanged: { editing in if !editing { onCommit() } }
             )
             .frame(width: 100)
+            .onChange(of: value) { _, new in onChange?(new) }
         }
     }
 }
