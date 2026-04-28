@@ -8,11 +8,11 @@ enum CaptureError: Error {
     case permissionDenied(media: AVMediaType)
     case alreadyRecording
     case firstSampleTimeout
-    /// `AVCaptureSession.synchronizationClock` is not the host-time clock.
-    /// We refuse to start in this case rather than silently producing
-    /// misaligned timestamps; a future v2 can convert PTS via
-    /// `CMSyncConvertTime` instead.
-    case unsynchronizedClock
+    /// Sample-buffer PTS could not be converted from the device clock to the
+    /// host clock (the two clocks aren't synchronizable). Should be impossible
+    /// on the standard built-in camera / Continuity Camera path; would only
+    /// fire on a pathological external pro-capture device.
+    case clockConversionFailed
 }
 
 /// Owns the single `AVCaptureSession` for the app. Two outputs:
@@ -47,6 +47,12 @@ final class CaptureSessionController: NSObject,
 
     private var stopContinuation: CheckedContinuation<Double, Error>?
     private var videoDevice: AVCaptureDevice?
+
+    /// Captured at `startRecording(to:)` time. Sample buffers from the data
+    /// output have PTS in this clock's time base; we convert to host time
+    /// before resuming `t0Continuation` so callers always see host-time
+    /// seconds (matching `CACurrentMediaTime()`).
+    private var sessionClock: CMClock = CMClockGetHostTimeClock()
 
     func configure() async throws {
         try await ensurePermission(.video)
@@ -136,7 +142,12 @@ final class CaptureSessionController: NSObject,
     /// 2-second timeout protects against camera failure (e.g. another app
     /// holding exclusive access). Refuses re-entry if a recording is pending.
     func startRecording(to url: URL) async throws -> Double {
-        try checkSessionClock()
+        // Capture the session's clock now so the data-output delegate can
+        // convert sample-buffer PTS into host-time seconds. On modern macOS
+        // even the built-in MacBook camera exposes a device-specific clock
+        // (not the host clock), so conversion is the rule, not the exception.
+        sessionClock = session.synchronizationClock ?? CMClockGetHostTimeClock()
+
         try dataQueue.sync {
             guard t0Continuation == nil, !isRecording else {
                 throw CaptureError.alreadyRecording
@@ -162,18 +173,6 @@ final class CaptureSessionController: NSObject,
         }
     }
 
-    /// `AVCaptureSession.synchronizationClock` is normally
-    /// `CMClockGetHostTimeClock()`, matching `CACurrentMediaTime()`. On
-    /// certain Continuity Camera or external pro-capture paths it's a
-    /// device-derived clock; we refuse rather than silently produce
-    /// misaligned timestamps. A future v2 can convert via `CMSyncConvertTime`.
-    private func checkSessionClock() throws {
-        let clock: CMClock? = session.synchronizationClock
-        if let c = clock, c !== CMClockGetHostTimeClock() {
-            throw CaptureError.unsynchronizedClock
-        }
-    }
-
     func stopRecording() async throws -> Double {
         try await withCheckedThrowingContinuation { cont in
             self.stopContinuation = cont
@@ -193,11 +192,34 @@ final class CaptureSessionController: NSObject,
         // during clock resets. Discard and wait for the next sample; the 2s
         // timeout still protects against pathological cases.
         guard pts.flags.contains(.valid), pts.seconds.isFinite else { return }
+
+        // PTS is in `sessionClock`'s time base. Convert to host time so the
+        // returned t0Seconds matches `CACurrentMediaTime()` — that's the
+        // contract `RecordingController` relies on for `recordTime` math.
+        let hostClock = CMClockGetHostTimeClock()
+        let hostTime: CMTime
+        if sessionClock === hostClock {
+            hostTime = pts
+        } else {
+            hostTime = CMSyncConvertTime(pts, from: sessionClock, to: hostClock)
+        }
+        guard hostTime.flags.contains(.valid), hostTime.seconds.isFinite else {
+            // Conversion failed (clocks not synchronizable). Tear down so the
+            // UI surfaces the error rather than anchoring to garbage.
+            awaitingFirstSample = false
+            t0Continuation = nil
+            firstSampleTimeoutTask?.cancel()
+            firstSampleTimeoutTask = nil
+            cont.resume(throwing: CaptureError.clockConversionFailed)
+            movieOutput.stopRecording()
+            return
+        }
+
         awaitingFirstSample = false
         t0Continuation = nil
         firstSampleTimeoutTask?.cancel()
         firstSampleTimeoutTask = nil
-        cont.resume(returning: pts.seconds)   // host-time clock; same as CACurrentMediaTime()
+        cont.resume(returning: hostTime.seconds)
     }
 
     // MARK: AVCaptureFileOutputRecordingDelegate
