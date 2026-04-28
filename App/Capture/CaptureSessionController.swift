@@ -76,13 +76,6 @@ final class CaptureSessionController: NSObject,
     /// have unrelated lifecycles.
     private let sessionQueue = DispatchQueue(label: "videoCoach.capture.session")
 
-    /// Flips to true the first time the data-output delegate receives a
-    /// valid sample buffer after the session starts running. `waitForWarmup`
-    /// polls this; cleared in `pauseSession` so the next resume waits for a
-    /// fresh frame rather than reading a stale flag from the prior session.
-    /// All access serialized on `dataQueue`.
-    private var hasProducedSampleSinceStart = false
-
     /// Resumed with the host-time PTS (in seconds) of the first sample buffer
     /// that lands AFTER the file output has opened. nil between recordings.
     /// `t0Continuation` and `awaitingFirstSample` are accessed only on
@@ -265,7 +258,6 @@ final class CaptureSessionController: NSObject,
         videoDevice = nil
         lastFallbackReason = nil
         isReady = false
-        dataQueue.sync { hasProducedSampleSinceStart = false }
     }
 
     /// Stops the session running so the indicator light goes off, but keeps
@@ -277,22 +269,17 @@ final class CaptureSessionController: NSObject,
         try? await runOnSessionQueue {
             if self.session.isRunning { self.session.stopRunning() }
         }
-        // Clear so the next warmup waits for a fresh frame rather than
-        // accepting the stale-true from the previous session run.
-        dataQueue.sync { hasProducedSampleSinceStart = false }
     }
 
     /// Brings the session up to "ready to record" state: configures it on
-    /// first call, ensures it's running, then waits for the data output to
-    /// actually deliver a frame so we know the camera is producing. Calling
-    /// `movieOutput.startRecording` against a session that hasn't produced
-    /// a frame yet leads to `didStartRecordingTo` never firing — the
-    /// underlying AVFoundation file output appears to wait for input.
-    /// Idempotent.
+    /// first call, then ensures it's running. Both ops dispatch through
+    /// `sessionQueue`, whose serial ordering guarantees that by the time
+    /// `startRecording(to:)` enqueues `movieOutput.startRecording`, the
+    /// session is fully running. No explicit warmup wait needed —
+    /// sessionQueue ordering replaces it. Idempotent.
     func prepareForRecording(
         preferredCameraID: String? = nil,
-        preferredMicID: String? = nil,
-        timeout: TimeInterval = 5.0
+        preferredMicID: String? = nil
     ) async throws {
         if !isReady {
             try await configure(
@@ -300,22 +287,8 @@ final class CaptureSessionController: NSObject,
                 preferredMicID: preferredMicID
             )
         }
-        if !session.isRunning { session.startRunning() }
-        try await waitForWarmup(timeout: timeout)
-    }
-
-    /// Polls `hasProducedSampleSinceStart` until a frame lands or the timeout
-    /// expires. Polling at 50ms granularity is plenty fast for the ~1s warmup
-    /// we expect — and is far simpler than wiring a continuation through the
-    /// data-output delegate, since the delegate already has a separate
-    /// continuation for the recording-time first-sample handshake.
-    private func waitForWarmup(timeout: TimeInterval) async throws {
-        let start = Date()
-        while !dataQueue.sync(execute: { hasProducedSampleSinceStart }) {
-            if Date().timeIntervalSince(start) > timeout {
-                throw CaptureError.firstSampleTimeout
-            }
-            try? await Task.sleep(nanoseconds: 50_000_000)
+        try await runOnSessionQueue {
+            if !self.session.isRunning { self.session.startRunning() }
         }
     }
 
@@ -325,16 +298,6 @@ final class CaptureSessionController: NSObject,
                        didOutput sampleBuffer: CMSampleBuffer,
                        from connection: AVCaptureConnection) {
         // Runs on `dataQueue`.
-        // Always note that frames are flowing — `waitForWarmup` polls this
-        // before we kick off `movieOutput.startRecording`, which prevents the
-        // file output from racing a session that hasn't fully spun up.
-        if !hasProducedSampleSinceStart {
-            let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-            if pts.flags.contains(.valid), pts.seconds.isFinite {
-                hasProducedSampleSinceStart = true
-            }
-        }
-
         guard awaitingFirstSample, let cont = t0Continuation else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         // Some external capture devices occasionally emit invalid/NaN PTS
