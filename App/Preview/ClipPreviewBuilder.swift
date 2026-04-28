@@ -197,7 +197,20 @@ enum ClipPreviewBuilder {
         // for now and can be re-wired via a different mechanism (e.g. a
         // static registry on PreviewCompositor) later if pause-clip preview
         // fidelity becomes important.
-        let renderSize = CGSize(width: 1280, height: 720)
+        // Match render size to the source video so it fills the canvas at
+        // full quality with no cropping. Hardcoding 1280×720 was clipping the
+        // top-left region of any source bigger than that. We also account for
+        // the source track's preferred transform (e.g. portrait recordings
+        // store landscape pixels + a 90° rotation hint), so the natural size
+        // becomes the post-transform display size.
+        let srcNatural = try await srcVideoTrack.load(.naturalSize)
+        let srcPreferred = try await srcVideoTrack.load(.preferredTransform)
+        let displaySize = srcNatural.applying(srcPreferred)
+        let renderSize = CGSize(
+            width: abs(displaySize.width),
+            height: abs(displaySize.height)
+        )
+
         let videoComp = AVMutableVideoComposition()
         videoComp.renderSize = renderSize
         videoComp.frameDuration = CMTime(value: 1, timescale: 30)
@@ -206,7 +219,12 @@ enum ClipPreviewBuilder {
         inst.timeRange = CMTimeRange(start: .zero, duration: clipDuration)
 
         let sourceLI = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVideoComp)
-        // Source fills the frame at default identity transform.
+        // Apply the source's preferred transform so portrait recordings (or
+        // any rotated content) display correctly. AVMutableComposition strips
+        // the asset-track transform on insert; we re-apply it here.
+        if !srcPreferred.isIdentity {
+            sourceLI.setTransform(srcPreferred, at: .zero)
+        }
 
         let webcamLI = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
         // PiP transform: scale webcam to 22% of render width, place

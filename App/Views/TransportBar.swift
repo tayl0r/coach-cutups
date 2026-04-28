@@ -203,10 +203,8 @@ struct PreviewTransport: View {
     var body: some View {
         HStack(spacing: 12) {
             Button(action: onClose) {
-                Image(systemName: "chevron.left")
-                Text("Source")
+                Label("Source", systemImage: "chevron.left")
             }
-            .buttonStyle(.borderless)
             .help("Close clip preview and return to source (Esc)")
 
             Divider().frame(height: 20)
