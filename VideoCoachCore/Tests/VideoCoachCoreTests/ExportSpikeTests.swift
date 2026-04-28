@@ -93,6 +93,7 @@ final class ExportSpikeTests: XCTestCase {
         XCTAssertGreaterThan(outSize, 1_000, "Output file suspiciously small — encoder may have skipped")
         XCTAssertLessThan(computedBitrate, 50_000_000, "Bitrate suspiciously high — preset may have written raw")
         XCTAssertEqual(outDuration, 10.0, accuracy: 0.5, "Output duration far from source")
+        print("[spike] codec=\(codec.map(fourCC) ?? "nil") size=\(outSize)B duration=\(String(format: "%.3f", outDuration))s bitrate=\(Int(computedBitrate))bps")
 
         // ─── Verification 2: Frame at t=1s is RED, not green. ───
         // Proves the custom compositor was actually invoked by the HEVC preset path.
@@ -105,6 +106,7 @@ final class ExportSpikeTests: XCTestCase {
         )
         XCTAssertGreaterThan(center.r, 0.8, "Frame is not red — compositor was bypassed (preset fast-path)")
         XCTAssertLessThan(center.g, 0.2, "Frame still has green — compositor was not honored")
+        print("[spike] center RGB at t=1s: r=\(String(format: "%.3f", center.r)) g=\(String(format: "%.3f", center.g)) b=\(String(format: "%.3f", center.b))")
 
         // ─── Verification 3: Audio is ~0.25× original RMS. ───
         // Proves the AVMutableAudioMix was honored by the export pipeline.
@@ -115,5 +117,17 @@ final class ExportSpikeTests: XCTestCase {
             outRMS / sourceRMS, 0.25, accuracy: 0.05,
             "Audio mix was not honored — output amplitude is \(outRMS / sourceRMS)× source"
         )
+        print("[spike] audio RMS ratio (out/source): \(String(format: "%.5f", outRMS / sourceRMS)) (target 0.25 ±0.05)")
+    }
+
+    /// Decode a four-character-code (e.g. `kCMVideoCodecType_HEVC` → `"hvc1"`) for log-friendly output.
+    private func fourCC(_ code: FourCharCode) -> String {
+        let bytes: [UInt8] = [
+            UInt8((code >> 24) & 0xFF),
+            UInt8((code >> 16) & 0xFF),
+            UInt8((code >> 8) & 0xFF),
+            UInt8(code & 0xFF),
+        ]
+        return String(bytes: bytes, encoding: .ascii) ?? String(code, radix: 16)
     }
 }
