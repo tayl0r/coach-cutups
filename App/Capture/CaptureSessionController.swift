@@ -487,18 +487,20 @@ final class CaptureSessionController: NSObject,
         }
         let newInput = try AVCaptureDeviceInput(device: newDevice)
 
-        session.beginConfiguration()
-        for input in session.inputs {
-            guard let deviceInput = input as? AVCaptureDeviceInput,
-                  deviceInput.device.hasMediaType(.video)
-            else { continue }
-            session.removeInput(deviceInput)
+        try await runOnSessionQueue {
+            self.session.beginConfiguration()
+            for input in self.session.inputs {
+                guard let deviceInput = input as? AVCaptureDeviceInput,
+                      deviceInput.device.hasMediaType(.video)
+                else { continue }
+                self.session.removeInput(deviceInput)
+            }
+            if self.session.canAddInput(newInput) { self.session.addInput(newInput) }
+            // Same canonical ordering as `configure()` — addInput resets
+            // activeFormat, so the explicit format selection MUST follow it.
+            try self.setPreferredFormat(on: newDevice)
+            self.session.commitConfiguration()
         }
-        if session.canAddInput(newInput) { session.addInput(newInput) }
-        // Same canonical ordering as `configure()` — addInput resets
-        // activeFormat, so the explicit format selection MUST follow it.
-        try setPreferredFormat(on: newDevice)
-        session.commitConfiguration()
         self.videoDevice = newDevice
         self.lastFallbackReason = nil
     }
@@ -523,15 +525,17 @@ final class CaptureSessionController: NSObject,
         }
         let newInput = try AVCaptureDeviceInput(device: newDevice)
 
-        session.beginConfiguration()
-        for input in session.inputs {
-            guard let deviceInput = input as? AVCaptureDeviceInput,
-                  deviceInput.device.hasMediaType(.audio)
-            else { continue }
-            session.removeInput(deviceInput)
+        try await runOnSessionQueue {
+            self.session.beginConfiguration()
+            for input in self.session.inputs {
+                guard let deviceInput = input as? AVCaptureDeviceInput,
+                      deviceInput.device.hasMediaType(.audio)
+                else { continue }
+                self.session.removeInput(deviceInput)
+            }
+            if self.session.canAddInput(newInput) { self.session.addInput(newInput) }
+            self.session.commitConfiguration()
         }
-        if session.canAddInput(newInput) { session.addInput(newInput) }
-        session.commitConfiguration()
         self.lastFallbackReason = nil
     }
 
