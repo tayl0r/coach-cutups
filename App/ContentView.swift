@@ -571,7 +571,6 @@ struct ContentView: View {
                 }
             } catch CaptureError.permissionDenied(let media) {
                 await MainActor.run {
-                    capture.pauseSession()
                     self.appMode = .scanning
                     self.pendingRecording = nil
                     let kind = media == .video ? "camera" : "microphone"
@@ -579,13 +578,14 @@ struct ContentView: View {
                         "Open System Settings → Privacy & Security → \(media == .video ? "Camera" : "Microphone") " +
                         "to grant permission, then try again."
                 }
+                await capture.pauseSession()
             } catch {
                 await MainActor.run {
-                    capture.pauseSession()
                     self.appMode = .scanning
                     self.pendingRecording = nil
                     self.recordingError = "Couldn't start recording: \(error.localizedDescription)"
                 }
+                await capture.pauseSession()
             }
         }
     }
@@ -622,10 +622,10 @@ struct ContentView: View {
                     self.pendingRecording = nil
                     self.appMode = .scanning
                     self.recordingStartedAtHostTime = nil
-                    // Free the camera/mic so the indicator light goes off
-                    // between recordings. Next record reconfigures lazily.
-                    capture.pauseSession()
                 }
+                // Free the camera/mic so the indicator light goes off
+                // between recordings. Next record reconfigures lazily.
+                await capture.pauseSession()
             } catch {
                 await MainActor.run {
                     self.recordingController = nil
@@ -633,8 +633,8 @@ struct ContentView: View {
                     self.appMode = .scanning
                     self.recordingStartedAtHostTime = nil
                     self.recordingError = "Recording finished with an error: \(error.localizedDescription)"
-                    capture.pauseSession()
                 }
+                await capture.pauseSession()
             }
         }
     }

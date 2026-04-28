@@ -249,13 +249,15 @@ final class CaptureSessionController: NSObject,
     /// just scanning footage. Calls to `configure` after `teardown` are
     /// expected to succeed: this restores the controller to its initial
     /// state. Refuses while a recording is still in flight.
-    func teardown() {
+    func teardown() async {
         guard !isRecording else { return }
-        if session.isRunning { session.stopRunning() }
-        session.beginConfiguration()
-        for input in session.inputs { session.removeInput(input) }
-        for output in session.outputs { session.removeOutput(output) }
-        session.commitConfiguration()
+        try? await runOnSessionQueue {
+            if self.session.isRunning { self.session.stopRunning() }
+            self.session.beginConfiguration()
+            for input in self.session.inputs { self.session.removeInput(input) }
+            for output in self.session.outputs { self.session.removeOutput(output) }
+            self.session.commitConfiguration()
+        }
         videoDevice = nil
         lastFallbackReason = nil
         isReady = false
@@ -266,9 +268,11 @@ final class CaptureSessionController: NSObject,
     /// the configuration intact (inputs, outputs, format). The next
     /// `prepareForRecording` just calls `startRunning` again, which is much
     /// faster than a full reconfigure. Refuses while recording is active.
-    func pauseSession() {
+    func pauseSession() async {
         guard !isRecording else { return }
-        if session.isRunning { session.stopRunning() }
+        try? await runOnSessionQueue {
+            if self.session.isRunning { self.session.stopRunning() }
+        }
         // Clear so the next warmup waits for a fresh frame rather than
         // accepting the stale-true from the previous session run.
         dataQueue.sync { hasProducedSampleSinceStart = false }
