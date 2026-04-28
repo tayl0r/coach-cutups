@@ -51,10 +51,6 @@ struct ContentView: View {
     /// at most once per change.
     @State private var drawingClearToken = 0
     @State private var recordingError: String?
-    /// Set to a clip's id when the user requests deletion (Cmd+Delete or
-    /// context menu). Drives a confirm alert; the actual deletion happens in
-    /// `confirmDeleteClip` once the user clicks the destructive button.
-    @State private var clipPendingDeletion: Clip.ID?
 
     private struct PendingRecording {
         var clipID: UUID
@@ -71,23 +67,6 @@ struct ContentView: View {
                 deviceFallbackAlert: $deviceFallbackAlert,
                 previewBuildErrorAlert: $previewBuildErrorAlert
             ))
-            // Destructive delete-clip confirm. Lives at the top level (not in
-            // AlertsModifier) because the action needs access to the workspace
-            // and to the selection state.
-            .alert(
-                "Delete Clip?",
-                isPresented: Binding(
-                    get: { clipPendingDeletion != nil },
-                    set: { if !$0 { clipPendingDeletion = nil } }
-                ),
-                presenting: clipPendingDeletion
-            ) { _ in
-                Button("Delete", role: .destructive) { confirmDeleteClip() }
-                Button("Cancel", role: .cancel) { clipPendingDeletion = nil }
-            } message: { id in
-                let name = workspace.project.clips.first(where: { $0.id == id })?.name ?? "this clip"
-                Text("This will permanently delete “\(name)” and its recording file. This can't be undone.")
-            }
             .modifier(DeviceWiringModifier(
                 appMode: appMode,
                 workspaceFolder: workspace.folder,
@@ -103,6 +82,9 @@ struct ContentView: View {
             // when no clip is selected or we're recording, so the menu item
             // (and its Cmd+Delete shortcut) auto-disable in those states.
             .focusedValue(\.deleteSelectedClip, deleteSelectedClipHandler)
+            // Undo delete is gated on Workspace.lastDeletedClip — also nil
+            // when nothing has been deleted, or while recording.
+            .focusedValue(\.undoLastDelete, undoLastDeleteHandler)
             .task {
                 // Configure the capture session once on first appearance.
                 // If the user denies permission, surface
@@ -524,14 +506,20 @@ struct ContentView: View {
         selectedClipID = nil
     }
 
-    /// Request deletion of a specific clip — pops the destructive confirm
-    /// alert. Wired by the sidebar context menu and the Clip ▸ Delete menu.
-    /// Ignored during recording (the user can't make sense of "delete a clip"
-    /// while one is being captured) and ignored when no clip is selected.
+    /// Delete a specific clip. No confirm alert — the action is recoverable
+    /// via Clip ▸ Undo Delete Clip / ⌘Z while the app is running. Ignored
+    /// during recording, and a no-op when no clip is selected. If the clip
+    /// is currently previewing, close the preview first so the player isn't
+    /// left holding a stale reference.
     private func requestDeleteClip(_ id: Clip.ID?) {
         guard let id else { return }
         if appMode == .recording || appMode == .recordingStarting { return }
-        clipPendingDeletion = id
+        if selectedClipID == id { handleClosePreview() }
+        do {
+            try workspace.deleteClip(id: id)
+        } catch {
+            recordingError = "Couldn't delete clip: \(error.localizedDescription)"
+        }
     }
 
     /// Computed handler published to the Clip menu via `@FocusedValue`.
@@ -543,16 +531,21 @@ struct ContentView: View {
         return { requestDeleteClip(id) }
     }
 
-    /// Actually delete after user confirms. If the clip was previewing, close
-    /// the preview first so the player isn't holding a stale reference.
-    private func confirmDeleteClip() {
-        guard let id = clipPendingDeletion else { return }
-        clipPendingDeletion = nil
-        if selectedClipID == id { handleClosePreview() }
-        do {
-            try workspace.deleteClip(id: id)
-        } catch {
-            recordingError = "Couldn't delete clip: \(error.localizedDescription)"
+    /// Computed handler for Clip ▸ Undo Delete Clip (⌘Z). nil when there's
+    /// nothing to undo OR while recording — the menu item disables itself
+    /// in either case. On success, re-selects the restored clip so the user
+    /// sees what came back.
+    private var undoLastDeleteHandler: (() -> Void)? {
+        guard workspace.lastDeletedClip != nil else { return nil }
+        if appMode == .recording || appMode == .recordingStarting { return nil }
+        return {
+            do {
+                if let restored = try workspace.undoLastDelete() {
+                    selectedClipID = restored
+                }
+            } catch {
+                recordingError = "Couldn't undo delete: \(error.localizedDescription)"
+            }
         }
     }
 

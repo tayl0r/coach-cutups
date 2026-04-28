@@ -9,10 +9,18 @@ private struct DeleteSelectedClipKey: FocusedValueKey {
     typealias Value = () -> Void
 }
 
+private struct UndoLastDeleteKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
 extension FocusedValues {
     var deleteSelectedClip: (() -> Void)? {
         get { self[DeleteSelectedClipKey.self] }
         set { self[DeleteSelectedClipKey.self] = newValue }
+    }
+    var undoLastDelete: (() -> Void)? {
+        get { self[UndoLastDeleteKey.self] }
+        set { self[UndoLastDeleteKey.self] = newValue }
     }
 }
 
@@ -21,12 +29,19 @@ extension FocusedValues {
 /// Room to grow: Rename Clip, Reveal Recording in Finder, Duplicate, etc.
 struct ClipCommands: Commands {
     @FocusedValue(\.deleteSelectedClip) private var deleteHandler
+    @FocusedValue(\.undoLastDelete) private var undoDeleteHandler
 
     var body: some Commands {
         CommandMenu("Clip") {
-            Button("Delete Clip…") { deleteHandler?() }
+            // No "…" — the action is one-shot now (no confirm) but
+            // recoverable via Undo Delete Clip below.
+            Button("Delete Clip") { deleteHandler?() }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(deleteHandler == nil)
+
+            Button("Undo Delete Clip") { undoDeleteHandler?() }
+                .keyboardShortcut("z", modifiers: .command)
+                .disabled(undoDeleteHandler == nil)
         }
     }
 }

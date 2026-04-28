@@ -56,7 +56,7 @@ struct ClipSidebar: View {
                     Button(role: .destructive) {
                         onRequestDeleteClip(id)
                     } label: {
-                        Label("Delete Clip…", systemImage: "trash")
+                        Label("Delete Clip", systemImage: "trash")
                     }
                     .disabled(isRecording)
                 }
