@@ -85,7 +85,11 @@ final class CaptureSessionController: NSObject,
 
     /// Resumed with the host-time PTS (in seconds) of the first sample buffer
     /// that lands AFTER the file output has opened. nil between recordings.
-    /// All access to the next three fields happens on `dataQueue`.
+    /// `t0Continuation` and `awaitingFirstSample` are accessed only on
+    /// `dataQueue`. `firstSampleTimeoutTask` is assigned on `sessionQueue`
+    /// (alongside `movieOutput.startRecording`) and read/cancelled on
+    /// `dataQueue` — the cross-queue handoff is safe because
+    /// `didStartRecordingTo → dataQueue.async` provides the memory barrier.
     private var t0Continuation: CheckedContinuation<Double, Error>?
     private var awaitingFirstSample = false
     private var firstSampleTimeoutTask: Task<Void, Never>?
