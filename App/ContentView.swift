@@ -18,6 +18,11 @@ struct ContentView: View {
     // MARK: - Capture / recording state
 
     @State private var capture = CaptureSessionController()
+    /// Surfaces a `ClipPreviewBuilder` failure as a one-shot alert. Cleared
+    /// when the user dismisses; the failure stays in
+    /// `Workspace._previewFailed` so re-selecting the same clip surfaces it
+    /// again rather than silently retrying.
+    @State private var previewBuildErrorAlert: String?
     /// Set when capture configuration fails because the user denied camera
     /// or microphone access. Renders `permissionDeniedView()` in place of
     /// the main UI so the user sees how to fix it.
@@ -55,7 +60,8 @@ struct ContentView: View {
             .modifier(AlertsModifier(
                 openProjectError: $openProjectError,
                 recordingError: $recordingError,
-                deviceFallbackAlert: $deviceFallbackAlert
+                deviceFallbackAlert: $deviceFallbackAlert,
+                previewBuildErrorAlert: $previewBuildErrorAlert
             ))
             .modifier(DeviceWiringModifier(
                 appMode: appMode,
@@ -238,6 +244,17 @@ struct ContentView: View {
             VStack(spacing: 0) {
                 ZStack {
                     PlayerSurface(player: currentPlayer)
+                    // Mode C overlays — only mounted when previewing so the
+                    // periodic time observer in StrokeReplayLayer doesn't run
+                    // during scanning/recording.
+                    if case .previewClip(let id) = appMode,
+                       let player = workspace.previewPlayer(for: id),
+                       let clip = workspace.project.clips.first(where: { $0.id == id }) {
+                        StrokeReplayOverlay(player: player, clip: clip)
+                            .allowsHitTesting(false)
+                        previewTextBar(for: clip)
+                            .allowsHitTesting(false)
+                    }
                     if appMode == .recording {
                         // Drawing overlay sits between the player and the key
                         // monitor — clicks/drags here become strokes; everything
@@ -294,6 +311,34 @@ struct ContentView: View {
         }
     }
 
+    /// Bottom strip mirroring the export's text bar: dark background pinned
+    /// to the bottom 8% of the player area, white "i/N, name, tags" text.
+    /// Mode C only ever previews a single clip at a time so the index is
+    /// always 1/1.
+    @ViewBuilder
+    private func previewTextBar(for clip: Clip) -> some View {
+        VStack {
+            Spacer()
+            HStack {
+                Text(textBarLine(for: clip))
+                    .foregroundStyle(.white)
+                    .lineLimit(1)
+                    .truncationMode(.tail)
+                    .padding(.horizontal, 8)
+                Spacer()
+            }
+            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity)
+            .background(Color.black.opacity(0.6))
+        }
+    }
+
+    private func textBarLine(for clip: Clip) -> String {
+        var parts: [String] = ["1/1", clip.name]
+        if !clip.tags.isEmpty { parts.append(clip.tags.joined(separator: " ")) }
+        return parts.joined(separator: ", ")
+    }
+
     private var drawingToolbar: some View {
         HStack(spacing: 12) {
             Toggle("Auto-clear (5s)", isOn: $autoClearStrokes)
@@ -324,16 +369,63 @@ struct ContentView: View {
     // MARK: - Mode transitions
 
     private func handleSelectionChange(_ newID: Clip.ID?) {
+        // Pause whatever was playing — switching selection should park the
+        // prior player so audio doesn't bleed across clips.
+        workspace.virtualPlayer?.pause()
+        if case .previewClip(let priorID) = appMode {
+            workspace.previewPlayer(for: priorID)?.pause()
+        }
+
         guard let newID else { appMode = .scanning; return }
+
+        // Already-cached: instant transition.
         if workspace.previewPlayer(for: newID) != nil {
             appMode = .previewClip(newID)
             return
         }
-        // TODO(Phase 8): kick off ClipPreviewBuilder and transition to
-        // .previewLoading → .previewClip when the cache populates. Until then,
-        // stay on .scanning so the player keeps showing the virtual concat
-        // and the inspector keeps the clip selected for metadata editing.
-        appMode = .scanning
+        // Already-failed: surface and revert to scanning. Don't loop into
+        // .previewLoading; the build won't be re-attempted while the failure
+        // is recorded.
+        if let err = workspace.previewBuildError(for: newID) {
+            previewBuildErrorAlert = err.localizedDescription
+            appMode = .scanning
+            return
+        }
+
+        // Cache miss + no prior failure: kick off the build (the call to
+        // previewPlayer above already started the Task; that's intentional
+        // — the inflight Set deduplicates) and poll for completion.
+        appMode = .previewLoading(newID)
+        Task {
+            // 50ms ticks until either the cache populates or an error lands.
+            // Bails out if the user re-selects a different clip mid-load.
+            for _ in 0..<400 { // ~20s upper bound — long-GOP HEVC freeze pre-decode can be slow
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                if Task.isCancelled { return }
+                let stillPending: Bool = await MainActor.run {
+                    if self.selectedClipID != newID { return false }
+                    if self.workspace.previewPlayer(for: newID) != nil {
+                        self.appMode = .previewClip(newID)
+                        return false
+                    }
+                    if let err = self.workspace.previewBuildError(for: newID) {
+                        self.previewBuildErrorAlert = err.localizedDescription
+                        self.appMode = .scanning
+                        return false
+                    }
+                    return true
+                }
+                if !stillPending { return }
+            }
+            // Timeout fallback — preserve the user's selection in the
+            // inspector but stop pretending we're loading.
+            await MainActor.run {
+                if case .previewLoading(let pendingID) = self.appMode, pendingID == newID {
+                    self.previewBuildErrorAlert = "Preview took too long to prepare. Try again."
+                    self.appMode = .scanning
+                }
+            }
+        }
     }
 
     // MARK: - Keyboard handling
@@ -485,6 +577,7 @@ private struct AlertsModifier: ViewModifier {
     @Binding var openProjectError: String?
     @Binding var recordingError: String?
     @Binding var deviceFallbackAlert: String?
+    @Binding var previewBuildErrorAlert: String?
 
     func body(content: Content) -> some View {
         content
@@ -508,6 +601,13 @@ private struct AlertsModifier: ViewModifier {
                 presenting: deviceFallbackAlert
             ) { _ in
                 Button("OK") { deviceFallbackAlert = nil }
+            } message: { Text($0) }
+            .alert(
+                "Preview Failed",
+                isPresented: .constant(previewBuildErrorAlert != nil),
+                presenting: previewBuildErrorAlert
+            ) { _ in
+                Button("OK") { previewBuildErrorAlert = nil }
             } message: { Text($0) }
     }
 }

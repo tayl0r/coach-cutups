@@ -18,10 +18,17 @@ final class Workspace {
 
     /// Cached AVPlayer per clip for Mode C preview. Populated by a background
     /// preparation Task that hands off finished `AVPlayerItem`s built by
-    /// `ClipPreviewBuilder` (Phase 8.1). Phase 6.1 keeps this dict empty —
-    /// `previewPlayer(for:)` always returns nil and the UI's polling loop
-    /// times out after 2 seconds back to `.scanning`.
+    /// `ClipPreviewBuilder`. Lookup-only via `previewPlayer(for:)`; that
+    /// method also kicks off the build Task on a cache miss.
     private var _previewCache: [Clip.ID: AVPlayer] = [:]
+    /// Clip IDs whose preview is currently being built. Prevents a SwiftUI
+    /// thundering herd (several view re-renders during the load window) from
+    /// spawning duplicate Tasks per clip.
+    private var _previewInflight: Set<Clip.ID> = []
+    /// Errors from the most recent failed build, surfaced via
+    /// `previewBuildError(for:)` so ContentView can show an alert and revert
+    /// to scanning. Cleared on the next successful build.
+    private var _previewFailed: [Clip.ID: Error] = [:]
 
     func openProject(folder: URL) async throws {
         self.folder = folder
@@ -116,23 +123,83 @@ final class Workspace {
 
     // MARK: - Preview cache (Mode C)
 
-    /// Returns a cached preview player for the given clip, or nil if the cache
-    /// hasn't been populated yet. Phase 6.1 ships the simple cache lookup only;
-    /// Phase 8.1 introduces `ClipPreviewBuilder` and the inflight/failure
-    /// tracking that prevents duplicate Tasks from a SwiftUI thundering herd.
+    /// Returns a cached preview player for the given clip. On a cache miss,
+    /// schedules a background Task that runs `ClipPreviewBuilder` off the
+    /// main actor and returns nil immediately — callers (ContentView's
+    /// `handleSelectionChange`) flip the UI to `.previewLoading` and poll
+    /// for the cache or an error to land.
+    ///
+    /// `_previewInflight` deduplicates the build so SwiftUI re-renders during
+    /// the load window don't spawn duplicate Tasks. `_previewFailed` records
+    /// the error so the UI can show it without re-attempting on every
+    /// subsequent re-render.
     func previewPlayer(for id: Clip.ID) -> AVPlayer? {
-        // TODO(Phase 8): wire ClipPreviewBuilder. When the cache is empty, kick
-        // off a Task that calls `ClipPreviewBuilder.buildPreviewItem(for:project:)`
-        // off the main actor, then assigns the resulting AVPlayer into
-        // `_previewCache[id]`. Add `_previewInflight` / `_previewFailed` state
-        // at the same time so SwiftUI re-queries don't spawn duplicate Tasks.
-        return _previewCache[id]
+        if let cached = _previewCache[id] { return cached }
+        if _previewFailed[id] != nil { return nil }
+        guard !_previewInflight.contains(id) else { return nil }
+        _previewInflight.insert(id)
+        Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.preparePreviewPlayer(for: id)
+            } catch {
+                await MainActor.run { self._previewFailed[id] = error }
+            }
+            await MainActor.run { _ = self._previewInflight.remove(id) }
+        }
+        return nil
     }
+
+    /// Returns the most recent build error for `id`, if any. Cleared on the
+    /// next successful build.
+    func previewBuildError(for id: Clip.ID) -> Error? { _previewFailed[id] }
 
     /// Drops the cached preview player for a clip. Call when the clip's events
     /// or source mapping change so the next access rebuilds with fresh content.
     func invalidatePreviewCache(for id: Clip.ID) {
         _previewCache.removeValue(forKey: id)
+        _previewFailed.removeValue(forKey: id)
+    }
+
+    private func preparePreviewPlayer(for id: Clip.ID) async throws {
+        guard let clip = project.clips.first(where: { $0.id == id }),
+              let folder = self.folder else { return }
+        let snapshot = project   // copy off the main actor for the nonisolated build
+        let item = try await ClipPreviewBuilder.buildPreviewItem(
+            for: clip,
+            project: snapshot,
+            projectFolder: folder
+        )
+        item.audioMix = audioMix(for: clip)
+        let player = AVPlayer(playerItem: item)
+        player.volume = 1.0
+        _previewCache[id] = player
+        _previewFailed.removeValue(forKey: id)
+    }
+
+    /// Builds a fresh `AVMutableAudioMix` from the project's current
+    /// preview-volume preferences. Note: mutating an existing mix on a
+    /// playing item doesn't take effect — the caller must reassign the mix
+    /// to `currentItem.audioMix`. See `updatePreviewVolumes(for:)`.
+    func audioMix(for clip: Clip) -> AVMutableAudioMix {
+        let mix = AVMutableAudioMix()
+        let sourceParams = AVMutableAudioMixInputParameters()
+        sourceParams.trackID = 2
+        sourceParams.setVolume(Float(project.preferences.previewSourceVolume), at: .zero)
+        let micParams = AVMutableAudioMixInputParameters()
+        micParams.trackID = 2000
+        micParams.setVolume(Float(project.preferences.previewCommentaryVolume), at: .zero)
+        mix.inputParameters = [sourceParams, micParams]
+        return mix
+    }
+
+    /// Rebuilds and reassigns the preview player's audio mix from current
+    /// preferences. Called by the volume sliders so source/commentary level
+    /// changes take effect during playback.
+    func updatePreviewVolumes(for id: Clip.ID) {
+        guard let clip = project.clips.first(where: { $0.id == id }),
+              let player = _previewCache[id] else { return }
+        player.currentItem?.audioMix = audioMix(for: clip)
     }
 
     // MARK: - Clip ordering
