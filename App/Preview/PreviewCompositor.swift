@@ -52,28 +52,38 @@ final class PreviewCompositor: NSObject, AVVideoCompositing {
     func cancelAllPendingVideoCompositionRequests() {}
 
     func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
-        guard let inst = request.videoCompositionInstruction as? PreviewInstruction else {
-            // Subclass-passthrough is documented behavior; a miss here would
-            // mean a future macOS regressed it. Crash visibly rather than
-            // silently render black for the entire preview.
-            fatalError("PreviewCompositor received a non-PreviewInstruction")
-        }
-
-        let recordTime = (request.compositionTime - inst.clipCompositionStart).seconds
-        let segIndex = inst.segmentIndex(forRecordTime: recordTime)
-        let segment = inst.segments.indices.contains(segIndex) ? inst.segments[segIndex] : nil
+        // AVPlayer's playback path on modern macOS sometimes strips the
+        // subclass from `videoCompositionInstruction` (the export-session path
+        // preserves it; the playback path does not, at least in our testing
+        // on macOS 26). When the cast fails we fall back to a best-effort
+        // composite using the known track-ID convention. The only thing we
+        // lose is per-segment freeze-frame rendering — clips without pauses
+        // play correctly through this path; clips with `.freeze` segments
+        // will render black during the freeze (or nothing if no source frame
+        // is available).
+        let inst = request.videoCompositionInstruction as? PreviewInstruction
+        let sourceTrackID = inst?.sourceTrackID ?? 1
+        let webcamTrackID = inst?.webcamTrackID ?? 1000
 
         // 1. Pick the base source frame:
-        //    - .freeze → pre-decoded frozen frame (immutable; safe under seeks)
-        //    - .play   → live source frame for this composition time
-        //    - otherwise (gap before the first sample) → nil ⇒ render black
+        //    - `.freeze` (only when we have the subclass) → pre-decoded frozen
+        //      frame, immutable so safe under reverse seeks.
+        //    - `.play`   → live source frame for this composition time.
+        //    - otherwise (subclass missing AND no live source) → nil ⇒ black.
         let base: CVPixelBuffer?
-        if let segment, segment.kind == .freeze {
-            base = inst.frozenFrames[segIndex]
-        } else if let live = request.sourceFrame(byTrackID: inst.sourceTrackID) {
-            base = live
+        if let inst {
+            let recordTime = (request.compositionTime - inst.clipCompositionStart).seconds
+            let segIndex = inst.segmentIndex(forRecordTime: recordTime)
+            let segment = inst.segments.indices.contains(segIndex) ? inst.segments[segIndex] : nil
+            if let segment, segment.kind == .freeze {
+                base = inst.frozenFrames[segIndex]
+            } else if let live = request.sourceFrame(byTrackID: sourceTrackID) {
+                base = live
+            } else {
+                base = nil
+            }
         } else {
-            base = nil
+            base = request.sourceFrame(byTrackID: sourceTrackID)
         }
 
         // 2. Allocate the output buffer.
@@ -124,7 +134,7 @@ final class PreviewCompositor: NSObject, AVVideoCompositing {
         //    is necessary because a custom compositor "owns" frame production;
         //    layer instructions are bypassed when `customVideoCompositorClass`
         //    is set.
-        if let webcam = request.sourceFrame(byTrackID: inst.webcamTrackID),
+        if let webcam = request.sourceFrame(byTrackID: webcamTrackID),
            let wImg = makeCGImage(webcam) {
             let pipW = CGFloat(w) * 0.22
             let webcamH = CVPixelBufferGetHeight(webcam)
