@@ -217,20 +217,22 @@ final class CaptureSessionController: NSObject,
             }
         }
         return try await withCheckedThrowingContinuation { cont in
-            dataQueue.sync {
-                self.t0Continuation = cont
-                self.awaitingFirstSample = false   // armed in didStartRecordingTo
-            }
-            movieOutput.startRecording(to: url, recordingDelegate: self)
-            isRecording = true
-            firstSampleTimeoutTask = Task { [weak self] in
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                self?.dataQueue.async {
-                    guard let self, let cont = self.t0Continuation else { return }
-                    self.t0Continuation = nil
-                    self.awaitingFirstSample = false
-                    cont.resume(throwing: CaptureError.firstSampleTimeout)
-                    self.movieOutput.stopRecording()
+            sessionQueue.async {
+                self.dataQueue.sync {
+                    self.t0Continuation = cont
+                    self.awaitingFirstSample = false   // armed in didStartRecordingTo
+                }
+                self.movieOutput.startRecording(to: url, recordingDelegate: self)
+                self.isRecording = true
+                self.firstSampleTimeoutTask = Task { [weak self] in
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    self?.dataQueue.async {
+                        guard let self, let cont = self.t0Continuation else { return }
+                        self.t0Continuation = nil
+                        self.awaitingFirstSample = false
+                        cont.resume(throwing: CaptureError.firstSampleTimeout)
+                        self.movieOutput.stopRecording()
+                    }
                 }
             }
         }
