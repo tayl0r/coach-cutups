@@ -248,16 +248,16 @@ public actor CompilationExporter {
                 case .play, .pause, .skip: return false
                 }
             }
-            // Bottom-bar info: `<n> / <total> | tag1, tag2, tag3`. If a clip
-            // has no tags, drop the separator + tag list so we don't render
-            // a stray trailing pipe.
+            // Bottom-bar info: `<n> / <total> | <name> | tag1, tag2, tag3`.
+            // Empty segments collapse — a clip with no tags just shows
+            // `<n> / <total> | <name>`; a name-less + tag-less clip just
+            // shows `<n> / <total>`. No trailing pipes.
             let position = "\(entry.indexInOutput + 1) / \(plan.entries.count)"
-            let textBarLine: String
-            if clip.tags.isEmpty {
-                textBarLine = position
-            } else {
-                textBarLine = "\(position) | \(clip.tags.joined(separator: ", "))"
-            }
+            var parts: [String] = [position]
+            let trimmedName = clip.name.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !trimmedName.isEmpty { parts.append(trimmedName) }
+            if !clip.tags.isEmpty { parts.append(clip.tags.joined(separator: ", ")) }
+            let textBarLine = parts.joined(separator: " | ")
             // Use the AVFoundation-assigned trackIDs captured above. The
             // webcam ID may be missing if some pathological per-clip flow
             // ran without inserting a webcam track — fall back to the

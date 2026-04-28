@@ -375,9 +375,11 @@ struct ContentView: View {
     /// Position is "1 / 1" in preview (single-clip context); export shows
     /// the real clip-in-compilation index.
     private func textBarLine(for clip: Clip) -> String {
-        let position = "1 / 1"
-        if clip.tags.isEmpty { return position }
-        return "\(position) | \(clip.tags.joined(separator: ", "))"
+        var parts: [String] = ["1 / 1"]
+        let trimmedName = clip.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedName.isEmpty { parts.append(trimmedName) }
+        if !clip.tags.isEmpty { parts.append(clip.tags.joined(separator: ", ")) }
+        return parts.joined(separator: " | ")
     }
 
     private var drawingToolbar: some View {
