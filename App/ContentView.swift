@@ -4,6 +4,12 @@ import AVFoundation
 import VideoCoachCore
 
 struct ContentView: View {
+    /// Owned by `VideoCoachApp` so the same instance backs both the
+    /// top-level Devices menu and this view's onChange handlers. Passed in
+    /// rather than created here so the menu's selection edits actually
+    /// reach the capture session.
+    @Bindable var deviceCatalog: DeviceCatalog
+
     @State private var workspace = Workspace()
     @State private var selectedClipID: Clip.ID?
     @State private var appMode: AppMode = .scanning
@@ -16,6 +22,10 @@ struct ContentView: View {
     /// or microphone access. Renders `permissionDeniedView()` in place of
     /// the main UI so the user sees how to fix it.
     @State private var permissionDenied = false
+    /// Set when a previously-saved preferred camera/mic isn't present (e.g.
+    /// USB camera unplugged between sessions). Surfaced as a non-fatal
+    /// alert; the session keeps running with the system default.
+    @State private var deviceFallbackAlert: String?
     /// Active during `.recording`. Created on the main actor only after the
     /// first sample buffer lands. nil between recordings.
     @State private var recordingController: RecordingController?
@@ -41,41 +51,177 @@ struct ContentView: View {
     }
 
     var body: some View {
-        Group {
-            if permissionDenied {
-                Self.permissionDeniedView()
-            } else {
-                mainSplit
+        rootContent
+            .modifier(AlertsModifier(
+                openProjectError: $openProjectError,
+                recordingError: $recordingError,
+                deviceFallbackAlert: $deviceFallbackAlert
+            ))
+            .modifier(DeviceWiringModifier(
+                appMode: appMode,
+                workspaceFolder: workspace.folder,
+                catalog: deviceCatalog,
+                onProjectOpened: seedAndApplyPreferredDevices,
+                onCameraChange: handleCameraSelectionChange,
+                onMicChange: handleMicSelectionChange
+            ))
+            .onChange(of: selectedClipID) { _, newID in
+                handleSelectionChange(newID)
+            }
+            .task {
+                // Configure the capture session once on first appearance.
+                // If the user denies permission, surface
+                // `permissionDeniedView()`. Preferred IDs aren't known yet
+                // — no project is open at this point — so we use system
+                // defaults; the project-opened handler swaps to the saved
+                // devices afterward.
+                do {
+                    try await capture.configure()
+                } catch CaptureError.permissionDenied {
+                    permissionDenied = true
+                } catch {
+                    // Capture-config failures other than permission denial
+                    // fail softly: the user can still scan footage,
+                    // recording is just disabled. Pressing R will surface
+                    // the error via the alert.
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var rootContent: some View {
+        if permissionDenied {
+            Self.permissionDeniedView()
+        } else {
+            mainSplit
+        }
+    }
+
+    // MARK: - Device handling
+
+    /// Called when a project just finished opening (or was switched). Reads
+    /// the project's preferred camera/mic IDs into the catalog and asks the
+    /// capture session to switch to them. If the saved device is gone, we
+    /// fall back to system default and surface a one-shot alert; the
+    /// preference is intentionally NOT cleared so reattaching the device
+    /// restores it.
+    private func seedAndApplyPreferredDevices() {
+        let cameraID = workspace.project.preferences.preferredCameraID
+        let micID = workspace.project.preferences.preferredMicID
+        // Seed the catalog WITHOUT firing the onChange handlers' usual
+        // save-back logic — we set the IDs to match the project, so
+        // there's no new value to save. The onChange handlers will see
+        // `oldID == newID` for the project's saved values and bail early
+        // (Picker assignment with the same value is a no-op anyway).
+        deviceCatalog.selectedCameraID = cameraID
+        deviceCatalog.selectedMicID = micID
+
+        Task {
+            var fallbackMessages: [String] = []
+            if cameraID != nil {
+                do {
+                    try await capture.switchVideoDevice(uniqueID: cameraID)
+                } catch CaptureError.deviceUnavailable {
+                    fallbackMessages.append(
+                        "Saved camera was unavailable; falling back to the system default."
+                    )
+                    try? await capture.switchVideoDevice(uniqueID: nil)
+                    // Reflect reality in the menu so the checkmark is on
+                    // "System Default", but DON'T overwrite the project's
+                    // preferredCameraID — leave it so reattaching the
+                    // device restores the selection on next launch.
+                    deviceCatalog.selectedCameraID = nil
+                } catch {
+                    // Other errors (permission, AVFoundation refusing the
+                    // input) fall through silently — recording will surface
+                    // the underlying problem when the user presses R.
+                }
+            }
+            if micID != nil {
+                do {
+                    try await capture.switchAudioDevice(uniqueID: micID)
+                } catch CaptureError.deviceUnavailable {
+                    fallbackMessages.append(
+                        "Saved microphone was unavailable; falling back to the system default."
+                    )
+                    try? await capture.switchAudioDevice(uniqueID: nil)
+                    deviceCatalog.selectedMicID = nil
+                } catch {
+                    // Same rationale as the camera branch.
+                }
+            }
+            if !fallbackMessages.isEmpty {
+                await MainActor.run {
+                    self.deviceFallbackAlert = fallbackMessages.joined(separator: "\n")
+                }
             }
         }
-        .alert(
-            "Open Project Failed",
-            isPresented: .constant(openProjectError != nil),
-            presenting: openProjectError
-        ) { _ in
-            Button("OK") { openProjectError = nil }
-        } message: { Text($0) }
-        .alert(
-            "Recording Failed",
-            isPresented: .constant(recordingError != nil),
-            presenting: recordingError
-        ) { _ in
-            Button("OK") { recordingError = nil }
-        } message: { Text($0) }
-        .onChange(of: selectedClipID) { _, newID in
-            handleSelectionChange(newID)
-        }
-        .task {
-            // Configure the capture session once on first appearance. If the
-            // user denies permission, surface `permissionDeniedView()`.
+    }
+
+    private func handleCameraSelectionChange(_ newID: String?) {
+        // Don't try to swap mid-recording — the menu disables itself in
+        // that state, but a stale notification could still slip through.
+        guard !deviceCatalog.lockedByRecording else { return }
+        // No-op if the project's saved preference already matches —
+        // happens during `seedAndApplyPreferredDevices`.
+        if workspace.project.preferences.preferredCameraID == newID,
+           capture.videoDeviceUniqueID == newID
+        { return }
+        Task {
             do {
-                try await capture.configure()
-            } catch CaptureError.permissionDenied {
-                permissionDenied = true
+                try await capture.switchVideoDevice(uniqueID: newID)
+                await MainActor.run {
+                    workspace.project.preferences.preferredCameraID = newID
+                    try? workspace.saveProject()
+                }
+            } catch CaptureError.deviceUnavailable(let id) {
+                await MainActor.run {
+                    self.deviceFallbackAlert = "Camera (\(String(id.prefix(12)))…) was unavailable."
+                    // Revert the menu selection back to whatever the
+                    // session is actually using right now.
+                    self.deviceCatalog.selectedCameraID = self.capture.videoDeviceUniqueID
+                }
+            } catch CaptureError.alreadyRecording {
+                // Stop trying — UI was supposed to disable. Revert the
+                // menu so the checkmark stays on the live device.
+                await MainActor.run {
+                    self.deviceCatalog.selectedCameraID = self.capture.videoDeviceUniqueID
+                }
             } catch {
-                // Capture-config failures other than permission denial fail
-                // softly: the user can still scan footage, recording is just
-                // disabled. Pressing R will surface the error via the alert.
+                await MainActor.run {
+                    self.deviceFallbackAlert = "Couldn't switch camera: \(error.localizedDescription)"
+                    self.deviceCatalog.selectedCameraID = self.capture.videoDeviceUniqueID
+                }
+            }
+        }
+    }
+
+    private func handleMicSelectionChange(_ newID: String?) {
+        guard !deviceCatalog.lockedByRecording else { return }
+        if workspace.project.preferences.preferredMicID == newID,
+           capture.audioDeviceUniqueID == newID
+        { return }
+        Task {
+            do {
+                try await capture.switchAudioDevice(uniqueID: newID)
+                await MainActor.run {
+                    workspace.project.preferences.preferredMicID = newID
+                    try? workspace.saveProject()
+                }
+            } catch CaptureError.deviceUnavailable(let id) {
+                await MainActor.run {
+                    self.deviceFallbackAlert = "Microphone (\(String(id.prefix(12)))…) was unavailable."
+                    self.deviceCatalog.selectedMicID = self.capture.audioDeviceUniqueID
+                }
+            } catch CaptureError.alreadyRecording {
+                await MainActor.run {
+                    self.deviceCatalog.selectedMicID = self.capture.audioDeviceUniqueID
+                }
+            } catch {
+                await MainActor.run {
+                    self.deviceFallbackAlert = "Couldn't switch microphone: \(error.localizedDescription)"
+                    self.deviceCatalog.selectedMicID = self.capture.audioDeviceUniqueID
+                }
             }
         }
     }
@@ -330,5 +476,69 @@ struct ContentView: View {
         }
         .padding(40)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+}
+
+/// Bundles the three string-bound alerts so the body's modifier chain stays
+/// short enough for the Swift type-checker to handle in reasonable time.
+private struct AlertsModifier: ViewModifier {
+    @Binding var openProjectError: String?
+    @Binding var recordingError: String?
+    @Binding var deviceFallbackAlert: String?
+
+    func body(content: Content) -> some View {
+        content
+            .alert(
+                "Open Project Failed",
+                isPresented: .constant(openProjectError != nil),
+                presenting: openProjectError
+            ) { _ in
+                Button("OK") { openProjectError = nil }
+            } message: { Text($0) }
+            .alert(
+                "Recording Failed",
+                isPresented: .constant(recordingError != nil),
+                presenting: recordingError
+            ) { _ in
+                Button("OK") { recordingError = nil }
+            } message: { Text($0) }
+            .alert(
+                "Device Unavailable",
+                isPresented: .constant(deviceFallbackAlert != nil),
+                presenting: deviceFallbackAlert
+            ) { _ in
+                Button("OK") { deviceFallbackAlert = nil }
+            } message: { Text($0) }
+    }
+}
+
+/// All Devices-menu wiring: mirror appMode into the catalog's lock flag,
+/// react to project-open by reading saved device prefs, and pipe menu
+/// selection edits back to the capture-session swap callbacks.
+private struct DeviceWiringModifier: ViewModifier {
+    let appMode: AppMode
+    let workspaceFolder: URL?
+    let catalog: DeviceCatalog
+    let onProjectOpened: () -> Void
+    let onCameraChange: (String?) -> Void
+    let onMicChange: (String?) -> Void
+
+    func body(content: Content) -> some View {
+        let stepOne = content
+            .onChange(of: appMode) { _, newMode in
+                catalog.lockedByRecording =
+                    (newMode == .recording || newMode == .recordingStarting)
+            }
+            .onChange(of: workspaceFolder) { _, newFolder in
+                guard newFolder != nil else { return }
+                onProjectOpened()
+            }
+        return stepOne
+            .onChange(of: catalog.selectedCameraID) { _, newID in
+                onCameraChange(newID)
+            }
+            .onChange(of: catalog.selectedMicID) { _, newID in
+                onMicChange(newID)
+            }
     }
 }
