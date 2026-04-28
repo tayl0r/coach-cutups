@@ -68,6 +68,14 @@ final class CaptureSessionController: NSObject,
     private let dataOutput = AVCaptureVideoDataOutput()
     private let dataQueue = DispatchQueue(label: "videoCoach.capture.data")
 
+    /// Serial queue for all `AVCaptureSession` interactions. Apple's AVCam
+    /// sample dispatches every session op to a queue like this because
+    /// `startRunning()` is documented as blocking, and AVFoundation's own
+    /// callbacks can race a stepped-on main runloop. Distinct from
+    /// `dataQueue` (sample-buffer delivery) on purpose — the two queues
+    /// have unrelated lifecycles.
+    private let sessionQueue = DispatchQueue(label: "videoCoach.capture.session")
+
     /// Flips to true the first time the data-output delegate receives a
     /// valid sample buffer after the session starts running. `waitForWarmup`
     /// polls this; cleared in `pauseSession` so the next resume waits for a
@@ -549,5 +557,26 @@ final class CaptureSessionController: NSObject,
             )
         }
         return defaultDevice
+    }
+
+    // MARK: - Session-queue dispatch
+
+    /// Bridges async/await callers onto the serial `sessionQueue` so
+    /// `session.startRunning()`, configuration changes, and
+    /// `movieOutput.startRecording(...)` all run there. The serial queue's
+    /// FIFO ordering replaces the polling-based warmup wait — by the time
+    /// a later block runs, every prior session op has fully returned.
+    private func runOnSessionQueue<T>(
+        _ work: @Sendable @escaping () throws -> T
+    ) async throws -> T {
+        try await withCheckedThrowingContinuation { cont in
+            sessionQueue.async {
+                do {
+                    cont.resume(returning: try work())
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
     }
 }
