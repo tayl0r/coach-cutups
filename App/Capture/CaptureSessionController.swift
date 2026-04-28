@@ -244,9 +244,7 @@ final class CaptureSessionController: NSObject,
     }
 
     /// Tears the session down so the OS frees the camera/mic — turns off the
-    /// recording-indicator light. Called after `stopRecording` returns (or
-    /// after a failed `configure`) so the camera isn't held while the user is
-    /// just scanning footage. Calls to `configure` after `teardown` are
+    /// recording-indicator light. Calls to `configure` after `teardown` are
     /// expected to succeed: this restores the controller to its initial
     /// state. Refuses while a recording is still in flight.
     func teardown() async {

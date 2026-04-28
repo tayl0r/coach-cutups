@@ -92,7 +92,7 @@ struct ContentView: View {
             // capture session at launch turns on the camera/mic indicator
             // light and triggers the OS permission prompt before the user
             // has shown any intent to record. We defer configuration to the
-            // first `startRecording()` instead, then teardown on stop so the
+            // first `startRecording()` instead, then pause on stop so the
             // light goes off between recordings.
     }
 
