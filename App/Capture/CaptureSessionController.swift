@@ -8,11 +8,6 @@ enum CaptureError: Error, LocalizedError {
     case permissionDenied(media: AVMediaType)
     case alreadyRecording
     case firstSampleTimeout
-    /// Sample-buffer PTS could not be converted from the device clock to the
-    /// host clock (the two clocks aren't synchronizable). Should be impossible
-    /// on the standard built-in camera / Continuity Camera path; would only
-    /// fire on a pathological external pro-capture device.
-    case clockConversionFailed
     /// User picked a device by `uniqueID` (via the Devices menu) that has
     /// since vanished — typically a USB camera unplugged between menu open
     /// and click. Surfaced via the menu's onChange so the UI reverts the
@@ -32,8 +27,6 @@ enum CaptureError: Error, LocalizedError {
         case .alreadyRecording: return "A recording is already in progress."
         case .firstSampleTimeout:
             return "Capture timed out waiting for the first frame from the camera (2s)."
-        case .clockConversionFailed:
-            return "Camera/host clock relationship couldn't be established."
         case .deviceUnavailable(let id):
             return "Selected device (\(String(id.prefix(12)))…) is unavailable."
         }
