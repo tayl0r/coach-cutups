@@ -23,6 +23,15 @@ public struct Preferences: Codable, Hashable, Sendable {
     public var previewCommentaryVolume: Double = 1.0
     public var lastExportResolution: Resolution = .r1080
     public var lastExportQuality: Quality = .medium
+    /// `AVCaptureDevice.uniqueID` of the user's preferred camera. `nil` means
+    /// "use the system default." If the saved device is not present at launch
+    /// (e.g. an unplugged USB cam), the app falls back to the system default
+    /// without clearing this — so the preference is restored if the device
+    /// reappears.
+    public var preferredCameraID: String? = nil
+    /// `AVCaptureDevice.uniqueID` of the user's preferred microphone. Same
+    /// fallback semantics as `preferredCameraID`.
+    public var preferredMicID: String? = nil
     public init() {}
 }
 

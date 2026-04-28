@@ -42,6 +42,41 @@ final class ProjectTests: XCTestCase {
         )
     }
 
+    func test_preferencesDeviceIDs_roundtripWhenSet() throws {
+        var p = Project(name: "DevicePrefs")
+        p.preferences.preferredCameraID = "cam-uniqueID-123"
+        p.preferences.preferredMicID = "mic-uniqueID-456"
+        let data = try JSONEncoder().encode(p)
+        let decoded = try JSONDecoder().decode(Project.self, from: data)
+        XCTAssertEqual(decoded.preferences.preferredCameraID, "cam-uniqueID-123")
+        XCTAssertEqual(decoded.preferences.preferredMicID, "mic-uniqueID-456")
+    }
+
+    func test_preferencesDeviceIDs_decodeFromLegacyJSONMissingKeys() throws {
+        // Legacy project.json from before the Devices menu shipped: no
+        // preferredCameraID / preferredMicID keys present. Must decode
+        // cleanly with both fields nil — this is the back-compat contract.
+        let legacyJSON = """
+        {
+          "formatVersion": 1,
+          "name": "Legacy",
+          "sourceVideos": [],
+          "clips": [],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium"
+          }
+        }
+        """.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(Project.self, from: legacyJSON)
+        XCTAssertNil(decoded.preferences.preferredCameraID)
+        XCTAssertNil(decoded.preferences.preferredMicID)
+        XCTAssertEqual(decoded.name, "Legacy")
+    }
+
     func test_projectWithNestedStrokeEventRoundtrips() throws {
         let strokeID = UUID()
         let stroke = Stroke(
