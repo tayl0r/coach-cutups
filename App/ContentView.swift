@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @State private var workspace = Workspace()
@@ -13,6 +14,10 @@ struct ContentView: View {
                 Button("Open Project Folder…") {
                     openProjectFolder()
                 }
+                Button("Add Source Video…") {
+                    addSourceVideo()
+                }
+                .disabled(workspace.folder == nil)
             }
         }
         .padding()
@@ -38,6 +43,15 @@ struct ContentView: View {
                     openProjectError = "Couldn't open project: \(error.localizedDescription)\n\nIf project.json is corrupted, restore it from a backup before retrying."
                 }
             }
+        }
+    }
+
+    private func addSourceVideo() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            Task { try? await workspace.addSourceVideo(url: url) }
         }
     }
 

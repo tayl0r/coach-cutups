@@ -40,6 +40,18 @@ final class Workspace {
         try ProjectStore.write(project, to: folder)
     }
 
+    func addSourceVideo(url: URL) async throws {
+        let bookmark = try url.bookmarkData(options: [])  // plain — we're unsandboxed
+        let asset = AVURLAsset(url: url)
+        let duration = try await asset.load(.duration)
+        project.sourceVideos.append(.init(
+            bookmark: bookmark,
+            displayName: url.lastPathComponent,
+            durationSeconds: duration.seconds))
+        try saveProject()
+        try await rebuildVirtualPlayer()
+    }
+
     func rebuildVirtualPlayer() async throws {
         guard !project.sourceVideos.isEmpty else { virtualPlayer = nil; return }
         let comp = AVMutableComposition()
