@@ -99,6 +99,10 @@ struct ContentView: View {
             .onChange(of: selectedClipID) { _, newID in
                 handleSelectionChange(newID)
             }
+            // Publish the delete handler to the top-level Clip menu — nil
+            // when no clip is selected or we're recording, so the menu item
+            // (and its Cmd+Delete shortcut) auto-disable in those states.
+            .focusedValue(\.deleteSelectedClip, deleteSelectedClipHandler)
             .task {
                 // Configure the capture session once on first appearance.
                 // If the user denies permission, surface
@@ -299,8 +303,7 @@ struct ContentView: View {
                         onSkip: handleSkip,
                         onTogglePlay: handleTogglePlay,
                         onToggleRecord: handleToggleRecord,
-                        onClosePreview: handleClosePreview,
-                        onRequestDeleteSelectedClip: { requestDeleteClip(selectedClipID) }
+                        onClosePreview: handleClosePreview
                     )
                     if case .previewLoading = appMode {
                         // Cover the player surface while we wait for the preview
@@ -522,13 +525,22 @@ struct ContentView: View {
     }
 
     /// Request deletion of a specific clip — pops the destructive confirm
-    /// alert. Wired by the sidebar context menu and the Cmd+Delete key.
+    /// alert. Wired by the sidebar context menu and the Clip ▸ Delete menu.
     /// Ignored during recording (the user can't make sense of "delete a clip"
     /// while one is being captured) and ignored when no clip is selected.
     private func requestDeleteClip(_ id: Clip.ID?) {
         guard let id else { return }
         if appMode == .recording || appMode == .recordingStarting { return }
         clipPendingDeletion = id
+    }
+
+    /// Computed handler published to the Clip menu via `@FocusedValue`.
+    /// nil when there's nothing to delete OR while recording — the menu
+    /// item disables itself in either case.
+    private var deleteSelectedClipHandler: (() -> Void)? {
+        guard let id = selectedClipID else { return nil }
+        if appMode == .recording || appMode == .recordingStarting { return nil }
+        return { requestDeleteClip(id) }
     }
 
     /// Actually delete after user confirms. If the clip was previewing, close
