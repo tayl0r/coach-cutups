@@ -65,51 +65,39 @@ final class KeyCatchingView: NSView {
         guard window != nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, let window = self.window, window.isKeyWindow else { return event }
+            // If a text editor (TextField field editor or TextEditor) currently has
+            // focus, let the keystroke through. Otherwise typing "space", "a", "d"
+            // into a name/tag/notes field would silently trigger video transport
+            // commands instead of inserting characters.
+            if window.firstResponder is NSText { return event }
 
             // While the recording is being prepared (waiting for the first
             // sample buffer), ignore every shortcut. Recording any event in
             // this window would anchor it to a t < 0 once t0 lands.
             if self.appMode == .recordingStarting { return nil }
 
-            // Escape gets evaluated BEFORE the text-field passthrough check.
-            // In `.previewClip` we want one Escape to always exit back to
-            // scanning even if the user is typing in the Name/Notes/Tags
-            // fields; ending field editing first commits any in-flight text
-            // (SwiftUI binding writes already happened on each keystroke;
-            // resigning first responder also ensures TagField's
-            // onDisappear-commit fires cleanly).
-            if event.keyCode == KeyCode.escape {
-                switch self.appMode {
-                case .previewClip, .previewLoading:
-                    if window.firstResponder is NSText {
-                        // Commits any pending edit by resigning first responder.
-                        window.makeFirstResponder(nil)
-                    }
-                    self.onClosePreview()
-                    return nil
-                case .recording:
-                    self.onToggleRecord()
-                    return nil
-                default:
-                    // Scanning: let AppKit handle Esc normally (e.g., abort
-                    // a field edit, dismiss a popover). Don't intercept.
-                    return event
-                }
-            }
-
-            // For every other shortcut, defer to text fields. Otherwise
-            // typing "space", "a", "d" into a name/tag/notes field would
-            // silently trigger video transport commands instead of inserting
-            // characters.
-            if window.firstResponder is NSText { return event }
-
             switch event.keyCode {
             case KeyCode.r:
                 // R toggles recording in scanning and recording modes; preview
-                // modes ignore it (the user already exits via Esc above).
+                // modes ignore it (the user may still want to flip back via Esc/Cmd).
                 switch self.appMode {
                 case .scanning, .recording:
                     self.onToggleRecord()
+                    return nil
+                default:
+                    return event
+                }
+            case KeyCode.escape:
+                // Esc handles "exit current mode": stop recording during
+                // .recording, close clip preview during .previewClip /
+                // .previewLoading. Outside those modes it falls through so
+                // AppKit's normal Esc (close popover, dismiss sheet) works.
+                switch self.appMode {
+                case .recording:
+                    self.onToggleRecord()
+                    return nil
+                case .previewClip, .previewLoading:
+                    self.onClosePreview()
                     return nil
                 default:
                     return event
