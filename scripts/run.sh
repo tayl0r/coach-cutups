@@ -15,6 +15,31 @@ if command -v xcodegen >/dev/null 2>&1 \
   xcodegen generate
 fi
 
+# Stamp App/BuildInfo.swift with the current git SHA + timestamp so the
+# running app can render its own build identity in the window subtitle.
+# The placeholder ("dev"/"") is restored after launch so `git status`
+# stays clean — see "restore BuildInfo" block below.
+SHA=$(git rev-parse --short HEAD)
+DIRTY=""
+if ! git diff --quiet HEAD -- ':!App/BuildInfo.swift'; then
+  DIRTY="-dirty"
+fi
+BUILT_AT=$(date '+%Y-%m-%d %H:%M:%S')
+cat > App/BuildInfo.swift <<EOF
+import Foundation
+
+/// Build-time identification baked in by \`scripts/run.sh\`. The script
+/// rewrites this file with the current short git SHA and timestamp before
+/// each \`xcodebuild\`, then restores the placeholder afterward so the
+/// working tree stays clean. \`ContentView\` reads \`BuildInfo.commit\` and
+/// renders it as the window's navigation subtitle so the user can verify
+/// which build is actually running.
+enum BuildInfo {
+    static let commit: String = "${SHA}${DIRTY}"
+    static let builtAt: String = "$BUILT_AT"
+}
+EOF
+
 echo "==> building"
 xcodebuild \
   -project VideoCoach.xcodeproj \
@@ -22,6 +47,12 @@ xcodebuild \
   -configuration Debug \
   build \
   | grep -E "error:|warning:|\*\* BUILD" || true
+
+# Restore the placeholder so the working tree doesn't show this file as
+# perpetually modified between runs. The compiled binary already captured
+# the real SHA above, so restoring the source has no effect on the running
+# app.
+git checkout HEAD -- App/BuildInfo.swift 2>/dev/null || true
 
 # Resolve the BUILT_PRODUCTS_DIR (DerivedData path varies per machine).
 APP=$(xcodebuild \

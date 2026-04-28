@@ -64,6 +64,11 @@ struct ContentView: View {
 
     var body: some View {
         rootContent
+            // Window title + subtitle. The subtitle exposes the build's git
+            // SHA + timestamp (set by scripts/run.sh into App/BuildInfo.swift)
+            // so the user can visually confirm which build they're testing.
+            .navigationTitle("Coach Cutups")
+            .navigationSubtitle(buildSubtitle)
             .modifier(AlertsModifier(
                 openProjectError: $openProjectError,
                 recordingError: $recordingError,
@@ -99,6 +104,14 @@ struct ContentView: View {
     @ViewBuilder
     private var rootContent: some View {
         mainSplit
+    }
+
+    /// Renders the navigation subtitle as "<sha> · <built-at>" when both
+    /// pieces are populated by `scripts/run.sh`, falling back to "dev" when
+    /// running an Xcode-direct build that didn't go through the script.
+    private var buildSubtitle: String {
+        if BuildInfo.builtAt.isEmpty { return BuildInfo.commit }
+        return "\(BuildInfo.commit) · \(BuildInfo.builtAt)"
     }
 
     // MARK: - Device handling
