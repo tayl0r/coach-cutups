@@ -89,6 +89,14 @@ struct ExportSheet: View {
             }
             resolution = workspace.project.preferences.lastExportResolution
             quality = workspace.project.preferences.lastExportQuality
+            // Default to "select all" — the all-clips synthetic row plus
+            // every real tag in the project. Per-row checkboxes still let
+            // the user narrow it down. Only seed once: if the user already
+            // unchecked things in this sheet presentation we don't want to
+            // re-tick them on re-render.
+            if selectedTags.isEmpty {
+                selectedTags = Set([Self.allClipsKey] + workspace.project.clips.flatMap(\.tags))
+            }
         }
         .alert(
             "Export Failed",
