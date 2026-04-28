@@ -14,6 +14,10 @@ struct ContentView: View {
     @State private var selectedClipID: Clip.ID?
     @State private var appMode: AppMode = .scanning
     @State private var openProjectError: String?
+    /// Drives the Export Compilations sheet. Toggled by the toolbar button
+    /// (disabled when there's no project open or the project has no clips —
+    /// a no-op export sheet would have nothing to do anyway).
+    @State private var showExportSheet = false
 
     // MARK: - Capture / recording state
 
@@ -310,6 +314,29 @@ struct ContentView: View {
                 selectedClipID: $selectedClipID
             )
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
+        }
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button {
+                    showExportSheet = true
+                } label: {
+                    Label("Export…", systemImage: "square.and.arrow.up")
+                }
+                // Disabled when the export would have nothing to render —
+                // either no project folder open or no clips recorded yet.
+                // ExportSheet itself enforces "at least one tag checked" on
+                // the Export button; this gate just prevents users opening
+                // an empty sheet.
+                .disabled(workspace.folder == nil || workspace.project.clips.isEmpty)
+                .help(workspace.folder == nil
+                      ? "Open a project to export"
+                      : (workspace.project.clips.isEmpty
+                         ? "Record at least one clip to export"
+                         : "Export compilations…"))
+            }
+        }
+        .sheet(isPresented: $showExportSheet) {
+            ExportSheet(workspace: workspace, isPresented: $showExportSheet)
         }
     }
 
