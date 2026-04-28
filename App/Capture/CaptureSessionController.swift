@@ -131,27 +131,29 @@ final class CaptureSessionController: NSObject,
         let videoInput = try AVCaptureDeviceInput(device: video)
         let audioInput = try AVCaptureDeviceInput(device: audio)
 
-        session.beginConfiguration()
-        // NOTE: `AVCaptureSession.Preset.inputPriority` is iOS-only. On macOS
-        // we leave the preset alone — setting `device.activeFormat` after
-        // `addInput` transitions the session's effective preset to
-        // input-priority semantics automatically, which is exactly what we
-        // want (the explicit `device.activeFormat` we set below wins).
-        if session.canAddInput(videoInput) { session.addInput(videoInput) }
-        if session.canAddInput(audioInput) { session.addInput(audioInput) }
-        if session.canAddOutput(movieOutput) { session.addOutput(movieOutput) }
-        if session.canAddOutput(dataOutput) {
-            dataOutput.setSampleBufferDelegate(self, queue: dataQueue)
-            dataOutput.alwaysDiscardsLateVideoFrames = true
-            session.addOutput(dataOutput)
+        try await runOnSessionQueue {
+            self.session.beginConfiguration()
+            // NOTE: `AVCaptureSession.Preset.inputPriority` is iOS-only. On macOS
+            // we leave the preset alone — setting `device.activeFormat` after
+            // `addInput` transitions the session's effective preset to
+            // input-priority semantics automatically, which is exactly what we
+            // want (the explicit `device.activeFormat` we set below wins).
+            if self.session.canAddInput(videoInput) { self.session.addInput(videoInput) }
+            if self.session.canAddInput(audioInput) { self.session.addInput(audioInput) }
+            if self.session.canAddOutput(self.movieOutput) { self.session.addOutput(self.movieOutput) }
+            if self.session.canAddOutput(self.dataOutput) {
+                self.dataOutput.setSampleBufferDelegate(self, queue: self.dataQueue)
+                self.dataOutput.alwaysDiscardsLateVideoFrames = true
+                self.session.addOutput(self.dataOutput)
+            }
+            // Canonical AVCam ordering: `addInput` resets the device to the
+            // preset's default format, so `activeFormat` MUST be set after the
+            // input is added (otherwise it's silently undone — notably back to
+            // 1920×1440 4:3 on Continuity Camera).
+            try self.setPreferredFormat(on: video)
+            self.session.commitConfiguration()
+            self.session.startRunning()
         }
-        // Canonical AVCam ordering: `addInput` resets the device to the
-        // preset's default format, so `activeFormat` MUST be set after the
-        // input is added (otherwise it's silently undone — notably back to
-        // 1920×1440 4:3 on Continuity Camera).
-        try setPreferredFormat(on: video)
-        session.commitConfiguration()
-        session.startRunning()
         isReady = true
     }
 
