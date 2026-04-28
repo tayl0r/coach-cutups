@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import AVFoundation
 import UniformTypeIdentifiers
 
 struct ContentView: View {
@@ -8,8 +9,22 @@ struct ContentView: View {
 
     var body: some View {
         VStack {
-            PlayerSurface(player: workspace.virtualPlayer)
-                .frame(minWidth: 640, minHeight: 360)
+            ZStack {
+                PlayerSurface(player: workspace.virtualPlayer)
+                KeyCommandView(
+                    player: workspace.virtualPlayer,
+                    onSkip: { delta in
+                        guard let p = workspace.virtualPlayer else { return }
+                        let t = p.currentTime() + CMTime(seconds: delta, preferredTimescale: 600)
+                        p.seek(to: t, toleranceBefore: .zero, toleranceAfter: .zero)
+                    },
+                    onTogglePlay: {
+                        guard let p = workspace.virtualPlayer else { return }
+                        p.rate == 0 ? p.play() : p.pause()
+                    }
+                )
+            }
+            .frame(minWidth: 640, minHeight: 360)
             HStack {
                 Button("Open Project Folder…") {
                     openProjectFolder()
