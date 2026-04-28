@@ -196,7 +196,18 @@ struct PreviewTransport: View {
     @State private var currentTime: Double = 0
     @State private var duration: Double = 0
     @State private var isPlaying: Bool = false
-    @State private var timeObserver: Any?
+    /// Bundles the time-observer token with the AVPlayer it was registered
+    /// against. Removing a token from the WRONG player throws an Obj-C
+    /// exception (which crashes the process), so we must keep the pair
+    /// together. The plain `player` computed property resolves to the
+    /// *current* clip's player — fine for play/pause/seek, but useless for
+    /// removeTimeObserver after a clip switch.
+    @State private var observerBinding: ObserverBinding?
+
+    private struct ObserverBinding {
+        let player: AVPlayer
+        let token: Any
+    }
 
     private var player: AVPlayer? { workspace.previewPlayer(for: clipID) }
 
@@ -268,6 +279,10 @@ struct PreviewTransport: View {
         .onAppear { attachObserver() }
         .onDisappear { detachObserver() }
         .onChange(of: clipID) { _, _ in
+            // Detach uses observerBinding (which holds the OLD player); attach
+            // grabs the NEW player from the computed property. Order matters
+            // — detach first so the old player's observer is cleanly removed
+            // before we install a new one.
             detachObserver()
             attachObserver()
         }
@@ -285,7 +300,7 @@ struct PreviewTransport: View {
             duration = item.duration.seconds.isFinite ? item.duration.seconds : 0
         }
         let interval = CMTime(seconds: 0.1, preferredTimescale: 600)
-        timeObserver = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
+        let token = player.addPeriodicTimeObserver(forInterval: interval, queue: .main) { time in
             currentTime = time.seconds.isFinite ? time.seconds : 0
             isPlaying = player.rate != 0
             // Duration may resolve asynchronously after the player item loads.
@@ -294,13 +309,17 @@ struct PreviewTransport: View {
                 duration = item.duration.seconds
             }
         }
+        observerBinding = ObserverBinding(player: player, token: token)
     }
 
     private func detachObserver() {
-        if let token = timeObserver, let player {
-            player.removeTimeObserver(token)
+        // CRITICAL: remove the token from the SAME AVPlayer it was registered
+        // against. Removing from a different player throws
+        // NSInternalInconsistencyException which crashes the process.
+        if let binding = observerBinding {
+            binding.player.removeTimeObserver(binding.token)
         }
-        timeObserver = nil
+        observerBinding = nil
     }
 }
 
