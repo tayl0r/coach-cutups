@@ -1,17 +1,21 @@
 import SwiftUI
 import VideoCoachCore
 
-/// Left pane: editable project name + a `List` of clips bound to
-/// `selectedClipID`. Drag-to-reorder rewrites `sortIndex` via
-/// `Workspace.reorderClips`. Selection is disabled while recording so users
-/// can't switch modes mid-capture.
+/// Left pane: editable project name + a `List` with two sections —
+/// collapsible Sources (drag-to-reorder, X to unload) and Clips (selection
+/// drives the inspector + preview). Drag-to-reorder rewrites `sortIndex`
+/// for clips and re-permutes `sourceIndex` for sources via Workspace.
+/// Selection is disabled while recording so users can't switch modes
+/// mid-capture.
 struct ClipSidebar: View {
     @Bindable var workspace: Workspace
     @Binding var selectedClipID: Clip.ID?
     let appMode: AppMode
-    /// Pops the destructive confirm alert. Owned by ContentView so the alert
-    /// has access to the workspace + selection state.
     var onRequestDeleteClip: (Clip.ID) -> Void
+
+    /// Persisted across launches — the user picked their preference once,
+    /// don't re-impose the default each session.
+    @AppStorage("sidebar.sourcesExpanded") private var sourcesExpanded: Bool = true
 
     private var sortedClips: [Clip] {
         workspace.project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
@@ -33,24 +37,12 @@ struct ClipSidebar: View {
             Divider()
 
             List(selection: $selectedClipID) {
-                ForEach(sortedClips) { clip in
-                    HStack {
-                        Text(clip.name).lineLimit(1)
-                        Spacer()
-                        Text(formatDuration(clip.recordingDuration))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .monospacedDigit()
-                    }
-                    .tag(clip.id)
-                }
-                .onMove { indices, dest in
-                    workspace.reorderClips(from: indices, to: dest)
-                }
+                sourcesSection
+                clipsSection
             }
-            // macOS 13+ selection-aware context menu. Handles right-click on
-            // an unselected row (briefly selects it for the action) and
-            // doesn't depend on per-row hit-target tricks like .contentShape.
+            // Selection-aware context menu for Clips. Sources rows have
+            // no `.tag()` so they can't be selected and won't ever
+            // trigger this — only Clip.IDs land here.
             .contextMenu(forSelectionType: Clip.ID.self) { ids in
                 if let id = ids.first {
                     Button(role: .destructive) {
@@ -62,6 +54,84 @@ struct ClipSidebar: View {
                 }
             }
             .disabled(isRecording)
+        }
+    }
+
+    // MARK: - Sources
+
+    @ViewBuilder
+    private var sourcesSection: some View {
+        Section(isExpanded: $sourcesExpanded) {
+            if workspace.project.sourceVideos.isEmpty {
+                Text("No source videos · add one from the toolbar")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                // Bookmark Data is Hashable and uniquely identifies a
+                // source ref; using it as the ForEach id keeps row
+                // identity stable across reorders.
+                ForEach(workspace.project.sourceVideos, id: \.bookmark) { src in
+                    sourceRow(src)
+                }
+                .onMove { offsets, dest in
+                    Task { try? await workspace.reorderSourceVideos(from: offsets, to: dest) }
+                }
+            }
+        } header: {
+            Text("Sources")
+        }
+    }
+
+    @ViewBuilder
+    private func sourceRow(_ src: SourceRef) -> some View {
+        // Look the index up by bookmark on every render — cheap (handful
+        // of items at most) and stays correct after reorders/removes.
+        let idx = workspace.project.sourceVideos.firstIndex(where: { $0.bookmark == src.bookmark })
+        let refCount = idx.map { workspace.clipsReferencing(sourceIndex: $0) } ?? 0
+        HStack(spacing: 6) {
+            Text(src.displayName).lineLimit(1).truncationMode(.middle)
+            Spacer(minLength: 4)
+            Text(formatDuration(src.durationSeconds))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+            Button {
+                if let i = idx {
+                    Task { try? await workspace.removeSourceVideo(at: i) }
+                }
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.borderless)
+            .disabled(refCount > 0)
+            .help(refCount > 0
+                  ? "\(refCount) clip\(refCount == 1 ? "" : "s") reference this source — delete those first"
+                  : "Unload this source")
+        }
+    }
+
+    // MARK: - Clips
+
+    @ViewBuilder
+    private var clipsSection: some View {
+        Section {
+            ForEach(sortedClips) { clip in
+                HStack {
+                    Text(clip.name).lineLimit(1)
+                    Spacer()
+                    Text(formatDuration(clip.recordingDuration))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .tag(clip.id)
+            }
+            .onMove { indices, dest in
+                workspace.reorderClips(from: indices, to: dest)
+            }
+        } header: {
+            Text("Clips")
         }
     }
 }

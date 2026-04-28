@@ -6,6 +6,10 @@ import Observation
 enum WorkspaceError: Error {
     case noVideoTrack(URL)
     case bookmarkResolutionFailed(displayName: String)
+    /// Refused to remove a source video because one or more clips still
+    /// reference it. The UI should disable the unload affordance with a
+    /// tooltip explaining; this case is the defensive fallback.
+    case sourceHasClipsReferencingIt(count: Int)
 }
 
 @Observable
@@ -128,6 +132,59 @@ final class Workspace {
         }
         self.virtualComposition = comp
         self.virtualPlayer = AVPlayer(playerItem: AVPlayerItem(asset: comp))
+    }
+
+    /// Number of clips whose `sourceIndex` points at the given source. The
+    /// sidebar's source-list X button reads this to decide whether to gate
+    /// removal — we refuse to drop a source that clips still depend on
+    /// because the alternative (silently retargeting their indices) would
+    /// produce subtly wrong playback.
+    func clipsReferencing(sourceIndex: Int) -> Int {
+        project.clips.filter { $0.sourceIndex == sourceIndex }.count
+    }
+
+    /// Removes a source video and rebuilds the virtual concat. Refuses
+    /// (throws) when any clip references this source — the UI gates on
+    /// `clipsReferencing(sourceIndex:)` so this throw is the defensive
+    /// fallback. Clips with `sourceIndex > index` get their index shifted
+    /// down by 1 so they keep pointing at the same physical files.
+    func removeSourceVideo(at index: Int) async throws {
+        guard project.sourceVideos.indices.contains(index) else { return }
+        let refCount = clipsReferencing(sourceIndex: index)
+        guard refCount == 0 else {
+            throw WorkspaceError.sourceHasClipsReferencingIt(count: refCount)
+        }
+        project.sourceVideos.remove(at: index)
+        for i in project.clips.indices where project.clips[i].sourceIndex > index {
+            project.clips[i].sourceIndex -= 1
+        }
+        try saveProject()
+        try await rebuildVirtualPlayer()
+    }
+
+    /// Drag-to-reorder support for the sources list. Builds an
+    /// `oldIndex → newIndex` permutation from bookmark identity, applies
+    /// the move to `sourceVideos`, then remaps every clip's `sourceIndex`
+    /// through the permutation so clips keep pointing at the same physical
+    /// files (just with a new ordinal in the concat).
+    func reorderSourceVideos(from offsets: IndexSet, to destination: Int) async throws {
+        let oldOrder = project.sourceVideos
+        var newOrder = oldOrder
+        newOrder.move(fromOffsets: offsets, toOffset: destination)
+        var indexMap: [Int: Int] = [:]
+        for (newI, src) in newOrder.enumerated() {
+            if let oldI = oldOrder.firstIndex(where: { $0.bookmark == src.bookmark }) {
+                indexMap[oldI] = newI
+            }
+        }
+        project.sourceVideos = newOrder
+        for i in project.clips.indices {
+            if let mapped = indexMap[project.clips[i].sourceIndex] {
+                project.clips[i].sourceIndex = mapped
+            }
+        }
+        try saveProject()
+        try await rebuildVirtualPlayer()
     }
 
     /// Replaces the bookmark + display name + duration for a specific source
