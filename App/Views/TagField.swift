@@ -61,6 +61,16 @@ struct TagField: View {
             // (e.g. user clicked a different clip) while focus loss hasn't fired
             // — without this the in-flight text is dropped.
             .onDisappear { commit() }
+            // Tab accepts the top suggestion when the popover is visible. When
+            // there's no suggestion to take, .ignored lets Tab do its normal
+            // focus-advance thing.
+            .onKeyPress(.tab) {
+                if let top = matchingSuggestions.first {
+                    applySuggestion(top)
+                    return .handled
+                }
+                return .ignored
+            }
             .popover(
                 isPresented: Binding(
                     get: { isFocused && !matchingSuggestions.isEmpty },
@@ -70,15 +80,21 @@ struct TagField: View {
                 arrowEdge: .bottom
             ) {
                 VStack(alignment: .leading, spacing: 0) {
-                    ForEach(matchingSuggestions, id: \.self) { suggestion in
+                    ForEach(Array(matchingSuggestions.enumerated()), id: \.element) { idx, suggestion in
                         Button {
                             applySuggestion(suggestion)
                         } label: {
-                            Text(suggestion)
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                                .contentShape(Rectangle())
-                                .padding(.vertical, 4)
-                                .padding(.horizontal, 8)
+                            HStack {
+                                Text(suggestion)
+                                Spacer()
+                                if idx == 0 {
+                                    Text("⇥ tab").font(.caption2).foregroundStyle(.secondary)
+                                }
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .contentShape(Rectangle())
+                            .padding(.vertical, 4)
+                            .padding(.horizontal, 8)
                         }
                         .buttonStyle(.plain)
                     }
