@@ -77,3 +77,30 @@ The fourth option is the highest-EV next step — comparing against working code
 ## Time spent in this session
 
 About an hour of investigation across the plan-write, adversarial-review, implementation, and 6+ debugging iterations. Findings worth keeping but the deadlock isn't cracking under rapid iteration.
+
+## UPDATE — session 2 progress (still paused)
+
+After web research + reading the canonical `gstreamer-rs/examples/src/bin/decodebin.rs`, three real fixes landed in `stash@{0}: phase-5-task-3-wip-debug-v3`:
+
+1. **Missing `queue` element between decodebin's dynamic pad and videoconvert.** The canonical example explicitly inserts a queue here ("decodebin → queue → videoconvert → ..."). Without it, decodebin's internal multiqueue stalls waiting for a streaming-thread switch that never happens. Pad probes confirmed: ZERO buffers flow past videoconvert without the queue; ONE buffer flows past it with the queue.
+
+2. **Missing `new_preroll` callback.** AppSink with decoded video DOES preroll the first buffer in PAUSED state. Without a `new_preroll` callback to drain it, the appsink stays in preroll forever and `new_sample` never fires. Adding `.new_preroll(|sink| { let _ = sink.pull_preroll(); Ok(...) })` made the preroll get consumed (logged "new_preroll consumed").
+
+3. **`emit-signals=true` + `set_callbacks` are mutually exclusive.** Removing the `set_property("emit-signals", true)` was clean-up.
+
+**Outstanding issue after all three fixes:** still only ONE buffer reaches appsink's sink pad. After `new_preroll` consumes it, no more buffers flow. The probes on videoconvert sink/src + appsink sink all show #0 only — upstream produces exactly one frame and stops.
+
+**Best remaining hypothesis** — chicken-and-egg between INPUT and OUTPUT chains:
+
+- Input chain produces preroll → appsink consumes it via new_preroll.
+- Pipeline state machine wants to transition to PLAYING.
+- For PLAYING, ALL sinks (appsink + filesink) must successfully preroll. filesink is downstream of appsrc → encoder. appsrc has never had a buffer pushed, so encoder produces nothing, so filesink hasn't prerolled.
+- Pipeline state stuck because filesink hasn't prerolled. With pipeline not in PLAYING, the input side stops producing buffers after the first preroll.
+
+If this hypothesis is right, the fix is structural: split into TWO pipelines connected by an `mpsc` channel. Pipeline A (input): decode → channel.send. Pipeline B (output): channel.recv → encode → file. Each pipeline is self-contained; neither blocks waiting for the other's state. This was the third option in the original investigation notes.
+
+## Stashes
+
+- `stash@{0}: phase-5-task-3-wip-debug-v3` — current best state with queue + new_preroll fixes
+- `stash@{1}: phase-5-task-3-wip-debug-v2` — VideoToolbox-disabled variant (subsumed)
+- `stash@{2}: phase-5-task-3-wip-debug` — original WIP (subsumed)
