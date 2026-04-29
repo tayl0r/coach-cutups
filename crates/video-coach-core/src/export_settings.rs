@@ -20,6 +20,8 @@ pub fn bitrate(resolution: Resolution, quality: Quality) -> u32 {
 
 pub fn pixel_size(resolution: Resolution) -> PixelSize {
     match resolution {
+        // `Source` returns 1920x1080 as a placeholder — the export pipeline
+        // overrides with the source asset's actual dimensions at render time.
         Resolution::Source | Resolution::R1080 => PixelSize {
             width: 1920,
             height: 1080,
@@ -46,6 +48,13 @@ mod tests {
 
     #[test]
     fn pixel_size_source_passes_through() {
+        assert_eq!(
+            pixel_size(Resolution::Source),
+            PixelSize {
+                width: 1920,
+                height: 1080
+            }
+        );
         assert_eq!(
             pixel_size(Resolution::R1080),
             PixelSize {
