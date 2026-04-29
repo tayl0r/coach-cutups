@@ -5,10 +5,35 @@ export component MainWindow inherits Window {
 
     in property <string> project-title: "No project open";
 
+    callback open-project-clicked();
+    callback quit-clicked();
+
+    MenuBar {
+        Menu {
+            title: "File";
+            MenuItem {
+                title: "Open Project…";
+                activated => { root.open-project-clicked(); }
+            }
+            MenuItem {
+                title: "Quit";
+                activated => { root.quit-clicked(); }
+            }
+        }
+    }
+
     Text {
         x: 16px;
         y: 16px;
         text: project-title;
         font-size: 18px;
     }
+}
+
+// Inline element for the Phase 6 Task 6 component test. Kept in the
+// same .slint file so tests reuse the build pipeline.
+export component ProjectTitleLabel inherits Text {
+    in property <string> name;
+    text: name;
+    font-size: 18px;
 }

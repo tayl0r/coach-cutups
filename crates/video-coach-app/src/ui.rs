@@ -14,15 +14,19 @@
 //! | Trigger                  | Path                                   |
 //! |--------------------------|----------------------------------------|
 //! | Window close button      | `on_close_requested` in this file      |
-//! | File → Quit (Phase 6 T5) | UI callback → bus `Quit`               |
+//! | File → Quit              | `on_quit_clicked` → bus `Quit`         |
 //! | Cmd-Q (macOS)            | winit translates to close → same as #1 |
 //! | Control socket `quit`    | bus `Quit` handler in bus.rs           |
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
-use crate::bus::BusHandle;
+use crate::bus::{BusHandle, Command};
 use slint::ComponentHandle;
 
 slint::include_modules!();
+
+/// Correlation id stamped on UI-originated bus commands. Future spans /
+/// tracing bridge can route on this prefix.
+const UI_COMMAND_ID: &str = "ui";
 
 pub fn run(
     bus: BusHandle,
@@ -32,36 +36,77 @@ pub fn run(
     let window = MainWindow::new()?;
 
     // Path 1: window close button / Cmd-Q (winit dispatches CloseRequested).
-    // Sending shutdown_tx ensures the socket-server task and any future
-    // headless block_on watchers wake up. Returning HideWindow so Slint
-    // also stops drawing and unwinds the event loop.
     let shutdown_for_close = shutdown_tx.clone();
     window.window().on_close_requested(move || {
-        tracing::info!(target: "app.lifecycle", event = "app.shutdown_requested", source = "window_close");
+        tracing::info!(
+            target: "app.lifecycle",
+            event = "app.shutdown_requested",
+            source = "window_close",
+        );
         let _ = shutdown_for_close.send(true);
         slint::CloseRequestResponse::HideWindow
     });
 
-    // Path 3 / 4 echo: when shutdown_tx fires from any source (socket Quit,
-    // signal in --headless mode that already exited but the runtime is
-    // still alive, etc.), unblock window.run() too. Using subscribe()
-    // gives a fresh receiver per event-loop start, independent of the
-    // original `shutdown_rx` that main.rs holds.
+    // Path 3 / 4 echo: when shutdown_tx fires from any source, unblock
+    // window.run().
     let mut shutdown_rx = shutdown_tx.subscribe();
     rt.spawn(async move {
-        // Skip the initial `false` value; we only care about transitions to
-        // true. `changed()` returns immediately if the value has *already*
-        // changed since the last call — for a freshly subscribed receiver
-        // that's the same as "wait for the next change."
         if shutdown_rx.changed().await.is_ok() && *shutdown_rx.borrow() {
             let _ = slint::quit_event_loop();
         }
     });
 
-    // Bus is held by future menu / file-dialog callbacks (Task 5). Holding
-    // the reference here keeps the type plumbing exercised end-to-end so
-    // Task 5's edits stay surgical.
-    let _ = &bus;
+    // File → Quit: dispatch through bus so the same shutdown path runs
+    // as for the socket-driven Quit.
+    let bus_for_quit = bus.clone();
+    let rt_for_quit = rt.clone();
+    window.on_quit_clicked(move || {
+        let bus = bus_for_quit.clone();
+        rt_for_quit.spawn(async move {
+            bus.send(UI_COMMAND_ID.into(), Command::Quit).await;
+        });
+    });
+
+    // File → Open Project: pop a folder picker, dispatch OpenProject on
+    // the user's choice, push the project's name back into the title-bar
+    // label on success.
+    let bus_for_open = bus.clone();
+    let rt_for_open = rt.clone();
+    let weak = window.as_weak();
+    window.on_open_project_clicked(move || {
+        let bus = bus_for_open.clone();
+        let weak = weak.clone();
+        rt_for_open.spawn(async move {
+            // rfd uses xdg-portal on Linux, NSOpenPanel on macOS,
+            // IFileOpenDialog on Windows. Cancellation returns None;
+            // bail silently.
+            let chosen = rfd::AsyncFileDialog::new().pick_folder().await;
+            let Some(folder) = chosen else { return; };
+            let path = folder.path().to_string_lossy().into_owned();
+            let path_for_title = path.clone();
+            let reply = bus
+                .send(
+                    UI_COMMAND_ID.into(),
+                    Command::OpenProject { path: path.clone() },
+                )
+                .await;
+            if reply.ok {
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_project_title(path_for_title.into());
+                    }
+                })
+                .ok();
+            } else {
+                tracing::warn!(
+                    target: "ui",
+                    error = ?reply.error,
+                    path = %path,
+                    "open_project failed",
+                );
+            }
+        });
+    });
 
     window.run().map_err(Into::into)
 }
