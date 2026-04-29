@@ -5,6 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+# Stub feature flag for tests that need a media-enabled video-coach-app
+# binary. Phase 3's recording_smoke test is gated on this; running with
+# `cargo test --workspace --features media` enables both this and the
+# matching feature on video-coach-app, so the spawned binary supports
+# StartRecording / StopRecording.
+media = []
+
 [dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "process", "time", "sync"] }
 serde = { workspace = true }
@@ -13,3 +21,4 @@ anyhow = "1"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+tempfile = "3"
