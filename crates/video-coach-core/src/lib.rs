@@ -3,6 +3,7 @@ pub mod denormalize;
 pub mod event;
 pub mod export_settings;
 pub mod project;
+pub mod project_store;
 pub mod stroke;
 pub mod stroke_replay;
 pub mod tag_aggregation;
