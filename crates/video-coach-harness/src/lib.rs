@@ -164,4 +164,22 @@ impl App {
         let _ = self.send(serde_json::json!({"cmd": "quit"})).await;
         Ok(self.child.wait().await?)
     }
+
+    pub async fn start_recording_from_fixture(
+        &mut self,
+        fixture_path: impl Into<String>,
+        output_path: impl Into<String>,
+    ) -> anyhow::Result<Frame> {
+        self.send(serde_json::json!({
+            "cmd": "start_recording",
+            "source": { "kind": "fixture", "path": fixture_path.into() },
+            "output": output_path.into(),
+        }))
+        .await
+    }
+
+    pub async fn stop_recording(&mut self) -> anyhow::Result<Frame> {
+        self.send(serde_json::json!({ "cmd": "stop_recording" }))
+            .await
+    }
 }
