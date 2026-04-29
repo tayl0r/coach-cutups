@@ -5,6 +5,9 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 
+[features]
+media = []
+
 [dependencies]
 gstreamer = "0.23"
 gstreamer-app = "0.23"

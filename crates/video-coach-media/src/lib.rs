@@ -1,5 +1,6 @@
 // Modules added in subsequent tasks.
 
+pub mod fixture_source;
 pub mod recording;
 pub mod source;
 
