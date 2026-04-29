@@ -959,7 +959,42 @@ fixtures/**/*.wav filter=lfs diff=lfs merge=lfs -text
 fixtures/**/*.m4a filter=lfs diff=lfs merge=lfs -text
 ```
 
-**Step 2: Initialize the fixtures directory + manifest**
+**Step 2: Prepare the fixtures**
+
+Two source files exist on the user's machine outside the repo:
+
+- **Webcam clip**: `/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov`
+  Duration 17.3 s, 1920×1080, H.264 + AAC, 45 MB. Copy verbatim into `fixtures/webcam.mov`.
+
+- **Source video**: `/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4`
+  Duration 83.7 min, 3840×2160 (4K), H.264 + AAC, 32 GB. Extract minutes 25–27 (timestamps 25:00–27:00) and re-encode to 1080p at ~6 Mbps to keep the fixture under 100 MB. Output: `fixtures/source.mp4`.
+
+`ffmpeg` is used here as a one-time dev/build tool. It is **not** an app dependency — the runtime project still uses GStreamer exclusively. Install with `brew install ffmpeg` if not present.
+
+```bash
+mkdir -p fixtures
+
+# Webcam: straight copy.
+cp "/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov" \
+   fixtures/webcam.mov
+
+# Source: extract minutes 25–27, downscale to 1080p, re-encode at 6 Mbps.
+# -ss before -i seeks fast (keyframe-aligned) and the re-encode pass cleans
+# up the seek edge.
+ffmpeg -ss 00:25:00 -t 00:02:00 -i "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4" \
+       -vf "scale=1920:1080:flags=lanczos" \
+       -c:v libx264 -preset slow -b:v 6000k -maxrate 6500k -bufsize 12000k \
+       -c:a aac -b:a 128k \
+       -movflags +faststart \
+       fixtures/source.mp4
+
+# Sanity check: should print ~120 seconds.
+ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/source.mp4
+```
+
+For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs it. Phase 2's smoke test does not. When needed, generate a synthetic tone or extract the audio track from the webcam clip.
+
+**Step 3: Initialize the fixtures manifest**
 
 ```json
 // fixtures/manifest.json
@@ -967,37 +1002,42 @@ fixtures/**/*.m4a filter=lfs diff=lfs merge=lfs -text
   "schemaVersion": 1,
   "fixtures": {
     "source.mp4": {
-      "purpose": "Sports source video. Used as the input timeline for recording-flow tests.",
-      "expectedDurationSeconds": null,
-      "path": null
+      "purpose": "Sports source video — input timeline for recording-flow tests.",
+      "durationSeconds": 120,
+      "width": 1920,
+      "height": 1080,
+      "originalSource": "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4",
+      "trimSpec": "00:25:00 → 00:27:00 (re-encoded 1080p H.264 ~6 Mbps)"
     },
-    "webcam.mp4": {
-      "purpose": "Pre-recorded webcam clip swapped in for live capture in test mode. Should be ≥30s, 1080p30 H.264.",
-      "expectedDurationSeconds": null,
-      "path": null
-    },
-    "mic.wav": {
-      "purpose": "Pre-recorded voice clip swapped in for live mic capture in test mode. Mono 48kHz, ≥30s.",
-      "expectedDurationSeconds": null,
-      "path": null
+    "webcam.mov": {
+      "purpose": "Pre-recorded webcam clip swapped in for live capture in test mode.",
+      "durationSeconds": 17.26,
+      "width": 1920,
+      "height": 1080,
+      "originalSource": "/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov",
+      "note": "Short — test recordings should stay ≤15s, or the fixture pipeline must loop the clip."
     }
   },
   "totalSizeBudgetMB": 200
 }
 ```
 
-```
-# fixtures/.gitkeep — placeholder until real fixtures land
-```
-
-**Step 3: Commit**
+**Step 4: Commit (LFS will pick up the binary files automatically)**
 
 ```bash
-git add .gitattributes fixtures/manifest.json fixtures/.gitkeep
-git commit -m "build: enable Git LFS for fixtures/ + initial manifest"
+git add .gitattributes fixtures/manifest.json fixtures/source.mp4 fixtures/webcam.mov
+git commit -m "build: enable Git LFS for fixtures + initial source/webcam fixtures"
 ```
 
-**Note:** Real fixture content (`source.mp4`, `webcam.mp4`, `mic.wav`) lands in a follow-up commit once the user provides the source video path. The `path` fields in `manifest.json` get filled in then. Until then, harness tests that need media will skip with `#[ignore]` annotations.
+Verify LFS picked up the binaries (not committed inline as text):
+
+```bash
+git lfs ls-files
+```
+
+Expected output: lines naming `fixtures/source.mp4` and `fixtures/webcam.mov` with their LFS SHAs.
+
+**Note on `mic.wav`**: not included in this task — defer until a recording-flow test in a later phase needs it. The `manifest.json` will be extended at that point.
 
 ---
 
