@@ -855,6 +855,30 @@ mod tests {
         );
     }
 
+    /// One-shot helper to produce a persistent output for ffprobe / visual
+    /// inspection. Ignored by default. Run with:
+    ///   cargo test -p video-coach-media --features media -- --ignored visual_check
+    /// then ffprobe /tmp/phase5_visual_check.mov.
+    #[test]
+    #[ignore]
+    fn visual_check_compose_to_tmp() {
+        std::env::set_var(
+            "GST_PLUGIN_FEATURE_RANK",
+            "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE",
+        );
+        let out = std::path::PathBuf::from("/tmp/phase5_visual_check.mov");
+        if out.exists() {
+            let _ = std::fs::remove_file(&out);
+        }
+        compose_two_files(
+            fixture("source-1080p.mp4"),
+            fixture("webcam.mov"),
+            out.clone(),
+        )
+        .unwrap();
+        eprintln!("visual_check output: {}", out.display());
+    }
+
     #[test]
     fn compose_source_plus_webcam_produces_playable_mov() {
         // Same VideoToolbox-disable trick as passthrough_source_to_mov.
