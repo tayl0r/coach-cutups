@@ -22,3 +22,9 @@ App/Info.plist
 
 # Rust
 /target
+
+# Fixtures (binary media) live in GitHub Release assets, not in git.
+# Pull them with `./scripts/fetch-fixtures.sh`.
+fixtures/*
+!fixtures/manifest.json
+!fixtures/.gitkeep

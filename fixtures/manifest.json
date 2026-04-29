@@ -1,0 +1,34 @@
+{
+  "schemaVersion": 1,
+  "releaseTag": "fixtures-v1",
+  "downloadUrlBase": "https://github.com/tayl0r/coach-cutups/releases/download",
+  "fixtures": {
+    "source-1080p.mp4": {
+      "sha256": "f5e0b725668e324e39db66e793af1b1455d7a2681177ca6a2a6969379b8167c5",
+      "purpose": "Default sports source video — input timeline for most recording-flow tests.",
+      "durationSeconds": 60,
+      "width": 1920,
+      "height": 1080,
+      "originalSource": "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4",
+      "trimSpec": "00:25:00 → 00:26:00 (re-encoded 1080p H.264 ~6 Mbps)"
+    },
+    "source-4k.mp4": {
+      "sha256": "b569c0a893133f20e330d080768888d1662e5122635eecdaea4cebbc855568a8",
+      "purpose": "4K source for playback/scrub regression tests (v1 had bugs in the 4K decode path) AND a distinct second source asset for multi-source-video project tests.",
+      "durationSeconds": 30,
+      "width": 3840,
+      "height": 2160,
+      "originalSource": "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4",
+      "trimSpec": "00:50:00 → 00:50:30 (re-encoded native 4K H.264 ~20 Mbps)"
+    },
+    "webcam.mov": {
+      "sha256": "0ad9db3122f3c900fa3470caa93f60a26f391337865e2591093f9a0e06dbed11",
+      "purpose": "Pre-recorded webcam clip swapped in for live capture in test mode.",
+      "durationSeconds": 17.26,
+      "width": 1920,
+      "height": 1080,
+      "originalSource": "/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov",
+      "note": "Short — test recordings should stay ≤15s, or the fixture pipeline must loop the clip."
+    }
+  }
+}
