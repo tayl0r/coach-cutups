@@ -1,0 +1,14 @@
+export component MainWindow inherits Window {
+    title: "Video Coach";
+    preferred-width: 1280px;
+    preferred-height: 800px;
+
+    in property <string> project-title: "No project open";
+
+    Text {
+        x: 16px;
+        y: 16px;
+        text: project-title;
+        font-size: 18px;
+    }
+}

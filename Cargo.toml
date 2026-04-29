@@ -15,3 +15,12 @@ serde_json = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
 thiserror = "2"
+# Slint UI (Phase 6+). Skia renderer chosen over default femtovg for more
+# reliable text shaping / native menu rendering on macOS and Linux. Compat
+# feature pins to the 1.2 macro syntax we're targeting.
+slint = { version = "1.8", default-features = false, features = ["std", "backend-winit", "renderer-skia", "compat-1-2"] }
+slint-build = "1.8"
+# Native file dialogs cross-platform. xdg-portal Linux, NSOpenPanel macOS,
+# IFileOpenDialog Windows. Tokio integration so dialog futures await on the
+# tokio runtime we already run.
+rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
