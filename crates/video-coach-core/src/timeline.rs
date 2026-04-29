@@ -97,22 +97,15 @@ mod tests {
     use crate::event::CommentaryEvent;
     use crate::project::Clip;
     use crate::stroke::{Rgba, Stroke};
-    use chrono::Utc;
+    use crate::test_fixtures::test_clip;
     use uuid::Uuid;
 
     fn clip_with(events: Vec<CommentaryEvent>, recording_duration: f64, start_source: f64) -> Clip {
         Clip {
-            id: Uuid::nil(),
-            name: "t".into(),
-            notes: "".into(),
-            tags: vec![],
-            source_index: 0,
-            start_source_seconds: start_source,
-            recording_duration,
-            recording_filename: "r.mov".into(),
             events,
-            sort_index: 0,
-            created_at: Utc::now(),
+            recording_duration,
+            start_source_seconds: start_source,
+            ..test_clip()
         }
     }
 

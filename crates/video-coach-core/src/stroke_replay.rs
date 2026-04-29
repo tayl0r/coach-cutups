@@ -58,32 +58,7 @@ mod tests {
     use super::*;
     use crate::event::CommentaryEvent;
     use crate::stroke::{Rgba, StrokePoint};
-    use chrono::Utc;
-    use uuid::Uuid;
-
-    // Mirrors the Swift `deterministicUUID(_:)` helper: encode each ASCII byte
-    // of `tag` as two hex chars, pad/truncate to 32 chars, parse as a UUID. The
-    // exact bytes don't matter — what matters is that two calls with the same
-    // tag produce the same Uuid, and different tags produce different Uuids.
-    fn deterministic_uuid(tag: &str) -> Uuid {
-        // Tags >16 bytes silently collide because the algorithm truncates to
-        // 32 hex chars (= 16 bytes). All current callers use 1-byte tags;
-        // this guard prevents future misuse.
-        debug_assert!(tag.len() <= 16, "deterministic_uuid tag must be <=16 bytes");
-        let mut hex = String::with_capacity(32);
-        for b in tag.bytes() {
-            hex.push_str(&format!("{:02x}", b));
-        }
-        while hex.len() < 32 {
-            hex.push('0');
-        }
-        hex.truncate(32);
-        let mut bytes = [0u8; 16];
-        for (i, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
-        }
-        Uuid::from_bytes(bytes)
-    }
+    use crate::test_fixtures::{deterministic_uuid, test_clip};
 
     /// Mouse-down == mouse-up at the event's recordTime: a single point at
     /// t=0 in stroke-local time, so `firstPointRecordTime == event.recordTime`.
@@ -124,17 +99,9 @@ mod tests {
 
     fn make_clip(events: Vec<CommentaryEvent>) -> Clip {
         Clip {
-            id: Uuid::nil(),
-            name: "t".into(),
-            notes: String::new(),
-            tags: vec![],
-            source_index: 0,
-            start_source_seconds: 0.0,
-            recording_duration: 100.0,
-            recording_filename: "t.mov".into(),
             events,
-            sort_index: 0,
-            created_at: Utc::now(),
+            recording_duration: 100.0,
+            ..test_clip()
         }
     }
 

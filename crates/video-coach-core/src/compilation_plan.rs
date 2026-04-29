@@ -75,7 +75,7 @@ fn build_plan(clips: &[&Clip], source_durations: &HashMap<usize, f64>) -> Compil
 mod tests {
     use super::*;
     use crate::event::{CommentaryEvent, EventKind};
-    use chrono::Utc;
+    use crate::test_fixtures::test_clip;
 
     fn make_clip(
         name: &str,
@@ -87,9 +87,7 @@ mod tests {
         events: Vec<CommentaryEvent>,
     ) -> Clip {
         Clip {
-            id: Uuid::new_v4(),
             name: name.to_string(),
-            notes: String::new(),
             tags: tags.into_iter().map(String::from).collect(),
             source_index,
             start_source_seconds,
@@ -97,7 +95,7 @@ mod tests {
             recording_filename: format!("{name}.mov"),
             events,
             sort_index,
-            created_at: Utc::now(),
+            ..test_clip()
         }
     }
 

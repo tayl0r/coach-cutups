@@ -9,6 +9,9 @@ pub mod stroke_replay;
 pub mod tag_aggregation;
 pub mod timeline;
 
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 // Top-level re-exports for the load-bearing data types so downstream crates
 // (Phase 2+) can `use video_coach_core::Project` without long module paths.
 // Functions and module-private types stay at their module paths.

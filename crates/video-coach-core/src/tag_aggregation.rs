@@ -31,24 +31,18 @@ pub fn aggregate(project: &Project) -> Vec<TagSummary> {
 mod tests {
     use super::*;
     use crate::project::Clip;
-    use chrono::Utc;
-    use uuid::Uuid;
+    use crate::test_fixtures::test_clip;
 
     fn make_project(clips: &[(&str, &[&str], f64)]) -> Project {
         let mut p = Project::new("Test");
         for (i, (name, tags, dur)) in clips.iter().enumerate() {
             p.clips.push(Clip {
-                id: Uuid::new_v4(),
                 name: (*name).to_string(),
-                notes: String::new(),
                 tags: tags.iter().map(|t| (*t).to_string()).collect(),
-                source_index: 0,
-                start_source_seconds: 0.0,
                 recording_duration: *dur,
                 recording_filename: "x.mov".to_string(),
-                events: Vec::new(),
                 sort_index: i as i64,
-                created_at: Utc::now(),
+                ..test_clip()
             });
         }
         p
