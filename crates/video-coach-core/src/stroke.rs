@@ -11,7 +11,12 @@ pub struct Rgba {
 }
 
 impl Rgba {
-    pub const RED: Rgba = Rgba { r: 1.0, g: 0.2, b: 0.2, a: 1.0 };
+    pub const RED: Rgba = Rgba {
+        r: 1.0,
+        g: 0.2,
+        b: 0.2,
+        a: 1.0,
+    };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -38,7 +43,15 @@ mod tests {
 
     #[test]
     fn red_constant_matches_swift() {
-        assert_eq!(Rgba::RED, Rgba { r: 1.0, g: 0.2, b: 0.2, a: 1.0 });
+        assert_eq!(
+            Rgba::RED,
+            Rgba {
+                r: 1.0,
+                g: 0.2,
+                b: 0.2,
+                a: 1.0
+            }
+        );
     }
 
     #[test]
@@ -47,7 +60,11 @@ mod tests {
             id: Uuid::nil(),
             color: Rgba::RED,
             line_width: 0.012,
-            points: vec![StrokePoint { x: 0.5, y: 0.5, t: 0.0 }],
+            points: vec![StrokePoint {
+                x: 0.5,
+                y: 0.5,
+                t: 0.0,
+            }],
             auto_clear_after_seconds: Some(5.0),
         };
         let json = serde_json::to_string(&s).unwrap();
@@ -66,7 +83,11 @@ mod tests {
         };
         let json = serde_json::to_value(&s).unwrap();
         let obj = json.as_object().unwrap();
-        assert!(obj.contains_key("lineWidth"), "expected camelCase `lineWidth`, got: {:?}", obj.keys().collect::<Vec<_>>());
+        assert!(
+            obj.contains_key("lineWidth"),
+            "expected camelCase `lineWidth`, got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
         assert!(obj.contains_key("autoClearAfterSeconds"));
     }
 }
