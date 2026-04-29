@@ -16,3 +16,6 @@ Package.resolved
 # XcodeGen
 *.xcodeproj
 App/Info.plist
+
+# Claude Code (local runtime state)
+.claude/
