@@ -178,98 +178,40 @@ enum ClipPreviewBuilder {
             }
         }
 
-        // 6. Build the video composition.
+        // 6. Build the video composition with our custom compositor. The
+        // compositor handles per-frame source selection (live for `.play`,
+        // pre-decoded buffer for `.freeze`) and PiP geometry directly — no
+        // layer instructions, since `customVideoCompositorClass` bypasses
+        // them entirely. Single render path with the export pipeline (see
+        // `CompilationCompositor`), so visual parity is automatic.
         //
-        // We deliberately do NOT use a `customVideoCompositorClass` here even
-        // though the design called for one. On macOS 26 AVPlayer's playback
-        // path strips the `AVMutableVideoCompositionInstruction` subclass we
-        // tried to use for per-clip metadata, AND it doesn't honor
-        // `requiredSourceTrackIDs` set via the override pattern — combined
-        // result was black frames. Built-in layer instructions sidestep both
-        // problems: AVFoundation natively understands them, the source +
-        // webcam tracks both appear, and PiP geometry is a single transform.
-        //
-        // Trade-off: clips with `.freeze` segments will show whatever
-        // AVFoundation renders during a source-track gap (typically the last
-        // available frame on the layer below, or black). The Phase-7 simple
-        // recording case has no pauses so this is invisible; the pre-decoded
-        // freeze-frame work earlier in this builder is wasted on those clips
-        // for now and can be re-wired via a different mechanism (e.g. a
-        // static registry on PreviewCompositor) later if pause-clip preview
-        // fidelity becomes important.
-        // Match render size to the source video so it fills the canvas at
-        // full quality with no cropping. Hardcoding 1280×720 was clipping the
-        // top-left region of any source bigger than that. We also account for
-        // the source track's preferred transform (e.g. portrait recordings
-        // store landscape pixels + a 90° rotation hint), so the natural size
-        // becomes the post-transform display size.
+        // v1 sources are landscape-only (matching
+        // `CompilationExporter.renderSize`), so renderSize is the source's
+        // raw natural size with no rotation handling.
         let srcNatural = try await srcVideoTrack.load(.naturalSize)
-        let srcPreferred = try await srcVideoTrack.load(.preferredTransform)
-        let displaySize = srcNatural.applying(srcPreferred)
         let renderSize = CGSize(
-            width: abs(displaySize.width),
-            height: abs(displaySize.height)
+            width: abs(srcNatural.width),
+            height: abs(srcNatural.height)
         )
 
         let videoComp = AVMutableVideoComposition()
         videoComp.renderSize = renderSize
         videoComp.frameDuration = CMTime(value: 1, timescale: 30)
+        videoComp.customVideoCompositorClass = PreviewCompositor.self
 
-        let inst = AVMutableVideoCompositionInstruction()
-        inst.timeRange = CMTimeRange(start: .zero, duration: clipDuration)
-
-        let sourceLI = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVideoComp)
-        // Apply the source's preferred transform so portrait recordings (or
-        // any rotated content) display correctly. AVMutableComposition strips
-        // the asset-track transform on insert; we re-apply it here.
-        if !srcPreferred.isIdentity {
-            sourceLI.setTransform(srcPreferred, at: .zero)
-        }
-
-        let webcamLI = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
-        // PiP transform: scale webcam to 22% of render width, place
-        // bottom-right with 2.2% margin. Pull the webcam's natural size from
-        // its first format description so we preserve aspect ratio.
-        let webcamNatural = try await webcamVideoTrack.load(.naturalSize)
-        let webcamTransform = pipTransform(
-            renderSize: renderSize,
-            webcamNaturalSize: webcamNatural,
-            widthFraction: 0.22,
-            marginFraction: 0.022
+        let inst = PreviewInstruction.make(
+            sourceTrackID: sourceTrackID,
+            webcamTrackID: webcamTrackID,
+            compositionStart: .zero,
+            clipDuration: clipDuration,
+            segments: segments,
+            frozenFrames: frozenFrames
         )
-        webcamLI.setTransform(webcamTransform, at: .zero)
-
-        // Order matters: webcam goes ON TOP of source. Layer instructions
-        // are composited bottom-up — first listed is on top in the output.
-        inst.layerInstructions = [webcamLI, sourceLI]
         videoComp.instructions = [inst]
 
         let item = AVPlayerItem(asset: comp)
         item.videoComposition = videoComp
         return item
-    }
-
-    /// Affine transform that places a webcam track at `widthFraction` of the
-    /// output width, bottom-right with a `marginFraction` margin. Preserves
-    /// the webcam's aspect ratio.
-    nonisolated private static func pipTransform(
-        renderSize: CGSize,
-        webcamNaturalSize: CGSize,
-        widthFraction: CGFloat,
-        marginFraction: CGFloat
-    ) -> CGAffineTransform {
-        let pipW = renderSize.width * widthFraction
-        let aspect = webcamNaturalSize.height / max(webcamNaturalSize.width, 1)
-        let pipH = pipW * aspect
-        let scale = pipW / max(webcamNaturalSize.width, 1)
-        let margin = renderSize.height * marginFraction
-        let tx = renderSize.width - pipW - margin
-        // Layer instruction transforms are applied in the composition's
-        // top-left coordinate space (origin top-left), so a higher Y is
-        // further DOWN the frame. Bottom-right means tx max, ty max.
-        let ty = renderSize.height - pipH - margin
-        return CGAffineTransform(translationX: tx, y: ty)
-            .scaledBy(x: scale, y: scale)
     }
 
     // MARK: - Helpers

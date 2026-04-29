@@ -524,6 +524,12 @@ struct ContentView: View {
             recordingError = "Add a source video before recording."
             return
         }
+        // Force-pause the source on R-press. Every clip then begins with a
+        // `.freeze` segment whose source-time is the playhead at R-press,
+        // collapsing the event-log shape that downstream code (preview,
+        // export) has to handle. KeyCommandView gates space while we're in
+        // .recordingStarting, so the source stays paused all the way to t0.
+        player.pause()
         appMode = .recordingStarting
 
         let clipID = UUID()
@@ -562,18 +568,12 @@ struct ContentView: View {
                 let fallback = capture.lastFallbackReason
                 await MainActor.run {
                     let controller = RecordingController(t0Seconds: t0)
-                    // Don't change the source-video play state — preserve
-                    // whatever the user had. Source-time reconstruction
-                    // (PlaybackTimeline) defaults `rate = 1.0` for an empty
-                    // event log, so we must append the actual current state
-                    // at t=0 to keep the log honest. Space/skip later
-                    // append additional events as the user changes state.
-                    let isPlaying = (workspace.virtualPlayer?.rate ?? 0) != 0
-                    if isPlaying {
-                        controller.appendPlay()
-                    } else {
-                        controller.appendPause()
-                    }
+                    // Source was paused on R-press and KeyCommandView blocks
+                    // space during .recordingStarting, so the source is
+                    // guaranteed paused at t0. Anchor the event log with
+                    // .pause so PlaybackTimeline reconstructs a leading
+                    // .freeze segment (rather than its rate=1.0 default).
+                    controller.appendPause()
                     self.recordingController = controller
                     self.appMode = .recording
                     self.recordingStartedAtHostTime = t0

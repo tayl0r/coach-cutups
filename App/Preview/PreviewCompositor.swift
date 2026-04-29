@@ -123,7 +123,9 @@ final class PreviewCompositor: NSObject, AVVideoCompositing {
         cg.translateBy(x: 0, y: CGFloat(h))
         cg.scaleBy(x: 1, y: -1)
 
-        // 3. Base full-frame.
+        // 3. Base full-frame. v1 source videos are landscape-only (matching
+        //    `CompilationCompositor` and `CompilationExporter.renderSize`),
+        //    so we don't apply any preferred transform here.
         if let base, let img = makeCGImage(base) {
             cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
         }
