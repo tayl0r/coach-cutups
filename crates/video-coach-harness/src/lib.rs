@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::path::PathBuf;
 use std::process::Stdio;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -24,6 +25,12 @@ pub struct Frame {
 pub struct App {
     child: Child,
     events: mpsc::UnboundedReceiver<Frame>,
+    /// Frames pulled off the channel by `send()` that didn't match the
+    /// expected `reply_to`. These are pushed back here so `wait_for_event`
+    /// can still find them. Without this, an event emitted by the same
+    /// command (e.g. `app.ping` from a `ping` command) would be silently
+    /// dropped if it arrived on the wire before the reply.
+    pending: VecDeque<Frame>,
     sock_writer: tokio::net::tcp::OwnedWriteHalf,
     next_id: u64,
 }
@@ -85,6 +92,7 @@ impl App {
         Ok(Self {
             child,
             events: event_rx,
+            pending: VecDeque::new(),
             sock_writer: write_half,
             next_id: 0,
         })
@@ -110,10 +118,18 @@ impl App {
             if f.reply_to.as_deref() == Some(&id) {
                 return Ok(f);
             }
+            // Not our reply — set it aside so `wait_for_event` can still
+            // observe it. The bus emits events synchronously before the
+            // reply lands on the wire, so an event from the same command
+            // typically arrives here first.
+            self.pending.push_back(f);
         }
     }
 
     pub async fn next_event(&mut self) -> Option<Frame> {
+        if let Some(f) = self.pending.pop_front() {
+            return Some(f);
+        }
         self.events.recv().await
     }
 
@@ -123,6 +139,13 @@ impl App {
         timeout: std::time::Duration,
     ) -> anyhow::Result<Frame> {
         tokio::time::timeout(timeout, async {
+            // Drain the pending buffer first — events held back by `send`
+            // live here.
+            while let Some(f) = self.pending.pop_front() {
+                if f.event.as_deref() == Some(name) {
+                    return Ok(f);
+                }
+            }
             loop {
                 let f = self
                     .events
