@@ -87,15 +87,26 @@ edition = "2021"
 max_width = 100
 ```
 
-**Step 6: Verify the workspace builds**
+**Step 6: Add Rust build artifacts to `.gitignore`**
+
+The repo's existing `.gitignore` is Xcode-flavored. Append the Rust entries:
+
+```
+# Rust
+/target
+```
+
+(Do **not** ignore `Cargo.lock` — even though Phase 1 is library-only, the workspace will gain binary crates in later phases and we want a single, committed lockfile across the workspace from day one.)
+
+**Step 7: Verify the workspace builds**
 
 Run: `cargo build`
 Expected: `Finished dev [unoptimized + debuginfo] target(s) in ...` — zero warnings, zero errors.
 
-**Step 7: Commit**
+**Step 8: Commit**
 
 ```bash
-git add Cargo.toml crates/video-coach-core/Cargo.toml crates/video-coach-core/src/lib.rs rust-toolchain.toml .rustfmt.toml
+git add Cargo.toml crates/video-coach-core/Cargo.toml crates/video-coach-core/src/lib.rs rust-toolchain.toml .rustfmt.toml .gitignore Cargo.lock
 git commit -m "feat(rust): bootstrap Cargo workspace and video-coach-core crate"
 ```
 
@@ -249,15 +260,34 @@ git commit -m "feat(core): port Stroke / StrokePoint / Rgba"
 
 **Step 1: Write the failing test that pins the wire format**
 
-Capture the Swift wire format by running this in a Swift REPL or test (one-time, exemplar):
-```swift
-let evs = [
-    CommentaryEvent(recordTime: 0, kind: .play),
-    CommentaryEvent(recordTime: 1.5, kind: .skip(delta: 3.0)),
+The Swift wire format for a `Codable` enum-with-mixed-cases is verified by running:
+
+```bash
+swift -e '
+import Foundation
+enum Kind: Codable {
+    case play
+    case pause
+    case skip(delta: Double)
+    case clearAll
+}
+struct Event: Codable { var recordTime: Double; var kind: Kind }
+let evs: [Event] = [
+    Event(recordTime: 0,   kind: .play),
+    Event(recordTime: 1.5, kind: .skip(delta: 3)),
+    Event(recordTime: 2,   kind: .clearAll),
 ]
 print(String(data: try JSONEncoder().encode(evs), encoding: .utf8)!)
-// → [{"recordTime":0,"kind":{"play":{}}},{"recordTime":1.5,"kind":{"skip":{"delta":3}}}]
+'
 ```
+
+Verified output (run on a Swift toolchain):
+
+```
+[{"kind":{"play":{}},"recordTime":0},{"kind":{"skip":{"delta":3}},"recordTime":1.5},{"kind":{"clearAll":{}},"recordTime":2}]
+```
+
+Unit cases (`play`, `pause`, `clearAll`) encode as `{"caseName": {}}`. Payload cases (`skip`, `stroke`) encode as `{"caseName": { ...payload... }}`. The pinning tests below assert exactly this format.
 
 Add to `crates/video-coach-core/src/event.rs`:
 
@@ -673,28 +703,33 @@ pub fn source_time_at(clip: &Clip, t: f64) -> f64 {
     source_time + (t - record_cursor) * rate
 }
 
+fn emit_segment(
+    record_end: f64,
+    segments: &mut Vec<PlaybackSegment>,
+    source_cursor: &mut f64,
+    record_cursor: &mut f64,
+    rate: f64,
+) {
+    let dur = record_end - *record_cursor;
+    if dur <= 0.0 { return; }
+    let kind = if rate == 0.0 { SegmentKind::Freeze } else { SegmentKind::Play };
+    segments.push(PlaybackSegment {
+        kind,
+        source_start: *source_cursor,
+        out_duration: dur,
+    });
+    if rate == 1.0 { *source_cursor += dur; }
+    *record_cursor = record_end;
+}
+
 pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegment> {
     let mut segments: Vec<PlaybackSegment> = Vec::new();
     let mut source_cursor = clip.start_source_seconds;
     let mut record_cursor = 0.0_f64;
     let mut rate = 1.0_f64;
 
-    let mut emit = |record_end: f64, segments: &mut Vec<PlaybackSegment>,
-                    source_cursor: &mut f64, record_cursor: &mut f64, rate: f64| {
-        let dur = record_end - *record_cursor;
-        if dur <= 0.0 { return; }
-        let kind = if rate == 0.0 { SegmentKind::Freeze } else { SegmentKind::Play };
-        segments.push(PlaybackSegment {
-            kind,
-            source_start: *source_cursor,
-            out_duration: dur,
-        });
-        if rate == 1.0 { *source_cursor += dur; }
-        *record_cursor = record_end;
-    };
-
     for ev in &clip.events {
-        emit(ev.record_time, &mut segments, &mut source_cursor, &mut record_cursor, rate);
+        emit_segment(ev.record_time, &mut segments, &mut source_cursor, &mut record_cursor, rate);
         match ev.kind {
             EventKind::Play     => rate = 1.0,
             EventKind::Pause    => rate = 0.0,
@@ -704,7 +739,7 @@ pub fn playback_segments(clip: &Clip, source_duration: f64) -> Vec<PlaybackSegme
             EventKind::Stroke(_) | EventKind::ClearAll => {}
         }
     }
-    emit(clip.recording_duration, &mut segments, &mut source_cursor, &mut record_cursor, rate);
+    emit_segment(clip.recording_duration, &mut segments, &mut source_cursor, &mut record_cursor, rate);
     segments
 }
 
@@ -770,41 +805,18 @@ pub mod timeline;
 **Step 3: Run tests**
 
 Run: `cargo test -p video-coach-core timeline::`
-Expected: starts failing on the first scenario where the closure-borrowing pattern misbehaves (the `emit` closure capturing mutable references is fiddly — may need refactor).
+Expected: 2 passed.
 
-**Step 4: If `emit` closure won't typecheck, refactor to a free function**
-
-Replace the closure with:
-
-```rust
-fn emit_segment(
-    record_end: f64,
-    segments: &mut Vec<PlaybackSegment>,
-    source_cursor: &mut f64,
-    record_cursor: &mut f64,
-    rate: f64,
-) {
-    let dur = record_end - *record_cursor;
-    if dur <= 0.0 { return; }
-    let kind = if rate == 0.0 { SegmentKind::Freeze } else { SegmentKind::Play };
-    segments.push(PlaybackSegment { kind, source_start: *source_cursor, out_duration: dur });
-    if rate == 1.0 { *source_cursor += dur; }
-    *record_cursor = record_end;
-}
-```
-
-Update `playback_segments` to call `emit_segment(...)` directly.
-
-**Step 5: Add EVERY test case from the Swift `PlaybackTimelineTests.swift`**
+**Step 4: Add EVERY test case from the Swift `PlaybackTimelineTests.swift`**
 
 Read the Swift file and translate each `func test_*` into a `#[test] fn ...`. Use the exact same numeric inputs and expected outputs.
 
-**Step 6: Run all timeline tests**
+**Step 5: Run all timeline tests**
 
 Run: `cargo test -p video-coach-core timeline::`
 Expected: ALL pass. If any fail, the divergence is a porting bug — fix before moving on. This module is the most behaviorally critical in the entire core.
 
-**Step 7: Commit**
+**Step 6: Commit**
 
 ```bash
 git add crates/video-coach-core/src/timeline.rs crates/video-coach-core/src/lib.rs
@@ -1049,6 +1061,8 @@ git commit -m "feat(core): port ExportSettings (HEVC bitrate table)"
 
 **Note:** Drop `CGSize`/`CGPoint` — use plain `f64` tuples. The `flipY` knob stays exactly as in v1; it's a load-bearing footgun that the export compositor depends on.
 
+The canvas size type is named `CanvasSize` (not `PixelSize`) to avoid colliding with `export_settings::PixelSize` from Task 8 — the two represent different concepts (continuous canvas extents in `f64` vs. integer pixel dimensions of the encoded output).
+
 **Step 1: Implementation + tests**
 
 ```rust
@@ -1058,14 +1072,14 @@ git commit -m "feat(core): port ExportSettings (HEVC bitrate table)"
 pub struct PixelPoint { pub x: f64, pub y: f64 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub struct PixelSize { pub width: f64, pub height: f64 }
+pub struct CanvasSize { pub width: f64, pub height: f64 }
 
 /// Map a normalized (top-left origin, x and y in 0..1) stroke point into pixels.
 ///
 /// `flip_y = true` for live overlays in a bottom-left-origin coordinate space.
 /// `flip_y = false` for the export compositor, which already applies its own flip.
 /// See `docs/plans/2026-04-27-video-coach-design.md` § "Drawing capture".
-pub fn point(x: f64, y: f64, into: PixelSize, flip_y: bool) -> PixelPoint {
+pub fn point(x: f64, y: f64, into: CanvasSize, flip_y: bool) -> PixelPoint {
     let px = x * into.width;
     let py = y * into.height;
     if flip_y { PixelPoint { x: px, y: into.height - py } }
@@ -1078,13 +1092,13 @@ mod tests {
 
     #[test]
     fn no_flip_passes_through() {
-        let p = point(0.5, 0.5, PixelSize { width: 1920.0, height: 1080.0 }, false);
+        let p = point(0.5, 0.5, CanvasSize { width: 1920.0, height: 1080.0 }, false);
         assert_eq!(p, PixelPoint { x: 960.0, y: 540.0 });
     }
 
     #[test]
     fn flip_inverts_y() {
-        let p = point(0.0, 0.0, PixelSize { width: 1920.0, height: 1080.0 }, true);
+        let p = point(0.0, 0.0, CanvasSize { width: 1920.0, height: 1080.0 }, true);
         assert_eq!(p, PixelPoint { x: 0.0, y: 1080.0 });
     }
 }
@@ -1237,7 +1251,7 @@ pub const RECORDINGS_DIR_NAME: &str = "recordings";
 pub enum ProjectStoreError {
     #[error("project.json not found in {0}")]
     MissingProjectJson(PathBuf),
-    #[error("unsupported formatVersion {0} (this build only opens v{})", Project::FORMAT_VERSION)]
+    #[error("unsupported formatVersion {0} (this build only opens v2)")]
     UnsupportedFormatVersion(i32),
     #[error("io error: {0}")]
     Io(#[from] io::Error),
