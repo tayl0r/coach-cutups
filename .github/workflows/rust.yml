@@ -25,11 +25,21 @@ jobs:
       # Headless wgpu needs a Vulkan adapter to run compositor tests on
       # Linux. lavapipe (Mesa software Vulkan) ships with mesa-vulkan-drivers.
       # macOS uses Metal natively; Windows uses D3D12 — no install there.
-      - name: Install Vulkan + lavapipe (Ubuntu only)
+      # Phase 6 also added Slint with the Skia renderer; on Linux the Skia
+      # crate needs fontconfig + freetype + xkbcommon at build time, plus
+      # libxcb / wayland headers for winit. macOS and Windows ship working
+      # toolchains by default.
+      - name: Install Vulkan + Slint Linux deps (Ubuntu only)
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+          sudo apt-get install -y \
+            libvulkan1 mesa-vulkan-drivers vulkan-tools \
+            libfontconfig1-dev libfreetype-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev \
+            libxcb-render-util0-dev libxcb-shape0-dev libxcb-xkb-dev \
+            libwayland-dev
 
       - run: cargo fmt --check
       - run: cargo clippy --workspace --exclude video-coach-media --all-targets -- -D warnings
@@ -47,9 +57,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
-      - name: Install GStreamer + Vulkan/lavapipe
+      - name: Install GStreamer + Vulkan/lavapipe + Slint deps
         # Vulkan/lavapipe is needed because the workspace build with
         # --features media includes video-coach-compositor's wgpu tests.
+        # Slint Skia + winit need fontconfig + freetype + xkbcommon + xcb
+        # + wayland headers (Phase 6).
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -63,7 +75,12 @@ jobs:
             gstreamer1.0-tools \
             libvulkan1 \
             mesa-vulkan-drivers \
-            vulkan-tools
+            vulkan-tools \
+            libfontconfig1-dev libfreetype-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev \
+            libxcb-icccm4-dev libxcb-image0-dev libxcb-keysyms1-dev \
+            libxcb-render-util0-dev libxcb-shape0-dev libxcb-xkb-dev \
+            libwayland-dev
 
       # Cache fixtures by manifest hash. When manifest is unchanged,
       # this restores fixtures/ from cache and the fetch script
