@@ -1,5 +1,7 @@
 // Modules added in subsequent tasks.
 
+#[cfg(feature = "media")]
+pub mod compose;
 pub mod fixture_source;
 pub mod recording;
 pub mod source;
