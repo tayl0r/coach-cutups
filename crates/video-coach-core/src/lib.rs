@@ -1,4 +1,5 @@
 pub mod event;
+pub mod export_settings;
 pub mod project;
 pub mod stroke;
 pub mod stroke_replay;
