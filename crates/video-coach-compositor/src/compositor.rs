@@ -444,4 +444,39 @@ mod tests {
             br
         );
     }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn pip_320x180_matches_macos_golden_hash() {
+        use sha2::{Digest, Sha256};
+
+        fn pixel_grid(w: u32, h: u32, scale: u8) -> Frame {
+            let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+            for y in 0..h {
+                for x in 0..w {
+                    pixels.extend_from_slice(&[
+                        (x * scale as u32) as u8,
+                        (y * scale as u32) as u8,
+                        128,
+                        255,
+                    ]);
+                }
+            }
+            Frame::new(w, h, pixels)
+        }
+
+        let comp = Compositor::new_headless().expect("compositor");
+        let source = pixel_grid(320, 180, 1);
+        let webcam = pixel_grid(160, 90, 3);
+        let out = comp.compose(&source, &webcam).expect("compose");
+
+        let hex = format!("{:x}", Sha256::digest(&out.pixels));
+        eprintln!("pip_320x180 hash on this machine: {hex}");
+
+        // First-run procedure: this assertion intentionally fails until the
+        // expected hash is filled in. Run `cargo test pip_320x180 -- --nocapture`,
+        // copy the printed hash, paste it below, re-run to confirm match.
+        let expected = "65557211990794a2aa913149e6a6e3ca2750f04597132938bb53e6f60ebbb55c";
+        assert_eq!(hex, expected, "golden frame mismatch on macOS Metal");
+    }
 }

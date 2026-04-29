@@ -11,3 +11,6 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
 thiserror = { workspace = true }
 tracing = "0.1"
+
+[dev-dependencies]
+sha2 = "0.10"
