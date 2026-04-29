@@ -19,3 +19,6 @@ App/Info.plist
 
 # Claude Code (local runtime state)
 .claude/
+
+# Rust
+/target
