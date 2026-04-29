@@ -117,6 +117,13 @@ async fn handle(
         Command::Quit => {
             tracing::info!(target: "app.lifecycle", event = "app.shutdown_requested");
             let _ = shutdown_tx.send(true);
+            // When a Slint UI is running on the main thread, the watch on
+            // shutdown_rx in ui::run also calls quit_event_loop. Calling it
+            // here too is a belt-and-suspenders no-op when no event loop
+            // is active (e.g. --headless), and it shaves the shutdown
+            // latency by one tokio scheduling round-trip when the UI is up.
+            // quit_event_loop is documented as thread-safe in Slint 1.8.
+            let _ = slint::quit_event_loop();
             CommandReply {
                 ok: true,
                 error: None,
