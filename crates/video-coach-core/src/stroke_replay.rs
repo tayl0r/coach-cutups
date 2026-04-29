@@ -66,6 +66,10 @@ mod tests {
     // exact bytes don't matter — what matters is that two calls with the same
     // tag produce the same Uuid, and different tags produce different Uuids.
     fn deterministic_uuid(tag: &str) -> Uuid {
+        // Tags >16 bytes silently collide because the algorithm truncates to
+        // 32 hex chars (= 16 bytes). All current callers use 1-byte tags;
+        // this guard prevents future misuse.
+        debug_assert!(tag.len() <= 16, "deterministic_uuid tag must be <=16 bytes");
         let mut hex = String::with_capacity(32);
         for b in tag.bytes() {
             hex.push_str(&format!("{:02x}", b));
@@ -100,6 +104,7 @@ mod tests {
     /// `point_count` evenly-spaced points over `duration_seconds`. The hosting
     /// event's recordTime is the END of the stroke.
     fn drag_stroke(id_tag: &str, duration_seconds: f64, point_count: usize) -> Stroke {
+        debug_assert!(point_count >= 2, "drag_stroke needs >=2 points to space");
         let dt = duration_seconds / (point_count as f64 - 1.0);
         let points = (0..point_count)
             .map(|i| StrokePoint {
