@@ -1,0 +1,14 @@
+[package]
+name = "video-coach-media"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+gstreamer = "0.23"
+gstreamer-app = "0.23"
+gstreamer-video = "0.23"
+gstreamer-audio = "0.23"
+thiserror = { workspace = true }
+tracing = "0.1"
