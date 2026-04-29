@@ -69,6 +69,9 @@ pub struct Clip {
     pub recording_filename: String,
     pub events: Vec<CommentaryEvent>,
     pub sort_index: i64,
+    /// Serialized as RFC 3339 with sub-second precision (chrono default).
+    /// Not parseable by Swift `JSONDecoder.dateDecodingStrategy = .iso8601`
+    /// — v2 has no Swift reader, so this is intentional.
     pub created_at: DateTime<Utc>,
 }
 
@@ -83,6 +86,14 @@ pub struct Project {
 }
 
 impl Project {
+    /// v2 deliberately differs from v1 in two on-disk shape details:
+    ///   - `SourceRef.bookmark` (macOS security-scoped bookmark) is replaced
+    ///     by `SourceRef.relative_path`, so a project folder is a
+    ///     self-contained, cross-platform unit.
+    ///   - JSON output emits keys in struct declaration order via
+    ///     `serde_json::to_vec_pretty`. v1 used Swift `JSONEncoder` with
+    ///     `.sortedKeys` (alphabetic). v2 has no Swift writer; declaration
+    ///     order is more readable in diffs.
     pub const FORMAT_VERSION: i32 = 2;
     pub fn new(name: impl Into<String>) -> Self {
         Self {
