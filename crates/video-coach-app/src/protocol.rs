@@ -1,6 +1,3 @@
-// Used by control_socket adapter (Task 5); only tests consume these for now.
-#![allow(dead_code)]
-
 use crate::bus::Command;
 use serde::{de, Deserialize, Deserializer, Serialize};
 
@@ -41,6 +38,8 @@ pub enum OutgoingFrame {
         #[serde(skip_serializing_if = "Option::is_none")]
         error: Option<String>,
     },
+    /// Constructed by the tracing → socket bridge in Task 6.
+    #[allow(dead_code)]
     Event {
         event: String,
         ts: u128,

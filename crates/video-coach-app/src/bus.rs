@@ -1,7 +1,3 @@
-// `BusHandle::send`, `Envelope::id`, and `BusHandle::tx` are unused until Task 5
-// wires the control socket; suppress dead_code so clippy stays clean.
-#![allow(dead_code)]
-
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 
@@ -18,6 +14,9 @@ pub enum Command {
 
 /// A command paired with a reply channel.
 pub struct Envelope {
+    /// Echoed back as `reply_to` on the matching reply, and propagated as the
+    /// originating id when forwarding events. Read in Task 6's tracing bridge.
+    #[allow(dead_code)]
     pub id: String,
     pub command: Command,
     pub reply: oneshot::Sender<CommandReply>,
