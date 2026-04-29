@@ -961,13 +961,15 @@ fixtures/**/*.m4a filter=lfs diff=lfs merge=lfs -text
 
 **Step 2: Prepare the fixtures**
 
-Two source files exist on the user's machine outside the repo:
+Source files on the user's machine outside the repo:
 
 - **Webcam clip**: `/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov`
   Duration 17.3 s, 1920×1080, H.264 + AAC, 45 MB. Copy verbatim into `fixtures/webcam.mov`.
 
-- **Source video**: `/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4`
-  Duration 83.7 min, 3840×2160 (4K), H.264 + AAC, 32 GB. Extract minutes 25–27 (timestamps 25:00–27:00) and re-encode to 1080p at ~6 Mbps to keep the fixture under 100 MB. Output: `fixtures/source.mp4`.
+- **Source video** (master): `/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4`
+  Duration 83.7 min, 3840×2160 (4K), H.264 + AAC, 32 GB. Extracted into **two fixtures from different minutes** so they double as distinct source assets — exercises the multi-source-video project case (v1 supports up to 2 source videos per project):
+  - `fixtures/source-1080p.mp4` — minute **25** (`00:25:00 → 00:26:00`), re-encoded to 1920×1080 at ~6 Mbps (~45 MB). Default for most flow tests.
+  - `fixtures/source-4k.mp4` — minute **50** (`00:50:00 → 00:51:00`), re-encoded at native 3840×2160 at ~20 Mbps (~150 MB). Used for 4K-playback regression tests; v1 had real bugs in the 4K decode/scrub path that we want to catch automatically.
 
 `ffmpeg` is used here as a one-time dev/build tool. It is **not** an app dependency — the runtime project still uses GStreamer exclusively. Install with `brew install ffmpeg` if not present.
 
@@ -978,18 +980,29 @@ mkdir -p fixtures
 cp "/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov" \
    fixtures/webcam.mov
 
-# Source: extract minutes 25–27, downscale to 1080p, re-encode at 6 Mbps.
-# -ss before -i seeks fast (keyframe-aligned) and the re-encode pass cleans
+# 1080p source: extract minute 25, downscale to 1080p, re-encode at 6 Mbps.
+# -ss before -i seeks fast (keyframe-aligned); the re-encode pass cleans
 # up the seek edge.
-ffmpeg -ss 00:25:00 -t 00:02:00 -i "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4" \
+ffmpeg -ss 00:25:00 -t 00:01:00 -i "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4" \
        -vf "scale=1920:1080:flags=lanczos" \
        -c:v libx264 -preset slow -b:v 6000k -maxrate 6500k -bufsize 12000k \
        -c:a aac -b:a 128k \
        -movflags +faststart \
-       fixtures/source.mp4
+       fixtures/source-1080p.mp4
 
-# Sanity check: should print ~120 seconds.
-ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/source.mp4
+# 4K source: different minute (50, not 25) so this doubles as a second
+# distinct source asset. Native resolution, lower bitrate than original
+# (~20 Mbps is enough quality for a regression-test fixture and keeps the
+# file under 200 MB).
+ffmpeg -ss 00:50:00 -t 00:01:00 -i "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4" \
+       -c:v libx264 -preset slow -b:v 20000k -maxrate 22000k -bufsize 40000k \
+       -c:a aac -b:a 128k \
+       -movflags +faststart \
+       fixtures/source-4k.mp4
+
+# Sanity-check both files: should print ~60 seconds for each.
+ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/source-1080p.mp4
+ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/source-4k.mp4
 ```
 
 For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs it. Phase 2's smoke test does not. When needed, generate a synthetic tone or extract the audio track from the webcam clip.
@@ -1001,13 +1014,21 @@ For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs
 {
   "schemaVersion": 1,
   "fixtures": {
-    "source.mp4": {
-      "purpose": "Sports source video — input timeline for recording-flow tests.",
-      "durationSeconds": 120,
+    "source-1080p.mp4": {
+      "purpose": "Default sports source video — input timeline for most recording-flow tests.",
+      "durationSeconds": 60,
       "width": 1920,
       "height": 1080,
       "originalSource": "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4",
-      "trimSpec": "00:25:00 → 00:27:00 (re-encoded 1080p H.264 ~6 Mbps)"
+      "trimSpec": "00:25:00 → 00:26:00 (re-encoded 1080p H.264 ~6 Mbps)"
+    },
+    "source-4k.mp4": {
+      "purpose": "4K source for playback/scrub regression tests (v1 had bugs in the 4K decode path) AND a distinct second source asset for multi-source-video project tests.",
+      "durationSeconds": 60,
+      "width": 3840,
+      "height": 2160,
+      "originalSource": "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4",
+      "trimSpec": "00:50:00 → 00:51:00 (re-encoded native 4K H.264 ~20 Mbps)"
     },
     "webcam.mov": {
       "purpose": "Pre-recorded webcam clip swapped in for live capture in test mode.",
@@ -1018,14 +1039,14 @@ For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs
       "note": "Short — test recordings should stay ≤15s, or the fixture pipeline must loop the clip."
     }
   },
-  "totalSizeBudgetMB": 200
+  "totalSizeBudgetMB": 300
 }
 ```
 
 **Step 4: Commit (LFS will pick up the binary files automatically)**
 
 ```bash
-git add .gitattributes fixtures/manifest.json fixtures/source.mp4 fixtures/webcam.mov
+git add .gitattributes fixtures/manifest.json fixtures/source-1080p.mp4 fixtures/source-4k.mp4 fixtures/webcam.mov
 git commit -m "build: enable Git LFS for fixtures + initial source/webcam fixtures"
 ```
 
@@ -1035,7 +1056,7 @@ Verify LFS picked up the binaries (not committed inline as text):
 git lfs ls-files
 ```
 
-Expected output: lines naming `fixtures/source.mp4` and `fixtures/webcam.mov` with their LFS SHAs.
+Expected output: lines naming each fixture with its LFS SHA.
 
 **Note on `mic.wav`**: not included in this task — defer until a recording-flow test in a later phase needs it. The `manifest.json` will be extended at that point.
 
