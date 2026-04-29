@@ -45,6 +45,11 @@ default = ["control-socket"]
 # When disabled (release packaging: --no-default-features), the control socket
 # adapter is compiled out entirely. The app cannot be remote-driven.
 control-socket = []
+# Stub feature flag for tests that depend on real media fixtures. No-op in
+# Phase 2 — declared so `cargo test --features media` is a legal command in CI
+# (workspace-level `--features` requires the flag to be declared somewhere).
+# Phases 3+ will tag fixture-dependent tests with `#[cfg(feature = "media")]`.
+media = []
 
 [dependencies]
 video-coach-core = { path = "../video-coach-core" }
@@ -329,20 +334,37 @@ git commit -m "feat(app): tokio runtime + typed Command bus with Quit/Ping"
 
 ```rust
 // crates/video-coach-app/src/protocol.rs
-use serde::{Deserialize, Serialize};
+use serde::{de, Deserialize, Deserializer, Serialize};
+use crate::bus::Command;
 
 /// One JSON line received on the control socket.
 /// Wraps a Command with a correlation id.
-#[derive(Debug, Deserialize)]
+///
+/// We hand-roll Deserialize because `#[serde(flatten)]` does not work over
+/// internally-tagged enums (serde-rs/serde#1189). The wire shape stays flat:
+/// `{"id": "1", "cmd": "quit"}` — `id` is split off, the rest deserializes
+/// as a Command via `serde_json::from_value`.
+#[derive(Debug)]
 pub struct IncomingFrame {
     pub id: String,
-    #[serde(flatten)]
-    pub command: crate::bus::Command,
+    pub command: Command,
+}
+
+impl<'de> Deserialize<'de> for IncomingFrame {
+    fn deserialize<D: Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
+        let mut map = serde_json::Map::<String, serde_json::Value>::deserialize(de)?;
+        let id = map.remove("id")
+            .and_then(|v| v.as_str().map(String::from))
+            .ok_or_else(|| de::Error::missing_field("id"))?;
+        let command = serde_json::from_value::<Command>(serde_json::Value::Object(map))
+            .map_err(de::Error::custom)?;
+        Ok(IncomingFrame { id, command })
+    }
 }
 
 /// One JSON line sent on the control socket. Either a reply to a command
 /// (correlated by id) or a lifecycle/state event.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum OutgoingFrame {
     Reply {
@@ -369,6 +391,19 @@ mod tests {
         let frame: IncomingFrame = serde_json::from_str(r#"{"id":"abc","cmd":"quit"}"#).unwrap();
         assert_eq!(frame.id, "abc");
         assert!(matches!(frame.command, Command::Quit));
+    }
+
+    #[test]
+    fn incoming_frame_parses_ping_with_id() {
+        let frame: IncomingFrame = serde_json::from_str(r#"{"id":"42","cmd":"ping"}"#).unwrap();
+        assert_eq!(frame.id, "42");
+        assert!(matches!(frame.command, Command::Ping));
+    }
+
+    #[test]
+    fn incoming_frame_missing_id_errors() {
+        let res: Result<IncomingFrame, _> = serde_json::from_str(r#"{"cmd":"quit"}"#);
+        assert!(res.is_err());
     }
 
     #[test]
@@ -404,7 +439,7 @@ mod protocol;
 **Step 2: Run tests**
 
 Run: `cargo test -p video-coach-app protocol::`
-Expected: 3 passed.
+Expected: 5 passed.
 
 **Step 3: Commit**
 
@@ -801,11 +836,17 @@ pub struct App {
 }
 
 impl App {
-    /// Locate the app binary. Cargo sets CARGO_BIN_EXE_<crate> at test time.
+    /// Locate the app binary. `CARGO_BIN_EXE_<name>` is only set for tests
+    /// of the SAME crate that owns the binary — useless cross-crate. Walk
+    /// up from the current test executable instead: cargo runs tests at
+    /// `target/<profile>/deps/<test>-<hash>`, so `target/<profile>/` is
+    /// two pops up, and the app binary lives there.
     pub fn binary_path() -> PathBuf {
-        std::env::var("CARGO_BIN_EXE_video-coach-app")
-            .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join("../debug/video-coach-app"))
+        let mut p = std::env::current_exe().expect("current_exe must succeed");
+        p.pop(); // drop test binary name
+        if p.ends_with("deps") { p.pop(); } // target/<profile>/deps -> target/<profile>
+        p.push(if cfg!(windows) { "video-coach-app.exe" } else { "video-coach-app" });
+        p
     }
 
     pub async fn launch() -> anyhow::Result<Self> {
@@ -909,12 +950,16 @@ use video_coach_harness::App;
 
 #[tokio::test]
 async fn launch_ping_quit_roundtrip() -> anyhow::Result<()> {
+    // App::launch() returning successfully already proves the app started
+    // (it parsed `control_socket.ready` from stdout). We do NOT assert on
+    // `app.launched` because it may have been emitted before the harness
+    // connected to the socket — there's a real race between stdout reading
+    // and TCP connection establishment.
     let mut app = App::launch().await?;
 
-    // Verify app.launched event arrived.
-    app.wait_for_event("app.launched", Duration::from_secs(2)).await?;
-
-    // Send a ping and verify it's acknowledged.
+    // Send a ping. Both the reply and the resulting `app.ping` event are
+    // emitted strictly after the socket connection exists, so they are
+    // race-free observations.
     let reply = app.send(serde_json::json!({ "cmd": "ping" })).await?;
     assert_eq!(reply.ok, Some(true), "ping should succeed");
     app.wait_for_event("app.ping", Duration::from_secs(2)).await?;
@@ -1060,7 +1105,17 @@ Record the three SHA256 values; they go into `manifest.json` in step 4.
 }
 ```
 
-The full download URL for each fixture is `{downloadUrlBase}/{releaseTag}/{filename}`. Replace `<OWNER>` with the actual GitHub repo owner when committing.
+The full download URL for each fixture is `{downloadUrlBase}/{releaseTag}/{filename}`.
+
+After writing the manifest with the literal `<OWNER>` placeholder, substitute the real GitHub owner in-place:
+
+```bash
+OWNER=$(git remote get-url origin | sed 's|.*github.com[:/]\([^/]*\)/.*|\1|')
+echo "owner = $OWNER"  # sanity check before substituting
+# macOS (BSD sed) requires an empty arg after -i; Linux (GNU sed) does not.
+# `perl -pi -e` works identically on both:
+perl -pi -e "s|<OWNER>|$OWNER|g" fixtures/manifest.json
+```
 
 ```
 # fixtures/.gitkeep — keeps fixtures/ in git when it's otherwise empty
@@ -1084,6 +1139,13 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MANIFEST="$REPO_ROOT/fixtures/manifest.json"
 FIX_DIR="$REPO_ROOT/fixtures"
+
+if ! command -v jq >/dev/null 2>&1; then
+  echo "error: jq is required to parse fixtures/manifest.json" >&2
+  echo "  macOS:  brew install jq" >&2
+  echo "  Ubuntu: sudo apt-get install jq" >&2
+  exit 1
+fi
 
 if [ ! -f "$MANIFEST" ]; then
   echo "manifest not found: $MANIFEST" >&2
@@ -1122,7 +1184,9 @@ for name in $names; do
   url="$url_base/$release_tag/$name"
   echo "get $name from $url"
   mkdir -p "$FIX_DIR"
-  curl -fLsS -o "$out" "$url"
+  # --connect-timeout: bail if no TCP handshake in 30s (CDN unreachable).
+  # --max-time:        bail on any single transfer that runs over 5 min.
+  curl -fLsS --connect-timeout 30 --max-time 300 -o "$out" "$url"
 
   actual=$(sha256 "$out")
   if [ "$actual" != "$expected_sha" ]; then
@@ -1237,7 +1301,10 @@ jobs:
           key: fixtures-${{ hashFiles('fixtures/manifest.json') }}
 
       - name: Install jq (Ubuntu has it preinstalled, but ensure it)
-        run: which jq || sudo apt-get update && sudo apt-get install -y jq
+        # Parens force `||` to gate the entire (update && install) chain.
+        # Without them, `&&` binds tighter and `apt-get install` runs on
+        # every invocation — even when jq is already present.
+        run: which jq || (sudo apt-get update && sudo apt-get install -y jq)
 
       - name: Fetch fixtures from release
         run: ./scripts/fetch-fixtures.sh
