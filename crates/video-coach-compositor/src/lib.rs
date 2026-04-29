@@ -1,9 +1,13 @@
-// Modules added in subsequent tasks.
+pub mod compositor;
+pub mod frame;
+
+pub use compositor::{Compositor, CompositorError};
+pub use frame::Frame;
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn smoke() {
-        // Crate compiles; runtime smoke happens in Task 3.
+        // Module wiring verified — runtime tests in subsequent tasks.
     }
 }
