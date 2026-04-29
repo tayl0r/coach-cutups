@@ -62,15 +62,349 @@ fn pick_h264_encoder() -> Result<gstreamer::Element, ComposeError> {
     Err(ComposeError::MissingElement("h264 encoder (any)".into()))
 }
 
-/// Compose two input video files (source + webcam) into a single output .mov.
-/// Phase 5 ignores audio and produces silent video. Output codec: H.264.
+/// Compose two input video files (source + webcam) into a single output .mov
+/// with the webcam scaled and overlaid in the bottom-right corner of the
+/// source. Phase 5 ignores audio and produces silent video. Output codec: H.264.
+///
+/// Pipeline shape:
+///
+/// ```text
+///   filesrc(source) → decodebin → queue → videoconvert → caps RGBA → appsink ─┐
+///                                                                              ├─→ wgpu PiP
+///   filesrc(webcam) → decodebin → queue → videoconvert → caps RGBA → appsink ─┘    composite
+///                                                                                  ↓
+///                                       appsrc → videoconvert → NV12 → x264enc → qtmux → filesink
+/// ```
+///
+/// The source appsink drives output: every source frame triggers
+/// `compositor.compose(&source_frame, &latest_webcam_frame)` and pushes the
+/// result through appsrc. The webcam appsink simply replaces its latest-frame
+/// slot. Webcam EOS is silently ignored (driver keeps using the last received
+/// webcam frame); source EOS triggers `appsrc.end_of_stream()`.
 pub fn compose_two_files(
-    _source: PathBuf,
-    _webcam: PathBuf,
-    _output: PathBuf,
+    source: PathBuf,
+    webcam: PathBuf,
+    output: PathBuf,
 ) -> Result<(), ComposeError> {
-    // Real implementation lands in Task 4.
-    Err(ComposeError::AppFlow("not implemented yet".into()))
+    crate::init().map_err(|e| ComposeError::Recording(e.into()))?;
+
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let compositor = Arc::new(video_coach_compositor::Compositor::new_headless()?);
+    let pipeline = gstreamer::Pipeline::new();
+
+    // Two input chains.
+    let source_appsink = build_input_chain(&pipeline, &source, "src")?;
+    let webcam_appsink = build_input_chain(&pipeline, &webcam, "cam")?;
+
+    // OUTPUT chain — same shape as passthrough.
+    let appsrc_caps =
+        gstreamer::Caps::from_str("video/x-raw,format=RGBA,width=1920,height=1080,framerate=30/1")
+            .unwrap();
+    let appsrc = AppSrc::builder()
+        .caps(&appsrc_caps)
+        .format(gstreamer::Format::Time)
+        .is_live(false)
+        .build();
+    let videoconvert_out = make_or("videoconvert")?;
+    let capsfilter_yuv = gstreamer::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gstreamer::Caps::from_str("video/x-raw,format=NV12").unwrap(),
+        )
+        .build()
+        .map_err(|_| ComposeError::MissingElement("capsfilter".into()))?;
+    let video_enc = pick_h264_encoder()?;
+    let h264parse = make_or("h264parse")?;
+    let qtmux = make_or("qtmux")?;
+    let filesink = gstreamer::ElementFactory::make("filesink")
+        .property("location", output.to_str().expect("utf8 path"))
+        .property("async", false)
+        .build()
+        .map_err(|_| ComposeError::MissingElement("filesink".into()))?;
+
+    pipeline
+        .add_many([
+            appsrc.upcast_ref::<gstreamer::Element>(),
+            &videoconvert_out,
+            &capsfilter_yuv,
+            &video_enc,
+            &h264parse,
+            &qtmux,
+            &filesink,
+        ])
+        .map_err(|e| ComposeError::AppFlow(format!("add output chain: {e}")))?;
+    gstreamer::Element::link_many([
+        appsrc.upcast_ref::<gstreamer::Element>(),
+        &videoconvert_out,
+        &capsfilter_yuv,
+        &video_enc,
+        &h264parse,
+        &qtmux,
+        &filesink,
+    ])
+    .map_err(|e| ComposeError::AppFlow(format!("link output chain: {e}")))?;
+
+    // Webcam slot — replaced on every webcam frame, read by source driver.
+    let latest_webcam: Arc<Mutex<Option<video_coach_compositor::Frame>>> =
+        Arc::new(Mutex::new(None));
+    {
+        let latest_webcam = latest_webcam.clone();
+        webcam_appsink.set_callbacks(
+            gstreamer_app::AppSinkCallbacks::builder()
+                .new_preroll(|sink| {
+                    let _ = sink.pull_preroll();
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .new_sample(move |sink| {
+                    let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
+                    if let Some(frame) = sample_to_compositor_frame(&sample) {
+                        *latest_webcam.lock().expect("webcam slot lock") = Some(frame);
+                    }
+                    Ok(gstreamer::FlowSuccess::Ok)
+                })
+                .build(),
+        );
+    }
+
+    // Source driver — produces composed output frames at the source's rate.
+    let appsrc_drive = appsrc.clone();
+    let appsrc_eos = appsrc.clone();
+    let pts_state = Arc::new(Mutex::new(0_u64));
+    let frame_duration_state = Arc::new(Mutex::new(33_333_333_u64));
+    let frame_duration_set = frame_duration_state.clone();
+    let frame_duration_read = frame_duration_state.clone();
+    let caps_forwarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let caps_forwarded_set = caps_forwarded.clone();
+    let comp = compositor.clone();
+    let webcam_for_drive = latest_webcam.clone();
+
+    source_appsink.set_callbacks(
+        gstreamer_app::AppSinkCallbacks::builder()
+            .new_preroll(|sink| {
+                let _ = sink.pull_preroll();
+                Ok(gstreamer::FlowSuccess::Ok)
+            })
+            .new_sample(move |sink| {
+                let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
+
+                // Framerate + appsrc caps forwarding (first-frame only).
+                if let Some(caps) = sample.caps() {
+                    if let Some(structure) = caps.structure(0) {
+                        if let Ok(fr) = structure.get::<gstreamer::Fraction>("framerate") {
+                            let num = fr.numer() as u64;
+                            let den = fr.denom() as u64;
+                            if num > 0 {
+                                let dur = 1_000_000_000_u64 * den / num;
+                                *frame_duration_set.lock().expect("fd lock") = dur;
+                            }
+                        }
+                    }
+                    if !caps_forwarded_set.load(std::sync::atomic::Ordering::SeqCst) {
+                        let owned = caps.to_owned();
+                        appsrc_drive.set_caps(Some(&owned));
+                        caps_forwarded_set.store(true, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+
+                let source_frame =
+                    sample_to_compositor_frame(&sample).ok_or(gstreamer::FlowError::Error)?;
+                // Use the latest webcam frame, or a 2x2 black placeholder if
+                // webcam hasn't produced one yet.
+                let webcam_frame = webcam_for_drive
+                    .lock()
+                    .expect("webcam slot lock")
+                    .clone()
+                    .unwrap_or_else(|| video_coach_compositor::Frame::solid(2, 2, [0, 0, 0, 255]));
+
+                let composed = comp
+                    .compose(&source_frame, &webcam_frame)
+                    .map_err(|_| gstreamer::FlowError::Error)?;
+
+                let mut out_buf = gstreamer::Buffer::with_size(composed.pixels.len())
+                    .map_err(|_| gstreamer::FlowError::Error)?;
+                {
+                    let buf_mut = out_buf.get_mut().ok_or(gstreamer::FlowError::Error)?;
+                    let mut out_map = buf_mut
+                        .map_writable()
+                        .map_err(|_| gstreamer::FlowError::Error)?;
+                    out_map.copy_from_slice(&composed.pixels);
+                    drop(out_map);
+                    let frame_duration_ns = *frame_duration_read.lock().expect("fd read lock");
+                    let mut pts = pts_state.lock().expect("pts state lock");
+                    buf_mut.set_pts(gstreamer::ClockTime::from_nseconds(*pts));
+                    buf_mut.set_duration(gstreamer::ClockTime::from_nseconds(frame_duration_ns));
+                    *pts += frame_duration_ns;
+                }
+
+                appsrc_drive
+                    .push_buffer(out_buf)
+                    .map_err(|_| gstreamer::FlowError::Error)?;
+                Ok(gstreamer::FlowSuccess::Ok)
+            })
+            .eos(move |_sink| {
+                // Source EOS = output is done. Webcam EOS (often earlier) is
+                // ignored; the driver keeps using the last webcam frame.
+                let _ = appsrc_eos.end_of_stream();
+            })
+            .build(),
+    );
+
+    pipeline
+        .set_state(gstreamer::State::Playing)
+        .map_err(|e| ComposeError::StateChange(format!("PLAYING: {e:?}")))?;
+
+    let bus = pipeline.bus().expect("pipeline bus");
+    let deadline = std::time::Instant::now() + Duration::from_secs(300);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            pipeline.set_state(gstreamer::State::Null).ok();
+            return Err(ComposeError::AppFlow(
+                "timeout waiting for filesink EOS".into(),
+            ));
+        }
+        if let Some(msg) = bus.timed_pop_filtered(
+            gstreamer::ClockTime::from_seconds(1),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        ) {
+            match msg.view() {
+                gstreamer::MessageView::Eos(_) => break,
+                gstreamer::MessageView::Error(err) => {
+                    pipeline.set_state(gstreamer::State::Null).ok();
+                    return Err(ComposeError::AppFlow(format!("pipeline error: {err}")));
+                }
+                _ => continue,
+            }
+        }
+    }
+    pipeline
+        .set_state(gstreamer::State::Null)
+        .map_err(|e| ComposeError::StateChange(format!("NULL: {e:?}")))?;
+    Ok(())
+}
+
+/// Build a `filesrc → decodebin → queue → videoconvert → caps RGBA → appsink`
+/// subgraph and add it to `pipeline`. Audio (or any non-video) pads from
+/// decodebin are routed to fakesinks so the pipeline doesn't stall on
+/// unlinked decoder outputs. Element names are prefixed with `label` so two
+/// chains in the same pipeline don't collide.
+fn build_input_chain(
+    pipeline: &gstreamer::Pipeline,
+    path: &Path,
+    label: &'static str,
+) -> Result<AppSink, ComposeError> {
+    let filesrc = gstreamer::ElementFactory::make("filesrc")
+        .name(format!("{label}-filesrc"))
+        .property("location", path.to_str().expect("utf8 path"))
+        .build()
+        .map_err(|_| ComposeError::MissingElement("filesrc".into()))?;
+    let decodebin = gstreamer::ElementFactory::make("decodebin")
+        .name(format!("{label}-decodebin"))
+        .build()
+        .map_err(|_| ComposeError::MissingElement("decodebin".into()))?;
+    let queue_in = gstreamer::ElementFactory::make("queue")
+        .name(format!("{label}-queue"))
+        .build()
+        .map_err(|_| ComposeError::MissingElement("queue".into()))?;
+    let videoconvert = gstreamer::ElementFactory::make("videoconvert")
+        .name(format!("{label}-videoconvert"))
+        .build()
+        .map_err(|_| ComposeError::MissingElement("videoconvert".into()))?;
+    let capsfilter = gstreamer::ElementFactory::make("capsfilter")
+        .name(format!("{label}-capsfilter"))
+        .property("caps", gstreamer::Caps::from_str(RGBA_CAPS).unwrap())
+        .build()
+        .map_err(|_| ComposeError::MissingElement("capsfilter".into()))?;
+    let appsink_elem = gstreamer::ElementFactory::make("appsink")
+        .name(format!("{label}-appsink"))
+        .build()
+        .map_err(|_| ComposeError::MissingElement("appsink".into()))?;
+    let appsink = appsink_elem
+        .clone()
+        .dynamic_cast::<AppSink>()
+        .map_err(|_| ComposeError::AppFlow(format!("{label}: appsink downcast failed")))?;
+    appsink.set_property("sync", false);
+
+    pipeline
+        .add_many([
+            &filesrc,
+            &decodebin,
+            &queue_in,
+            &videoconvert,
+            &capsfilter,
+            appsink.upcast_ref::<gstreamer::Element>(),
+        ])
+        .map_err(|e| ComposeError::AppFlow(format!("{label}: add chain: {e}")))?;
+    filesrc
+        .link(&decodebin)
+        .map_err(|e| ComposeError::AppFlow(format!("{label}: filesrc→decodebin: {e}")))?;
+    gstreamer::Element::link_many([&queue_in, &videoconvert, &capsfilter]).map_err(|e| {
+        ComposeError::AppFlow(format!("{label}: queue→videoconvert→capsfilter: {e}"))
+    })?;
+    capsfilter
+        .link(&appsink)
+        .map_err(|e| ComposeError::AppFlow(format!("{label}: capsfilter→appsink: {e}")))?;
+
+    let queue_sink = queue_in
+        .static_pad("sink")
+        .ok_or_else(|| ComposeError::AppFlow(format!("{label}: queue has no sink pad")))?;
+    let pipeline_weak = pipeline.downgrade();
+    decodebin.connect_pad_added(move |_dbin, pad| {
+        let Some(caps) = pad.current_caps() else {
+            return;
+        };
+        let Some(structure) = caps.structure(0) else {
+            return;
+        };
+        let media = structure.name().to_string();
+        if media.starts_with("video/") {
+            if pad.link(&queue_sink).is_err() {
+                tracing::warn!(target: "compose", chain = label, "failed to link decoded video pad");
+            }
+        } else {
+            let Some(pipeline) = pipeline_weak.upgrade() else {
+                return;
+            };
+            let fakesink = match gstreamer::ElementFactory::make("fakesink")
+                .name(format!("{label}-audio-fakesink"))
+                .property("sync", false)
+                .property("async", false)
+                .build()
+            {
+                Ok(f) => f,
+                Err(_) => return,
+            };
+            if pipeline.add(&fakesink).is_err() {
+                return;
+            }
+            if fakesink.sync_state_with_parent().is_err() {
+                return;
+            }
+            if let Some(sink_pad) = fakesink.static_pad("sink") {
+                let _ = pad.link(&sink_pad);
+            }
+        }
+    });
+
+    Ok(appsink)
+}
+
+/// Pull a `Sample` and reshape it into a wgpu-compositor-friendly RGBA Frame.
+fn sample_to_compositor_frame(sample: &gstreamer::Sample) -> Option<video_coach_compositor::Frame> {
+    let buffer = sample.buffer()?;
+    let caps = sample.caps()?;
+    let structure = caps.structure(0)?;
+    let width = structure.get::<i32>("width").ok()? as u32;
+    let height = structure.get::<i32>("height").ok()? as u32;
+    let map = buffer.map_readable().ok()?;
+    Some(video_coach_compositor::Frame::new(
+        width,
+        height,
+        map.to_vec(),
+    ))
 }
 
 /// Single-input passthrough: source video → RGBA appsink → RGBA appsrc → encode → file.
@@ -518,6 +852,29 @@ mod tests {
         assert!(
             n > 100,
             "expected hundreds of buffers from a 60s 30fps video; got {n}"
+        );
+    }
+
+    #[test]
+    fn compose_source_plus_webcam_produces_playable_mov() {
+        // Same VideoToolbox-disable trick as passthrough_source_to_mov.
+        std::env::set_var(
+            "GST_PLUGIN_FEATURE_RANK",
+            "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE",
+        );
+        let tmp_dir = tempfile::tempdir().unwrap();
+        let out = tmp_dir.path().join("composed.mov");
+        compose_two_files(
+            fixture("source-1080p.mp4"),
+            fixture("webcam.mov"),
+            out.clone(),
+        )
+        .unwrap();
+        let metadata = std::fs::metadata(&out).unwrap();
+        assert!(
+            metadata.len() > 100_000,
+            "composed output too small: {} bytes",
+            metadata.len()
         );
     }
 }
