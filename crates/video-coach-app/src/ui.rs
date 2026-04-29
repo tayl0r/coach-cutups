@@ -110,3 +110,39 @@ pub fn run(
 
     window.run().map_err(Into::into)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Phase 6 Task 6 — proves the Slint component build pipeline + the
+    /// headless testing backend are wired up.
+    ///
+    /// Honest scope (per the adversarial review): this test does NOT cover
+    /// native MenuBar interaction. Slint's testing backend cannot drive
+    /// macOS `NSMenu` items. The only real test of the menu→bus path is
+    /// the manual smoke checklist in Task 8 plus the existing harness E2E
+    /// coverage of the underlying OpenProject / Quit bus commands.
+    ///
+    /// What this DOES prove: `slint::include_modules!()` produced a usable
+    /// `MainWindow` type, the `project-title` `in property <string>`
+    /// round-trips through the generated getter/setter, and
+    /// `i_slint_backend_testing` initializes a backend without a display.
+    /// Future phases can extend this scaffold.
+    #[test]
+    fn main_window_project_title_property_round_trips() {
+        // init_no_event_loop is idempotent across multiple #[test]s in the
+        // same binary (cargo test runs them serially in the same process by
+        // default); subsequent calls are cheap no-ops.
+        i_slint_backend_testing::init_no_event_loop();
+        let window =
+            MainWindow::new().expect("MainWindow::new must succeed under testing backend");
+        assert_eq!(
+            window.get_project_title().as_str(),
+            "No project open",
+            "default project-title should match the .slint default",
+        );
+        window.set_project_title("Phase 6 Smoke".into());
+        assert_eq!(window.get_project_title().as_str(), "Phase 6 Smoke");
+    }
+}

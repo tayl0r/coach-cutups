@@ -30,3 +30,8 @@ rfd = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }
+
+[dev-dependencies]
+# Slint's testing backend lets component tests run headless (no winit
+# window). Pinned to the same minor as the runtime slint dep.
+i-slint-backend-testing = "1.8"

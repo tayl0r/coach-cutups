@@ -30,10 +30,3 @@ export component MainWindow inherits Window {
     }
 }
 
-// Inline element for the Phase 6 Task 6 component test. Kept in the
-// same .slint file so tests reuse the build pipeline.
-export component ProjectTitleLabel inherits Text {
-    in property <string> name;
-    text: name;
-    font-size: 18px;
-}
