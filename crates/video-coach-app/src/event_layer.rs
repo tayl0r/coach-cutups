@@ -109,3 +109,16 @@ impl tracing::field::Visit for JsonVisitor {
             .insert(field.name().to_string(), serde_json::Value::Bool(value));
     }
 }
+
+#[cfg(all(test, feature = "control-socket"))]
+mod tests {
+    use super::FORWARDED_TARGETS;
+
+    #[test]
+    fn forwarded_targets_include_recording() {
+        assert!(
+            FORWARDED_TARGETS.contains(&"recording"),
+            "recording.* events must reach the control socket",
+        );
+    }
+}
