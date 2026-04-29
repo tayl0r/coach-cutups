@@ -152,26 +152,77 @@ The product behavior described in `2026-04-27-video-coach-design.md` carries ove
 
 ## Testing strategy
 
-- **`video-coach-core`**: pure-logic unit tests with `cargo test`. No GStreamer, no GPU — runs in CI on every push.
-- **`video-coach-compositor`**: golden-frame tests. Render known input textures + a known stroke list, hash the output, compare. Runs headlessly in CI with a software wgpu adapter (lavapipe / WARP).
-- **`video-coach-media`**: GStreamer integration tests with synthetic test sources (`videotestsrc` / `audiotestsrc`). Verify pipeline construction, end-to-end encode/decode round trips, frame counts. Doesn't require real cameras.
-- **End-to-end**: scripted Slint UI tests for the critical paths (new project → record clip → export). Slint has limited UI-test tooling; expect these to be smoke tests, not exhaustive.
-- **Visual parity test (preview vs export)**: same input clip + plan, render through preview path and through export path, compare hashes. Must match. Catches divergence the moment it's introduced.
+**Hard requirement: zero manual testing.** Every feature ships with automated coverage. The harness must be able to drive the live app — open projects, simulate clicks and keystrokes, run recordings against fixture media, trigger exports, and verify outputs — without a human ever touching a window. This shapes the architecture (see "Test infrastructure" below), not just the test suite.
 
-## Phasing (rough — formalized in the implementation plan)
+Three layers, cheapest to most expensive:
 
-1. Workspace skeleton, `video-coach-core` ported from Swift (data model, project IO, source-time reconstruction, plan generation).
-2. GStreamer capture pipeline (camera + mic → file). Shippable as a CLI before any UI.
-3. wgpu compositor: PiP + stroke layer. Tested via golden-frame harness.
-4. GStreamer export pipeline: file → decode → composite → encode → mux.
-5. Slint UI shell, project picker, source-video timeline, basic transport.
-6. Recording UI integration.
-7. Clip preview integration (compositor surface → Slint image).
-8. Export sheet UI.
-9. Polish, packaging, cross-platform CI green.
+- **Layer 1 — Pure logic (`video-coach-core`)**: `cargo test`. No GStreamer, no GPU, no Slint. Fastest, runs on every push, the bulk of correctness coverage for algorithms (source-time reconstruction, stroke replay, plan building, tag aggregation).
+- **Layer 2 — Component-level**:
+  - `video-coach-compositor`: golden-frame tests. Render known input textures + stroke list, hash the output, compare. Headless via software wgpu adapter (lavapipe / WARP).
+  - `video-coach-media`: GStreamer integration tests with synthetic sources (`videotestsrc` / `audiotestsrc`) and fixture-file sources. Pipeline construction, encode/decode round trips, frame counts.
+  - **Slint component tests**: per-component Rust integration tests using `slint::testing` to instantiate a `.slint` component, drive simulated input via the API, assert output state. No real window, no display, headless. Catches binding/wiring bugs without launching the full app.
+- **Layer 3 — Full end-to-end**: full app launched in test mode, driven through a control socket against fixture media. Verifies complete user flows. See "Test infrastructure" for the architecture.
+
+**Visual parity test (preview vs export)**: same input clip + plan, render through preview path and through export path, compare hashes. Must match. Catches divergence the moment it's introduced.
+
+## Test infrastructure
+
+The end-to-end harness is a first-class part of the architecture, not an afterthought. The plumbing lands in Phase 2 — *before* any UI or capture code — so every subsequent phase is tested through it from day one.
+
+```
+                                          ┌─ control socket (UDS / named pipe) ─┐
+test harness  (or Claude, or a script)  ◄►│  enabled by --control-socket=PATH    │  ◄── live app
+                                          │  cfg(debug_assertions) only          │
+                                          └─ subscribes to event bus ────────────┘
+                                          
+                                          fixtures/   (Git LFS, swapped in for live capture)
+                                          ├─ source.mp4
+                                          ├─ webcam.mp4
+                                          └─ mic.wav
+```
+
+Components:
+
+- **In-process command bus**: every UI action and external command is a typed `Command` enum dispatched on one channel. The UI dispatches commands; the harness dispatches commands; same code path. Means the harness can never get out of sync with what real users can do.
+- **`tracing` crate for telemetry**: Rust ecosystem standard. Named lifecycle events at every meaningful point — `app.launch`, `project.opened`, `recording.started`, `clip.finalized`, `export.frame { n, total }`, `export.done`. JSON-line output to stdout in test mode, human-readable in dev. Filterable by target/level.
+- **Control socket adapter**: thin wrapper around the bus that exposes commands and a curated event subscription over a Unix domain socket (or named pipe on Windows) when `--control-socket=PATH` is passed. **Compiled out entirely in release builds** via `#[cfg(debug_assertions)]` — release binaries cannot have a control socket exposed even if a flag is passed.
+- **Wire protocol**: JSON-line. One JSON object per line. Two channels multiplexed on the same connection:
+  - **Commands in**: `{"id": "1", "cmd": "press_key", "key": "r"}` / `{"id": "2", "cmd": "click", "target": "export-button"}` / `{"id": "3", "cmd": "open_project", "path": "..."}` / `{"id": "4", "cmd": "wait_for", "event": "clip.finalized", "timeout_ms": 5000}`
+  - **Replies + events out**: `{"reply_to": "1", "ok": true}` paired by id; events as `{"event": "recording.started", "ts": 1714325000123, ...fields}`
+- **Pluggable capture sources**: GStreamer pipeline factory swaps between platform-native (`avfvideosrc`/`mfvideosrc`/etc.) and fixture-based (`filesrc location=fixtures/webcam.mp4 ! decodebin`) at runtime. Triggered by `VIDEO_COACH_CAPTURE=fixture:./fixtures/webcam.mp4` env var or the equivalent CLI flag. Same downstream graph; deterministic input.
+- **Harness crate (`crates/video-coach-harness`)**: Rust library + binary that launches the app subprocess with `--control-socket=...`, sends commands, subscribes to events, asserts on event sequences and output file properties. Used by integration tests in CI; also usable as a CLI for ad-hoc debugging.
+- **Output verification**: harness probes output files via GStreamer (codec, duration, sample frame hashes at known timestamps). No external `ffprobe` dependency — same GStreamer the app uses.
+
+**Fixtures**: real media files stored in `fixtures/` via Git LFS. `.gitattributes` tracks `fixtures/**/*.mp4`, `fixtures/**/*.wav`, `fixtures/**/*.mov`. CI checks out LFS content. Initial fixture set:
+
+- `fixtures/source.mp4` — sports source video, [path TBD by user]
+- `fixtures/webcam.mp4` — short pre-recorded webcam clip, ≥30s, 1080p30 H.264
+- `fixtures/mic.wav` — short voice recording, mono 48kHz, ≥30s
+
+Fixtures kept ≤200 MB total to stay within reasonable LFS bandwidth quotas.
+
+**Claude as a driver**: same protocol the harness uses. I can launch the app in test mode locally, drive it through the JSON-line socket, and iterate on bugs autonomously without anyone clicking. The control socket is a debugging tool as much as a test interface.
+
+## Phasing
+
+1. **Workspace skeleton + `video-coach-core` port** from Swift (data model, project IO, source-time reconstruction, plan generation, tag aggregation, export settings, denormalize, stroke replay). Pure logic, `cargo test` only. *Plan: `2026-04-28-rust-rewrite-phase-1-core.md`.*
+2. **Testability foundation**: tracing instrumentation, in-process command bus, control socket adapter, harness crate skeleton, Git LFS setup, fixture manifest, smoke test that proves the launch-command-event loop end-to-end against an empty app shell. *Plan: TBD.*
+3. **GStreamer capture pipeline** with pluggable source factory (production + fixture variants). Audio + video. Tests via the harness using fixture inputs.
+4. **wgpu compositor**: PiP + stroke layer. Golden-frame tests in CI.
+5. **GStreamer export pipeline**: file → decode → composite → encode → mux. HEVC HW where available, x265 fallback.
+6. **Slint UI shell**: window, menus, file dialogs, project picker. First UI ever — every component lands with a Slint component test from day one. UI dispatches commands through the bus. E2E coverage via the harness becomes the default for all UI work after this point.
+7. **Source-video timeline + transport**: open project, scrub, play/pause, skip. Component tests + E2E.
+8. **Recording integration**: R-press, freeze on R, capture pipeline lifecycle, stroke capture. E2E test exercises full record-clip flow against fixtures.
+9. **Clip preview integration**: compositor surface bound to Slint Image. **Visual parity test** (preview path hash == export path hash) gates merges from this point on.
+10. **Export sheet UI**: modal, tag list, resolution/quality, batch export. E2E test exercises full select-tags-then-export flow.
+11. **Polish, packaging, cross-platform CI green** on macOS / Windows / Linux.
+
+The "Phase 2 first" insertion is the key restructure. Every phase from 3 onward gets E2E coverage for free because the bus, tracing, and harness are already there to plug into.
 
 ## Open questions
 
-- **Audio mixing**: in v1 source-volume and commentary-volume sliders are global project preferences. v2 keeps that. GStreamer's `audiomixer` element handles the live mix cleanly. Confirm the mix happens server-side (in the encode pipeline) and not in the UI layer.
-- **Stroke replay timing**: v1's `StrokeReplay.swift` reconstructs stroke timing from event logs; the algorithm should port verbatim. Verify the porting preserves timing semantics with a golden-event-log test.
+- **Audio mixing**: in v1 source-volume and commentary-volume sliders are global project preferences. v2 keeps that. GStreamer's `audiomixer` element handles the live mix cleanly. Confirm the mix happens in the encode pipeline, not the UI layer.
+- **Stroke replay timing**: v1's `StrokeReplay.swift` reconstructs stroke timing from event logs; the algorithm ports verbatim. Verify with a golden-event-log test.
 - **Hardened-runtime / signing on macOS**: v1 was personal-use unsigned. v2 may distribute more broadly — decide on Developer ID signing and notarization scope when packaging matters.
+- **Source video fixture path**: user to provide; included in `fixtures/` via Git LFS once chosen.
+- **Slint testing API limits**: Slint is younger than Qt, and `slint::testing` may not expose every interaction (especially custom-painted surfaces like the wgpu video view). Expect occasional "extend the testing API or work around it" friction during Phases 6–10.
