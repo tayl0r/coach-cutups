@@ -193,13 +193,11 @@ Components:
 - **Harness crate (`crates/video-coach-harness`)**: Rust library + binary that launches the app subprocess with `--control-socket=...`, sends commands, subscribes to events, asserts on event sequences and output file properties. Used by integration tests in CI; also usable as a CLI for ad-hoc debugging.
 - **Output verification**: harness probes output files via GStreamer (codec, duration, sample frame hashes at known timestamps). No external `ffprobe` dependency — same GStreamer the app uses.
 
-**Fixtures**: real media files stored in `fixtures/` via Git LFS. `.gitattributes` tracks `fixtures/**/*.mp4`, `fixtures/**/*.wav`, `fixtures/**/*.mov`. CI checks out LFS content. Initial fixture set:
+**Fixtures**: real media files hosted as **GitHub Release assets**, not in git. `fixtures/` is gitignored except for `manifest.json` (which lists each fixture with its SHA256, byte size, release tag, and purpose). A `scripts/fetch-fixtures.sh` script reads the manifest, downloads any missing or stale fixtures from the release, and verifies SHA256s. Contributors run it once; CI runs it with `actions/cache` keyed on the manifest's hash so unchanged fixtures don't redownload.
 
-- `fixtures/source.mp4` — sports source video, [path TBD by user]
-- `fixtures/webcam.mp4` — short pre-recorded webcam clip, ≥30s, 1080p30 H.264
-- `fixtures/mic.wav` — short voice recording, mono 48kHz, ≥30s
+Why Release assets instead of Git LFS: unlimited bandwidth and storage on releases vs. 1 GB/month free LFS bandwidth that exhausts after ~6 public clones. Releases also mean people exploring the code don't pay fixture bandwidth — only contributors actually running the test harness do.
 
-Fixtures kept ≤200 MB total to stay within reasonable LFS bandwidth quotas.
+Fixture updates are explicit: bump the release tag in `manifest.json`, attach new files to the new release. Old releases stay around as immutable history.
 
 **Claude as a driver**: same protocol the harness uses. I can launch the app in test mode locally, drive it through the JSON-line socket, and iterate on bugs autonomously without anyone clicking. The control socket is a debugging tool as much as a test interface.
 

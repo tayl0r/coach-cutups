@@ -940,23 +940,27 @@ git commit -m "test(harness): smoke test — launch, ping, quit roundtrip via co
 
 ---
 
-## Task 9: Git LFS + fixtures manifest
+## Task 9: Fixtures via GitHub Release assets + fetch script
+
+Fixtures are hosted as GitHub Release assets, not stored in git. The repo carries `fixtures/manifest.json` (text, in git) and a `scripts/fetch-fixtures.sh` that downloads missing/stale binaries from the release and verifies SHA256s. This avoids LFS bandwidth quotas entirely — Release assets have unlimited bandwidth and storage.
 
 **Files:**
-- Create: `.gitattributes`
+- Modify: `.gitignore`
 - Create: `fixtures/manifest.json`
 - Create: `fixtures/.gitkeep`
+- Create: `scripts/fetch-fixtures.sh`
+- Create: `scripts/README.md` (or add a section to a top-level README)
 
-**Prerequisite:** Git LFS installed locally — `git lfs version` should print a version. If not: `brew install git-lfs && git lfs install`.
+**Step 1: Gitignore the fixture binaries**
 
-**Step 1: Configure LFS tracking**
+Append to `.gitignore`:
 
 ```
-# .gitattributes
-fixtures/**/*.mp4 filter=lfs diff=lfs merge=lfs -text
-fixtures/**/*.mov filter=lfs diff=lfs merge=lfs -text
-fixtures/**/*.wav filter=lfs diff=lfs merge=lfs -text
-fixtures/**/*.m4a filter=lfs diff=lfs merge=lfs -text
+# Fixtures (binary media) live in GitHub Release assets, not in git.
+# Pull them with `./scripts/fetch-fixtures.sh`.
+fixtures/*
+!fixtures/manifest.json
+!fixtures/.gitkeep
 ```
 
 **Step 2: Prepare the fixtures**
@@ -1006,14 +1010,27 @@ ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/so
 
 For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs it. Phase 2's smoke test does not. When needed, generate a synthetic tone or extract the audio track from the webcam clip.
 
-**Step 3: Initialize the fixtures manifest**
+**Step 3: Compute SHA256s for the prepared fixtures**
+
+```bash
+cd fixtures
+shasum -a 256 source-1080p.mp4 source-4k.mp4 webcam.mov
+cd ..
+```
+
+Record the three SHA256 values; they go into `manifest.json` in step 4.
+
+**Step 4: Initialize the fixtures manifest**
 
 ```json
 // fixtures/manifest.json
 {
   "schemaVersion": 1,
+  "releaseTag": "fixtures-v1",
+  "downloadUrlBase": "https://github.com/<OWNER>/video-coach/releases/download",
   "fixtures": {
     "source-1080p.mp4": {
+      "sha256": "<SHA256 from step 3>",
       "purpose": "Default sports source video — input timeline for most recording-flow tests.",
       "durationSeconds": 60,
       "width": 1920,
@@ -1022,6 +1039,7 @@ For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs
       "trimSpec": "00:25:00 → 00:26:00 (re-encoded 1080p H.264 ~6 Mbps)"
     },
     "source-4k.mp4": {
+      "sha256": "<SHA256 from step 3>",
       "purpose": "4K source for playback/scrub regression tests (v1 had bugs in the 4K decode path) AND a distinct second source asset for multi-source-video project tests.",
       "durationSeconds": 30,
       "width": 3840,
@@ -1030,6 +1048,7 @@ For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs
       "trimSpec": "00:50:00 → 00:50:30 (re-encoded native 4K H.264 ~20 Mbps)"
     },
     "webcam.mov": {
+      "sha256": "<SHA256 from step 3>",
       "purpose": "Pre-recorded webcam clip swapped in for live capture in test mode.",
       "durationSeconds": 17.26,
       "width": 1920,
@@ -1037,36 +1056,145 @@ For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs
       "originalSource": "/Users/taylor/coach-cutups/2026-spring/week-2/recordings/clip-EE39C52F-C292-4B1F-9702-44F6A4BADC50.mov",
       "note": "Short — test recordings should stay ≤15s, or the fixture pipeline must loop the clip."
     }
-  },
-  "totalSizeBudgetMB": 300
+  }
 }
 ```
 
-**Step 4: Commit (LFS will pick up the binary files automatically)**
+The full download URL for each fixture is `{downloadUrlBase}/{releaseTag}/{filename}`. Replace `<OWNER>` with the actual GitHub repo owner when committing.
 
-```bash
-git add .gitattributes fixtures/manifest.json fixtures/source-1080p.mp4 fixtures/source-4k.mp4 fixtures/webcam.mov
-git commit -m "build: enable Git LFS for fixtures + initial source/webcam fixtures"
+```
+# fixtures/.gitkeep — keeps fixtures/ in git when it's otherwise empty
 ```
 
-Verify LFS picked up the binaries (not committed inline as text):
+**Step 5: Write the fetch script**
 
 ```bash
-git lfs ls-files
+# scripts/fetch-fixtures.sh
+#!/usr/bin/env bash
+#
+# Download fixture binaries from the GitHub Release listed in
+# fixtures/manifest.json. Skips downloads when an existing local file
+# already matches the recorded SHA256.
+#
+# Usage: ./scripts/fetch-fixtures.sh
+# Requires: bash, curl, shasum (or sha256sum), jq.
+
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+MANIFEST="$REPO_ROOT/fixtures/manifest.json"
+FIX_DIR="$REPO_ROOT/fixtures"
+
+if [ ! -f "$MANIFEST" ]; then
+  echo "manifest not found: $MANIFEST" >&2
+  exit 1
+fi
+
+# Pick a SHA256 implementation that exists on the host.
+sha256() {
+  if command -v shasum >/dev/null 2>&1; then
+    shasum -a 256 "$1" | awk '{print $1}'
+  elif command -v sha256sum >/dev/null 2>&1; then
+    sha256sum "$1" | awk '{print $1}'
+  else
+    echo "no shasum/sha256sum on PATH" >&2
+    exit 1
+  fi
+}
+
+release_tag=$(jq -r '.releaseTag' "$MANIFEST")
+url_base=$(jq -r '.downloadUrlBase' "$MANIFEST")
+names=$(jq -r '.fixtures | keys[]' "$MANIFEST")
+
+for name in $names; do
+  expected_sha=$(jq -r --arg n "$name" '.fixtures[$n].sha256' "$MANIFEST")
+  out="$FIX_DIR/$name"
+
+  if [ -f "$out" ]; then
+    actual=$(sha256 "$out")
+    if [ "$actual" = "$expected_sha" ]; then
+      echo "ok  $name (cached)"
+      continue
+    fi
+    echo "stale $name (sha mismatch — refetching)"
+  fi
+
+  url="$url_base/$release_tag/$name"
+  echo "get $name from $url"
+  mkdir -p "$FIX_DIR"
+  curl -fLsS -o "$out" "$url"
+
+  actual=$(sha256 "$out")
+  if [ "$actual" != "$expected_sha" ]; then
+    echo "SHA mismatch for $name: expected $expected_sha got $actual" >&2
+    exit 1
+  fi
+  echo "ok  $name (downloaded)"
+done
+
+echo "all fixtures present and verified"
 ```
 
-Expected output: lines naming each fixture with its LFS SHA.
+Make it executable:
 
-**Note on `mic.wav`**: not included in this task — defer until a recording-flow test in a later phase needs it. The `manifest.json` will be extended at that point.
+```bash
+chmod +x scripts/fetch-fixtures.sh
+```
+
+**Step 6: Publish the release (one-time, manual)**
+
+The release upload is a manual step performed by the project owner. After step 2 (encoding) but before step 7 (commit), upload the three fixture files to a new GitHub release tagged `fixtures-v1`:
+
+```bash
+# Requires GitHub CLI: brew install gh; gh auth login
+gh release create fixtures-v1 \
+    --title "Test fixtures v1" \
+    --notes "Initial test fixtures: source-1080p, source-4k, webcam." \
+    fixtures/source-1080p.mp4 \
+    fixtures/source-4k.mp4 \
+    fixtures/webcam.mov
+```
+
+Once the release exists, the `downloadUrlBase` + `releaseTag` from `manifest.json` resolves to working URLs.
+
+**Step 7: Verify the fetch script works against the published release**
+
+Wipe the local fixtures, run the script, confirm everything downloads and verifies:
+
+```bash
+rm fixtures/source-1080p.mp4 fixtures/source-4k.mp4 fixtures/webcam.mov
+./scripts/fetch-fixtures.sh
+ls -la fixtures/
+```
+
+Expected: all three files present, `manifest.json` and `.gitkeep` still tracked, the binaries are now untracked (gitignored).
+
+**Step 8: Commit (binaries are NOT committed — only the manifest, script, and gitignore changes)**
+
+```bash
+git add .gitignore fixtures/manifest.json fixtures/.gitkeep scripts/fetch-fixtures.sh
+git commit -m "build: fixtures via GitHub Release assets + fetch script"
+```
+
+**Note on `mic.wav`**: not included in this release. When a future recording-flow test needs it, generate the file, upload to a new release `fixtures-v2`, bump `releaseTag` in `manifest.json`, add the new entry. Old releases stay as immutable history.
+
+**Note on contributor onboarding**: anyone cloning the repo runs `./scripts/fetch-fixtures.sh` once after clone. People exploring code without running E2E tests don't need to fetch fixtures at all.
 
 ---
 
-## Task 10: CI — LFS checkout + harness tests
+## Task 10: CI — fetch fixtures + harness tests
+
+The CI workflow has two job shapes:
+
+- **`test`** (3-OS matrix) — runs everything that doesn't need fixtures. The Phase 2 smoke test (Task 8) lands here. No fixtures pulled, no bandwidth cost.
+- **`media-tests`** (Linux only) — runs tests behind a `media` feature flag that need the real fixtures. Pulls fixtures via the script, with `actions/cache` keyed on the manifest hash so unchanged fixtures don't redownload.
+
+This split means each push pulls each fixture **at most once** (the first time the manifest changes), and only on a single OS. Phase 2 has no `media` tests yet — this scaffolding lands now so phases 3+ plug straight in.
 
 **Files:**
 - Modify: `.github/workflows/rust.yml`
 
-**Step 1: Update the workflow**
+**Step 1: Replace the workflow**
 
 ```yaml
 # .github/workflows/rust.yml
@@ -1084,8 +1212,6 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
-        with:
-          lfs: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
@@ -1093,18 +1219,46 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  media-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Cache fixtures by manifest hash. When manifest is unchanged,
+      # this restores fixtures/ from cache and the fetch script
+      # short-circuits (sha256 already matches, no download).
+      - name: Cache fixtures
+        uses: actions/cache@v4
+        with:
+          path: fixtures
+          key: fixtures-${{ hashFiles('fixtures/manifest.json') }}
+
+      - name: Install jq (Ubuntu has it preinstalled, but ensure it)
+        run: which jq || sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Fetch fixtures from release
+        run: ./scripts/fetch-fixtures.sh
+
+      - name: Run media-tagged tests
+        run: cargo test --workspace --features media
 ```
 
 **Step 2: Push and verify**
 
 ```bash
 git add .github/workflows/rust.yml
-git commit -m "ci: enable LFS checkout + ensure harness tests run on all OSes"
+git commit -m "ci: 3-OS matrix for non-media tests + linux media-tests with fixture cache"
 git push
 ```
 
 Wait for the GitHub Actions run.
-Expected: all three OS jobs green. The smoke test from Task 8 runs as part of `cargo test --workspace` and exercises the full subprocess launch on every OS.
+Expected:
+- `test` matrix (3 OSes) green — runs the smoke test from Task 8.
+- `media-tests` job green. First run downloads ~165 MB of fixtures from the release, verifies SHAs, runs `cargo test --features media` (which is a no-op in Phase 2 since no test sets the `media` feature yet — but the job exits 0).
+- Subsequent runs hit the cache and skip the download entirely (the fetch script's "ok (cached)" path).
 
 ---
 
