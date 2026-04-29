@@ -20,3 +20,31 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
+
+  media-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Cache fixtures by manifest hash. When manifest is unchanged,
+      # this restores fixtures/ from cache and the fetch script
+      # short-circuits (sha256 already matches, no download).
+      - name: Cache fixtures
+        uses: actions/cache@v4
+        with:
+          path: fixtures
+          key: fixtures-${{ hashFiles('fixtures/manifest.json') }}
+
+      - name: Install jq (Ubuntu has it preinstalled, but ensure it)
+        # Parens force `||` to gate the entire (update && install) chain.
+        # Without them, `&&` binds tighter and `apt-get install` runs on
+        # every invocation — even when jq is already present.
+        run: which jq || (sudo apt-get update && sudo apt-get install -y jq)
+
+      - name: Fetch fixtures from release
+        run: ./scripts/fetch-fixtures.sh
+
+      - name: Run media-tagged tests
+        run: cargo test --workspace --features media
