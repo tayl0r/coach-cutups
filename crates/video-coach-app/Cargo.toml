@@ -10,14 +10,14 @@ default = ["control-socket"]
 # When disabled (release packaging: --no-default-features), the control socket
 # adapter is compiled out entirely. The app cannot be remote-driven.
 control-socket = []
-# Stub feature flag for tests that depend on real media fixtures. No-op in
-# Phase 2 — declared so `cargo test --features media` is a legal command in CI
-# (workspace-level `--features` requires the flag to be declared somewhere).
-# Phases 3+ will tag fixture-dependent tests with `#[cfg(feature = "media")]`.
-media = []
+# Recording machinery: pulls in video-coach-media + gstreamer system libs.
+# Without this feature, StartRecording / StopRecording return errors at
+# runtime and the binary builds with no GStreamer dependency.
+media = ["dep:video-coach-media"]
 
 [dependencies]
 video-coach-core = { path = "../video-coach-core" }
+video-coach-media = { path = "../video-coach-media", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

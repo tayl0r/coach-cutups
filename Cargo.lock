@@ -1234,6 +1234,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "video-coach-core",
+ "video-coach-media",
 ]
 
 [[package]]
