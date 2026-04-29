@@ -316,16 +316,18 @@ impl CaptureSourceFactory for FixtureSource {
             let sink_pad = convert.static_pad("sink").expect("convert sink pad");
             pad.link(&sink_pad).expect("link decoded pad");
 
+            // CRITICAL: name the ghost pad explicitly. `GhostPad::with_target`
+            // takes the target pad's name (always `"src"` here), so without an
+            // override both video and audio ghost pads would collide and the
+            // recording pipeline's pad_added handler (which dispatches by
+            // ghost-pad name) would fail to link, yielding an empty .mov.
             let src_pad = convert.static_pad("src").expect("convert src pad");
-            let ghost = GhostPad::with_target(&src_pad).expect("ghost pad");
+            let ghost = GhostPad::builder_with_target(&src_pad)
+                .expect("ghost builder")
+                .name(ghost_name)
+                .build();
             ghost.set_active(true).expect("set ghost active");
             bin.add_pad(&ghost).expect("add ghost pad");
-            // Ghost pads from a Bin are named after the inner pad by default;
-            // rename so callers can find them deterministically.
-            // (gstreamer-rs's `with_target_and_name` would be cleaner; this
-            // is the version-agnostic path.)
-            let _ = src_pad;
-            let _ = ghost_name;
         });
 
         Ok(bin)
@@ -611,12 +613,13 @@ fn fixture(name: &str) -> PathBuf {
 
 #[test]
 fn record_3s_from_webcam_fixture_produces_playable_mov() {
-    let tmp = tempfile::Builder::new()
-        .prefix("phase3-rec-")
-        .suffix(".mov")
-        .tempfile()
-        .unwrap();
-    let out_path = tmp.path().to_path_buf();
+    // tempfile() on Windows opens the file with FILE_SHARE_NONE, which would
+    // block GStreamer's filesink from opening the same path. Use a tempdir
+    // instead and place a freshly-named .mov inside it; tempdir on Windows
+    // doesn't lock its children. Phase 3's media-tests CI is Linux-only so
+    // this only matters for local Windows dev runs.
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let out_path = tmp_dir.path().join("recording.mov");
 
     let factory = Arc::new(FixtureSource::new(fixture("webcam.mov")));
     let rec = start(factory, out_path.clone()).unwrap();
@@ -657,7 +660,7 @@ git commit -m "feat(media): record fixture source to .mov via H.264 + AAC + qtmu
 
 **Files:**
 - Modify: `crates/video-coach-app/src/bus.rs`
-- Modify: `crates/video-coach-app/Cargo.toml` (add `video-coach-media` dep)
+- Modify: `crates/video-coach-app/Cargo.toml` (add `video-coach-media` as an OPTIONAL dep gated by the existing `media` feature)
 
 **Step 1: Add the variants**
 
@@ -670,6 +673,8 @@ pub enum Command {
     Ping,
     /// Start a recording. `source` selects fixture vs. production. `output`
     /// is the .mov path; the parent dir is auto-created.
+    /// Only handled when the app is built with `--features media`; without
+    /// it, the dispatcher returns an error.
     StartRecording {
         source: SourceConfig,
         output: String,
@@ -687,59 +692,127 @@ pub enum SourceConfig {
 }
 ```
 
-**Step 2: Add the dep**
+**Step 2: Add `video-coach-media` as an OPTIONAL feature-gated dep**
+
+`video-coach-media` requires GStreamer system libs at build time. If we depend on it unconditionally, every `cargo build` (including the release-no-default-features build the user just stabilized in Phase 2) requires GStreamer. Gate the dep behind the `media` feature to preserve that.
 
 In `crates/video-coach-app/Cargo.toml`:
 
 ```toml
 [dependencies]
-# ...existing...
-video-coach-media = { path = "../video-coach-media" }
+# ...existing entries...
+video-coach-media = { path = "../video-coach-media", optional = true }
+
+[features]
+default = ["control-socket"]
+control-socket = []
+# Recording machinery: pulls in video-coach-media + gstreamer system libs.
+# Without this feature, StartRecording / StopRecording return errors at
+# runtime and the binary builds with no GStreamer dependency.
+media = ["dep:video-coach-media"]
 ```
 
-**Step 3: Wire dispatch**
+**Step 3: Rewrite the bus dispatcher to thread `Option<Recording>` state through the loop**
 
-In `bus::handle`, add arms for the two new variants. The bus owns an `Option<Recording>` — start populates it, stop drains and calls `.stop()`. Since the bus is a `&mut`-owning task, this is naturally serialized:
+The existing `bus.rs` has:
+- `pub fn spawn(shutdown_tx) -> BusHandle { tokio::spawn(async move { while let Some(env) = rx.recv().await { let reply = handle(env.command, &shutdown_tx).await; ... } }); ... }`
+- `async fn handle(cmd: Command, shutdown_tx: &...) -> CommandReply { match cmd { ... } }`
 
-```rust
-// pseudo — see actual structure of bus::spawn
-match cmd {
-    Command::StartRecording { source, output } => {
-        if recording.is_some() {
-            CommandReply { ok: false, error: Some("already recording".into()) }
-        } else {
-            let factory: Arc<dyn CaptureSourceFactory> = match source {
-                SourceConfig::Fixture { path } => Arc::new(FixtureSource::new(path)),
-                SourceConfig::PlatformDefault => {
-                    return CommandReply {
-                        ok: false,
-                        error: Some("platform default source not yet implemented".into()),
-                    };
-                }
-            };
-            match video_coach_media::recording::start(factory, output.into()) {
-                Ok(rec) => {
-                    recording = Some(rec);
-                    CommandReply { ok: true, error: None }
-                }
-                Err(e) => CommandReply { ok: false, error: Some(e.to_string()) },
-            }
-        }
-    }
-    Command::StopRecording => {
-        match recording.take() {
-            Some(rec) => match rec.stop() {
-                Ok(()) => CommandReply { ok: true, error: None },
-                Err(e) => CommandReply { ok: false, error: Some(e.to_string()) },
-            },
-            None => CommandReply { ok: false, error: Some("no active recording".into()) },
-        }
-    }
-    // ...existing Quit / Ping arms unchanged
-}
-```
+Phase 3 changes both:
 
-The `recording: Option<Recording>` lives in the dispatcher loop's local state, threaded through `handle` as a `&mut Option<Recording>`.
+1. **Add a recording-state local inside the spawned task closure**:
+
+   ```rust
+   pub fn spawn(shutdown_tx: tokio::sync::watch::Sender<bool>) -> BusHandle {
+       let (tx, mut rx) = mpsc::channel::<Envelope>(64);
+       tokio::spawn(async move {
+           // Per-task recording state. `None` until StartRecording succeeds;
+           // taken by StopRecording. Held across loop iterations because
+           // start and stop are necessarily separate commands.
+           #[cfg(feature = "media")]
+           let mut recording: Option<video_coach_media::recording::Recording> = None;
+
+           while let Some(env) = rx.recv().await {
+               let reply = handle(
+                   env.command,
+                   &shutdown_tx,
+                   #[cfg(feature = "media")]
+                   &mut recording,
+               ).await;
+               let _ = env.reply.send(reply);
+           }
+       });
+       BusHandle { tx }
+   }
+   ```
+
+2. **Update `handle`'s signature**:
+
+   ```rust
+   async fn handle(
+       cmd: Command,
+       shutdown_tx: &tokio::sync::watch::Sender<bool>,
+       #[cfg(feature = "media")]
+       recording: &mut Option<video_coach_media::recording::Recording>,
+   ) -> CommandReply {
+       match cmd {
+           Command::Quit => { /* ...existing... */ }
+           Command::Ping => { /* ...existing... */ }
+           Command::StartRecording { source, output } => {
+               #[cfg(not(feature = "media"))]
+               { let _ = (source, output); CommandReply { ok: false, error: Some("media feature disabled in this build".into()) } }
+               #[cfg(feature = "media")]
+               {
+                   use std::sync::Arc;
+                   use video_coach_media::source::CaptureSourceFactory;
+                   use video_coach_media::fixture_source::FixtureSource;
+                   if recording.is_some() {
+                       return CommandReply { ok: false, error: Some("already recording".into()) };
+                   }
+                   let factory: Arc<dyn CaptureSourceFactory> = match source {
+                       SourceConfig::Fixture { path } => Arc::new(FixtureSource::new(path)),
+                       SourceConfig::PlatformDefault => {
+                           return CommandReply {
+                               ok: false,
+                               error: Some("platform default source not yet implemented".into()),
+                           };
+                       }
+                   };
+                   match video_coach_media::recording::start(factory, output.into()) {
+                       Ok(rec) => {
+                           *recording = Some(rec);
+                           CommandReply { ok: true, error: None }
+                       }
+                       Err(e) => CommandReply { ok: false, error: Some(e.to_string()) },
+                   }
+               }
+           }
+           Command::StopRecording => {
+               #[cfg(not(feature = "media"))]
+               { CommandReply { ok: false, error: Some("media feature disabled in this build".into()) } }
+               #[cfg(feature = "media")]
+               {
+                   match recording.take() {
+                       Some(rec) => {
+                           // Recording::stop blocks for up to 5s waiting on a
+                           // GStreamer bus message. Offload to a blocking pool
+                           // so we don't stall the tokio executor thread.
+                           let result = tokio::task::spawn_blocking(move || rec.stop()).await;
+                           match result {
+                               Ok(Ok(())) => CommandReply { ok: true, error: None },
+                               Ok(Err(e)) => CommandReply { ok: false, error: Some(e.to_string()) },
+                               Err(join) => CommandReply { ok: false, error: Some(format!("join: {join}")) },
+                           }
+                       }
+                       None => CommandReply { ok: false, error: Some("no active recording".into()) },
+                   }
+               }
+           }
+       }
+   }
+   ```
+
+The `#[cfg(feature = "media")]` attribute on a function parameter is valid Rust; a function called both with and without the parameter requires the same `#[cfg]` on the call site (handled by Step 1's spawn closure). When `media` is off, the recording-state local doesn't exist, the call passes only two args, and `handle` accepts only two args — all gated consistently.
 
 **Step 4: Bus unit tests for the new wire shape**
 
@@ -789,9 +862,10 @@ The `event_layer::FORWARDED_TARGETS` list already contains `"recording"` (Phase 
 
 **Step 1: Add a test that pins the curated target list**
 
+`event_layer.rs` currently has no `mod tests` block. `FORWARDED_TARGETS` is itself `#[cfg(feature = "control-socket")]`-gated, so the test mod has to share that gate. Append the following at the very end of `event_layer.rs` (after every existing item, INSIDE no other module):
+
 ```rust
-#[cfg(test)]
-#[cfg(feature = "control-socket")]
+#[cfg(all(test, feature = "control-socket"))]
 mod tests {
     use super::FORWARDED_TARGETS;
 
@@ -886,11 +960,9 @@ fn fixture(name: &str) -> PathBuf {
 async fn record_from_fixture_via_harness() -> anyhow::Result<()> {
     let mut app = App::launch().await?;
 
-    let tmp = tempfile::Builder::new()
-        .prefix("e2e-rec-")
-        .suffix(".mov")
-        .tempfile()?;
-    let out = tmp.path().to_path_buf();
+    // See Task 5's note on Windows file-locking — use tempdir, not tempfile.
+    let tmp_dir = tempfile::tempdir()?;
+    let out = tmp_dir.path().join("recording.mov");
 
     let reply = app.start_recording_from_fixture(
         fixture("webcam.mov").display().to_string(),
@@ -924,19 +996,19 @@ tempfile = "3"
 
 The harness's existing `Cargo.toml` may already pull tempfile via a transitive path; check first. If not declared, add it.
 
-**Step 2: Make harness pass `--features media` to the app launch**
+**Step 2: Ensure the binary under test was built with `--features media`**
 
-The app's media feature is currently a stub — Phase 3 should activate it on the app side too. Check `App::launch` in `lib.rs` and ensure the spawned subprocess inherits the `media` feature flag. The simplest approach: have the harness build the binary with `--features media` via cargo invocation, OR have `App::binary_path` accept a `profile` hint and walk to a different target.
+Per Task 6, `video-coach-media` is an optional dep gated by `media`, AND the `StartRecording`/`StopRecording` dispatch is gated by `#[cfg(feature = "media")]`. Without the feature, those commands return `"media feature disabled in this build"`.
 
-Actually, the simplest path: the app binary itself doesn't need `--features media` because the StartRecording dispatch in `bus.rs` is unconditional. The `media` feature flag is only used by tests. So no harness changes are needed here.
+`App::launch` (Phase 2) shells out to the pre-built binary at `target/<profile>/video-coach-app`. Whichever feature combination Cargo most-recently compiled into that path is what the test will exercise.
 
-Verify by running:
+`cargo test -p video-coach-harness --features media` directs Cargo to enable `media` workspace-wide before running the harness's tests, so the binary is rebuilt with the feature on. Verify by running:
 
 ```bash
 cargo build --workspace --features media
 ```
 
-The build should succeed and the binary should support `start_recording` regardless of feature flag.
+The output `target/debug/video-coach-app` will dispatch `StartRecording` correctly. If a developer runs `cargo test --test recording_smoke` without `--features media`, the test fails because the running binary has no recording machinery. The test harness should detect this and fail loudly: a fast-fail check on `start_recording` reply makes the failure obvious — the smoke test in Step 1 already asserts `reply.ok == Some(true)`, so the misuse is caught immediately.
 
 **Step 3: Run the test**
 
@@ -983,8 +1055,11 @@ For the `test` matrix:
       - name: Install GStreamer (Windows)
         if: runner.os == 'Windows'
         run: |
-          choco install gstreamer --version=1.24.0 -y
-          choco install gstreamer-devel --version=1.24.0 -y
+          # Don't pin a specific version — Chocolatey reaps old packages and
+          # gstreamer-rs 0.23 supports any GStreamer 1.24+. Latest tracks
+          # whatever the runner has cached.
+          choco install gstreamer -y
+          choco install gstreamer-devel -y
           echo "C:\gstreamer\1.0\msvc_x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
           echo "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" >> $env:GITHUB_ENV
 ```
