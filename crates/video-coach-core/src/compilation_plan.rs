@@ -84,7 +84,7 @@ mod tests {
         start_source_seconds: f64,
         recording_duration: f64,
         sort_index: i64,
-        events: Option<Vec<CommentaryEvent>>,
+        events: Vec<CommentaryEvent>,
     ) -> Clip {
         Clip {
             id: Uuid::new_v4(),
@@ -95,7 +95,7 @@ mod tests {
             start_source_seconds,
             recording_duration,
             recording_filename: format!("{name}.mov"),
-            events: events.unwrap_or_default(),
+            events,
             sort_index,
             created_at: Utc::now(),
         }
@@ -109,9 +109,9 @@ mod tests {
     fn compilation_plan_filters_by_tag_excluding_clips_without_tag() {
         let mut project = Project::new("p");
         project.clips = vec![
-            make_clip("a", vec!["forehand"], 0, 0.0, 5.0, 0, None),
-            make_clip("b", vec!["backhand"], 0, 10.0, 4.0, 1, None),
-            make_clip("c", vec!["forehand", "serve"], 0, 20.0, 3.0, 2, None),
+            make_clip("a", vec!["forehand"], 0, 0.0, 5.0, 0, vec![]),
+            make_clip("b", vec!["backhand"], 0, 10.0, 4.0, 1, vec![]),
+            make_clip("c", vec!["forehand", "serve"], 0, 20.0, 3.0, 2, vec![]),
         ];
 
         let plan = project.compilation_plan_for("forehand", &durations(&[(0, 100.0)]));
@@ -124,9 +124,9 @@ mod tests {
     fn compilation_plan_sorts_by_sort_index_ascending() {
         let mut project = Project::new("p");
         project.clips = vec![
-            make_clip("later", vec!["t"], 0, 0.0, 5.0, 9, None),
-            make_clip("earlier", vec!["t"], 0, 0.0, 5.0, 1, None),
-            make_clip("middle", vec!["t"], 0, 0.0, 5.0, 4, None),
+            make_clip("later", vec!["t"], 0, 0.0, 5.0, 9, vec![]),
+            make_clip("earlier", vec!["t"], 0, 0.0, 5.0, 1, vec![]),
+            make_clip("middle", vec!["t"], 0, 0.0, 5.0, 4, vec![]),
         ];
 
         let plan = project.compilation_plan_for("t", &durations(&[(0, 100.0)]));
@@ -146,9 +146,9 @@ mod tests {
     fn compilation_plan_composition_start_accumulates_preceding_durations() {
         let mut project = Project::new("p");
         project.clips = vec![
-            make_clip("a", vec!["t"], 0, 0.0, 4.0, 0, None),
-            make_clip("b", vec!["t"], 0, 0.0, 7.0, 1, None),
-            make_clip("c", vec!["t"], 0, 0.0, 2.0, 2, None),
+            make_clip("a", vec!["t"], 0, 0.0, 4.0, 0, vec![]),
+            make_clip("b", vec!["t"], 0, 0.0, 7.0, 1, vec![]),
+            make_clip("c", vec!["t"], 0, 0.0, 2.0, 2, vec![]),
         ];
 
         let plan = project.compilation_plan_for("t", &durations(&[(0, 100.0)]));
@@ -164,8 +164,8 @@ mod tests {
     fn compilation_plan_index_in_output_is_zero_based_and_monotonic() {
         let mut project = Project::new("p");
         project.clips = vec![
-            make_clip("a", vec!["t"], 0, 0.0, 1.0, 5, None),
-            make_clip("b", vec!["t"], 0, 0.0, 1.0, 7, None),
+            make_clip("a", vec!["t"], 0, 0.0, 1.0, 5, vec![]),
+            make_clip("b", vec!["t"], 0, 0.0, 1.0, 7, vec![]),
         ];
 
         let plan = project.compilation_plan_for("t", &durations(&[(0, 10.0)]));
@@ -177,7 +177,7 @@ mod tests {
     #[test]
     fn compilation_plan_empty_tag_yields_zero_entries_and_zero_duration() {
         let mut project = Project::new("p");
-        project.clips = vec![make_clip("a", vec!["forehand"], 0, 0.0, 5.0, 0, None)];
+        project.clips = vec![make_clip("a", vec!["forehand"], 0, 0.0, 5.0, 0, vec![])];
 
         let plan = project.compilation_plan_for("missing", &durations(&[(0, 100.0)]));
 
@@ -189,9 +189,9 @@ mod tests {
     fn all_clips_compilation_plan_includes_every_clip_ordered_by_sort_index() {
         let mut project = Project::new("p");
         project.clips = vec![
-            make_clip("tagged", vec!["t"], 0, 0.0, 3.0, 1, None),
-            make_clip("untagged", vec![], 0, 0.0, 2.0, 0, None),
-            make_clip("another", vec!["x", "y"], 0, 0.0, 4.0, 2, None),
+            make_clip("tagged", vec!["t"], 0, 0.0, 3.0, 1, vec![]),
+            make_clip("untagged", vec![], 0, 0.0, 2.0, 0, vec![]),
+            make_clip("another", vec!["x", "y"], 0, 0.0, 4.0, 2, vec![]),
         ];
 
         let plan = project.all_clips_compilation_plan(&durations(&[(0, 100.0)]));
@@ -225,10 +225,10 @@ mod tests {
             998.0,
             3.0,
             0,
-            Some(vec![CommentaryEvent {
+            vec![CommentaryEvent {
                 record_time: 1.0,
                 kind: EventKind::Skip { delta: 100.0 },
-            }]),
+            }],
         );
         let mut project = Project::new("p");
         project.clips = vec![clip.clone()];
@@ -245,7 +245,7 @@ mod tests {
     #[test]
     fn compilation_plan_recording_duration_per_entry_matches_clip() {
         let mut project = Project::new("p");
-        project.clips = vec![make_clip("a", vec!["t"], 0, 0.0, 6.25, 0, None)];
+        project.clips = vec![make_clip("a", vec!["t"], 0, 0.0, 6.25, 0, vec![])];
 
         let plan = project.compilation_plan_for("t", &durations(&[(0, 100.0)]));
 
@@ -254,7 +254,7 @@ mod tests {
 
     #[test]
     fn compilation_plan_missing_source_duration_falls_back_gracefully() {
-        let clip = make_clip("fb", vec!["t"], 3, 0.0, 5.0, 0, None);
+        let clip = make_clip("fb", vec!["t"], 3, 0.0, 5.0, 0, vec![]);
         let mut project = Project::new("p");
         project.clips = vec![clip];
 
