@@ -1266,6 +1266,7 @@ dependencies = [
  "gstreamer-app",
  "gstreamer-audio",
  "gstreamer-video",
+ "tempfile",
  "thiserror",
  "tracing",
 ]

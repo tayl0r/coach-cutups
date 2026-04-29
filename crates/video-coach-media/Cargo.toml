@@ -15,3 +15,6 @@ gstreamer-video = "0.23"
 gstreamer-audio = "0.23"
 thiserror = { workspace = true }
 tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
