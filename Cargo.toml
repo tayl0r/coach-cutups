@@ -7,11 +7,11 @@ members = ["crates/video-coach-core"]
 edition = "2021"
 rust-version = "1.78"
 license = "AGPL-3.0-only"
-repository = "https://github.com/<owner>/video-coach"
+repository = "https://github.com/tayl0r/coach-cutups"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["serde", "v4"] }
 chrono = { version = "0.4", default-features = false, features = ["serde", "clock"] }
-thiserror = "1"
+thiserror = "2"
