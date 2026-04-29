@@ -4,6 +4,9 @@ use serde::ser::{SerializeMap, Serializer};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 
+// The custom Serialize/Deserialize uses `serde_json::Value` for lenient
+// unit-variant payload consumption. That makes the impl serde_json-only;
+// non-self-describing formats (bincode etc.) won't roundtrip correctly.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EventKind {
     Play,
@@ -38,7 +41,9 @@ impl<'de> Deserialize<'de> for EventKind {
                 f.write_str("a single-key map describing an event kind")
             }
             fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<EventKind, A::Error> {
-                let key: String = map.next_key()?.ok_or_else(|| de::Error::custom("empty"))?;
+                let key: String = map.next_key()?.ok_or_else(|| {
+                    de::Error::custom("expected a single-key map for EventKind, got empty map")
+                })?;
                 match key.as_str() {
                     "play" => {
                         let _: serde_json::Value = map.next_value()?;
