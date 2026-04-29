@@ -24,6 +24,13 @@ pub enum Command {
         output: String,
     },
     StopRecording,
+    /// Open the project folder at `path`. Reads `<path>/project.json`,
+    /// validates the format version, and stashes the parsed `Project` in
+    /// the bus task's per-task state. Emits a `project.opened` event with
+    /// the project's `name` field on success.
+    OpenProject {
+        path: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -94,12 +101,19 @@ pub fn spawn_on(
         #[cfg(feature = "media")]
         let mut recording: Option<video_coach_media::recording::Recording> = None;
 
+        // Per-task project state. `None` until OpenProject succeeds. Held
+        // here (vs in the UI module) because future bus commands —
+        // StartRecording-with-clip-metadata, ExportClip, etc. — need the
+        // project record without bouncing through the UI thread.
+        let mut current_project: Option<video_coach_core::project::Project> = None;
+
         while let Some(env) = rx.recv().await {
             let reply = handle(
                 env.command,
                 &shutdown_tx,
                 #[cfg(feature = "media")]
                 &mut recording,
+                &mut current_project,
             )
             .await;
             let _ = env.reply.send(reply);
@@ -112,6 +126,7 @@ async fn handle(
     cmd: Command,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] recording: &mut Option<video_coach_media::recording::Recording>,
+    current_project: &mut Option<video_coach_core::project::Project>,
 ) -> CommandReply {
     match cmd {
         Command::Quit => {
@@ -219,6 +234,39 @@ async fn handle(
                 }
             }
         }
+        Command::OpenProject { path } => {
+            let folder = std::path::PathBuf::from(&path);
+            // ProjectStore::read does sync file IO + serde_json::from_slice
+            // on potentially megabytes of stroke data. Same pattern as
+            // StopRecording: spawn_blocking so the bus task isn't held
+            // while disk reads complete.
+            let result =
+                tokio::task::spawn_blocking(move || video_coach_core::project_store::read(&folder))
+                    .await;
+            match result {
+                Ok(Ok(project)) => {
+                    tracing::info!(
+                        target: "project.lifecycle",
+                        event = "project.opened",
+                        path = %path,
+                        name = %project.name,
+                    );
+                    *current_project = Some(project);
+                    CommandReply {
+                        ok: true,
+                        error: None,
+                    }
+                }
+                Ok(Err(e)) => CommandReply {
+                    ok: false,
+                    error: Some(e.to_string()),
+                },
+                Err(join) => CommandReply {
+                    ok: false,
+                    error: Some(format!("join: {join}")),
+                },
+            }
+        }
     }
 }
 
@@ -264,6 +312,29 @@ mod tests {
         let cmd = Command::StopRecording;
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v, serde_json::json!({"cmd": "stop_recording"}));
+    }
+
+    #[test]
+    fn open_project_serializes_with_path() {
+        let cmd = Command::OpenProject {
+            path: "/tmp/proj".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "open_project");
+        assert_eq!(v["path"], "/tmp/proj");
+    }
+
+    #[test]
+    fn open_project_deserializes_with_path() {
+        let v = serde_json::json!({
+            "cmd": "open_project",
+            "path": "/tmp/proj"
+        });
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::OpenProject { path } => assert_eq!(path, "/tmp/proj"),
+            _ => panic!("expected OpenProject"),
+        }
     }
 
     #[test]

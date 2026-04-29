@@ -14,6 +14,7 @@ use crate::protocol::OutgoingFrame;
 const FORWARDED_TARGETS: &[&str] = &[
     "app.lifecycle",
     "project",
+    "project.lifecycle",
     "recording",
     "preview",
     "export",
