@@ -1,3 +1,4 @@
+pub mod denormalize;
 pub mod event;
 pub mod export_settings;
 pub mod project;
