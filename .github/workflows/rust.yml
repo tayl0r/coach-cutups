@@ -19,6 +19,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # Build bin targets first. `cargo test --workspace` only builds lib +
+      # test + bench targets; the harness's smoke test depends on the
+      # video-coach-app binary existing in target/, which requires an
+      # explicit build of [[bin]]s.
+      - run: cargo build --workspace
       - run: cargo test --workspace
 
   media-tests:
@@ -46,5 +51,7 @@ jobs:
       - name: Fetch fixtures from release
         run: ./scripts/fetch-fixtures.sh
 
+      - name: Build bin targets (smoke test launches video-coach-app)
+        run: cargo build --workspace --features media
       - name: Run media-tagged tests
         run: cargo test --workspace --features media
