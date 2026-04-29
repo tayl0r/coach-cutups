@@ -1919,6 +1919,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "video-coach-compositor",
 ]
 
 [[package]]

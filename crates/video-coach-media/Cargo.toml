@@ -6,7 +6,9 @@ rust-version.workspace = true
 license.workspace = true
 
 [features]
-media = []
+# Phase 4 added a stub `media = []`. Phase 5 expands it: enabling `media`
+# also pulls in video-coach-compositor (and transitively wgpu).
+media = ["dep:video-coach-compositor"]
 
 [dependencies]
 gstreamer = "0.23"
@@ -15,6 +17,7 @@ gstreamer-video = "0.23"
 gstreamer-audio = "0.23"
 thiserror = { workspace = true }
 tracing = "0.1"
+video-coach-compositor = { path = "../video-coach-compositor", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
