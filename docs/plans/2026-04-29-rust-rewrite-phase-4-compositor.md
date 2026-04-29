@@ -153,15 +153,22 @@ impl Compositor {
     }
 
     async fn new_headless_async() -> Result<Self, CompositorError> {
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+        // wgpu 22's `Instance::new` takes the descriptor BY VALUE (not by
+        // reference). A later wgpu version flipped this; using `&` here
+        // produces a type-mismatch compile error against 22.x.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
             backends: wgpu::Backends::PRIMARY,
             ..Default::default()
         });
+        // `force_fallback_adapter: true` is required so headless Linux CI
+        // (lavapipe = software Vulkan) returns an adapter at all. With
+        // `false` and no real GPU, `request_adapter` returns `None` and
+        // the test fails before the pipeline is built.
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::LowPower,
                 compatible_surface: None,
-                force_fallback_adapter: false,
+                force_fallback_adapter: true,
             })
             .await
             .ok_or(CompositorError::NoAdapter)?;
@@ -265,31 +272,214 @@ fn fs_passthrough(in: VsOut) -> @location(0) vec4<f32> {
 }
 ```
 
-**Step 2: Replace `Compositor::compose`** with a real wgpu render pass that:
+**Step 2: Replace `Compositor::compose`** with a real wgpu render pass.
 
-1. Uploads `source.pixels` into a `wgpu::Texture` (RGBA8UnormSrgb? — see note below).
-2. Creates a render target texture of the same dimensions.
-3. Runs the passthrough pipeline.
-4. Reads the render target back into a `Vec<u8>` via a buffer + `device.poll(MaintainBase::Wait)`.
-5. Returns a `Frame` with the read-back bytes.
+**Format note:** Use `wgpu::TextureFormat::Rgba8Unorm` (NOT `Rgba8UnormSrgb`). The render target's format must match the texture upload format and the pipeline's `ColorTargetState::format` — a mismatch silently double-converts gamma. Phase 5+ can revisit when actual color management matters.
 
-**Format note:** Use `wgpu::TextureFormat::Rgba8Unorm` (NOT `Rgba8UnormSrgb`) so the bytes are passed through linearly — sRGB would apply gamma during sampling and the round-trip wouldn't be byte-identical. Phase 5+ can revisit when actual color management matters.
+**wgpu 22 API gotchas the executor MUST honor:**
+- `wgpu::util::DeviceExt::create_texture_with_data(queue, desc, ORDER, data)` requires a `wgpu::util::TextureDataOrder` argument as the third parameter. Use `TextureDataOrder::LayerMajor`. Add `use wgpu::util::DeviceExt;` to bring the trait into scope.
+- `device.poll(...)` takes `wgpu::Maintain::Wait`, NOT `MaintainBase::Wait`. Returns `MaintainResult`; bind to `let _` to satisfy clippy under `-D warnings`.
+- `RenderPipelineDescriptor` has a `cache: Option<&PipelineCache>` field added in wgpu 22. Set it to `None` (or use `..Default::default()`).
+- `slice.map_async(...)` takes a callback `FnOnce(Result<(), BufferAsyncError>) + Send + 'static`; pair with a `flume::bounded`/`std::sync::mpsc` channel to await synchronously.
 
-The body is long enough that the implementer should place it in `compositor.rs` directly. Key API calls:
-- `wgpu::util::DeviceExt::create_texture_with_data` for the source upload
-- `device.create_shader_module(wgpu::include_wgsl!("shaders/passthrough.wgsl"))`
-- `device.create_render_pipeline(...)` with a single bind group layout
-- A staging buffer with `MAP_READ | COPY_DST` usage; `device.poll(...)` after `submit`; `slice.map_async` then `slice.get_mapped_range()`.
-
-**Bytes-per-row alignment:** wgpu requires `bytes_per_row` on `ImageDataLayout` to be a multiple of `COPY_BYTES_PER_ROW_ALIGNMENT` (256). For widths whose `width * 4` isn't a multiple of 256, compute padded `bytes_per_row` and strip padding when reading back. Use the helper:
+Full `compose` body (place in `compositor.rs`):
 
 ```rust
+use wgpu::util::DeviceExt;
+
 fn padded_bytes_per_row(width: u32) -> u32 {
     let unpadded = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
     (unpadded + align - 1) / align * align
 }
+
+impl Compositor {
+    pub fn compose(
+        &self,
+        source: &Frame,
+        _webcam: &Frame,
+    ) -> Result<Frame, CompositorError> {
+        let w = source.width;
+        let h = source.height;
+
+        // 1. Upload source as a sampled texture.
+        let src_tex = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("source"),
+                size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &source.pixels,
+        );
+
+        // 2. Render target.
+        let target = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("target"),
+            size: wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8Unorm,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+
+        // 3. Pipeline (constructed once, but kept inline here for clarity;
+        //    real code can cache on Compositor).
+        let shader = self.device.create_shader_module(wgpu::include_wgsl!("shaders/passthrough.wgsl"));
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let bgl = self.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("passthrough-bgl"),
+            entries: &[
+                wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 1,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                    count: None,
+                },
+            ],
+        });
+        let pl_layout = self.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("passthrough-layout"),
+            bind_group_layouts: &[&bgl],
+            push_constant_ranges: &[],
+        });
+        let pipeline = self.device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("passthrough-pipeline"),
+            layout: Some(&pl_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_fullscreen"),
+                compilation_options: Default::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_passthrough"),
+                compilation_options: Default::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: None,
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
+            multisample: wgpu::MultisampleState::default(),
+            multiview: None,
+            cache: None, // wgpu 22 added this; absence is a compile error.
+        });
+
+        let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("passthrough-bg"),
+            layout: &bgl,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&src_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
+            ],
+        });
+
+        // 4. Encode + submit.
+        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("compose-encoder"),
+        });
+        {
+            let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("compose-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &target_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+            });
+            rpass.set_pipeline(&pipeline);
+            rpass.set_bind_group(0, &bind_group, &[]);
+            rpass.draw(0..3, 0..1);
+        }
+
+        // 5. Copy render target → staging buffer (with row alignment).
+        let bytes_per_row = padded_bytes_per_row(w);
+        let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("readback-staging"),
+            size: (bytes_per_row * h) as u64,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::ImageCopyTexture {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::ImageCopyBuffer {
+                buffer: &staging,
+                layout: wgpu::ImageDataLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(h),
+                },
+            },
+            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+        );
+        self.queue.submit(Some(encoder.finish()));
+
+        // 6. Map + read back.
+        let slice = staging.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| { let _ = tx.send(r); });
+        let _ = self.device.poll(wgpu::Maintain::Wait);
+        rx.recv()
+            .map_err(|e| CompositorError::Readback(format!("recv: {e}")))?
+            .map_err(|e| CompositorError::Readback(format!("map_async: {e}")))?;
+
+        let mapped = slice.get_mapped_range();
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        let unpadded = (w * 4) as usize;
+        for row in 0..h as usize {
+            let start = row * bytes_per_row as usize;
+            pixels.extend_from_slice(&mapped[start..start + unpadded]);
+        }
+        drop(mapped);
+        staging.unmap();
+
+        Ok(Frame::new(w, h, pixels))
+    }
+}
 ```
+
+**Bytes-per-row alignment:** `width=64, RGBA8` → `64*4 = 256` (already aligned). `width=320, RGBA8` → `320*4 = 1280` (also aligned by chance). For widths where `w*4` is NOT a multiple of 256 (e.g., `width=160` → `640`), the code above pads correctly: `padded_bytes_per_row(160) = 768` and the readback strips the trailing 128 bytes per row.
 
 **Step 3: Test.** Append to `lib.rs`'s `#[cfg(test)] mod tests` (or split into a per-module test mod):
 
@@ -416,15 +606,27 @@ fn pip_rect(out_w: u32, out_h: u32, webcam_w: u32, webcam_h: u32) -> [f32; 4] {
 }
 ```
 
-**Step 3: Add a uniform buffer to `Compositor`.** Replace `compose` to bind both textures + the uniform.
+**Step 3: Replace `compose` with the PiP variant.** The structure is identical to Task 3's passthrough body — same wgpu-22 API gotchas apply (`Maintain::Wait`, `TextureDataOrder::LayerMajor`, `cache: None`). The only deltas:
 
-The render path now:
-1. Upload source → texture A.
-2. Upload webcam → texture B.
-3. Write `pip_rect(...)` into a `wgpu::Buffer` (UNIFORM | COPY_DST).
-4. Build a bind group with both textures + sampler + uniform.
-5. Run a single draw call (3 vertices, fullscreen triangle).
-6. Readback as before.
+1. Upload BOTH textures (source AND webcam, identical descriptor pattern).
+2. Create a uniform buffer holding the four `f32`s from `pip_rect(...)`:
+   ```rust
+   #[repr(C)]
+   #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+   struct PipParamsUniform { x: f32, y: f32, w: f32, h: f32 }
+
+   let rect = pip_rect(source.width, source.height, webcam.width, webcam.height);
+   let uniform = PipParamsUniform { x: rect[0], y: rect[1], w: rect[2], h: rect[3] };
+   let uniform_buf = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+       label: Some("pip-params"),
+       contents: bytemuck::bytes_of(&uniform),
+       usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+   });
+   ```
+   (Requires `use wgpu::util::DeviceExt;` for the `create_buffer_init` extension method.)
+3. Bind group layout grows to FOUR entries: `binding=0` source texture, `binding=1` webcam texture, `binding=2` sampler, `binding=3` uniform buffer (`BindingType::Buffer { ty: Uniform, has_dynamic_offset: false, min_binding_size: None }`, visible to fragment stage). The shader's `@group(0) @binding(N)` numbers must match.
+4. Pipeline uses `pip.wgsl` instead of `passthrough.wgsl`. Entry points: `vs_fullscreen` and `fs_pip`.
+5. Render pass and readback are identical to Task 3.
 
 **Step 4: Golden-frame test.**
 
@@ -467,54 +669,85 @@ git commit -m "feat(compositor): PiP composite — webcam scaled into bottom-rig
 
 ---
 
-## Task 5: Golden-frame hash test
+## Task 5: Golden-frame hash test (macOS only)
 
-Add a test that pins the EXACT byte hash of a known input → output. Catches accidental shader regressions, sampler config changes, or driver-version differences.
+Pin the EXACT byte hash of a known input → output to catch accidental shader regressions or sampler config changes.
 
-**Files:** Modify `crates/video-coach-compositor/src/compositor.rs` (or a new `tests/golden.rs` integration test).
+**Important — cross-platform reality:** GPU rasterization is NOT byte-identical across drivers. Metal (macOS), lavapipe (Linux software Vulkan), and D3D12 (Windows) apply bilinear filtering with subtly different sub-pixel rounding. Even for a fullscreen-triangle passthrough, the hash will differ. The test is therefore gated `#[cfg(target_os = "macos")]` — it serves as a regression sentinel on the dev machine, not a cross-platform contract. If a future task wants a cross-platform pixel test, it must use a tolerance-based comparison (sum of absolute pixel differences < threshold), not a hash.
 
-**Step 1: Pick the canonical inputs.** Use 320×180 to keep the bytes small and the hash compact.
+**Files:** Modify `crates/video-coach-compositor/src/compositor.rs` AND `crates/video-coach-compositor/Cargo.toml`.
+
+**Step 1: Add the dev-dep BEFORE writing the test code.**
+
+In `crates/video-coach-compositor/Cargo.toml`:
+
+```toml
+[dev-dependencies]
+sha2 = "0.10"
+```
+
+**Step 2: Add the gated test.**
+
+In the existing `#[cfg(test)] mod tests` block:
 
 ```rust
-// inside the existing test mod
-use sha2::{Digest, Sha256};
-
-fn pixel_grid(w: u32, h: u32, scale: u8) -> Frame {
-    let mut pixels = Vec::with_capacity((w * h * 4) as usize);
-    for y in 0..h {
-        for x in 0..w {
-            // Distinguishable per-pixel so any shader bug shows.
-            pixels.extend_from_slice(&[(x * scale as u32) as u8, (y * scale as u32) as u8, 128, 255]);
-        }
-    }
-    Frame::new(w, h, pixels)
-}
-
+#[cfg(target_os = "macos")]
 #[test]
-fn pip_320x180_matches_golden_hash() {
+fn pip_320x180_matches_macos_golden_hash() {
+    use sha2::{Digest, Sha256};
+
+    fn pixel_grid(w: u32, h: u32, scale: u8) -> Frame {
+        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        for y in 0..h {
+            for x in 0..w {
+                pixels.extend_from_slice(&[
+                    (x * scale as u32) as u8,
+                    (y * scale as u32) as u8,
+                    128,
+                    255,
+                ]);
+            }
+        }
+        Frame::new(w, h, pixels)
+    }
+
     let comp = Compositor::new_headless().expect("compositor");
     let source = pixel_grid(320, 180, 1);
     let webcam = pixel_grid(160, 90, 3);
     let out = comp.compose(&source, &webcam).expect("compose");
-    let mut hasher = Sha256::new();
-    hasher.update(&out.pixels);
-    let hex = format!("{:x}", hasher.finalize());
 
-    // Expected hash: filled in on first run via:
-    //   cargo test -p video-coach-compositor pip_320x180_matches_golden -- --nocapture
-    // ...then paste the printed hash here.
+    let hex = format!("{:x}", Sha256::digest(&out.pixels));
+    eprintln!("pip_320x180 hash on this machine: {hex}");
+
+    // First-run procedure: this assertion intentionally fails until the
+    // expected hash is filled in. Run `cargo test pip_320x180 -- --nocapture`,
+    // copy the printed hash, paste it below, re-run to confirm match.
     let expected = "<TODO-FILL-AFTER-FIRST-RUN>";
-    assert_eq!(hex, expected, "golden frame mismatch");
+    assert_eq!(hex, expected, "golden frame mismatch on macOS Metal");
 }
 ```
 
-**Step 2: First-run dance.** The implementer runs the test once with `eprintln!("{hex}");` instead of `assert_eq!`, captures the actual hash, pastes it as the `expected`, then re-runs to confirm match. Add `sha2 = "0.10"` to `[dev-dependencies]` in the compositor crate.
+**Step 3: First-run procedure.**
 
-**Step 3: Commit.**
+Run the test:
+
+```bash
+cargo test -p video-coach-compositor pip_320x180 -- --nocapture
+```
+
+Expected on first run: the test FAILS with the expected `<TODO-FILL-AFTER-FIRST-RUN>` literal. The eprintln line above the assertion prints the actual hash. Copy that hash, replace `<TODO-FILL-AFTER-FIRST-RUN>` in the test, and re-run.
+
+The test should now pass:
+
+```bash
+cargo test -p video-coach-compositor pip_320x180
+```
+
+**Step 4: Commit (only after the hash is filled in).**
 
 ```bash
 git add crates/video-coach-compositor/Cargo.toml crates/video-coach-compositor/src/ Cargo.lock
-git commit -m "test(compositor): pin golden-frame hash for PiP at 320x180"
+git commit -m "test(compositor): pin macOS golden-frame hash for 320x180 PiP"
 ```
 
 ---
@@ -554,6 +787,7 @@ git commit -m "ci: install lavapipe so headless wgpu has a software Vulkan adapt
 - `cargo test -p video-coach-compositor` green locally on macOS.
 - `cargo build -p video-coach-app --release --no-default-features` still clean — compositor is NOT yet wired into the app, so this should be unaffected.
 - CI `test` matrix green on macOS / Windows / Linux.
-- The `pip_places_webcam_in_bottom_right` and `pip_320x180_matches_golden_hash` tests both pass on Linux CI (proving lavapipe gives reproducible output).
+- `pip_places_webcam_in_bottom_right` (tolerance-based, cross-platform) passes on all 3 OSes — proves lavapipe gives functionally correct output even if not byte-identical.
+- `pip_320x180_matches_macos_golden_hash` is gated `#[cfg(target_os = "macos")]` and passes locally on the dev machine. CI Linux/Windows skip it.
 
 When this is green, Phase 5 starts wiring the compositor into the GStreamer recording pipeline (appsink → wgpu → appsrc) and adds the stroke overlay.
