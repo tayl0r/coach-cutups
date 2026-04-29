@@ -66,6 +66,14 @@ The fourth option is the highest-EV next step — comparing against working code
 
 ## Resume procedure
 
-1. `git stash pop` to restore the WIP debug code, OR start fresh from skeleton.
-2. Read the `gstreamer-rs` examples/appsink.rs path and diff the structure.
-3. If still stuck, try the pad probe approach — it removes appsink as a variable.
+1. `git stash pop` to restore the WIP debug code, OR start fresh from skeleton. Two stashes exist:
+   - `stash@{0}: phase-5-task-3-wip-debug-v2` — adds `GST_PLUGIN_FEATURE_RANK=vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE` to switch to software codecs. Switch confirmed (avdec_h264 in use), but new_sample STILL doesn't fire — so VideoToolbox+runloop is NOT the root cause.
+   - `stash@{1}: phase-5-task-3-wip-debug` — earlier WIP state without the rank override.
+2. Read the `gstreamer-rs` examples/appsink.rs path — fetched to `/tmp/appsink_example.rs`. The example uses `audiotestsrc → appsink`, callbacks-based, and ALSO uses `examples_common::run` for macOS Cocoa runloop. The Cocoa runloop is needed for VIDEO elements specifically — but disabling VT didn't unblock us, so the issue is something else.
+3. **Highest-EV next step**: try `pad probe` on the videoconvert_in src pad to intercept buffers directly. If buffers ARE flowing past videoconvert_in but appsink isn't seeing them, the appsink itself is broken in this pipeline shape. If buffers AREN'T flowing past videoconvert_in, the input chain has a stall before that point.
+4. **Alternative architectural path**: split into two pipelines connected by an `mpsc` channel. Pipeline 1: filesrc → decodebin → videoconvert → appsink-with-pull-loop-on-thread. Pipeline 2: appsrc → videoconvert → encoder → muxer → filesink. The producer thread `pull_sample()`s from appsink and `push_buffer()`s to appsrc. Decouples state-change coordination, sidesteps any single-pipeline appsink/appsrc interaction issue.
+5. **Pragmatic alternative**: prototype Phase 5 using GStreamer's native `compositor` element instead of wgpu. Gives up the "preview = export" parity benefit but proves the pipeline shape works; can swap in wgpu later when the bridge is understood.
+
+## Time spent in this session
+
+About an hour of investigation across the plan-write, adversarial-review, implementation, and 6+ debugging iterations. Findings worth keeping but the deadlock isn't cracking under rapid iteration.
