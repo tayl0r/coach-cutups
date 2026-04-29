@@ -61,7 +61,18 @@ async fn handle_connection(
                         return;
                     }
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    // The broadcast channel buffer (256) overflowed before
+                    // this subscriber drained. Silent drops have caused at
+                    // least one mystery test timeout; surface them so the
+                    // harness operator sees the cause.
+                    tracing::warn!(
+                        target: "control_socket",
+                        skipped,
+                        "event subscriber lagged; some events were dropped",
+                    );
+                    continue;
+                }
                 Err(broadcast::error::RecvError::Closed) => return,
             }
         }

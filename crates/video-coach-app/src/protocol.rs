@@ -1,3 +1,8 @@
+// Same rationale as bus.rs: protocol types are only consumed by the
+// control_socket adapter today. UI dispatch (Task 5) doesn't go through
+// IncomingFrame/OutgoingFrame — it calls BusHandle::send directly.
+#![cfg_attr(not(feature = "control-socket"), allow(dead_code))]
+
 use crate::bus::Command;
 use serde::{de, Deserialize, Deserializer, Serialize};
 

@@ -1,16 +1,14 @@
+mod bus;
 mod cli;
 mod event_layer;
 mod logging;
+mod protocol;
 
-// bus, protocol, and control_socket are only reachable from the control-socket
-// feature path; gating the modules together keeps release-no-default-features
-// builds free of dead bus/protocol code.
-#[cfg(feature = "control-socket")]
-mod bus;
+// Only the control_socket adapter and the layer's broadcast wiring stay
+// behind the feature flag. The bus + protocol are universal: Phase 6's
+// Slint UI also dispatches via the bus.
 #[cfg(feature = "control-socket")]
 mod control_socket;
-#[cfg(feature = "control-socket")]
-mod protocol;
 
 use clap::Parser;
 use cli::Args;
@@ -37,15 +35,24 @@ async fn main() -> anyhow::Result<()> {
     let forward_layer: Option<event_layer::ForwardLayer> = None;
 
     logging::init(args.json_logs, forward_layer);
+    // Note: this event fires before the control_socket binds and before any
+    // socket client subscribes to the broadcast channel. Socket-based test
+    // harnesses cannot observe `app.launched` — they rely on
+    // `control_socket.ready` (parsed from stdout) as the launch signal.
+    // See `video-coach-harness::App::launch` and `tests/smoke.rs` for the
+    // existing workaround. Don't add tests that wait on `app.launched`.
     tracing::info!(target: "app.lifecycle", event = "app.launched", version = env!("CARGO_PKG_VERSION"));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Bus + control socket are only useful when the socket is the remote
-    // driver. Without the feature, only Ctrl-C ends the app.
+    // The bus is universal — every command (UI, socket, signal) flows through
+    // it. Spawning unconditionally costs one idle mpsc loop in the
+    // no-feature build; harmless and avoids dead-code warnings on bus.rs.
+    let bus = bus::spawn(shutdown_tx.clone());
+    let _ = &bus; // silence unused warning when no consumer is wired in this build
+
     #[cfg(feature = "control-socket")]
     {
-        let bus = bus::spawn(shutdown_tx.clone());
         if let Some(port) = args.control_socket {
             let (listener, addr) = control_socket::bind(port).await?;
             // The harness reads stdout for this exact event to discover the port.
@@ -59,6 +66,10 @@ async fn main() -> anyhow::Result<()> {
     }
     #[cfg(not(feature = "control-socket"))]
     let _ = &shutdown_tx;
+
+    // `--headless` is currently always implied (no UI built yet). Phase 6
+    // Task 1 wires the Slint window behind `!args.headless`.
+    let _ = args.headless;
 
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {

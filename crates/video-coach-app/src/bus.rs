@@ -1,3 +1,8 @@
+// Until the Slint UI in Phase 6 Task 2 dispatches commands through the bus,
+// the no-default-features build (no control-socket, no UI consumer) leaves
+// BusHandle::send dormant. Allow dead_code in that shape only.
+#![cfg_attr(not(feature = "control-socket"), allow(dead_code))]
+
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, oneshot};
 

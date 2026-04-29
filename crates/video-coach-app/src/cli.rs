@@ -13,4 +13,10 @@ pub struct Args {
     #[cfg(feature = "control-socket")]
     #[arg(long)]
     pub control_socket: Option<u16>,
+
+    /// Skip Slint UI initialization. Independent of `--control-socket`:
+    /// the socket can drive a real GUI app for debugging, or a headless
+    /// app for tests. Tests pass `--headless` plus `--control-socket`.
+    #[arg(long)]
+    pub headless: bool,
 }
