@@ -1,7 +1,7 @@
 # Cargo.toml
 [workspace]
 resolver = "2"
-members = ["crates/video-coach-core"]
+members = ["crates/video-coach-core", "crates/video-coach-app"]
 
 [workspace.package]
 edition = "2021"
