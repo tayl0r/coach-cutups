@@ -969,7 +969,7 @@ Source files on the user's machine outside the repo:
 - **Source video** (master): `/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4`
   Duration 83.7 min, 3840×2160 (4K), H.264 + AAC, 32 GB. Extracted into **two fixtures from different minutes** so they double as distinct source assets — exercises the multi-source-video project case (v1 supports up to 2 source videos per project):
   - `fixtures/source-1080p.mp4` — minute **25** (`00:25:00 → 00:26:00`), re-encoded to 1920×1080 at ~6 Mbps (~45 MB). Default for most flow tests.
-  - `fixtures/source-4k.mp4` — minute **50** (`00:50:00 → 00:51:00`), re-encoded at native 3840×2160 at ~20 Mbps (~150 MB). Used for 4K-playback regression tests; v1 had real bugs in the 4K decode/scrub path that we want to catch automatically.
+  - `fixtures/source-4k.mp4` — **30 seconds** starting at minute **50** (`00:50:00 → 00:50:30`), re-encoded at native 3840×2160 at ~20 Mbps (~75 MB). Used for 4K-playback regression tests; v1 had real bugs in the 4K decode/scrub path that we want to catch automatically. 30s is plenty to exercise decode/scrub; the duration is shorter than the 1080p fixture purely to keep LFS bandwidth in check.
 
 `ffmpeg` is used here as a one-time dev/build tool. It is **not** an app dependency — the runtime project still uses GStreamer exclusively. Install with `brew install ffmpeg` if not present.
 
@@ -991,16 +991,15 @@ ffmpeg -ss 00:25:00 -t 00:01:00 -i "/Users/taylor/Downloads/VID_20260425_090418_
        fixtures/source-1080p.mp4
 
 # 4K source: different minute (50, not 25) so this doubles as a second
-# distinct source asset. Native resolution, lower bitrate than original
-# (~20 Mbps is enough quality for a regression-test fixture and keeps the
-# file under 200 MB).
-ffmpeg -ss 00:50:00 -t 00:01:00 -i "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4" \
+# distinct source asset. 30 seconds at native resolution, ~20 Mbps —
+# enough to exercise 4K decode/scrub without bloating LFS.
+ffmpeg -ss 00:50:00 -t 00:00:30 -i "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4" \
        -c:v libx264 -preset slow -b:v 20000k -maxrate 22000k -bufsize 40000k \
        -c:a aac -b:a 128k \
        -movflags +faststart \
        fixtures/source-4k.mp4
 
-# Sanity-check both files: should print ~60 seconds for each.
+# Sanity-check both files: 1080p should print ~60s, 4K should print ~30s.
 ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/source-1080p.mp4
 ffprobe -v error -show_entries format=duration -of default=nw=1:nk=1 fixtures/source-4k.mp4
 ```
@@ -1024,11 +1023,11 @@ For audio (`fixtures/mic.wav`), defer until a recording-flow test actually needs
     },
     "source-4k.mp4": {
       "purpose": "4K source for playback/scrub regression tests (v1 had bugs in the 4K decode path) AND a distinct second source asset for multi-source-video project tests.",
-      "durationSeconds": 60,
+      "durationSeconds": 30,
       "width": 3840,
       "height": 2160,
       "originalSource": "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4",
-      "trimSpec": "00:50:00 → 00:51:00 (re-encoded native 4K H.264 ~20 Mbps)"
+      "trimSpec": "00:50:00 → 00:50:30 (re-encoded native 4K H.264 ~20 Mbps)"
     },
     "webcam.mov": {
       "purpose": "Pre-recorded webcam clip swapped in for live capture in test mode.",
