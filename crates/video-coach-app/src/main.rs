@@ -1,4 +1,5 @@
 mod cli;
+mod event_layer;
 mod logging;
 
 // bus, protocol, and control_socket are only reachable from the control-socket
@@ -17,18 +18,34 @@ use cli::Args;
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let args = Args::parse();
-    logging::init(args.json_logs);
+
+    // events_tx must exist before logging::init so the ForwardLayer can hold
+    // the sender. Constructed unconditionally; the no-feature build never wires
+    // it to a subscriber but keeps the type plumbing uniform.
+    #[cfg(feature = "control-socket")]
+    let (events_tx, _) = tokio::sync::broadcast::channel::<protocol::OutgoingFrame>(256);
+
+    #[cfg(feature = "control-socket")]
+    let forward_layer = if args.control_socket.is_some() {
+        Some(event_layer::ForwardLayer {
+            events: events_tx.clone(),
+        })
+    } else {
+        None
+    };
+    #[cfg(not(feature = "control-socket"))]
+    let forward_layer: Option<event_layer::ForwardLayer> = None;
+
+    logging::init(args.json_logs, forward_layer);
     tracing::info!(target: "app.lifecycle", event = "app.launched", version = env!("CARGO_PKG_VERSION"));
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
 
-    // Bus + event broadcast are only useful when the control socket is the
-    // remote driver. Without the feature, only Ctrl-C ends the app, so the
-    // bus would be unreachable dead code.
+    // Bus + control socket are only useful when the socket is the remote
+    // driver. Without the feature, only Ctrl-C ends the app.
     #[cfg(feature = "control-socket")]
     {
         let bus = bus::spawn(shutdown_tx.clone());
-        let (events_tx, _) = tokio::sync::broadcast::channel::<protocol::OutgoingFrame>(256);
         if let Some(port) = args.control_socket {
             let (listener, addr) = control_socket::bind(port).await?;
             // The harness reads stdout for this exact event to discover the port.
