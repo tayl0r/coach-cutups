@@ -1,6 +1,7 @@
 mod bus;
 mod cli;
 mod logging;
+mod protocol;
 
 use clap::Parser;
 use cli::Args;
