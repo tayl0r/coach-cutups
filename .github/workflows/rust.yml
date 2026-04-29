@@ -17,6 +17,33 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install GStreamer (macOS)
+        if: runner.os == 'macOS'
+        run: brew install gstreamer
+      - name: Install GStreamer (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-tools
+      - name: Install GStreamer (Windows)
+        if: runner.os == 'Windows'
+        # Don't pin a specific chocolatey version — Chocolatey reaps old
+        # packages and gstreamer-rs 0.23 supports any GStreamer 1.24+.
+        run: |
+          choco install gstreamer -y
+          choco install gstreamer-devel -y
+          echo "C:\gstreamer\1.0\msvc_x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          echo "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" >> $env:GITHUB_ENV
+
       - run: cargo fmt --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
       # Build bin targets first. `cargo test --workspace` only builds lib +
@@ -32,6 +59,19 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+
+      - name: Install GStreamer
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good \
+            gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly \
+            gstreamer1.0-libav \
+            gstreamer1.0-tools
 
       # Cache fixtures by manifest hash. When manifest is unchanged,
       # this restores fixtures/ from cache and the fetch script
