@@ -57,7 +57,14 @@ impl App {
 
     pub async fn launch() -> anyhow::Result<Self> {
         let mut cmd = Command::new(Self::binary_path());
-        cmd.arg("--json-logs").arg("--control-socket").arg("0");
+        // Phase 6: --headless is independent of --control-socket. The harness
+        // tests the bus + socket without a real window — UI E2E coverage
+        // waits for a virtual-display strategy (Phase 11). Without this flag
+        // the child would try to open a Slint window in the test subprocess.
+        cmd.arg("--json-logs")
+            .arg("--headless")
+            .arg("--control-socket")
+            .arg("0");
         cmd.stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = cmd.spawn()?;
 

@@ -79,9 +79,15 @@ impl BusHandle {
     }
 }
 
-pub fn spawn(shutdown_tx: tokio::sync::watch::Sender<bool>) -> BusHandle {
+/// Spawn the bus task on the given tokio runtime handle. Phase 6 dropped
+/// `#[tokio::main]` so the bus runs on the same multi-threaded runtime
+/// that drives the control socket and any UI-dispatched async work.
+pub fn spawn_on(
+    rt: &tokio::runtime::Handle,
+    shutdown_tx: tokio::sync::watch::Sender<bool>,
+) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
-    tokio::spawn(async move {
+    rt.spawn(async move {
         // Per-task recording state. `None` until StartRecording succeeds;
         // taken by StopRecording. Held across loop iterations because start
         // and stop are necessarily separate commands.
