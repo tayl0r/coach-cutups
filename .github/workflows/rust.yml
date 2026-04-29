@@ -5,6 +5,10 @@ on:
     branches: [main, rust-rewrite]
   pull_request:
 jobs:
+  # Non-media code health on all three OSes. video-coach-media is excluded
+  # because GStreamer installs (especially the Windows pkg-config + glib-sys
+  # path) are fragile in CI; the media crate's own coverage lives in the
+  # `media-tests` job below, on a Linux runner where the install is well-trodden.
   test:
     strategy:
       fail-fast: false
@@ -17,41 +21,14 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-
-      - name: Install GStreamer (macOS)
-        if: runner.os == 'macOS'
-        run: brew install gstreamer
-      - name: Install GStreamer (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            gstreamer1.0-plugins-base \
-            gstreamer1.0-plugins-good \
-            gstreamer1.0-plugins-bad \
-            gstreamer1.0-plugins-ugly \
-            gstreamer1.0-libav \
-            gstreamer1.0-tools
-      - name: Install GStreamer (Windows)
-        if: runner.os == 'Windows'
-        # Don't pin a specific chocolatey version — Chocolatey reaps old
-        # packages and gstreamer-rs 0.23 supports any GStreamer 1.24+.
-        run: |
-          choco install gstreamer -y
-          choco install gstreamer-devel -y
-          echo "C:\gstreamer\1.0\msvc_x86_64\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
-          echo "PKG_CONFIG_PATH=C:\gstreamer\1.0\msvc_x86_64\lib\pkgconfig" >> $env:GITHUB_ENV
-
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
+      - run: cargo clippy --workspace --exclude video-coach-media --all-targets -- -D warnings
       # Build bin targets first. `cargo test --workspace` only builds lib +
       # test + bench targets; the harness's smoke test depends on the
       # video-coach-app binary existing in target/, which requires an
       # explicit build of [[bin]]s.
-      - run: cargo build --workspace
-      - run: cargo test --workspace
+      - run: cargo build --workspace --exclude video-coach-media
+      - run: cargo test --workspace --exclude video-coach-media
 
   media-tests:
     runs-on: ubuntu-latest
