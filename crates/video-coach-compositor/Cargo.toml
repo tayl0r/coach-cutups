@@ -1,0 +1,13 @@
+[package]
+name = "video-coach-compositor"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+wgpu = "22"
+bytemuck = { version = "1", features = ["derive"] }
+pollster = "0.3"
+thiserror = { workspace = true }
+tracing = "0.1"
