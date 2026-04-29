@@ -41,7 +41,7 @@ pub fn write(project: &Project, folder: &Path) -> Result<(), ProjectStoreError> 
     let target = folder.join(PROJECT_FILE_NAME);
     let tmp = folder.join("project.json.tmp");
 
-    // Pretty-printed; key order is BTreeMap-stable (alphabetic) by serde's struct serialization.
+    // Pretty-printed; field order matches the struct declaration order in `Project`.
     let data = serde_json::to_vec_pretty(project)?;
     fs::write(&tmp, &data)?;
     if target.exists() {
