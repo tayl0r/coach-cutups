@@ -21,6 +21,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+
+      # Headless wgpu needs a Vulkan adapter to run compositor tests on
+      # Linux. lavapipe (Mesa software Vulkan) ships with mesa-vulkan-drivers.
+      # macOS uses Metal natively; Windows uses D3D12 — no install there.
+      - name: Install Vulkan + lavapipe (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan1 mesa-vulkan-drivers vulkan-tools
+
       - run: cargo fmt --check
       - run: cargo clippy --workspace --exclude video-coach-media --all-targets -- -D warnings
       # Build bin targets first. `cargo test --workspace` only builds lib +
