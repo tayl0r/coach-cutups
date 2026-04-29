@@ -17,6 +17,36 @@ pub struct Compositor {
     pub(crate) queue: wgpu::Queue,
 }
 
+/// PiP geometry matches v1's `pipTransform`: webcam at 22% of output width,
+/// 2.2% margin from bottom-right. Aspect-ratio preserved via webcam frame
+/// dimensions (the shader maps the rectangle uniformly).
+const PIP_WIDTH_FRACTION: f32 = 0.22;
+const PIP_MARGIN_FRACTION: f32 = 0.022;
+
+fn pip_rect(out_w: u32, out_h: u32, webcam_w: u32, webcam_h: u32) -> [f32; 4] {
+    let pip_w = PIP_WIDTH_FRACTION;
+    let aspect = webcam_h as f32 / webcam_w.max(1) as f32;
+    // The (out_w/out_h) factor compensates: pip_w and pip_h are normalized
+    // to the OUTPUT's anisotropic coords, so to get a square-aspect PiP rect
+    // for a square-aspect webcam, pip_h must scale by the inverse of the
+    // output's aspect ratio.
+    let pip_h = pip_w * aspect * (out_w as f32 / out_h.max(1) as f32);
+    let margin_y = PIP_MARGIN_FRACTION;
+    let margin_x = PIP_MARGIN_FRACTION * (out_h as f32 / out_w.max(1) as f32);
+    let pip_x = 1.0 - pip_w - margin_x;
+    let pip_y = 1.0 - pip_h - margin_y;
+    [pip_x, pip_y, pip_w, pip_h]
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct PipParamsUniform {
+    x: f32,
+    y: f32,
+    w: f32,
+    h: f32,
+}
+
 fn padded_bytes_per_row(width: u32) -> u32 {
     let unpadded = width * 4;
     let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -74,7 +104,7 @@ impl Compositor {
         Ok(Self { device, queue })
     }
 
-    pub fn compose(&self, source: &Frame, _webcam: &Frame) -> Result<Frame, CompositorError> {
+    pub fn compose(&self, source: &Frame, webcam: &Frame) -> Result<Frame, CompositorError> {
         let w = source.width;
         let h = source.height;
 
@@ -101,7 +131,28 @@ impl Compositor {
             &source.pixels,
         );
 
-        // 2. Render target.
+        // 1b. Upload webcam as a sampled texture.
+        let webcam_tex = self.device.create_texture_with_data(
+            &self.queue,
+            &wgpu::TextureDescriptor {
+                label: Some("webcam"),
+                size: wgpu::Extent3d {
+                    width: webcam.width,
+                    height: webcam.height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+            wgpu::util::TextureDataOrder::LayerMajor,
+            &webcam.pixels,
+        );
+
+        // 2. Render target (output is source-sized).
         let target = self.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("target"),
             size: wgpu::Extent3d {
@@ -117,10 +168,26 @@ impl Compositor {
             view_formats: &[],
         });
 
+        // 2b. Uniform buffer with the PiP rectangle.
+        let rect = pip_rect(source.width, source.height, webcam.width, webcam.height);
+        let uniform = PipParamsUniform {
+            x: rect[0],
+            y: rect[1],
+            w: rect[2],
+            h: rect[3],
+        };
+        let uniform_buf = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("pip-params"),
+                contents: bytemuck::bytes_of(&uniform),
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            });
+
         // 3. Pipeline.
         let shader = self
             .device
-            .create_shader_module(wgpu::include_wgsl!("shaders/passthrough.wgsl"));
+            .create_shader_module(wgpu::include_wgsl!("shaders/pip.wgsl"));
         let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
@@ -131,7 +198,7 @@ impl Compositor {
         let bgl = self
             .device
             .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("passthrough-bgl"),
+                label: Some("pip-bgl"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
@@ -146,7 +213,27 @@ impl Compositor {
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -154,14 +241,14 @@ impl Compositor {
         let pl_layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("passthrough-layout"),
+                label: Some("pip-layout"),
                 bind_group_layouts: &[&bgl],
                 push_constant_ranges: &[],
             });
         let pipeline = self
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("passthrough-pipeline"),
+                label: Some("pip-pipeline"),
                 layout: Some(&pl_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
@@ -171,7 +258,7 @@ impl Compositor {
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: "fs_passthrough",
+                    entry_point: "fs_pip",
                     compilation_options: Default::default(),
                     targets: &[Some(wgpu::ColorTargetState {
                         format: wgpu::TextureFormat::Rgba8Unorm,
@@ -188,8 +275,9 @@ impl Compositor {
             });
 
         let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
+        let webcam_view = webcam_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("passthrough-bg"),
+            label: Some("pip-bg"),
             layout: &bgl,
             entries: &[
                 wgpu::BindGroupEntry {
@@ -198,7 +286,15 @@ impl Compositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::TextureView(&webcam_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: wgpu::BindingResource::Sampler(&sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform_buf.as_entire_binding(),
                 },
             ],
         });
@@ -301,16 +397,51 @@ mod tests {
         let out = comp.compose(&source, &webcam).expect("compose");
         assert_eq!(out.width, 64);
         assert_eq!(out.height, 64);
-        // Allow tiny rounding from sample/blit; compare a center pixel.
-        let i = ((32 * 64 + 32) * 4) as usize;
-        let center = &out.pixels[i..i + 4];
+        // Sample the top-left corner: it's well outside the PiP rect (which
+        // sits in the bottom-right) so should retain the source color.
+        let i = ((8 * 64 + 8) * 4) as usize;
+        let tl = &out.pixels[i..i + 4];
         assert!(
-            (center[0] as i32 - 200).abs() <= 2
-                && (center[1] as i32 - 100).abs() <= 2
-                && (center[2] as i32 - 50).abs() <= 2
-                && center[3] == 255,
-            "center pixel diverged: {:?}",
-            center
+            (tl[0] as i32 - 200).abs() <= 2
+                && (tl[1] as i32 - 100).abs() <= 2
+                && (tl[2] as i32 - 50).abs() <= 2
+                && tl[3] == 255,
+            "top-left pixel diverged: {:?}",
+            tl
+        );
+    }
+
+    #[test]
+    fn pip_places_webcam_in_bottom_right() {
+        let comp = Compositor::new_headless().expect("compositor");
+
+        // Source: solid red. Webcam: solid blue. After compose, the
+        // top-left of the output should be red and the bottom-right region
+        // should be blue.
+        let source = Frame::solid(640, 360, [255, 0, 0, 255]);
+        let webcam = Frame::solid(160, 90, [0, 0, 255, 255]);
+        let out = comp.compose(&source, &webcam).expect("compose");
+
+        let sample = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * out.width + x) * 4) as usize;
+            [
+                out.pixels[i],
+                out.pixels[i + 1],
+                out.pixels[i + 2],
+                out.pixels[i + 3],
+            ]
+        };
+
+        // Top-left (well outside the PiP) is the source color.
+        let tl = sample(8, 8);
+        assert_eq!(tl[..3], [255, 0, 0], "top-left should be red, got {:?}", tl);
+
+        // Pixel near the bottom-right margin is inside the PiP and should be webcam blue.
+        let br = sample(out.width - 12, out.height - 12);
+        assert!(
+            (br[2] as i32 - 255).abs() <= 4,
+            "bottom-right should be webcam blue, got {:?}",
+            br
         );
     }
 }
