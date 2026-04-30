@@ -189,10 +189,26 @@ enum ClipPreviewBuilder {
         // `CompilationExporter.renderSize`), so renderSize is the source's
         // raw natural size with no rotation handling.
         let srcNatural = try await srcVideoTrack.load(.naturalSize)
-        let renderSize = CGSize(
+        let nativeRender = CGSize(
             width: abs(srcNatural.width),
             height: abs(srcNatural.height)
         )
+        // Preview is shown in a window — the source's full native dimensions
+        // (often 4K) inflate every per-frame composite/output buffer with no
+        // visible benefit. Cap the longer side to 1920px and preserve aspect.
+        // Export keeps native (CompilationExporter has its own composition).
+        let maxLongSide: CGFloat = 1920
+        let longest = max(nativeRender.width, nativeRender.height)
+        let renderSize: CGSize
+        if longest > maxLongSide {
+            let scale = maxLongSide / longest
+            renderSize = CGSize(
+                width: (nativeRender.width * scale).rounded(),
+                height: (nativeRender.height * scale).rounded()
+            )
+        } else {
+            renderSize = nativeRender
+        }
 
         let videoComp = AVMutableVideoComposition()
         videoComp.renderSize = renderSize
