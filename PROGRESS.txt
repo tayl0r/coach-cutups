@@ -142,7 +142,14 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
       7's platform_audio_sink_name. bus.rs PlatformDefault arm wires
       it in. New ignored test platform_source_smoke (cfg macos +
       #[ignore]); ran locally — see Task 6 closeout.
-- [ ] Task 3: UI — R key + REC indicator + elapsed timer
+- [x] Task 3: UI — R key + REC indicator + elapsed timer (commit c88bba6)
+      main.slint gains `mode`, `recording-elapsed-seconds`,
+      `record-toggled` + `r` key handler in keyscope. Top-left REC
+      indicator: red+M:SS while recording, yellow+"Preparing…" during
+      recording_starting, hidden when scanning. ui.rs frame timer
+      reads RecordingStateSlot BEFORE PlayerStateSlot (adversarial
+      fix #8). on_record_toggled snapshots playhead from PlayerState
+      slot BEFORE dispatch (adversarial fix #1).
 - [ ] Task 4: Stroke event capture (events only, no drawing)
 - [ ] Task 5: Harness E2E — full record-clip flow against fixture
 - [ ] Task 6: Closeout
