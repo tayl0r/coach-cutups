@@ -14,9 +14,11 @@ import Foundation
 ///
 /// Per-clip context (segments, pre-decoded freeze frames, track IDs) rides on
 /// a `PreviewInstruction` subclass of `AVMutableVideoCompositionInstruction`.
-/// The cast in `startRequest` `fatalError`s on miss because subclass
-/// passthrough is documented behavior — a failure means a future macOS
-/// regressed it, and silently rendering black would mask the bug.
+/// `startRequest` casts via `as?` because AVPlayer's playback path on modern
+/// macOS sometimes strips the subclass; on miss we fall back to default
+/// track IDs (1 = source, 1000 = webcam) and best-effort composite without
+/// per-segment freeze rendering. The fallback is documented in detail in
+/// the comment above `startRequest`.
 ///
 /// **Backward-scrub correctness**: AVPlayer can call `startRequest` out of
 /// temporal order during seeks. A naive "remember the last `.play` source
