@@ -424,3 +424,115 @@ cargo test  --workspace --features media
 - New `add_source_video_persists_to_disk` harness test passing.
 - New `source_player` GStreamer integration tests passing.
 - No regressions in existing Phase 1–6 tests.
+
+---
+
+## Closeout (2026-04-30)
+
+**Status: shipped.** CI run 25173830999 green on all four jobs
+(macOS, Linux, Windows test + media-tests). See `PROGRESS.txt` for
+the authoritative per-task commit map.
+
+CI red runs along the way (each fixed by a small follow-up):
+- 25148901311: clippy `unneeded_return` in no-media build, plus Linux
+  `pulsesink` failed PAUSED→PLAYING with no PulseAudio daemon.
+  Follow-up `6a0ca1f` fixed both: dropped the `return`; added
+  `VIDEO_COACH_NO_AUDIO=1` env that switches to `fakesink sync=true`,
+  set unconditionally by `App::launch` for harness-spawned binaries.
+- 25171962188: same audio fix worked in the harness path but the
+  `crates/video-coach-media/tests/source_player.rs` integration tests
+  open SourcePlayer in-process and bypass the harness env. Follow-up
+  `06c4fe4` set the env in `disable_vt_decoders()` (which already
+  runs at the top of every source_player test).
+
+**Commits (in order):**
+
+| Task | Commit  | Title                                                               |
+|------|---------|---------------------------------------------------------------------|
+| 0    | 46ed43b | Bus command shapes + path normalization                             |
+| 1    | 029de7d | SourcePlayer headless + 5 fixture tests                             |
+| 2    | bf90602 | AddSourceVideo command + project mutation                           |
+| 3    | e107240 | Bus ↔ SourcePlayer wiring + macOS path canonicalization             |
+| 4    | 6d441a9 | Slint video surface + display-rate pull                             |
+| 4b   | 0899d9b | File → Add Source Video menu item                                   |
+| 5    | df034dd | Transport UI (play/pause + scrubber + clock)                        |
+| 6    | 2dd5003 | Skip buttons + keyboard shortcuts                                   |
+| 7    | c3f69ba | Scan-volume slider + persistence                                    |
+
+Plus several `chore(progress)` follow-ups filling SHA references in
+PROGRESS.txt (the SHA can't be inlined in the same commit it
+references; pattern is documented in the file's header).
+
+**Test counts:** 75 → 76 default (+1 play_without_source unit test);
+87 → 89 with media (+2 play_pause_seek + add_source_video harness E2E).
+
+**Adversarial-review fixes verified in code:**
+
+- ✅ Single-slot frame buffer + 30Hz pull (`frame_sink.rs::FrameSlot`,
+  `ui.rs` Slint Timer). NOT per-frame `invoke_from_event_loop`.
+- ✅ Frame pool partial — single-slot model means at most one
+  un-displayed frame in flight; full pool deferred (documented
+  in-code).
+- ✅ AddSourceVideo spawns the player when first source arrives.
+- ✅ OpenProject / NewProject canonicalize the project folder
+  (handles macOS /tmp → /private/tmp symlink).
+- ✅ Platform-specific audio sinks unconditionally
+  (`source_player.rs::platform_audio_sink_name`).
+- ✅ SourcePlayer::open accepts known duration; no Discoverer race.
+- ✅ TouchArea + manual fill bar for scrubber (Slint Slider can't
+  separate press/release).
+- ✅ Position polling suppresses one cycle after seek
+  (`bus.rs::spawn_position_poll`, 200 ms window).
+- ✅ Position events emit from poll task (Task 5), not from
+  earlier task handlers.
+
+**Empirical findings recorded for future phases:**
+
+- The `source-1080p.mp4` fixture's GOP is ~5 s. Keyframe-snap seeks
+  during slider drag can land up to 5 s away from the requested
+  position. The hybrid policy (drag = keyframe, release = accurate)
+  is confirmed correct for this footage.
+- macOS test subprocesses launched by the harness MUST disable VT
+  decoders via `GST_PLUGIN_FEATURE_RANK=vtdec_hw:NONE,...` — the
+  Cocoa NSApplication runloop the decoders need doesn't exist in
+  `cargo test` workers. Already wired in `App::launch`.
+- f64 fields in tracing events fall through to `record_debug` (which
+  encodes them as JSON strings) unless `record_f64` is implemented
+  on the visitor. Phase 7 added it; Phase 8+ tracing fields can use
+  numeric f64 fields freely.
+
+**Outstanding follow-ups:**
+
+- Slider hydration from `project.preferences.scan_volume` on project
+  open. Phase 7 MVP starts the volume slider at 1.0 every session;
+  Phase 8+ should wire the loaded preferences value back into the UI
+  via the existing `PlayerStateSlot` pattern (or a new
+  `ProjectPrefsSlot`).
+- Multi-source virtual concat (v1's "scanning mode" stitches all
+  `sourceVideos[]` into one timeline). Phase 7 MVP uses
+  `sourceVideos[0]` only.
+- Frame buffer pool. Single-slot is safe under the current load; if
+  4K playback shows allocator jitter, swap in a fixed-size 2-buffer
+  pool inside `SlintFrameSink`.
+- Player swap (close project → open another). Position-poll task
+  currently lives until app shutdown; multi-player support needs an
+  `AbortHandle` for cancellation.
+
+**Manual smoke checklist (recorded by user when verifying):**
+
+- [ ] Open a project (existing or via New Project)
+- [ ] Add Source Video via menu (file picker → pick a .mp4)
+- [ ] Source plays in the window with audio
+- [ ] Pause/play button works
+- [ ] Scrubber drags responsively, release lands at exact position
+- [ ] Skip buttons land exactly +/- 3s, 10s
+- [ ] Space / ←  / → / Shift+← / Shift+→ keyboard shortcuts work
+- [ ] Volume slider mutes/unmutes audio in real time
+
+The headless socket-driven flows are fully automated by
+`play_pause_seek_roundtrip_via_harness`; the items above need a
+human at the keyboard until Phase 11 ships a virtual-display
+strategy.
+
+**Phase 8 entry conditions met.** Recording integration can build on
+the bus + SourcePlayer + transport UI without further refactor.

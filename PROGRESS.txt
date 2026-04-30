@@ -42,7 +42,8 @@ Tasks 0–8 + bonus File→New Project menu.
 
 
 ## Phase 7 — source-video timeline + transport
-IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md
+SHIPPED 2026-04-30. CI run 25173830999 green on all 4 jobs. Plan:
+docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md
 
 - [x] Task 0: Bus command shapes + path normalization (commit 46ed43b)
       AddSourceVideo / Play / Pause / Seek / SetScanVolume serde + 6 unit tests.
@@ -100,7 +101,11 @@ IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.m
       to project.json via spawn_blocking. Defer hydration of slider
       from project.preferences to Phase 8+ (slider always starts at 1.0
       per session in Phase 7 MVP).
-- [ ] Task 8: Closeout (build matrix, push, verify CI green)
+- [x] Task 8: Closeout — build matrix all green, CI verified
+      (commits 6a0ca1f + 06c4fe4 fixed two CI-only issues:
+      clippy unneeded-return in no-media build, and
+      pulsesink → fakesink fallback for headless environments via
+      VIDEO_COACH_NO_AUDIO env)
 
 
 ## Phase 8+ — pending
