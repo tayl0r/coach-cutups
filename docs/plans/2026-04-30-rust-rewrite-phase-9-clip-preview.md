@@ -127,33 +127,68 @@ Suggested namespace: `clip_preview.opened`, `clip_preview.closed`,
 `recording.*` or `clip_recording.*`.
 
 **2. Sub-agent prompt sizing (Phase 8 lesson).** The watchdog timed
-out twice on Phase 8's single-prompt-for-all-tasks approach. Phase 9
-should be split: dispatch ONE sub-agent for Tasks 0-2 (compositor
-strokes + preview pipeline + bus wiring — the "media + bus" half),
-verify CI green, then a SECOND sub-agent for Tasks 3-5 (UI + tests +
-closeout). Or split even finer.
+out twice on Phase 8's **3-task** prompts. The lesson is "split into
+smaller per-task agent prompts" — so Phase 9 splits into 4-5 small
+agents, NOT 2 big ones:
+- Agent 1: Task 0 (preflight — mostly mechanical: bus shapes, AppMode
+  Clone-ification, FORWARDED_TARGETS, ClipSummary/ClipListSlot
+  scaffolding).
+- Agent 2: Task 1 (compositor strokes — self-contained; verify with
+  the Task-1 golden test before handing off).
+- Agent 3: Task 2 (preview pipeline — biggest single task; deserves
+  its own agent so the watchdog doesn't trip mid-decode-pipeline).
+- Agent 4: Tasks 3+4 (bus wiring + UI — tightly coupled; the bus
+  routes Play/Pause/Seek + the UI shows the new sidebar/transport).
+- Main session: Tasks 5+6+7 (harness E2E + parity + closeout —
+  each is small).
+
+After every agent, verify locally + push + check CI green BEFORE
+dispatching the next.
 
 **3. FrameSink contention with the source player.** Phase 7's
 `SourcePlayer` and the new preview pipeline both write to the SAME
-`FrameSlot` (single-slot Arc<Mutex<Option<...>>>). On
-`OpenClipPreview` the source player pauses (no more frames written),
-THEN the preview pipeline starts (begins writing). On `ClosePreview`
-the preview pipeline stops, then the source player can play again
-(unpauses NOT done — match v1; user re-presses Space). The handover
-must be ordered: `pause source player` → `wait for last frame to
-flush` → `spawn preview pipeline`. Otherwise a race delivers a
-preview frame followed by a stale source frame.
+`FrameSlot` (single-slot Arc<Mutex<Option<...>>>). After
+`player.pause().await` returns, the GStreamer streaming thread can
+STILL deliver one or two queued frames to the player's FrameSink
+(set_state(Paused) returning is not a frame-flush guarantee), so
+just "pause then spawn preview" leaves a race where a stale source
+frame lands AFTER preview's first frame.
+
+Fix: every `SlintFrameSink` carries an `active: Arc<AtomicBool>`
+(default true). `push_frame` checks the flag and drops on the floor
+when false. The bus owns one flag per mounted pipeline:
+- On `OpenClipPreview`: set the **player's** flag false BEFORE the
+  pause-await. Spawn the preview pipeline; its sink starts with
+  active=true.
+- On `ClosePreview`: set the **preview's** flag false, tear down the
+  pipeline, set the player's flag true (the player is paused so it
+  won't push anything until the user resumes — fix #9).
+- The `FrameSinkFactory` returns `(Box<dyn FrameSink>,
+  Arc<AtomicBool>)` so the bus keeps the handle. (Or wrap into a
+  small `MountedSink` struct.)
+
+This is cheaper than mutex'ing the slot writes and gives the bus
+deterministic ownership of "who's writing pixels right now". Phase 7's
+`SlintFrameSink` and `NullFrameSink` both grow the flag.
 
 **4. Strokes-in-compositor coordinate space.** Phase 8 stored stroke
 points normalized to [0,1] against the displayed (post-letterbox)
-video rect. The compositor renders into a fixed-size output frame
-(say 1920x1080). Stroke vertices need to be transformed from
-[0,1]-relative to the source video aspect-ratio rect within the
-output canvas. Concretely: if export resolution is 1920x1080 and the
-source is also 16:9, [0,1] maps to [0,1920] x [0,1080]. If a future
-export targets 1080x1920 (vertical) for a 16:9 source, strokes letter
-box too. Phase 9 ships only 16:9 → 16:9, but the shader should accept
-the active rect as a uniform so the math is in one place.
+video rect. The compositor renders into the source-aspect-ratio
+frame (e.g. 1920x1080 for a 16:9 source). For Phase 9's locked-in
+"16:9 source → 16:9 output" scope, the displayed-rect-relative
+coordinates and the source-frame-relative coordinates are IDENTICAL —
+[0.5, 0.5] in the displayed letterboxed UI is also [0.5, 0.5] in the
+source frame, which is also [0.5, 0.5] in the compositor output.
+**No coordinate transform needed for Phase 9.**
+
+Skip the active-rect uniform; pass stroke points to the shader in
+[0,1] space and convert to clip space (`x*2-1`, `1-y*2`) in the
+vertex shader. When Phase 10/11 adds aspect-ratio mismatch (e.g.
+16:9 source → 9:16 vertical export), introduce the active-rect
+uniform THEN — the export sheet is the right place to define
+"what's the active video rect within the output canvas". Adding it
+prematurely in Phase 9 invites a bug where `[0,0,1,1]` fights with
+the no-letterbox scenario it's supposed to handle.
 
 **5. Compositor `compose()` API change is breaking.** Phase 5's
 `compose.rs` calls `compose(source, webcam)` per frame. Adding a
@@ -237,17 +272,129 @@ If any of these three write sites are missing, the sidebar shows a
 stale or empty list. Sub-agent: write a unit test that exercises
 each path.
 
+**14. `PreviewPipeline` teardown must mirror `Recording::stop`.**
+Phase 8 spent four commits (`802ef66`, `2d8d8dc`, `515876c`,
+`59561ed`) learning that GStreamer pipelines on macOS need stepped
+Paused → Ready → Null transitions with sync-state waits at each
+level, plus ghost-pad linking + `sync_state_with_parent` on every
+dynamic element. Audio sinks are gentler than `osxaudiosrc` but the
+preview pipeline still has an `osxaudiosink` (or `pulsesink` /
+`wasapisink`) and decoders that close OS handles on Null transition.
+Specify an explicit `PreviewPipeline::stop(self) -> Result<(),
+PreviewPipelineError>` (NOT just relying on Drop), called from
+`ClosePreview` via `spawn_blocking`. Drop should ALSO call the same
+teardown as belt-and-suspenders for panic paths. Pattern: copy
+`recording.rs::Recording::stop` shape (no EOS send needed since
+we're not finalizing a file — but DO step through Paused/Ready
+before Null).
+
+**15. Position-poll task for the preview pipeline.** Phase 7's
+`spawn_position_poll` writes `PlayerStateSlotData` every 100ms so
+the scrubber + mm:ss label update at display rate. Phase 9 must
+spawn the SAME pattern when the preview pipeline mounts (so the
+preview's scrubber moves while it plays). Add an `AbortHandle`
+return so `ClosePreview` can cancel the task — Phase 7 didn't need
+this (single long-lived player) but Phase 9 mounts/unmounts the
+preview pipeline repeatedly. Refactor `spawn_position_poll` to
+return its `JoinHandle` and store it in
+`current_preview_poll: Option<AbortHandle>` on the bus task.
+ClosePreview aborts before dropping the pipeline.
+
+**16. `PlayerStateSlot` is shared, ONE slot for both pipelines.**
+Don't add a separate `PreviewStateSlot`. The bus's `Play/Pause/Seek`
+handlers route to whichever pipeline is mounted (preview when
+`current_mode == PreviewClip`, source player otherwise). Whoever is
+mounted writes its `snapshot()` into the same slot. The UI's 30 Hz
+timer reads ONE slot and doesn't need to know which pipeline
+produced the data. The `last_seek_at` suppression continues to work
+unchanged because Seek is already routed to the active pipeline.
+
+**17. Preview output framerate is pinned to 30 fps, NOT
+source-driven.** v1 sets `videoComp.frameDuration = 1/30`. The
+existing `compose.rs::compose_two_files` is source-driven (every
+source frame triggers a compose) which works for export but at
+1080p60 source playing live preview would push 480 MB/s through
+GPU↔CPU readback (existing `compose()` does a sync `map_async +
+poll(Wait)` per call). Pin preview's driver to a 30 Hz internal
+timer that asks "what record_time are we at now?" → looks up the
+segment → asks the source decoder for the frame at the resolved
+source time (or pulls the cached frozen frame) → composes →
+pushes. This decouples decode rate from preview rate and bounds GPU
+work. Caveat: the source decoder still streams at its native rate;
+we just sample at 30 Hz. (Optimizing the per-call wgpu pipeline
+rebuild is still a Phase-10 follow-up; that's already in "Known
+performance risks".)
+
+**18. `ClipSummary` shape is defined in Task 0, not Task 4.** The
+`Arc<Mutex<Vec<ClipSummary>>>` slot is set up in Task 0 alongside
+the other slots so Task 3's bus handlers and Task 4's UI both have a
+typed contract to agree on. Minimum fields:
+```rust
+#[derive(Debug, Clone)]
+pub struct ClipSummary {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub recording_duration: f64,
+    pub source_index: usize,
+}
+```
+The Slint side gets a `clip-id: string` per row so the click handler
+dispatches `OpenClipPreview { clip_id }` with the right UUID. Slint
+ListView consumes a `[{id: string, name: string, duration: float}]`
+model; the UI thread converts from `ClipSummary` on each timer tick
+(cheap; clip lists stay small).
+
+**19. Compositor depends on `video-coach-core`.** Task 1 imports
+`video_coach_core::stroke_replay::VisibleStroke` and
+`video_coach_core::stroke::Stroke` for the new `compose()`
+parameter. Today compositor depends only on wgpu + bytemuck +
+thiserror; add `video-coach-core = { path = "../video-coach-core" }`
+to compositor's `Cargo.toml`. No cycle (core has no compositor dep).
+
+**20. Webcam EOS during preview is non-fatal.** The recording.mov
+can finish a frame or two before `clip.recording_duration` (qtmux
+finalize). The preview pipeline must keep going past webcam EOS
+using the LAST received webcam frame (matches
+`compose.rs::compose_two_files` driver behavior). Source EOS or
+record-time reaching `clip.recording_duration` is the actual end-
+of-preview signal; emit `clip_preview.completed` (or just stop
+pushing frames and let the user click "← Source"). Phase 9 picks
+"stop pushing frames at clip.recording_duration; let mode stay
+PreviewClip until ClosePreview is sent" — simpler than auto-
+closing.
+
+**21. Single-frame parity uses ONE shared `Compositor` instance.**
+Task 6's byte-for-byte assertion only holds when both call sites
+(direct `compose(...)` and `PreviewPipeline` internal compose) use
+the SAME `Compositor` instance. Different instances on the same
+machine can diverge by a bit or two due to driver pipeline-cache
+state. Wire the preview pipeline to accept an
+`Arc<Compositor>` parameter; the parity test constructs one and
+passes it to both paths. (Production code can construct its own per
+preview; tests just need determinism.)
+
+**22. Click-while-preview-open: refuse and require explicit close.**
+Task 3's OpenClipPreview handler refuses if `current_mode` isn't
+`Scanning`. v1 likely auto-closes the prior preview, but for
+Phase 9 MVP refuse is simpler and safer (no double-teardown race).
+UX: clicking another clip while one is open is a no-op + a
+`clip_preview.failed` event with `reason="already_in_preview"`. The
+user sees the "← Source" button and clicks it, then clicks the new
+clip. Phase 10/11 can add auto-close-and-reopen; the cost of
+refusing is one extra click that's at least obvious.
+
 ---
 
-## Tasks (~7 total — split across two sub-agent dispatches)
+## Tasks (~7 total — split across 4-5 sub-agent dispatches per fix #2)
 
-### Task 0: Preflight — bus shapes + AppMode extension + tracing targets
+### Task 0: Preflight — bus shapes + AppMode + slots + FrameSink active flag
 
 **Files:**
 - Modify: `crates/video-coach-app/src/bus.rs`
 - Modify: `crates/video-coach-app/src/event_layer.rs`
-- Modify: `crates/video-coach-app/src/frame_sink.rs` (extend
-  `RecordingMode` enum mirror — add a `PreviewClip` variant).
+- Modify: `crates/video-coach-app/src/frame_sink.rs`
+- Modify: `crates/video-coach-app/src/main.rs` (wire the new slot
+  + factory shape).
 
 **Add to `Command`:**
 - `OpenClipPreview { clip_id: String }` (UUID as string per existing
@@ -255,14 +402,55 @@ each path.
 - `ClosePreview`.
 
 **`AppMode` gains `PreviewClip(Uuid)` variant.** Drop `#[derive(Copy)]`
-from `AppMode`; switch to `Clone`. Update every read site that
-expects `Copy` (mostly `*current_mode = ...` patterns). Cargo
-clippy catches the rest.
+from `AppMode`; switch to `Clone`. Update every read site (passing
+by value or via `*deref`); pass `&AppMode` or `clone()` where the
+old code passed `*current_mode`. Update `is_recording`'s signature
+from `current_mode: AppMode` → `current_mode: &AppMode` (one less
+clone). Run `cargo clippy --workspace --all-targets --features
+media -- -D warnings` to catch fallout.
+
+**`RecordingMode` mirror in frame_sink.rs gains `PreviewClip` variant.**
+The mirror only needs to distinguish "is the REC indicator visible"
+vs. "is the preview transport visible"; UUID payload doesn't ride
+the mirror (the bus task is the source of truth for which clip).
 
 **`FORWARDED_TARGETS` gains `clip_preview.lifecycle`**. Per
 adversarial fix #1, every event in this phase namespaces under
 `clip_preview.*` — never `preview.*` (would collide), never
 `recording.*`.
+
+**`ClipSummary` + `ClipListSlot` (per fix #18).** Add to
+`frame_sink.rs`:
+```rust
+#[derive(Debug, Clone)]
+pub struct ClipSummary {
+    pub id: uuid::Uuid,
+    pub name: String,
+    pub recording_duration: f64,
+    pub source_index: usize,
+}
+pub type ClipListSlot = Arc<Mutex<Vec<ClipSummary>>>;
+pub fn new_clip_list() -> ClipListSlot { /* ... */ }
+```
+Thread the slot through `bus::spawn_on` + `ui::run` signatures (same
+shape as `RecordingStateSlot`). Hydration in handlers lands in
+Task 3 (per fix #13: OpenProject populates, NewProject clears,
+StopClipRecording appends).
+
+**FrameSink active flag (per fix #3).** Modify `SlintFrameSink` and
+`NullFrameSink` so each carries an `active: Arc<AtomicBool>` (default
+true). `push_frame` returns early when active is false. Add
+constructor that returns the sink + a clone of the flag handle so
+the bus can flip it.
+
+**`FrameSinkFactory` becomes `FrameMountFactory`** that returns
+`(Box<dyn FrameSink>, Arc<AtomicBool>)` — or wrap into a
+`MountedSink { sink, active }` struct. Bus task gets two mount
+handles: `current_player_mount` (set on player open) and
+`current_preview_mount` (set on OpenClipPreview, cleared on
+ClosePreview). On preview open: flip player_mount.active=false
+BEFORE pause. On preview close: flip preview_mount.active=false,
+tear down, flip player_mount.active=true.
 
 **Bus serde unit tests** for the two new commands + the AppMode
 variant.
@@ -274,10 +462,12 @@ variant.
 ### Task 1: Compositor strokes — extend `compose()` API + new wgpu pass
 
 **Files:**
+- Modify: `crates/video-coach-compositor/Cargo.toml` (per fix #19,
+  add `video-coach-core = { path = "../video-coach-core" }` dep).
 - Modify: `crates/video-coach-compositor/src/compositor.rs`.
 - Create: `crates/video-coach-compositor/src/shaders/strokes.wgsl`.
-- Modify: `crates/video-coach-compositor/src/lib.rs` (re-exports if
-  any).
+- Modify: `crates/video-coach-compositor/src/lib.rs` (re-export
+  `video_coach_core::stroke_replay::VisibleStroke` for callers).
 - Modify: `crates/video-coach-media/src/compose.rs` — Phase 5 export
   pipeline gains a `&[]` pass for strokes (no strokes during the
   Phase 5 → Phase 9 transition).
@@ -288,23 +478,35 @@ pub fn compose(
     &self,
     source: &Frame,
     webcam: &Frame,
-    strokes: &[VisibleStroke], // re-export from video-coach-core
+    strokes: &[VisibleStroke],
 ) -> Result<Frame, CompositorError>;
 ```
 
-**Stroke pass:** new wgpu pipeline that takes a vertex buffer of
-stroke points (one VBO per stroke, line-strip primitive) + a uniform
-(stroke color, stroke width, active-rect bounds for letterbox math
-per fix #4) and renders on top of the PiP-composited output. v1's
-StrokeReplayLayer uses CALayer with a CGPath; ours is GPU-rendered
-lines, anti-aliased via a fragment shader that does perpendicular
-distance + smoothstep. Width: ~4 px on output. Color: white with 80%
-alpha.
+**Stroke pass:** new wgpu pipeline that takes stroke vertices in
+[0,1] space (per fix #4 — Phase 9 ships only 16:9→16:9, so no
+active-rect uniform; the vertex shader maps `[0,1] → clip space` via
+`x*2-1, 1-y*2`). Uniform carries stroke color + stroke width only.
+v1's StrokeReplayLayer uses CALayer with a CGPath; ours is GPU-
+rendered, anti-aliased via a fragment shader that does perpendicular
+distance + smoothstep.
+
+**Line-rendering approach:** wgpu's `LineStrip` primitive only
+guarantees 1-px lines on most backends. Skip the line-strip detour
+and go directly to a triangle-strip-from-line-segments
+implementation: for each pair of adjacent stroke points, emit a quad
+(two triangles) wide enough to render the line + AA falloff. The
+fragment shader computes perpendicular distance to the segment and
+smoothsteps the alpha. Width: ~4 px on output (passed in the
+uniform as a fraction of output height so it scales with resolution).
+Color: white with 80% alpha.
 
 **Tests:**
 - New golden-frame test in `video-coach-compositor`: `compose` with
   one stroke should differ from `compose` with no strokes; check that
   pixels along the stroke path differ from the no-stroke output.
+- Sanity test: `compose` with `&[]` strokes produces byte-identical
+  output to a Phase-5-style call (verifies no regressions in the
+  stroke-less path that export uses).
 
 **Update PROGRESS.txt + commit.**
 
@@ -329,6 +531,7 @@ impl PreviewPipeline {
         recording_path: &Path,
         clip: &video_coach_core::project::Clip,
         source_duration_seconds: f64,
+        compositor: Arc<video_coach_compositor::Compositor>, // fix #21
         frame_sink: Box<dyn FrameSink>,
     ) -> Result<Self, PreviewPipelineError>;
 
@@ -337,34 +540,64 @@ impl PreviewPipeline {
     pub fn seek(&self, record_time_seconds: f64, accurate: bool)
         -> Result<(), PreviewPipelineError>;
     pub fn snapshot(&self) -> PlayerSnapshot; // same shape as Phase 7
+    pub fn stop(self) -> Result<(), PreviewPipelineError>; // fix #14
 }
 ```
 
 **Inside `open()`:**
 1. Use `playback_segments(clip, source_duration)` to get the
    `Vec<PlaybackSegment>` for the clip.
-2. **Pre-decode freeze frames** (per fix #6) — for each `Freeze`
-   segment, decode one frame at `segment.source_start` from the
-   source video. Use `gst-launch`-style filesrc → decodebin → seek
-   → appsink → grab one buffer → close. Run in `spawn_blocking`
-   throughout. Store as `HashMap<usize, Frame>`.
+2. **Pre-decode freeze frames** (per fix #6 + fix #11) — for each
+   `Freeze` segment, walk segments backward from index `i` to find
+   the most recent `Play`; the source-time to decode is
+   `prev_play.source_start + prev_play.out_duration` (or
+   `clip.start_source_seconds` if no preceding Play). Decode via a
+   `filesrc → decodebin → videoconvert → RGBA appsink` mini-pipeline
+   that seeks → grabs one buffer → tears down. Run in
+   `spawn_blocking` throughout. Store as `HashMap<usize, Frame>`.
 3. Build the GStreamer composition pipeline:
    - Source decoder (filesrc → decodebin → videoconvert → RGBA
-     appsink), seekable.
+     appsink), seekable. **Source AUDIO chain is NOT built** — webcam
+     is the only audio source in preview (Phase 9 ships commentary-
+     only per "deliberately not included"). decodebin's audio pad
+     gets routed to a fakesink to avoid "Internal data flow error".
    - Webcam decoder (filesrc on the recording.mov → decodebin →
-     videoconvert → RGBA appsink + audio sink chain).
-   - A driver task picks the source frame per output time (live
-     decode for `Play`, frozen frame for `Freeze`), pulls the
-     concurrent webcam frame, computes strokes via
-     `visible_strokes_at(events, record_time)`, calls
-     `compositor.compose(source, webcam, &strokes)`, pushes to the
-     `FrameSink`.
-4. Audio: webcam audio plays through the platform sink (or fakesink
-   under VIDEO_COACH_NO_AUDIO). v1 also has a source-volume +
-   commentary-volume mix; Phase 9 ships commentary-only (webcam audio
-   passes through; source video audio is muted during preview to
-   match v1's "preview commentary" mode default). Future patch can
-   add the live volume mix.
+     videoconvert → RGBA appsink + audio sink chain via
+     `audioconvert → audioresample → volume → osxaudiosink|...`,
+     same `platform_audio_sink_name()` helper as `source_player.rs`
+     including `VIDEO_COACH_NO_AUDIO=fakesink` fallback).
+   - **Driver: a 30 Hz tokio interval timer** (per fix #17), NOT the
+     source appsink. Each tick:
+     a. Compute `record_time = playhead.elapsed()` (with pause/seek
+        bookkeeping).
+     b. If `record_time >= clip.recording_duration`: stop pushing
+        frames; emit `clip_preview.completed`; pause internally
+        (mode in bus stays PreviewClip until ClosePreview, per fix
+        #20).
+     c. Resolve segment index for this record_time.
+     d. If segment is `Freeze`: source frame = pre-decoded frozen
+        frame for that segment.
+     e. If segment is `Play`: ensure source decoder is positioned at
+        `source_time_at(clip, record_time)` (via fix #12); pull the
+        latest source frame from a single-slot Mutex written by the
+        source appsink.
+     f. Pull the latest webcam frame (single-slot Mutex written by
+        the webcam appsink; persists last frame past webcam EOS per
+        fix #20).
+     g. Compute strokes via
+        `visible_strokes(clip, record_time)`.
+     h. Call `compositor.compose(source, webcam, &strokes)`.
+     i. Push to `FrameSink`.
+4. Webcam EOS handling (fix #20): the webcam appsink's EOS callback
+   is a no-op; the webcam slot keeps the last frame. The driver
+   sees `Some(...)` in the slot and continues compositing until
+   record_time hits `clip.recording_duration`.
+
+**Teardown (`stop`, per fix #14):** mirror `recording.rs::Recording::
+stop`'s stepped Paused → Ready → Null transitions with `state(timeout)`
+waits at each level. No EOS send (we're not finalizing a file). Drop
+impl calls the same teardown as a panic-path safety net. Cancel the
+30 Hz driver timer task before transitioning state.
 
 **Smoke test:** record a clip via the existing flow → open a
 preview → assert ≥10 frames flowed through the FrameSink in 1s of
@@ -388,38 +621,64 @@ playback. No display needed.
 **OpenClipPreview handler:**
 1. Parse `clip_id` (Uuid::parse_str). Error on malformed.
 2. Refuse if no project open.
-3. Refuse if `current_mode` isn't `Scanning` (preview during recording
-   = bad UX). Mirror `is_recording()` style: a centralized
-   `is_busy()` that says "is the bus mid-op" → returns true if mode
-   != Scanning OR recording_clip is some.
+3. Refuse if `current_mode` isn't `Scanning` (per fix #22, including
+   the "already in preview" case — emit `clip_preview.failed` with
+   `reason="already_in_preview"`). Reuse the centralized busy check
+   from Phase 8 — extend `is_recording()` to `is_busy()` that returns
+   true if mode != Scanning OR recording_clip is some.
 4. Find clip by id in `project.clips`. Error if missing.
-5. Resolve `source_path = canonicalize(folder.join(clip's source
-   ref).path)`. Resolve `recording_path =
-   folder.join("recordings").join(clip.recording_filename).
-   canonicalize()`.
-6. Pause source player (per fix #3 — order matters, do this before
-   spawning preview).
-7. `spawn_blocking(|| PreviewPipeline::open(...))`. On success:
+5. Resolve `source_path = canonicalize(folder.join(source_ref
+   .relative_path))`. Resolve `recording_path =
+   folder.join("recordings").join(clip.recording_filename)
+   .canonicalize()`. Look up `source_duration_seconds` from
+   `project.source_videos[clip.source_index].duration_seconds`.
+6. **Flip player_mount.active=false** (per fix #3) BEFORE pausing —
+   even if pause is async, no more frames reach the slot once the
+   flag is off.
+7. Pause source player (per fix #3 — order: flag-off → pause →
+   spawn preview).
+8. Build a fresh preview FrameSink + active flag via
+   `frame_mount_factory()`; stash as `current_preview_mount`.
+9. `spawn_blocking(|| PreviewPipeline::open(..., compositor.clone(),
+   sink))`. The bus task holds an `Arc<Compositor>` (constructed
+   once at startup, shared across preview opens — keeps fix #21's
+   parity test architecturally honest). On success:
    - `current_preview = Some(Arc::new(pipeline))`.
    - `current_mode = AppMode::PreviewClip(clip_id_uuid)`.
    - `RecordingStateSlot` updated to mode = PreviewClip.
+   - **Spawn position-poll task** (per fix #15) using a
+     refactored `spawn_position_poll` that returns its
+     `JoinHandle`/`AbortHandle`. Store the handle in
+     `current_preview_poll: Option<AbortHandle>`. The task writes
+     `pipeline.snapshot()` into the **same** `PlayerStateSlot` (fix
+     #16) that Phase 7 uses — no separate slot.
    - `tracing::info!(target: "clip_preview.lifecycle", event =
      "clip_preview.opened", clip_id, source = ..., recording = ...)`.
-8. Failure: emit `clip_preview.failed` with the error; mode stays
-   Scanning; player stays paused (won't auto-resume per fix #9 —
-   user pressed "Open" then it failed; better not to resume).
+10. Failure: flip player_mount.active=true (rollback); emit
+    `clip_preview.failed` with the error; mode stays Scanning;
+    player stays paused (won't auto-resume per fix #9).
 
 **ClosePreview handler:**
 1. Refuse if mode isn't PreviewClip.
-2. Tear down `current_preview` (drop the pipeline; gstreamer state
-   transitions to Null on drop).
-3. Mode → Scanning. Slot updated.
-4. Source player NOT auto-resumed (fix #9). User re-presses Space.
-5. `tracing::info!(... event = "clip_preview.closed" ...)`.
+2. Abort the preview position-poll task
+   (`current_preview_poll.take().map(|h| h.abort())`).
+3. **Flip preview_mount.active=false** (per fix #3) BEFORE teardown
+   — no more pixel writes from the preview's GStreamer threads even
+   if a callback is in flight.
+4. Tear down `current_preview` via explicit `pipeline.stop()` in
+   `spawn_blocking` (per fix #14 — NOT relying on Drop). Drop is a
+   safety-net only.
+5. Mode → Scanning. RecordingStateSlot updated.
+6. **Flip player_mount.active=true** so the source player's
+   FrameSink can write again when the user resumes. Player is paused
+   (fix #9); it won't push until the user re-presses Space, but the
+   slot needs to be writable when they do.
+7. `tracing::info!(... event = "clip_preview.closed" ...)`.
 
 **Existing `Play` / `Pause` / `Seek` commands**: route to
-`current_preview` when in PreviewClip mode, to `current_player`
-otherwise. Single-line dispatch.
+`current_preview` when in `PreviewClip` mode, to `current_player`
+otherwise. Single-line dispatch. The `last_seek_at` write into
+`PlayerStateSlot` is unchanged (fix #16 — one shared slot).
 
 **Update PROGRESS.txt + commit.**
 
@@ -485,10 +744,28 @@ control-plane lifecycle works end-to-end.
 **Files:**
 - Create: `crates/video-coach-media/tests/preview_export_parity.rs`.
 
-Builds the same input frame (source + webcam + one stroke at a known
-position), runs through `compositor.compose(..., &strokes)` once, and
-also through a 1-frame `PreviewPipeline` instance. Asserts byte-for-
-byte equality on the output Frame's RGBA buffer.
+Per fix #21: builds **one** `Arc<Compositor>` and passes it to both
+call sites so byte-for-byte equality is achievable.
+
+1. Construct `let compositor = Arc::new(Compositor::new_headless()?)`.
+2. Build a fixed source `Frame` + webcam `Frame` (same fixtures as
+   the compositor's existing tests, or hand-rolled solid-color
+   frames).
+3. Build a hand-rolled `Clip` with one Stroke event that places a
+   stroke at a known position.
+4. **Path A**: `compositor.compose(&source, &webcam,
+   &visible_strokes(&clip, t))` directly.
+5. **Path B**: Construct a `PreviewPipeline` whose driver is forced
+   to emit exactly one frame at record_time `t` and then stop, using
+   the SAME `compositor` Arc. Capture the FrameSink output.
+6. Assert `path_a.pixels == path_b.pixels` (byte-for-byte).
+
+If byte-for-byte proves flaky in CI across runs (driver pipeline
+cache state can flip 1-bit RGB values), downgrade to a tolerance
+diff (`(a as i16 - b as i16).abs() <= 2` per channel, fail if any
+channel exceeds). Fix #21 says the single-instance design SHOULD
+make byte-for-byte hold; if it doesn't, that's data worth knowing
+before Phase 10's full N-frame parity lands.
 
 This is the **Phase 9 down-payment on the visual parity test**. The
 full N-frame "preview hash == export hash" lands in Phase 10 once
