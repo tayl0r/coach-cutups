@@ -161,6 +161,63 @@ pub fn run(
         });
     });
 
+    // File → Add Source Video: pop a file picker (filtered to video
+    // formats), dispatch AddSourceVideo. The bus auto-spawns the
+    // SourcePlayer if this is the first source, so play/pause/seek
+    // become available immediately.
+    let bus_for_add = bus.clone();
+    let rt_for_add = rt.clone();
+    let weak_for_add = window.as_weak();
+    window.on_add_source_video_clicked(move || {
+        let bus = bus_for_add.clone();
+        let weak = weak_for_add.clone();
+        rt_for_add.spawn(async move {
+            let chosen = rfd::AsyncFileDialog::new()
+                .set_title("Add a source video to this project")
+                .add_filter("Video", &["mp4", "mov", "m4v", "mkv"])
+                .pick_file()
+                .await;
+            let Some(file) = chosen else {
+                return;
+            };
+            let path = file.path().to_string_lossy().into_owned();
+            let reply = bus
+                .send(
+                    UI_COMMAND_ID.into(),
+                    Command::AddSourceVideo {
+                        absolute_path: path.clone(),
+                    },
+                )
+                .await;
+            if !reply.ok {
+                let err_text = reply
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "add_source_video failed (no error detail)".into());
+                tracing::warn!(
+                    target: "ui",
+                    error = ?reply.error,
+                    path = %path,
+                    "add_source_video failed",
+                );
+                let display = format!("Couldn't add {path}\n{err_text}");
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_error_message(display.into());
+                    }
+                })
+                .ok();
+            } else {
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_error_message("".into());
+                    }
+                })
+                .ok();
+            }
+        });
+    });
+
     // File → Open Project: pop a folder picker, dispatch OpenProject on
     // the user's choice, push the project's name back into the title-bar
     // label on success.

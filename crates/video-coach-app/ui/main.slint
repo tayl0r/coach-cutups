@@ -12,6 +12,7 @@ export component MainWindow inherits Window {
 
     callback new-project-clicked();
     callback open-project-clicked();
+    callback add-source-video-clicked();
     callback quit-clicked();
 
     MenuBar {
@@ -24,6 +25,10 @@ export component MainWindow inherits Window {
             MenuItem {
                 title: "Open Project…";
                 activated => { root.open-project-clicked(); }
+            }
+            MenuItem {
+                title: "Add Source Video…";
+                activated => { root.add-source-video-clicked(); }
             }
             MenuItem {
                 title: "Quit";
