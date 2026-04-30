@@ -214,6 +214,147 @@ async fn add_source_video_persists_to_disk() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "media")]
+#[tokio::test]
+async fn play_pause_seek_roundtrip_via_harness() -> anyhow::Result<()> {
+    use std::path::PathBuf;
+
+    let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fixture.push("../../fixtures/source-1080p.mp4");
+    let fixture = fixture.canonicalize()?;
+
+    let parent = TempDir::new()?;
+    let project_path = parent.path().join("phase7-transport-test");
+    std::fs::create_dir(&project_path)?;
+
+    let mut app = App::launch().await?;
+
+    let create = app
+        .send(serde_json::json!({
+            "cmd": "new_project",
+            "path": project_path.to_string_lossy(),
+        }))
+        .await?;
+    assert_eq!(
+        create.ok,
+        Some(true),
+        "new_project failed: {:?}",
+        create.error
+    );
+    let _ = app
+        .wait_for_event("project.opened", Duration::from_secs(2))
+        .await?;
+
+    // Adding the first source should trigger the bus auto-spawn of a
+    // SourcePlayer (Phase 7 Task 3 adversarial fix #3).
+    let reply = app
+        .send(serde_json::json!({
+            "cmd": "add_source_video",
+            "absolute_path": fixture.to_string_lossy(),
+        }))
+        .await?;
+    assert_eq!(
+        reply.ok,
+        Some(true),
+        "add_source_video failed: {:?}",
+        reply.error
+    );
+
+    let opened = app
+        .wait_for_event("player.opened", Duration::from_secs(10))
+        .await?;
+    let dur = opened
+        .other
+        .get("duration_seconds")
+        .and_then(|v| v.as_f64());
+    assert!(
+        dur.is_some_and(|d| (d - 60.0).abs() < 1.0),
+        "player.opened should report ~60s; got {:?}",
+        dur
+    );
+
+    // Play, then wait briefly for frames to flow, then pause.
+    let play_reply = app.send(serde_json::json!({"cmd": "play"})).await?;
+    assert_eq!(
+        play_reply.ok,
+        Some(true),
+        "play failed: {:?}",
+        play_reply.error
+    );
+    app.wait_for_event("player.playing", Duration::from_secs(2))
+        .await?;
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    let pause_reply = app.send(serde_json::json!({"cmd": "pause"})).await?;
+    assert_eq!(
+        pause_reply.ok,
+        Some(true),
+        "pause failed: {:?}",
+        pause_reply.error
+    );
+    app.wait_for_event("player.paused", Duration::from_secs(2))
+        .await?;
+
+    // Frame-exact seek to 5s.
+    let seek_reply = app
+        .send(serde_json::json!({
+            "cmd": "seek",
+            "seconds": 5.0,
+            "accurate": true,
+        }))
+        .await?;
+    assert_eq!(
+        seek_reply.ok,
+        Some(true),
+        "seek failed: {:?}",
+        seek_reply.error
+    );
+    let seeked = app
+        .wait_for_event("player.seeked", Duration::from_secs(2))
+        .await?;
+    let landed = seeked.other.get("seconds").and_then(|v| v.as_f64());
+    assert!(
+        landed.is_some_and(|s| (s - 5.0).abs() < 0.001),
+        "player.seeked should echo the requested time; got {:?}",
+        landed
+    );
+
+    // SetScanVolume should round-trip cleanly (no event emitted; the
+    // reply ok=true is the contract).
+    let vol_reply = app
+        .send(serde_json::json!({
+            "cmd": "set_scan_volume",
+            "value": 0.5,
+        }))
+        .await?;
+    assert_eq!(
+        vol_reply.ok,
+        Some(true),
+        "set_scan_volume failed: {:?}",
+        vol_reply.error
+    );
+
+    app.quit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn play_without_source_returns_error() -> anyhow::Result<()> {
+    let mut app = App::launch().await?;
+    let reply = app.send(serde_json::json!({"cmd": "play"})).await?;
+    assert_eq!(reply.ok, Some(false));
+    // Default-features build has no media, so the error wording differs;
+    // accept either shape.
+    let err = reply.error.as_deref().unwrap_or("");
+    assert!(
+        err.contains("no source loaded") || err.contains("media feature disabled"),
+        "unexpected play error wording: {err}",
+    );
+    app.quit().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn open_project_missing_returns_error() -> anyhow::Result<()> {
     let dir = TempDir::new()?;

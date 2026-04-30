@@ -62,7 +62,17 @@ fn main() -> anyhow::Result<()> {
     // The bus runs on the same runtime as the socket and any UI-spawned async
     // work. Phase 6 Task 5 will wire UI callbacks to bus.send() through this
     // same handle.
-    let bus = bus::spawn_on(runtime.handle(), shutdown_tx.clone());
+    //
+    // Phase 7 Task 3: the bus spawns SourcePlayer instances on its own and
+    // needs a way to mint a fresh `FrameSink` each time. For headless runs
+    // (`--headless`) and for the harness, we hand it a `NullFrameSink`
+    // factory; Task 4 swaps in a Slint-backed sink for the windowed path.
+    let bus = bus::spawn_on(
+        runtime.handle(),
+        shutdown_tx.clone(),
+        #[cfg(feature = "media")]
+        bus::null_frame_sink_factory(),
+    );
     let _ = &bus;
 
     #[cfg(feature = "control-socket")]

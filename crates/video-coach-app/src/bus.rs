@@ -125,12 +125,28 @@ impl BusHandle {
     }
 }
 
+/// Build a fresh `FrameSink` for a newly-spawned `SourcePlayer`. The bus
+/// task can't hold a `slint::Weak` directly (UI types are not always
+/// `Send`-friendly to bind to), so the UI hands the bus a factory at
+/// startup which the bus invokes whenever it spawns a new player. For
+/// headless builds (no UI), the factory yields `NullFrameSink` and frames
+/// are dropped on the GStreamer streaming thread.
+#[cfg(feature = "media")]
+pub type FrameSinkFactory =
+    std::sync::Arc<dyn Fn() -> Box<dyn video_coach_media::source_player::FrameSink> + Send + Sync>;
+
+#[cfg(feature = "media")]
+pub fn null_frame_sink_factory() -> FrameSinkFactory {
+    std::sync::Arc::new(|| Box::new(video_coach_media::source_player::NullFrameSink))
+}
+
 /// Spawn the bus task on the given tokio runtime handle. Phase 6 dropped
 /// `#[tokio::main]` so the bus runs on the same multi-threaded runtime
 /// that drives the control socket and any UI-dispatched async work.
 pub fn spawn_on(
     rt: &tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "media")] frame_sink_factory: FrameSinkFactory,
 ) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
     rt.spawn(async move {
@@ -147,6 +163,16 @@ pub fn spawn_on(
         // back to the same `project.json`.
         let mut current: Option<(video_coach_core::project::Project, std::path::PathBuf)> = None;
 
+        // Phase 7: per-task source-player state. Spawned (in
+        // spawn_blocking) when a project with `sourceVideos[0]` becomes
+        // current. Played/paused/seeked by the bus's transport commands.
+        // Held in an `Arc` so position-poll tasks (Task 5) can also read
+        // a snapshot without blocking the bus loop.
+        #[cfg(feature = "media")]
+        let mut current_player: Option<
+            std::sync::Arc<video_coach_media::source_player::SourcePlayer>,
+        > = None;
+
         while let Some(env) = rx.recv().await {
             let reply = handle(
                 env.command,
@@ -154,6 +180,10 @@ pub fn spawn_on(
                 #[cfg(feature = "media")]
                 &mut recording,
                 &mut current,
+                #[cfg(feature = "media")]
+                &mut current_player,
+                #[cfg(feature = "media")]
+                &frame_sink_factory,
             )
             .await;
             let _ = env.reply.send(reply);
@@ -167,6 +197,10 @@ async fn handle(
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] recording: &mut Option<video_coach_media::recording::Recording>,
     current: &mut Option<(video_coach_core::project::Project, std::path::PathBuf)>,
+    #[cfg(feature = "media")] current_player: &mut Option<
+        std::sync::Arc<video_coach_media::source_player::SourcePlayer>,
+    >,
+    #[cfg(feature = "media")] frame_sink_factory: &FrameSinkFactory,
 ) -> CommandReply {
     match cmd {
         Command::Quit => {
@@ -276,6 +310,21 @@ async fn handle(
         }
         Command::NewProject { path } => {
             let folder = normalize_project_folder(&path);
+            // Canonicalize ahead of pathdiff math (Phase 7 AddSourceVideo
+            // stores paths relative to this folder). Required on macOS
+            // where `/tmp` is a symlink to `/private/tmp` — non-canonical
+            // folder + canonical source produces a relative path with the
+            // wrong number of `..` segments and filesrc can't open it.
+            // For NewProject the folder may not exist yet, so canonicalize
+            // the parent and rejoin the basename.
+            let folder = match folder.parent().and_then(|p| {
+                p.canonicalize()
+                    .ok()
+                    .and_then(|cp| folder.file_name().map(|name| cp.join(name)))
+            }) {
+                Some(c) => c,
+                None => folder,
+            };
             let folder_for_blocking = folder.clone();
             let result = tokio::task::spawn_blocking(
                 move || -> Result<video_coach_core::project::Project, String> {
@@ -307,6 +356,10 @@ async fn handle(
                         created = true,
                     );
                     *current = Some((project, folder));
+                    #[cfg(feature = "media")]
+                    {
+                        try_spawn_current_player(current, current_player, frame_sink_factory).await;
+                    }
                     CommandReply {
                         ok: true,
                         error: None,
@@ -324,6 +377,8 @@ async fn handle(
         }
         Command::OpenProject { path } => {
             let folder = normalize_project_folder(&path);
+            // Same canonicalize as NewProject — see comment there.
+            let folder = folder.canonicalize().unwrap_or(folder);
             let folder_for_blocking = folder.clone();
             // ProjectStore::read does sync file IO + serde_json::from_slice
             // on potentially megabytes of stroke data. Same pattern as
@@ -342,6 +397,10 @@ async fn handle(
                         name = %project.name,
                     );
                     *current = Some((project, folder));
+                    #[cfg(feature = "media")]
+                    {
+                        try_spawn_current_player(current, current_player, frame_sink_factory).await;
+                    }
                     CommandReply {
                         ok: true,
                         error: None,
@@ -445,6 +504,11 @@ async fn handle(
                             duration_seconds,
                             count = project.source_videos.len(),
                         );
+                        // If this was the first source ever added to this
+                        // project AND no player is loaded yet, spin one
+                        // up so subsequent Play/Pause/Seek commands have
+                        // somewhere to land. (Adversarial fix #3.)
+                        try_spawn_current_player(current, current_player, frame_sink_factory).await;
                         CommandReply {
                             ok: true,
                             error: None,
@@ -467,25 +531,211 @@ async fn handle(
                 }
             }
         }
-        Command::Play => CommandReply {
-            ok: false,
-            error: Some("play not yet implemented (Phase 7 Task 3)".into()),
-        },
-        Command::Pause => CommandReply {
-            ok: false,
-            error: Some("pause not yet implemented (Phase 7 Task 3)".into()),
-        },
-        Command::Seek {
-            seconds: _,
-            accurate: _,
-        } => CommandReply {
-            ok: false,
-            error: Some("seek not yet implemented (Phase 7 Task 3)".into()),
-        },
-        Command::SetScanVolume { value: _ } => CommandReply {
-            ok: false,
-            error: Some("set_scan_volume not yet implemented (Phase 7 Task 7)".into()),
-        },
+        Command::Play => {
+            #[cfg(not(feature = "media"))]
+            {
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                let Some(player) = current_player.as_ref() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no source loaded".into()),
+                    };
+                };
+                let player = player.clone();
+                let result = tokio::task::spawn_blocking(move || player.play()).await;
+                match result {
+                    Ok(Ok(())) => CommandReply {
+                        ok: true,
+                        error: None,
+                    },
+                    Ok(Err(e)) => CommandReply {
+                        ok: false,
+                        error: Some(e.to_string()),
+                    },
+                    Err(join) => CommandReply {
+                        ok: false,
+                        error: Some(format!("join: {join}")),
+                    },
+                }
+            }
+        }
+        Command::Pause => {
+            #[cfg(not(feature = "media"))]
+            {
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                let Some(player) = current_player.as_ref() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no source loaded".into()),
+                    };
+                };
+                let player = player.clone();
+                let result = tokio::task::spawn_blocking(move || player.pause()).await;
+                match result {
+                    Ok(Ok(())) => CommandReply {
+                        ok: true,
+                        error: None,
+                    },
+                    Ok(Err(e)) => CommandReply {
+                        ok: false,
+                        error: Some(e.to_string()),
+                    },
+                    Err(join) => CommandReply {
+                        ok: false,
+                        error: Some(format!("join: {join}")),
+                    },
+                }
+            }
+        }
+        Command::Seek { seconds, accurate } => {
+            #[cfg(not(feature = "media"))]
+            {
+                let _ = (seconds, accurate);
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                let Some(player) = current_player.as_ref() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no source loaded".into()),
+                    };
+                };
+                let player = player.clone();
+                let result =
+                    tokio::task::spawn_blocking(move || player.seek(seconds, accurate)).await;
+                match result {
+                    Ok(Ok(())) => CommandReply {
+                        ok: true,
+                        error: None,
+                    },
+                    Ok(Err(e)) => CommandReply {
+                        ok: false,
+                        error: Some(e.to_string()),
+                    },
+                    Err(join) => CommandReply {
+                        ok: false,
+                        error: Some(format!("join: {join}")),
+                    },
+                }
+            }
+        }
+        Command::SetScanVolume { value } => {
+            #[cfg(not(feature = "media"))]
+            {
+                let _ = value;
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                let Some(player) = current_player.as_ref() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no source loaded".into()),
+                    };
+                };
+                // set_volume is a cheap GObject property write; no need
+                // to spawn_blocking. The volume name lookup is mutex'd
+                // inside GStreamer.
+                player.set_volume(value);
+                CommandReply {
+                    ok: true,
+                    error: None,
+                }
+            }
+        }
+    }
+}
+
+/// If `current` has a project with `sourceVideos[0]` and no player is
+/// already attached, open a `SourcePlayer` for that source. The disk
+/// path is resolved by joining `relative_path` against the project
+/// folder, so cross-platform `..` traversal lands at the original file.
+///
+/// Spawning blocks on GStreamer preroll (~tens of milliseconds for an
+/// already-decoded mp4, longer for first-time hardware-decoder cold
+/// starts), so this runs inside `spawn_blocking` and does not stall the
+/// bus's mpsc loop. Failure to open does not unwind the project — we
+/// log the error and leave `current_player` empty so subsequent
+/// transport commands return "no source loaded" cleanly.
+#[cfg(feature = "media")]
+async fn try_spawn_current_player(
+    current: &Option<(video_coach_core::project::Project, std::path::PathBuf)>,
+    current_player: &mut Option<std::sync::Arc<video_coach_media::source_player::SourcePlayer>>,
+    frame_sink_factory: &FrameSinkFactory,
+) {
+    if current_player.is_some() {
+        return;
+    }
+    let Some((project, folder)) = current.as_ref() else {
+        return;
+    };
+    let Some(first) = project.source_videos.first() else {
+        return;
+    };
+    // Resolve to a clean absolute path. PathBuf::join keeps `..`
+    // components literal (e.g. `/tmp/proj/../../Users/...`); GStreamer's
+    // filesrc on macOS can't open such paths cleanly. Canonicalize
+    // collapses them. Fall back to the joined path if canonicalize
+    // fails (e.g. file moved) so the error message stays informative.
+    let joined = folder.join(&first.relative_path);
+    let abs = joined.canonicalize().unwrap_or(joined);
+    let duration = first.duration_seconds;
+    let display_name = first.display_name.clone();
+    let frame_sink = frame_sink_factory();
+    let abs_for_blocking = abs.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        video_coach_media::source_player::SourcePlayer::open(
+            &abs_for_blocking,
+            frame_sink,
+            duration,
+        )
+    })
+    .await;
+    match result {
+        Ok(Ok(player)) => {
+            tracing::info!(
+                target: "player.lifecycle",
+                event = "player.opened",
+                path = %abs.display(),
+                display_name = %display_name,
+                duration_seconds = duration,
+            );
+            *current_player = Some(std::sync::Arc::new(player));
+        }
+        Ok(Err(e)) => {
+            tracing::warn!(
+                target: "player.lifecycle",
+                error = %e,
+                path = %abs.display(),
+                "failed to open source player",
+            );
+        }
+        Err(join) => {
+            tracing::warn!(
+                target: "player.lifecycle",
+                error = %join,
+                "join error opening source player",
+            );
+        }
     }
 }
 

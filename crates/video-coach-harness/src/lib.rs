@@ -65,6 +65,15 @@ impl App {
             .arg("--headless")
             .arg("--control-socket")
             .arg("0");
+        // Phase 7: macOS' VideoToolbox decoders need a Cocoa NSApplication
+        // runloop that doesn't exist in cargo-test child processes; without
+        // this rank-override the SourcePlayer's preroll deadlocks. The
+        // production binary keeps VT enabled (the user's main thread is the
+        // NSApplication runloop). Compose tests use the same trick.
+        cmd.env(
+            "GST_PLUGIN_FEATURE_RANK",
+            "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE",
+        );
         cmd.stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = cmd.spawn()?;
 
