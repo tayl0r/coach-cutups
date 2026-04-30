@@ -32,6 +32,10 @@ public final class PreviewCompositor: NSObject, AVVideoCompositing {
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
     ]
 
+    /// Hoisted to type scope so `CIContext.render(_:to:bounds:colorSpace:)`
+    /// doesn't allocate a fresh `CGColorSpace` per frame on the hot path.
+    private static let outputColorSpace: CGColorSpace = CGColorSpaceCreateDeviceRGB()
+
     private var renderContext: AVVideoCompositionRenderContext?
 
     /// Shared CIContext for `CVPixelBuffer → CGImage` conversions. Eager
@@ -86,79 +90,69 @@ public final class PreviewCompositor: NSObject, AVVideoCompositing {
             base = request.sourceFrame(byTrackID: sourceTrackID)
         }
 
-        // 2. Allocate the output buffer.
-        guard let out = renderContext?.newPixelBuffer() else {
+        guard let renderContext, let out = renderContext.newPixelBuffer() else {
             request.finishCancelledRequest()
             return
         }
-        CVPixelBufferLockBaseAddress(out, [])
-        defer { CVPixelBufferUnlockBaseAddress(out, []) }
+        let outW = CGFloat(CVPixelBufferGetWidth(out))
+        let outH = CGFloat(CVPixelBufferGetHeight(out))
+        let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
 
-        let w = CVPixelBufferGetWidth(out)
-        let h = CVPixelBufferGetHeight(out)
-        let cs = CGColorSpaceCreateDeviceRGB()
-        guard let cg = CGContext(
-            data: CVPixelBufferGetBaseAddress(out),
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: CVPixelBufferGetBytesPerRow(out),
-            space: cs,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                | CGBitmapInfo.byteOrder32Little.rawValue
-        ) else {
-            request.finishCancelledRequest()
-            return
-        }
+        // 2. Black background only when there's no base. The old CPU path
+        //    unconditionally black-filled the buffer even when `base` would
+        //    cover the whole frame; that fill was wasted memory traffic and
+        //    we drop it. CIImage(color:) is essentially free — it's just a
+        //    constant generator the GPU evaluates per-sample on demand.
+        var composite: CIImage = CIImage(color: .black).cropped(to: outRect)
 
-        // newPixelBuffer() doesn't guarantee zeroed memory — fill black first
-        // so a missing base (e.g. clip starts paused with no cached frame)
-        // renders cleanly instead of showing whatever was in the pool slot.
-        cg.setFillColor(CGColor(gray: 0, alpha: 1))
-        cg.fill(CGRect(x: 0, y: 0, width: w, height: h))
-
-        // After this transform, user-space (0, 0) is the top-left of the
-        // image — same convention CompilationCompositor uses, so a CGImage
-        // drawn into it appears right-side-up.
-        cg.translateBy(x: 0, y: CGFloat(h))
-        cg.scaleBy(x: 1, y: -1)
-
-        // 3. Base full-frame. v1 source videos are landscape-only (matching
-        //    `CompilationCompositor` and `CompilationExporter.renderSize`),
-        //    so we don't apply any preferred transform here.
-        if let base, let img = makeCGImage(base) {
-            cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-        }
-
-        // 4. Webcam PiP, bottom-right at 22% width with 2.2% margin — same
-        //    geometry as `CompilationCompositor`. Keeping the math here
-        //    (rather than in built-in `AVMutableVideoCompositionLayerInstructions`)
-        //    is necessary because a custom compositor "owns" frame production;
-        //    layer instructions are bypassed when `customVideoCompositorClass`
-        //    is set.
-        if let webcam = request.sourceFrame(byTrackID: webcamTrackID),
-           let wImg = makeCGImage(webcam) {
-            let pipW = CGFloat(w) * 0.22
-            let webcamH = CVPixelBufferGetHeight(webcam)
-            let webcamW = CVPixelBufferGetWidth(webcam)
-            let pipH = pipW * CGFloat(webcamH) / CGFloat(max(webcamW, 1))
-            let margin = CGFloat(h) * 0.022
-            let rect = CGRect(
-                x: CGFloat(w) - pipW - margin,
-                y: CGFloat(h) - pipH - margin,
-                width: pipW,
-                height: pipH
+        if let base {
+            let baseCI = CIImage(cvPixelBuffer: base)
+            // Non-uniform scale to match the old `cg.draw(img, in: outRect)`
+            // stretch behavior. Don't switch this to `max(sx, sy)` (uniform
+            // crop-fill) — that would be a visual policy change.
+            let baseScale = CGAffineTransform(
+                scaleX: outW / max(baseCI.extent.width, 1),
+                y: outH / max(baseCI.extent.height, 1)
             )
-            cg.draw(wImg, in: rect)
+            composite = baseCI.transformed(by: baseScale).composited(over: composite)
         }
 
+        // 3. Webcam PiP, bottom-right at 22% width with 2.2% margin — same
+        //    geometry as `CompilationCompositor`. CIImage's coordinate origin
+        //    is bottom-left, so "bottom-right with margin" = (outW - margin -
+        //    pipW, margin). Keeping the math here (rather than in built-in
+        //    AVMutableVideoCompositionLayerInstructions) is necessary because
+        //    a custom compositor "owns" frame production; layer instructions
+        //    are bypassed when `customVideoCompositorClass` is set.
+        if let webcam = request.sourceFrame(byTrackID: webcamTrackID) {
+            let camCI = CIImage(cvPixelBuffer: webcam)
+            let camW = camCI.extent.width
+            let camH = camCI.extent.height
+            let pipW = outW * 0.22
+            let pipH = pipW * camH / max(camW, 1)
+            let margin = outH * 0.022
+            let scale = CGAffineTransform(
+                scaleX: pipW / max(camW, 1),
+                y: pipH / max(camH, 1)
+            )
+            let translate = CGAffineTransform(
+                translationX: outW - margin - pipW,
+                y: margin
+            )
+            composite = camCI.transformed(by: scale)
+                .transformed(by: translate)
+                .composited(over: composite)
+        }
+
+        // 4. Single GPU render straight into the output buffer. No CGContext,
+        //    no pixel-buffer lock, no per-frame CGImage allocation — saves
+        //    ~70 MB/frame of memory traffic at 4K relative to the old path.
+        ciContext.render(
+            composite,
+            to: out,
+            bounds: outRect,
+            colorSpace: Self.outputColorSpace
+        )
         request.finish(withComposedVideoFrame: out)
-    }
-
-    // MARK: - Helpers
-
-    private func makeCGImage(_ buffer: CVPixelBuffer) -> CGImage? {
-        let ci = CIImage(cvPixelBuffer: buffer)
-        return ciContext.createCGImage(ci, from: ci.extent)
     }
 }
