@@ -92,7 +92,7 @@ IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.m
       {seconds=current+delta, accurate=true}. Top-level FocusScope
       catches Space (play/pause) + Left/Right (-3/+3) +
       Shift+Left/Right (-10/+10).
-- [x] Task 7: Audio + scan-volume slider (commit TBD)
+- [x] Task 7: Audio + scan-volume slider (commit c3f69ba)
       scan-volume: 0..1 in-out property + scan-volume-changed callback.
       Custom volume-track + TouchArea overlay (matches scrubber style).
       ui.rs handler dispatches SetScanVolume on every change. bus.rs
