@@ -21,6 +21,7 @@
 
 use crate::bus::{BusHandle, Command};
 use crate::frame_sink::{FrameSlot, PlayerStateSlot};
+use crate::last_project;
 use slint::ComponentHandle;
 
 slint::include_modules!();
@@ -42,6 +43,7 @@ pub fn run(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     frame_slot: FrameSlot,
     player_state: PlayerStateSlot,
+    startup_project: Option<String>,
 ) -> anyhow::Result<()> {
     let window = MainWindow::new()?;
 
@@ -247,6 +249,7 @@ pub fn run(
                 )
                 .await;
             if reply.ok {
+                last_project::save(&path);
                 slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
                         w.set_project_title(path_for_title.into());
@@ -359,6 +362,7 @@ pub fn run(
                 )
                 .await;
             if reply.ok {
+                last_project::save(&path);
                 slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
                         w.set_project_title(path_for_title.into());
@@ -387,6 +391,54 @@ pub fn run(
             }
         });
     });
+
+    // Auto-reopen the project that was active when we last quit. Failure
+    // here is non-fatal — we surface the error in the UI's error label
+    // and leave the window in the no-project-open state. We don't
+    // re-save the path on success: it's already persisted; saving here
+    // would be a no-op write but also masks the case where startup
+    // open succeeds against a path the user later moves (we'd happily
+    // re-save the now-stale path).
+    if let Some(path) = startup_project {
+        let bus_for_init = bus.clone();
+        let weak = window.as_weak();
+        rt.spawn(async move {
+            let path_for_title = path.clone();
+            let reply = bus_for_init
+                .send(
+                    UI_COMMAND_ID.into(),
+                    Command::OpenProject { path: path.clone() },
+                )
+                .await;
+            if reply.ok {
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_project_title(path_for_title.into());
+                        w.set_error_message("".into());
+                    }
+                })
+                .ok();
+            } else {
+                let err_text = reply
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "open_project failed (no error detail)".into());
+                tracing::warn!(
+                    target: "app.lifecycle",
+                    path = %path,
+                    error = ?reply.error,
+                    "auto-reopen of last project failed",
+                );
+                let display = format!("Couldn't reopen {path}\n{err_text}");
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_error_message(display.into());
+                    }
+                })
+                .ok();
+            }
+        });
+    }
 
     window.run().map_err(Into::into)
 }

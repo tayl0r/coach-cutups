@@ -2,6 +2,7 @@ mod bus;
 mod cli;
 mod event_layer;
 mod frame_sink;
+mod last_project;
 mod logging;
 mod protocol;
 mod ui;
@@ -125,6 +126,10 @@ fn main() -> anyhow::Result<()> {
             }
         });
     } else {
+        // Auto-reopen the last project we had open (if any). Read here on
+        // the main thread before handing the path to the UI, which
+        // dispatches an OpenProject through the bus once the window is up.
+        let startup_project = last_project::load();
         // Slint blocks the main thread until the window closes. Tokio
         // workers continue polling the socket / bus while the UI runs.
         ui::run(
@@ -133,6 +138,7 @@ fn main() -> anyhow::Result<()> {
             shutdown_tx,
             frame_slot,
             player_state,
+            startup_project,
         )?;
     }
 

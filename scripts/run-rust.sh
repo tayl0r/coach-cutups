@@ -3,9 +3,10 @@
 # (which builds the legacy Swift app via xcodebuild) but for the
 # Cargo-based v2 binary on branch rust-rewrite.
 #
-# Defaults to `cargo build --release` for snappier launches; pass
-# `--debug` for a debug build or `--features media` to compile in the
-# GStreamer recording machinery.
+# Defaults to `cargo build --release --features media` (full app
+# including the GStreamer recording + source-playback pipeline). Pass
+# `--debug` for a debug build, or `--features <extra>` to add more
+# features on top of `media`.
 #
 # After build it kills any prior video-coach-app instance and launches
 # the new binary with --json-logs piped to stderr (so tracing events
@@ -38,9 +39,9 @@ done
 
 SHA=$(git rev-parse --short HEAD)
 SUBJECT=$(git log -1 --pretty=%s)
-echo "==> building (profile=$PROFILE_DIR${EXTRA_FEATURES:+, $EXTRA_FEATURES})"
+echo "==> building (profile=$PROFILE_DIR, --features media${EXTRA_FEATURES:+ $EXTRA_FEATURES})"
 # shellcheck disable=SC2086
-cargo build -p video-coach-app $PROFILE_FLAG $EXTRA_FEATURES
+cargo build -p video-coach-app $PROFILE_FLAG --features media $EXTRA_FEATURES
 
 BIN="target/$PROFILE_DIR/video-coach-app"
 if [ ! -x "$BIN" ]; then
