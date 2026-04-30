@@ -33,6 +33,14 @@ final class StrokeReplayLayer: NSView {
     /// resize events that require all paths to be rebuilt at the new scale.
     private var lastLayoutSize: CGSize = .zero
 
+    /// While true, `tick` early-returns so the overlay holds its last drawn
+    /// state regardless of `player.currentTime()`. Used by ContentView to
+    /// mask the keyframe-decode window during coarse FF/RW seeks — without
+    /// it, the overlay would flash strokes to wrong positions because
+    /// AVPlayer reports the seek target immediately while the displayed
+    /// frame is still at the prior keyframe.
+    private var replayFrozen: Bool = false
+
     override var isFlipped: Bool { false }
 
     init(clip: Clip, player: AVPlayer, clipCompositionStart: CMTime = .zero) {
@@ -91,6 +99,12 @@ final class StrokeReplayLayer: NSView {
         clearAllLayers()
     }
 
+    /// Setter for `replayFrozen`. Called from `StrokeReplayOverlay`'s
+    /// `updateNSView` whenever ContentView's `coarseSeekInFlight` flag flips.
+    func setReplayFrozen(_ frozen: Bool) {
+        replayFrozen = frozen
+    }
+
     override func layout() {
         super.layout()
         // If the view was resized, rebuild every visible path so line widths
@@ -117,6 +131,7 @@ final class StrokeReplayLayer: NSView {
     }
 
     private func tick(at compositionTime: CMTime) {
+        guard !replayFrozen else { return }
         guard bounds.width > 0, bounds.height > 0 else { return }
         let recordSeconds = max(0, (compositionTime - clipCompositionStart).seconds)
         let visible = visibleStrokes(in: clip, atRecordTime: recordSeconds)
@@ -247,15 +262,19 @@ final class StrokeReplayLayer: NSView {
 struct StrokeReplayOverlay: NSViewRepresentable {
     let player: AVPlayer
     let clip: Clip
+    let replayFrozen: Bool
 
     func makeNSView(context: Context) -> StrokeReplayLayer {
-        StrokeReplayLayer(clip: clip, player: player)
+        let view = StrokeReplayLayer(clip: clip, player: player)
+        view.setReplayFrozen(replayFrozen)
+        return view
     }
 
     func updateNSView(_ nsView: StrokeReplayLayer, context: Context) {
         if nsView.clip.id != clip.id {
             nsView.setClip(clip)
         }
+        nsView.setReplayFrozen(replayFrozen)
     }
 
     static func dismantleNSView(_ nsView: StrokeReplayLayer, coordinator: ()) {

@@ -16,6 +16,11 @@ struct ContentView: View {
     /// Identity of the AVPlayer that the coordinator's current state belongs
     /// to. When the active player changes (clip swap, preview close), reset.
     @State private var skipCoordinatorPlayerID: ObjectIdentifier?
+    /// True while a coarse (keyframe-tolerant) FF/RW seek is in flight.
+    /// StrokeReplayLayer reads this via the overlay representable and freezes
+    /// its periodic redraw so strokes don't flash to wrong positions during
+    /// the keyframe-decode window.
+    @State private var coarseSeekInFlight: Bool = false
     @State private var selectedClipID: Clip.ID?
     @State private var appMode: AppMode = .scanning
     @State private var openProjectError: String?
@@ -220,7 +225,7 @@ struct ContentView: View {
                     if case .previewClip(let id) = appMode,
                        let player = workspace.previewPlayer(for: id),
                        let clip = workspace.project.clips.first(where: { $0.id == id }) {
-                        StrokeReplayOverlay(player: player, clip: clip)
+                        StrokeReplayOverlay(player: player, clip: clip, replayFrozen: coarseSeekInFlight)
                             .allowsHitTesting(false)
                         previewTextBar(for: clip)
                             .allowsHitTesting(false)
@@ -476,6 +481,9 @@ struct ContentView: View {
         if let s = decision.seek {
             let t = CMTime(seconds: s.targetSeconds, preferredTimescale: 600)
             let tol: CMTime = s.exact ? .zero : .positiveInfinity
+            if !s.exact {
+                coarseSeekInFlight = true
+            }
             player.seek(to: t, toleranceBefore: tol, toleranceAfter: tol) { _ in
                 // AVPlayer fires the completion on a private queue. Bounce
                 // back to the main actor before mutating coordinator state.
@@ -483,6 +491,9 @@ struct ContentView: View {
                     // If the active player changed since this seek was issued,
                     // ignore the late completion — coordinator was reset already.
                     guard self.skipCoordinatorPlayerID == pid else { return }
+                    // Clear before the recursion: a follow-up exact seek
+                    // shouldn't inherit the coarse-in-flight freeze.
+                    self.coarseSeekInFlight = false
                     let next = self.skipCoordinator.seekCompleted(
                         nowMonotonicSeconds: CACurrentMediaTime()
                     )
@@ -535,6 +546,7 @@ struct ContentView: View {
         skipDebounceTask = nil
         skipCoordinator.reset()
         skipCoordinatorPlayerID = nil
+        coarseSeekInFlight = false
     }
 
     /// Deselect the current clip and route the player back to the source
