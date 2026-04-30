@@ -74,6 +74,13 @@ impl App {
             "GST_PLUGIN_FEATURE_RANK",
             "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE",
         );
+        // Phase 7: CI Linux runners + sandboxed test environments may not
+        // have a reachable audio daemon. The real platform sinks
+        // (pulsesink/wasapisink/osxaudiosink) build fine but fail the
+        // PAUSED→PLAYING transition. Force fakesink for any harness-
+        // driven binary; production launches without this env var get
+        // real audio.
+        cmd.env("VIDEO_COACH_NO_AUDIO", "1");
         cmd.stdout(Stdio::piped()).stderr(Stdio::null());
         let mut child = cmd.spawn()?;
 

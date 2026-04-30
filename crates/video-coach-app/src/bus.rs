@@ -493,10 +493,10 @@ async fn handle(
             #[cfg(not(feature = "media"))]
             {
                 let _ = absolute_path;
-                return CommandReply {
+                CommandReply {
                     ok: false,
                     error: Some("media feature disabled in this build".into()),
-                };
+                }
             }
             #[cfg(feature = "media")]
             {

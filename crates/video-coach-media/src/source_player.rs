@@ -331,7 +331,18 @@ fn build_and_link_audio_chain(
         .property("volume", 1.0_f64)
         .build()
         .map_err(|_| SourcePlayerError::MissingElement("volume".into()))?;
-    let audiosink = make_or(platform_audio_sink_name())?;
+    let audiosink = if platform_audio_sink_name() == "fakesink" {
+        // Emulate a real audio sink's clock by syncing fakesink to the
+        // pipeline clock — without sync=true the fake sink consumes
+        // buffers as fast as decode produces them, sending the pipeline
+        // way past real-time.
+        gstreamer::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .build()
+            .map_err(|_| SourcePlayerError::MissingElement("fakesink".into()))?
+    } else {
+        make_or(platform_audio_sink_name())?
+    };
 
     pipeline
         .add_many([&queue, &convert, &resample, &volume, &audiosink])
@@ -355,7 +366,15 @@ fn build_and_link_audio_chain(
 /// macOS, which on a clean install fires a microphone-permission dialog
 /// even though we're only playing back. Naming the platform sink
 /// directly skips the probe.
+///
+/// `VIDEO_COACH_NO_AUDIO=1` forces `fakesink sync=true` instead. Used by
+/// CI runners where no audio daemon is reachable — without it, the
+/// real platform sink builds successfully but fails the
+/// PAUSED→PLAYING transition with a StateChangeError.
 fn platform_audio_sink_name() -> &'static str {
+    if std::env::var("VIDEO_COACH_NO_AUDIO").is_ok() {
+        return "fakesink";
+    }
     if cfg!(target_os = "macos") {
         "osxaudiosink"
     } else if cfg!(target_os = "windows") {
