@@ -1,9 +1,9 @@
 //! Phase 8 Task 2. Manual smoke test for the `PlatformDefaultSource`.
 //!
-//! Records short clips of real webcam + microphone audio to temp .mov
-//! files on the host machine, then asserts each file is non-trivial
-//! (>10 KB). Gated by `cfg(target_os = "macos")` AND `#[ignore]` so CI
-//! never runs it (no camera permission in CI). Run locally with:
+//! Records ~1s of webcam + microphone audio to a temp .mov on the host
+//! machine, then asserts the file is non-trivial (>10 KB). Gated by
+//! `cfg(target_os = "macos")` AND `#[ignore]` so CI never runs it (no
+//! camera permission in CI). Run locally with:
 //!
 //! ```sh
 //! cargo test --features media -p video-coach-media -- \
@@ -14,10 +14,14 @@
 //! permission; granting both is required. On Deny the test panics with
 //! a state-change error.
 //!
-//! The test loops start/stop several times because the `osxaudiosrc`
-//! teardown race against CoreAudio's HAL IO thread is timing-dependent
-//! — a single iteration may not surface it. A short loop is reliable
-//! enough to use as a regression gate when touching `recording::stop`.
+//! Limitation: this test deadlocks when run under a plain `cargo test`
+//! binary because `avfvideosrc` / `osxaudiosrc` need an NSApplication +
+//! Cocoa main-thread / runloop (which Slint provides in the real app)
+//! to actually deliver buffers — without it the streaming threads
+//! block downstream and `pipeline.send_event(EOS)` deadlocks on stream
+//! locks. So it doesn't catch teardown regressions on its own; the
+//! authoritative validation for `recording::stop` changes is to
+//! rebuild the app and exercise start/stop interactively.
 
 #![cfg(all(feature = "media", target_os = "macos"))]
 
@@ -28,28 +32,23 @@ use video_coach_media::{platform_source::PlatformDefaultSource, recording::start
 #[test]
 #[ignore]
 fn platform_source_smoke_records_short_clip() {
-    for iteration in 0..5 {
-        let tmp_dir = tempfile::tempdir().unwrap();
-        let out_path = tmp_dir.path().join(format!("platform-smoke-{iteration}.mov"));
+    let tmp_dir = tempfile::tempdir().unwrap();
+    let out_path = tmp_dir.path().join("platform-smoke.mov");
 
-        let factory = Arc::new(PlatformDefaultSource::new());
-        let rec = start(factory, out_path.clone()).expect("start recording");
-        // 1.5s gives vtenc_h264 + qtmux a real keyframe + audio frames to
-        // flush at EOS; shorter and qtmux errors with "Internal data
-        // stream error" instead of finalizing.
-        std::thread::sleep(Duration::from_millis(1500));
-        rec.stop().expect("stop recording");
+    let factory = Arc::new(PlatformDefaultSource::new());
+    let rec = start(factory, out_path.clone()).expect("start recording");
+    std::thread::sleep(Duration::from_secs(1));
+    rec.stop().expect("stop recording");
 
-        let metadata = std::fs::metadata(&out_path).expect("output should exist");
-        assert!(
-            metadata.len() > 10_000,
-            "iteration {iteration}: output should be >10 KB; got {} bytes",
-            metadata.len()
-        );
-        eprintln!(
-            "platform_source_smoke iter {iteration}: recorded {} bytes to {}",
-            metadata.len(),
-            out_path.display()
-        );
-    }
+    let metadata = std::fs::metadata(&out_path).expect("output should exist");
+    assert!(
+        metadata.len() > 10_000,
+        "output should be >10 KB; got {} bytes",
+        metadata.len()
+    );
+    eprintln!(
+        "platform_source_smoke: recorded {} bytes to {}",
+        metadata.len(),
+        out_path.display()
+    );
 }
