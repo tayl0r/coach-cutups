@@ -88,6 +88,12 @@ struct ContentView: View {
                 onCameraChange: handleCameraSelectionChange,
                 onMicChange: handleMicSelectionChange
             ))
+            .onChange(of: selectedClipID) { _, _ in
+                // Even if the user navigates A → B → A, the cache may return the
+                // *same* AVPlayer for A — `handleSkip`'s pid-equality check would
+                // not detect that as a swap. Reset unconditionally on selection.
+                resetSkipState()
+            }
             .onChange(of: selectedClipID) { _, newID in
                 handleSelectionChange(newID)
             }
@@ -442,9 +448,9 @@ struct ContentView: View {
 
         let pid = ObjectIdentifier(player)
         if skipCoordinatorPlayerID != pid {
-            skipCoordinator.reset()
-            skipDebounceTask?.cancel()
-            skipDebounceTask = nil
+            resetSkipState()
+            // Don't nil this on swap — the late-completion guard inside
+            // applySkipDecision reads it to short-circuit stale callbacks.
             skipCoordinatorPlayerID = pid
         }
 
@@ -462,11 +468,14 @@ struct ContentView: View {
         applySkipDecision(decision, on: player)
     }
 
+    /// Side-effecting executor for SkipCoordinator decisions. May call itself
+    /// recursively at most once per completion/debounce; the recursive call's
+    /// seek schedules an async completion that does not re-enter synchronously.
     private func applySkipDecision(_ decision: SkipDecision, on player: AVPlayer) {
+        let pid = ObjectIdentifier(player)
         if let s = decision.seek {
             let t = CMTime(seconds: s.targetSeconds, preferredTimescale: 600)
             let tol: CMTime = s.exact ? .zero : .positiveInfinity
-            let pid = ObjectIdentifier(player)
             player.seek(to: t, toleranceBefore: tol, toleranceAfter: tol) { _ in
                 // AVPlayer fires the completion on a private queue. Bounce
                 // back to the main actor before mutating coordinator state.
@@ -483,10 +492,9 @@ struct ContentView: View {
         }
         if let after = decision.armDebounceSeconds {
             skipDebounceTask?.cancel()
-            let pid = ObjectIdentifier(player)
             skipDebounceTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
-                if Task.isCancelled { return }
+                guard !Task.isCancelled else { return }
                 guard self.skipCoordinatorPlayerID == pid else { return }
                 let next = self.skipCoordinator.burstEnded(
                     nowMonotonicSeconds: CACurrentMediaTime()
@@ -518,10 +526,22 @@ struct ContentView: View {
         }
     }
 
+    /// Cancels any in-flight debounce, resets coordinator state, and clears
+    /// the player-id guard. Idempotent. Call on close, sidebar selection
+    /// change, recording-state changes — anywhere the active preview player
+    /// might have flipped.
+    private func resetSkipState() {
+        skipDebounceTask?.cancel()
+        skipDebounceTask = nil
+        skipCoordinator.reset()
+        skipCoordinatorPlayerID = nil
+    }
+
     /// Deselect the current clip and route the player back to the source
     /// virtual concat. Wired to the Source button in `PreviewTransport` and
     /// to the Esc key when `appMode` is a preview state.
     private func handleClosePreview() {
+        resetSkipState()
         // Pause the preview player so audio doesn't keep playing if AVPlayer
         // somehow holds a reference past the swap.
         workspace.previewPlayer(for: selectedClipID ?? UUID())?.pause()
