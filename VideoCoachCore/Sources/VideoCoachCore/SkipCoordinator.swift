@@ -74,8 +74,22 @@ public final class SkipCoordinator {
     /// (b) if `exactPending && target != nil` → fire an exact seek to `target`;
     /// (c) if the completed seek was coarse and `target` advanced during flight → refire coarse to the latest `target`;
     /// (d) else if the completed seek landed exact, clear `target`; otherwise no-op.
-    // TODO(plan-1.3): implement the seek-completion settle logic described above.
-    public func seekCompleted(nowMonotonicSeconds: TimeInterval) -> SkipDecision { .none }
+    // TODO(plan-1.4): implement branches (a) and (b) — exactPending handling.
+    public func seekCompleted(nowMonotonicSeconds: TimeInterval) -> SkipDecision {
+        let landedTarget = flying
+        let landedExact = flyingExact
+        flying = nil
+        // Stale target → refire coarse to the latest.
+        // (Task 1.4 will add the exactPending and landedExact-clears-target
+        // branches above this one.)
+        if !landedExact, let tgt = target, tgt != landedTarget {
+            flying = tgt
+            flyingExact = false
+            return SkipDecision(seek: .init(targetSeconds: tgt, exact: false))
+        }
+        // Landed coarse on the same target the user wanted; debounce will fire exact.
+        return .none
+    }
 
     /// Notify the coordinator that the burst-end debounce has fired.
     ///
