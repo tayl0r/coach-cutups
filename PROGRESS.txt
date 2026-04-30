@@ -86,7 +86,7 @@ IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.m
       scrub track (Rectangle with TouchArea overlay — Slint Slider can't
       separate press/release), mm:ss / mm:ss label. Drag dispatches Seek
       accurate=false; release dispatches accurate=true.
-- [x] Task 6: Skip buttons + keyboard shortcuts (commit TBD)
+- [x] Task 6: Skip buttons + keyboard shortcuts (commit 2dd5003)
       4 buttons in transport bar: −10, −3, +3, +10. Each dispatches
       skip-clicked(delta) which the UI handler maps to Seek
       {seconds=current+delta, accurate=true}. Top-level FocusScope
