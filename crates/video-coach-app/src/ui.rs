@@ -20,7 +20,7 @@
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
 use crate::bus::{BusHandle, Command};
-use crate::frame_sink::FrameSlot;
+use crate::frame_sink::{FrameSlot, PlayerStateSlot};
 use slint::ComponentHandle;
 
 slint::include_modules!();
@@ -41,6 +41,7 @@ pub fn run(
     rt: tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     frame_slot: FrameSlot,
+    player_state: PlayerStateSlot,
 ) -> anyhow::Result<()> {
     let window = MainWindow::new()?;
 
@@ -52,6 +53,7 @@ pub fn run(
     let frame_timer = slint::Timer::default();
     let weak_for_frames = window.as_weak();
     let slot_for_timer = frame_slot.clone();
+    let player_state_for_timer = player_state.clone();
     frame_timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(FRAME_TICK_MS),
@@ -60,10 +62,21 @@ pub fn run(
                 let mut guard = slot_for_timer.lock().expect("frame slot poisoned");
                 guard.take()
             };
-            if let Some(buf) = next_frame {
-                if let Some(w) = weak_for_frames.upgrade() {
+            // Snapshot transport state. Drop the lock before touching
+            // the window so we never block the position-poll task.
+            let (pos, dur, playing) = {
+                let g = player_state_for_timer
+                    .lock()
+                    .expect("player_state poisoned");
+                (g.position_seconds, g.duration_seconds, g.is_playing)
+            };
+            if let Some(w) = weak_for_frames.upgrade() {
+                if let Some(buf) = next_frame {
                     w.set_source_frame(slint::Image::from_rgba8(buf));
                 }
+                w.set_position_seconds(pos as f32);
+                w.set_duration_seconds(dur as f32);
+                w.set_is_playing(playing);
             }
         },
     );
@@ -91,6 +104,65 @@ pub fn run(
         if shutdown_rx.changed().await.is_ok() && *shutdown_rx.borrow() {
             let _ = slint::quit_event_loop();
         }
+    });
+
+    // Transport: play/pause toggle. Dispatches Play or Pause based on
+    // the current is-playing property; doesn't try to remember its own
+    // state since the bus + position-poll is the source of truth.
+    let bus_for_play = bus.clone();
+    let rt_for_play = rt.clone();
+    let weak_for_play = window.as_weak();
+    window.on_play_pause_clicked(move || {
+        let bus = bus_for_play.clone();
+        let was_playing = weak_for_play
+            .upgrade()
+            .map(|w| w.get_is_playing())
+            .unwrap_or(false);
+        rt_for_play.spawn(async move {
+            let cmd = if was_playing {
+                Command::Pause
+            } else {
+                Command::Play
+            };
+            bus.send(UI_COMMAND_ID.into(), cmd).await;
+        });
+    });
+
+    // Scrub during drag: keyframe-snap seek for snappy preview.
+    let bus_for_drag = bus.clone();
+    let rt_for_drag = rt.clone();
+    window.on_scrub_dragged(move |seconds: f32| {
+        let bus = bus_for_drag.clone();
+        let s = seconds as f64;
+        rt_for_drag.spawn(async move {
+            bus.send(
+                UI_COMMAND_ID.into(),
+                Command::Seek {
+                    seconds: s,
+                    accurate: false,
+                },
+            )
+            .await;
+        });
+    });
+
+    // Scrub on release: frame-exact seek so the user lands where they
+    // pointed.
+    let bus_for_release = bus.clone();
+    let rt_for_release = rt.clone();
+    window.on_scrub_released(move |seconds: f32| {
+        let bus = bus_for_release.clone();
+        let s = seconds as f64;
+        rt_for_release.spawn(async move {
+            bus.send(
+                UI_COMMAND_ID.into(),
+                Command::Seek {
+                    seconds: s,
+                    accurate: true,
+                },
+            )
+            .await;
+        });
     });
 
     // File → Quit: dispatch through bus so the same shutdown path runs

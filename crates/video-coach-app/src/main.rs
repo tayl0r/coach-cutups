@@ -72,6 +72,7 @@ fn main() -> anyhow::Result<()> {
     // is created but never read; SlintFrameSink still writes into it
     // and the data is dropped on next overwrite — harmless.
     let frame_slot = frame_sink::new_slot();
+    let player_state = frame_sink::new_player_state();
 
     #[cfg(feature = "media")]
     let frame_sink_factory: bus::FrameSinkFactory = {
@@ -84,6 +85,8 @@ fn main() -> anyhow::Result<()> {
         shutdown_tx.clone(),
         #[cfg(feature = "media")]
         frame_sink_factory,
+        #[cfg(feature = "media")]
+        player_state.clone(),
     );
     let _ = &bus;
 
@@ -124,7 +127,13 @@ fn main() -> anyhow::Result<()> {
     } else {
         // Slint blocks the main thread until the window closes. Tokio
         // workers continue polling the socket / bus while the UI runs.
-        ui::run(bus, runtime.handle().clone(), shutdown_tx, frame_slot)?;
+        ui::run(
+            bus,
+            runtime.handle().clone(),
+            shutdown_tx,
+            frame_slot,
+            player_state,
+        )?;
     }
 
     tracing::info!(target: "app.lifecycle", event = "app.shutdown");

@@ -65,15 +65,27 @@ IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.m
       and NewProject — required on macOS where /tmp → /private/tmp symlink
       meant relative paths had the wrong number of `..` segments. New harness
       tests: play_pause_seek_roundtrip_via_harness + play_without_source_returns_error.
-- [x] Task 4: Slint video surface (single-slot frame buffer + 30Hz pull) (commit TBD)
+- [x] Task 4: Slint video surface (single-slot frame buffer + 30Hz pull) (commits 6d441a9, 0899d9b)
       New crate module crates/video-coach-app/src/frame_sink.rs holding
       FrameSlot = Arc<Mutex<Option<SharedPixelBuffer<Rgba8Pixel>>>> +
       SlintFrameSink (cfg-gated by media). main.slint adds an Image
       bound to source-frame property. ui::run starts a 30Hz Slint Timer
       that takes() the slot and calls set_source_frame; per-frame
       invoke_from_event_loop is avoided. main.rs wires the shared slot
-      into both the bus's frame_sink_factory and ui::run.
-- [ ] Task 5: Transport UI (TouchArea-based scrubber, position polling)
+      into both the bus's frame_sink_factory and ui::run. Follow-up
+      commit added File → Add Source Video menu item so manual smoke
+      doesn't need the control socket.
+- [x] Task 5: Transport UI (TouchArea-based scrubber, position polling) (commit df034dd)
+      PlayerStateSlot in frame_sink.rs (alongside FrameSlot). Position-poll
+      task spawned alongside each player; reads snapshot every 100ms;
+      writes position/duration/is_playing to slot. Bus's Seek handler
+      records last_seek_at — poll skips updates within 200ms (adversarial
+      fix #8). UI's existing 30Hz timer reads slot, drives is_playing /
+      position_seconds / duration_seconds Slint properties. Transport bar
+      at bottom: play/pause button (TouchArea on a Rectangle), custom
+      scrub track (Rectangle with TouchArea overlay — Slint Slider can't
+      separate press/release), mm:ss / mm:ss label. Drag dispatches Seek
+      accurate=false; release dispatches accurate=true.
 - [ ] Task 6: Skip buttons + keyboard shortcuts
 - [ ] Task 7: Audio + scan-volume slider
 - [ ] Task 8: Closeout (build matrix, push, verify CI green)

@@ -25,6 +25,7 @@
 #![allow(dead_code)] // referenced by ui::run when feature = "media"
 
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[cfg(feature = "media")]
 use video_coach_media::source_player::FrameSink;
@@ -36,6 +37,28 @@ pub type FrameSlot = Arc<Mutex<Option<slint::SharedPixelBuffer<slint::Rgba8Pixel
 
 pub fn new_slot() -> FrameSlot {
     Arc::new(Mutex::new(None))
+}
+
+/// Phase 7 Task 5: transport state shared between the position-poll
+/// task (writer, ~10 Hz) and the UI's display-rate timer (reader,
+/// 30 Hz). Position lags the wall clock by at most one poll interval
+/// (100 ms), which is fine for a transport label.
+#[derive(Debug, Clone, Default)]
+pub struct PlayerStateSlotData {
+    pub position_seconds: f64,
+    pub duration_seconds: f64,
+    pub is_playing: bool,
+    /// When the bus last issued a seek. The poll task skips updates
+    /// that arrive within ~200 ms of this so the position bar doesn't
+    /// briefly snap back to the pre-seek value while the decoder is
+    /// still flushing. (Adversarial-review fix #8.)
+    pub last_seek_at: Option<Instant>,
+}
+
+pub type PlayerStateSlot = Arc<Mutex<PlayerStateSlotData>>;
+
+pub fn new_player_state() -> PlayerStateSlot {
+    Arc::new(Mutex::new(PlayerStateSlotData::default()))
 }
 
 #[cfg(feature = "media")]

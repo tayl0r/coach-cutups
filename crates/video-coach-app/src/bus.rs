@@ -142,8 +142,13 @@ pub fn spawn_on(
     rt: &tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] frame_sink_factory: FrameSinkFactory,
+    #[cfg(feature = "media")] player_state: crate::frame_sink::PlayerStateSlot,
 ) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
+    #[cfg(feature = "media")]
+    let rt_for_poll = rt.clone();
+    #[cfg(feature = "media")]
+    let shutdown_tx_for_poll = shutdown_tx.clone();
     rt.spawn(async move {
         // Per-task recording state. `None` until StartRecording succeeds;
         // taken by StopRecording. Held across loop iterations because start
@@ -179,6 +184,12 @@ pub fn spawn_on(
                 &mut current_player,
                 #[cfg(feature = "media")]
                 &frame_sink_factory,
+                #[cfg(feature = "media")]
+                &rt_for_poll,
+                #[cfg(feature = "media")]
+                &shutdown_tx_for_poll,
+                #[cfg(feature = "media")]
+                &player_state,
             )
             .await;
             let _ = env.reply.send(reply);
@@ -187,6 +198,54 @@ pub fn spawn_on(
     BusHandle { tx }
 }
 
+/// Phase 7 Task 5. Position-polling task. Spawned alongside each
+/// SourcePlayer; reads `snapshot()` every 100 ms and writes the result
+/// to the shared `PlayerStateSlot`. Runs until `shutdown_rx` fires —
+/// for the MVP we don't support multiple players, so a single
+/// long-lived task is correct. (When swap-player lands in Phase 7.5+
+/// this will need an AbortHandle to cancel the old task.)
+#[cfg(feature = "media")]
+fn spawn_position_poll(
+    rt: &tokio::runtime::Handle,
+    player: std::sync::Arc<video_coach_media::source_player::SourcePlayer>,
+    state: crate::frame_sink::PlayerStateSlot,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) {
+    rt.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        // Skip the initial tick — `interval` fires immediately on
+        // creation; we want the first poll to happen after 100ms so
+        // GStreamer has had time to publish a position.
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let snap = player.snapshot();
+                    let mut guard = state.lock().expect("player_state poisoned");
+                    // Suppress one cycle after a recent seek (200 ms
+                    // window — the decoder typically delivers its
+                    // first post-seek buffer well within that).
+                    let suppress = guard
+                        .last_seek_at
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(200))
+                        .unwrap_or(false);
+                    if !suppress {
+                        guard.position_seconds = snap.position_seconds;
+                    }
+                    guard.duration_seconds = snap.duration_seconds;
+                    guard.is_playing = snap.is_playing;
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn handle(
     cmd: Command,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
@@ -196,6 +255,9 @@ async fn handle(
         std::sync::Arc<video_coach_media::source_player::SourcePlayer>,
     >,
     #[cfg(feature = "media")] frame_sink_factory: &FrameSinkFactory,
+    #[cfg(feature = "media")] rt_for_poll: &tokio::runtime::Handle,
+    #[cfg(feature = "media")] shutdown_tx_for_poll: &tokio::sync::watch::Sender<bool>,
+    #[cfg(feature = "media")] player_state: &crate::frame_sink::PlayerStateSlot,
 ) -> CommandReply {
     match cmd {
         Command::Quit => {
@@ -353,7 +415,15 @@ async fn handle(
                     *current = Some((project, folder));
                     #[cfg(feature = "media")]
                     {
-                        try_spawn_current_player(current, current_player, frame_sink_factory).await;
+                        try_spawn_current_player(
+                            current,
+                            current_player,
+                            frame_sink_factory,
+                            rt_for_poll,
+                            shutdown_tx_for_poll,
+                            player_state,
+                        )
+                        .await;
                     }
                     CommandReply {
                         ok: true,
@@ -394,7 +464,15 @@ async fn handle(
                     *current = Some((project, folder));
                     #[cfg(feature = "media")]
                     {
-                        try_spawn_current_player(current, current_player, frame_sink_factory).await;
+                        try_spawn_current_player(
+                            current,
+                            current_player,
+                            frame_sink_factory,
+                            rt_for_poll,
+                            shutdown_tx_for_poll,
+                            player_state,
+                        )
+                        .await;
                     }
                     CommandReply {
                         ok: true,
@@ -503,7 +581,15 @@ async fn handle(
                         // project AND no player is loaded yet, spin one
                         // up so subsequent Play/Pause/Seek commands have
                         // somewhere to land. (Adversarial fix #3.)
-                        try_spawn_current_player(current, current_player, frame_sink_factory).await;
+                        try_spawn_current_player(
+                            current,
+                            current_player,
+                            frame_sink_factory,
+                            rt_for_poll,
+                            shutdown_tx_for_poll,
+                            player_state,
+                        )
+                        .await;
                         CommandReply {
                             ok: true,
                             error: None,
@@ -614,6 +700,15 @@ async fn handle(
                 let player = player.clone();
                 let result =
                     tokio::task::spawn_blocking(move || player.seek(seconds, accurate)).await;
+                // Record the seek so the position-poll task suppresses
+                // its next update — otherwise the bar briefly snaps
+                // back to the pre-seek position while the decoder
+                // flushes. (Adversarial-review fix #8.)
+                if matches!(result, Ok(Ok(()))) {
+                    let mut g = player_state.lock().expect("player_state poisoned");
+                    g.last_seek_at = Some(std::time::Instant::now());
+                    g.position_seconds = seconds.max(0.0);
+                }
                 match result {
                     Ok(Ok(())) => CommandReply {
                         ok: true,
@@ -672,10 +767,14 @@ async fn handle(
 /// log the error and leave `current_player` empty so subsequent
 /// transport commands return "no source loaded" cleanly.
 #[cfg(feature = "media")]
+#[allow(clippy::too_many_arguments)]
 async fn try_spawn_current_player(
     current: &Option<(video_coach_core::project::Project, std::path::PathBuf)>,
     current_player: &mut Option<std::sync::Arc<video_coach_media::source_player::SourcePlayer>>,
     frame_sink_factory: &FrameSinkFactory,
+    rt_for_poll: &tokio::runtime::Handle,
+    shutdown_tx_for_poll: &tokio::sync::watch::Sender<bool>,
+    player_state: &crate::frame_sink::PlayerStateSlot,
 ) {
     if current_player.is_some() {
         return;
@@ -714,7 +813,23 @@ async fn try_spawn_current_player(
                 display_name = %display_name,
                 duration_seconds = duration,
             );
-            *current_player = Some(std::sync::Arc::new(player));
+            let player = std::sync::Arc::new(player);
+            // Seed the state slot with the known duration so the UI's
+            // first paint shows a non-zero scrub track.
+            {
+                let mut g = player_state.lock().expect("player_state poisoned");
+                g.duration_seconds = duration;
+                g.position_seconds = 0.0;
+                g.is_playing = false;
+                g.last_seek_at = None;
+            }
+            spawn_position_poll(
+                rt_for_poll,
+                player.clone(),
+                player_state.clone(),
+                shutdown_tx_for_poll.subscribe(),
+            );
+            *current_player = Some(player);
         }
         Ok(Err(e)) => {
             tracing::warn!(

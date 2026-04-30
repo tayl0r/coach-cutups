@@ -10,10 +10,22 @@ export component MainWindow inherits Window {
     // FrameSink. Source-fit "contain" keeps aspect ratio.
     in property <image> source-frame;
 
+    // Phase 7 Task 5: transport state, written by the position-poll
+    // task at ~10 Hz, displayed by the UI at 30 Hz.
+    in property <bool> is-playing: false;
+    in property <float> position-seconds: 0;
+    in property <float> duration-seconds: 0;
+
     callback new-project-clicked();
     callback open-project-clicked();
     callback add-source-video-clicked();
     callback quit-clicked();
+    callback play-pause-clicked();
+    // accurate=false during drag; accurate=true on release. UI dispatches
+    // both via two separate callbacks so the bus can route to different
+    // GST_SEEK_FLAG values.
+    callback scrub-dragged(float);
+    callback scrub-released(float);
 
     MenuBar {
         Menu {
@@ -37,12 +49,11 @@ export component MainWindow inherits Window {
         }
     }
 
-    // Source video surface fills the window; transport bar (Task 5)
-    // will land below this at the bottom edge.
+    // Source video surface — fills above the transport bar.
     Image {
         x: 0; y: 0;
         width: parent.width;
-        height: parent.height;
+        height: parent.height - 56px;
         image-fit: contain;
         source: source-frame;
     }
@@ -64,5 +75,101 @@ export component MainWindow inherits Window {
         wrap: word-wrap;
         width: parent.width - 32px;
     }
-}
 
+    // Transport bar at the bottom: play/pause + custom scrub track +
+    // position label.
+    Rectangle {
+        x: 0;
+        y: parent.height - 56px;
+        width: parent.width;
+        height: 56px;
+        background: #1a1a1a;
+
+        play-button := Rectangle {
+            x: 12px;
+            y: (parent.height - self.height) / 2;
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            background: play-area.pressed ? #303030 : (play-area.has-hover ? #2a2a2a : transparent);
+
+            Text {
+                text: is-playing ? "❚❚" : "▶";
+                font-size: 18px;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+
+            play-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.play-pause-clicked(); }
+            }
+        }
+
+        // Custom scrubber: a fill bar inside a track Rectangle, with a
+        // TouchArea overlay handling drag + release. Slint 1.16's
+        // built-in Slider doesn't expose pressed/released as separate
+        // events, which the hybrid-seek policy needs.
+        track := Rectangle {
+            x: 56px;
+            y: (parent.height - 6px) / 2;
+            width: time-label.x - self.x - 12px;
+            height: 6px;
+            border-radius: 3px;
+            background: #2a2a2a;
+
+            // Played fill
+            Rectangle {
+                x: 0;
+                y: 0;
+                height: parent.height;
+                width: parent.width * (root.duration-seconds > 0
+                    ? root.position-seconds / root.duration-seconds
+                    : 0);
+                border-radius: 3px;
+                background: #4a90e2;
+            }
+
+            scrub-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                        if (root.duration-seconds > 0) {
+                            root.scrub-released(self.mouse-x / self.width * root.duration-seconds);
+                        }
+                    }
+                }
+                moved => {
+                    if (self.pressed && root.duration-seconds > 0) {
+                        root.scrub-dragged(self.mouse-x / self.width * root.duration-seconds);
+                    }
+                }
+            }
+        }
+
+        // Position / duration label, mm:ss format. Slint expressions
+        // don't have a built-in mm:ss formatter; we inline the math.
+        time-label := Text {
+            x: parent.width - self.width - 12px;
+            y: (parent.height - self.height) / 2;
+            text: format-mmss(root.position-seconds) + " / " + format-mmss(root.duration-seconds);
+            font-size: 13px;
+            color: #cccccc;
+            font-family: "Menlo";
+        }
+    }
+
+    // mm:ss formatter as a pure function. Slint 1.16 supports
+    // `function` items for this.
+    function format-mmss(t: float) -> string {
+        if (t < 0) {
+            return "0:00";
+        }
+        return floor(t / 60) + ":" + (mod(floor(t), 60) < 10 ? "0" : "") + mod(floor(t), 60);
+    }
+}
