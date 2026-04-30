@@ -128,6 +128,32 @@ pub fn run(
         });
     });
 
+    // Skip ±3s / ±10s buttons + Left/Right keyboard. UI reads the
+    // current position-seconds and dispatches Seek with accurate=true
+    // so the user lands exactly delta seconds away (within decoder
+    // tolerance — ~50ms on modern HW).
+    let bus_for_skip = bus.clone();
+    let rt_for_skip = rt.clone();
+    let weak_for_skip = window.as_weak();
+    window.on_skip_clicked(move |delta_seconds: i32| {
+        let bus = bus_for_skip.clone();
+        let current = weak_for_skip
+            .upgrade()
+            .map(|w| w.get_position_seconds())
+            .unwrap_or(0.0) as f64;
+        let target = (current + delta_seconds as f64).max(0.0);
+        rt_for_skip.spawn(async move {
+            bus.send(
+                UI_COMMAND_ID.into(),
+                Command::Seek {
+                    seconds: target,
+                    accurate: true,
+                },
+            )
+            .await;
+        });
+    });
+
     // Scrub during drag: keyframe-snap seek for snappy preview.
     let bus_for_drag = bus.clone();
     let rt_for_drag = rt.clone();

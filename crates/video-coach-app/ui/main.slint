@@ -26,6 +26,14 @@ export component MainWindow inherits Window {
     // GST_SEEK_FLAG values.
     callback scrub-dragged(float);
     callback scrub-released(float);
+    // Phase 7 Task 6: skip buttons + keyboard shortcuts. delta-seconds
+    // can be positive or negative; the UI handler resolves the new
+    // position by adding delta to the current position-seconds.
+    callback skip-clicked(int);
+
+    // Capture keyboard focus at root so Space / arrow keys hit the
+    // transport handlers regardless of which TouchArea last clicked.
+    forward-focus: keyscope;
 
     MenuBar {
         Menu {
@@ -46,6 +54,26 @@ export component MainWindow inherits Window {
                 title: "Quit";
                 activated => { root.quit-clicked(); }
             }
+        }
+    }
+
+    keyscope := FocusScope {
+        width: 100%;
+        height: 100%;
+        key-pressed(event) => {
+            if (event.text == " ") {
+                root.play-pause-clicked();
+                return accept;
+            }
+            if (event.text == Key.LeftArrow) {
+                root.skip-clicked(event.modifiers.shift ? -10 : -3);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.skip-clicked(event.modifiers.shift ? 10 : 3);
+                return accept;
+            }
+            return reject;
         }
     }
 
@@ -85,8 +113,54 @@ export component MainWindow inherits Window {
         height: 56px;
         background: #1a1a1a;
 
-        play-button := Rectangle {
+        // Skip −10s
+        skip-back-10 := Rectangle {
             x: 12px;
+            y: (parent.height - self.height) / 2;
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            background: sb10-area.pressed ? #303030 : (sb10-area.has-hover ? #2a2a2a : transparent);
+            Text {
+                text: "⏪";
+                font-size: 14px;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+            sb10-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.skip-clicked(-10); }
+            }
+        }
+        // Skip −3s
+        skip-back-3 := Rectangle {
+            x: skip-back-10.x + skip-back-10.width + 4px;
+            y: (parent.height - self.height) / 2;
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            background: sb3-area.pressed ? #303030 : (sb3-area.has-hover ? #2a2a2a : transparent);
+            Text {
+                text: "−3";
+                font-size: 12px;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+            sb3-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.skip-clicked(-3); }
+            }
+        }
+        play-button := Rectangle {
+            x: skip-back-3.x + skip-back-3.width + 4px;
             y: (parent.height - self.height) / 2;
             width: 32px;
             height: 32px;
@@ -109,13 +183,59 @@ export component MainWindow inherits Window {
                 clicked => { root.play-pause-clicked(); }
             }
         }
+        // Skip +3s
+        skip-fwd-3 := Rectangle {
+            x: play-button.x + play-button.width + 4px;
+            y: (parent.height - self.height) / 2;
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            background: sf3-area.pressed ? #303030 : (sf3-area.has-hover ? #2a2a2a : transparent);
+            Text {
+                text: "+3";
+                font-size: 12px;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+            sf3-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.skip-clicked(3); }
+            }
+        }
+        // Skip +10s
+        skip-fwd-10 := Rectangle {
+            x: skip-fwd-3.x + skip-fwd-3.width + 4px;
+            y: (parent.height - self.height) / 2;
+            width: 32px;
+            height: 32px;
+            border-radius: 4px;
+            background: sf10-area.pressed ? #303030 : (sf10-area.has-hover ? #2a2a2a : transparent);
+            Text {
+                text: "⏩";
+                font-size: 14px;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+            sf10-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.skip-clicked(10); }
+            }
+        }
 
         // Custom scrubber: a fill bar inside a track Rectangle, with a
         // TouchArea overlay handling drag + release. Slint 1.16's
         // built-in Slider doesn't expose pressed/released as separate
         // events, which the hybrid-seek policy needs.
         track := Rectangle {
-            x: 56px;
+            x: skip-fwd-10.x + skip-fwd-10.width + 12px;
             y: (parent.height - 6px) / 2;
             width: time-label.x - self.x - 12px;
             height: 6px;
