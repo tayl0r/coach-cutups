@@ -5,6 +5,8 @@ pub mod compose;
 pub mod fixture_source;
 pub mod recording;
 pub mod source;
+#[cfg(feature = "media")]
+pub mod source_player;
 
 /// Initialize GStreamer once per process. Idempotent — safe to call from
 /// every entry point. Required before any pipeline construction.
