@@ -128,6 +128,23 @@ pub fn run(
         });
     });
 
+    // Volume slider: live-update player. Persistence to
+    // project.preferences happens inside the SetScanVolume bus
+    // handler. Slint slider's `changed` fires per-tick during drag,
+    // so this is the live update path AND the persist path; the
+    // inline writes are cheap (project.json is small + atomic rename).
+    // Future patch can debounce if profiling shows it matters.
+    let bus_for_vol = bus.clone();
+    let rt_for_vol = rt.clone();
+    window.on_scan_volume_changed(move |value: f32| {
+        let bus = bus_for_vol.clone();
+        let v = value as f64;
+        rt_for_vol.spawn(async move {
+            bus.send(UI_COMMAND_ID.into(), Command::SetScanVolume { value: v })
+                .await;
+        });
+    });
+
     // Skip ±3s / ±10s buttons + Left/Right keyboard. UI reads the
     // current position-seconds and dispatches Seek with accurate=true
     // so the user lands exactly delta seconds away (within decoder

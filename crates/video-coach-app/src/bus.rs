@@ -746,6 +746,20 @@ async fn handle(
                 // to spawn_blocking. The volume name lookup is mutex'd
                 // inside GStreamer.
                 player.set_volume(value);
+                // Persist to project.preferences.scan_volume so the
+                // setting survives across sessions. Phase 7 MVP writes
+                // on every change — project.json is small and atomic
+                // rename is cheap. Future patch can debounce.
+                if let Some((project, folder)) = current.as_mut() {
+                    project.preferences.scan_volume = value;
+                    let project_clone = project.clone();
+                    let folder_clone = folder.clone();
+                    let _ = tokio::task::spawn_blocking(move || {
+                        let _ =
+                            video_coach_core::project_store::write(&project_clone, &folder_clone);
+                    })
+                    .await;
+                }
                 CommandReply {
                     ok: true,
                     error: None,

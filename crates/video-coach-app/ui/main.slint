@@ -15,6 +15,10 @@ export component MainWindow inherits Window {
     in property <bool> is-playing: false;
     in property <float> position-seconds: 0;
     in property <float> duration-seconds: 0;
+    // Phase 7 Task 7. UI-side defaults to 1.0; we don't hydrate from
+    // project.preferences in Phase 7 MVP, so the slider starts maxed
+    // each session. Phase 8+ can add a project-loaded → set this hook.
+    in-out property <float> scan-volume: 1.0;
 
     callback new-project-clicked();
     callback open-project-clicked();
@@ -30,6 +34,7 @@ export component MainWindow inherits Window {
     // can be positive or negative; the UI handler resolves the new
     // position by adding delta to the current position-seconds.
     callback skip-clicked(int);
+    callback scan-volume-changed(float);
 
     // Capture keyboard focus at root so Space / arrow keys hit the
     // transport handlers regardless of which TouchArea last clicked.
@@ -275,12 +280,51 @@ export component MainWindow inherits Window {
         // Position / duration label, mm:ss format. Slint expressions
         // don't have a built-in mm:ss formatter; we inline the math.
         time-label := Text {
-            x: parent.width - self.width - 12px;
+            x: volume-track.x - self.width - 16px;
             y: (parent.height - self.height) / 2;
             text: format-mmss(root.position-seconds) + " / " + format-mmss(root.duration-seconds);
             font-size: 13px;
             color: #cccccc;
             font-family: "Menlo";
+        }
+
+        // Scan-volume slider (right edge). Custom-built like the
+        // scrubber: track + fill + TouchArea, so drag handlers stay
+        // consistent with the rest of the bar. Slint's built-in Slider
+        // also works here but using TouchArea keeps the visual style
+        // matched.
+        volume-track := Rectangle {
+            x: parent.width - self.width - 12px;
+            y: (parent.height - 6px) / 2;
+            width: 96px;
+            height: 6px;
+            border-radius: 3px;
+            background: #2a2a2a;
+
+            Rectangle {
+                x: 0; y: 0;
+                width: parent.width * root.scan-volume;
+                height: parent.height;
+                border-radius: 3px;
+                background: #888;
+            }
+
+            volume-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                moved => {
+                    if (self.pressed) {
+                        root.scan-volume = max(0, min(1, self.mouse-x / self.width));
+                        root.scan-volume-changed(root.scan-volume);
+                    }
+                }
+                pointer-event(event) => {
+                    if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                        root.scan-volume = max(0, min(1, self.mouse-x / self.width));
+                        root.scan-volume-changed(root.scan-volume);
+                    }
+                }
+            }
         }
     }
 
