@@ -81,7 +81,9 @@ pub fn run(
             // IFileOpenDialog on Windows. Cancellation returns None;
             // bail silently.
             let chosen = rfd::AsyncFileDialog::new().pick_folder().await;
-            let Some(folder) = chosen else { return; };
+            let Some(folder) = chosen else {
+                return;
+            };
             let path = folder.path().to_string_lossy().into_owned();
             let path_for_title = path.clone();
             let reply = bus
@@ -135,8 +137,7 @@ mod tests {
         // same binary (cargo test runs them serially in the same process by
         // default); subsequent calls are cheap no-ops.
         i_slint_backend_testing::init_no_event_loop();
-        let window =
-            MainWindow::new().expect("MainWindow::new must succeed under testing backend");
+        let window = MainWindow::new().expect("MainWindow::new must succeed under testing backend");
         assert_eq!(
             window.get_project_title().as_str(),
             "No project open",

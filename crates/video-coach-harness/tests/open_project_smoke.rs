@@ -57,7 +57,11 @@ async fn open_project_emits_event_with_name() -> anyhow::Result<()> {
     );
 
     let status = app.quit().await?;
-    assert!(status.success(), "app should exit cleanly, got {:?}", status);
+    assert!(
+        status.success(),
+        "app should exit cleanly, got {:?}",
+        status
+    );
     Ok(())
 }
 
