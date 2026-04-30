@@ -56,7 +56,7 @@ IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.m
       probe_duration via Discoverer + pathdiff::diff_paths + project_store
       ::write. State refactor current_project → current: (Project, PathBuf).
       record_f64 added to event visitor. 1 new harness E2E.
-- [x] Task 3: Wire bus → SourcePlayer (Play/Pause/Seek/SetScanVolume) (commit TBD)
+- [x] Task 3: Wire bus → SourcePlayer (Play/Pause/Seek/SetScanVolume) (commit e107240)
       Bus task gains current_player: Option<Arc<SourcePlayer>>. FrameSinkFactory
       type so the UI can inject a real sink later. Auto-spawns the player when
       OpenProject/AddSourceVideo brings sourceVideos[0] into existence. New
