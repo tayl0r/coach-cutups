@@ -112,7 +112,7 @@ docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md
 In progress. Plan:
 docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
 
-- [x] Task 0: Preflight — AppMode + new command shapes + tracing targets
+- [x] Task 0: Preflight — AppMode + new command shapes + tracing targets (commit 3a95bcc)
       StartClipRecording { playhead_snapshot_seconds }, StopClipRecording,
       AppendStroke { points_json }. AppMode enum
       (Scanning|RecordingStarting|Recording, snake_case serde).
