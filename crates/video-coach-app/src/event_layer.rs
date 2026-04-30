@@ -23,6 +23,11 @@ const FORWARDED_TARGETS: &[&str] = &[
     // open/close, `player.state` covers play/pause/seeked/position.
     "player.lifecycle",
     "player.state",
+    // Phase 8 — clip-recording mode transitions (mode.changed,
+    // recording.started, recording.stopped, recording.failed). Distinct
+    // from the lower-level "recording" target which carries the
+    // capture-pipeline lifecycle events (recording.encoder_picked etc).
+    "recording.lifecycle",
 ];
 
 #[cfg(feature = "control-socket")]

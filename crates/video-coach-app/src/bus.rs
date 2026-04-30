@@ -70,6 +70,55 @@ pub enum Command {
     SetScanVolume {
         value: f64,
     },
+    /// Phase 8. Begin a clip recording: pause the source player, snapshot
+    /// the playhead, derive a clip filename + path under
+    /// `<project>/recordings/`, and start the platform-default capture
+    /// pipeline. `playhead_snapshot_seconds` is captured by the UI
+    /// BEFORE this command is dispatched (adversarial fix #1) — the bus
+    /// uses it directly as `start_source_seconds` rather than re-reading
+    /// after the async `player.pause()` round-trip (which can take
+    /// 10–200 ms during which the source has moved on).
+    StartClipRecording {
+        playhead_snapshot_seconds: f64,
+    },
+    /// Phase 8. Stop the active clip recording, flush the qtmux moov
+    /// atom, finalize a `Clip` record, append it to `project.clips`,
+    /// and persist `project.json`. Transitions mode back to Scanning.
+    StopClipRecording,
+    /// Phase 8. Append a stroke event to the in-progress clip
+    /// recording's event log. `points_json` is a JSON-encoded array of
+    /// `{ "x": f64, "y": f64, "t": f64 }` entries; coordinates are in
+    /// `[0, 1]` against the displayed video rect (post-letterbox), `t`
+    /// is seconds since the recording's `t0`. Errors if no clip
+    /// recording is in progress (`current_mode != Recording`).
+    AppendStroke {
+        points_json: String,
+    },
+}
+
+/// Phase 8. Mutually-exclusive UI/bus modes. Mirrors v1's
+/// `App/Models/AppMode.swift` enum 1:1 (modulo preview cases which
+/// land in Phase 9).
+///
+/// Used by the bus task as `current_mode` (Task 1) and serialized as a
+/// string field on `mode.changed` events. The Task-0 stub for the new
+/// commands doesn't reference it yet; the `dead_code` allow keeps the
+/// no-default-features build warning-free until Task 1 lands.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AppMode {
+    /// Idle: source player is mounted, transport runs, R-press starts a
+    /// recording.
+    Scanning,
+    /// `R` pressed: capture pipeline is being constructed (camera
+    /// permission prompts may pop here on macOS first run). The
+    /// transport bar shows a yellow "Preparing…" indicator. Mid-
+    /// transition presses of `R` are ignored.
+    RecordingStarting,
+    /// Capture pipeline is recording; stroke events accumulate into the
+    /// in-progress clip; second `R` press stops + finalizes the clip.
+    Recording,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -766,6 +815,31 @@ async fn handle(
                 }
             }
         }
+        Command::StartClipRecording {
+            playhead_snapshot_seconds,
+        } => {
+            // Task 0 stub: serde shape only. Real handler lands in Task 1.
+            let _ = playhead_snapshot_seconds;
+            CommandReply {
+                ok: false,
+                error: Some("start_clip_recording: not yet implemented".into()),
+            }
+        }
+        Command::StopClipRecording => {
+            // Task 0 stub: serde shape only. Real handler lands in Task 1.
+            CommandReply {
+                ok: false,
+                error: Some("stop_clip_recording: not yet implemented".into()),
+            }
+        }
+        Command::AppendStroke { points_json } => {
+            // Task 0 stub: serde shape only. Real handler lands in Task 4.
+            let _ = points_json;
+            CommandReply {
+                ok: false,
+                error: Some("append_stroke: not yet implemented".into()),
+            }
+        }
     }
 }
 
@@ -1048,6 +1122,77 @@ mod tests {
             Command::OpenProject { path } => assert_eq!(path, "/tmp/proj"),
             _ => panic!("expected OpenProject"),
         }
+    }
+
+    #[test]
+    fn start_clip_recording_serde_roundtrips() {
+        let cmd = Command::StartClipRecording {
+            playhead_snapshot_seconds: 12.5,
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "start_clip_recording");
+        assert_eq!(v["playhead_snapshot_seconds"], 12.5);
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::StartClipRecording {
+                playhead_snapshot_seconds,
+            } => {
+                assert!((playhead_snapshot_seconds - 12.5).abs() < f64::EPSILON);
+            }
+            _ => panic!("expected StartClipRecording"),
+        }
+    }
+
+    #[test]
+    fn stop_clip_recording_serializes_to_bare_tag() {
+        let cmd = Command::StopClipRecording;
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v, serde_json::json!({"cmd": "stop_clip_recording"}));
+
+        let cmd: Command =
+            serde_json::from_value(serde_json::json!({"cmd": "stop_clip_recording"})).unwrap();
+        assert!(matches!(cmd, Command::StopClipRecording));
+    }
+
+    #[test]
+    fn append_stroke_serde_roundtrips() {
+        let cmd = Command::AppendStroke {
+            points_json: r#"[{"x":0.5,"y":0.5,"t":0.1}]"#.into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "append_stroke");
+        assert_eq!(v["points_json"], r#"[{"x":0.5,"y":0.5,"t":0.1}]"#);
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::AppendStroke { points_json } => {
+                assert_eq!(points_json, r#"[{"x":0.5,"y":0.5,"t":0.1}]"#);
+            }
+            _ => panic!("expected AppendStroke"),
+        }
+    }
+
+    #[test]
+    fn app_mode_serializes_with_snake_case() {
+        // AppMode is published over the bus / control socket as the
+        // value of a "mode" field on mode.changed events; verify the
+        // serde shape directly.
+        assert_eq!(
+            serde_json::to_value(AppMode::Scanning).unwrap(),
+            serde_json::Value::String("scanning".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(AppMode::RecordingStarting).unwrap(),
+            serde_json::Value::String("recording_starting".into()),
+        );
+        assert_eq!(
+            serde_json::to_value(AppMode::Recording).unwrap(),
+            serde_json::Value::String("recording".into()),
+        );
+        let m: AppMode = serde_json::from_value(serde_json::Value::String("recording".into()))
+            .expect("snake_case roundtrip");
+        assert_eq!(m, AppMode::Recording);
     }
 
     #[test]

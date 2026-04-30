@@ -61,6 +61,49 @@ pub fn new_player_state() -> PlayerStateSlot {
     Arc::new(Mutex::new(PlayerStateSlotData::default()))
 }
 
+/// Phase 8: recording-mode state shared between the bus task (writer,
+/// at mode transitions) and the UI's display-rate timer (reader, 30
+/// Hz). Carries the current `AppMode` plus the host-time anchor for
+/// the in-progress recording so the UI can compute elapsed `M:SS`
+/// without a separate poll task.
+///
+/// Read order in the UI timer: this slot is read BEFORE
+/// `PlayerStateSlot` so a transition out of `Recording` (REC indicator
+/// clears) lands in the same frame as the player resuming, rather than
+/// the player updating one tick before the indicator (visually
+/// distracting). Adversarial-review fix #8.
+#[derive(Debug, Clone, Copy)]
+pub struct RecordingStateSlotData {
+    pub mode: RecordingMode,
+    /// `Some(t0)` while `mode != Scanning`; `None` otherwise. Used by
+    /// the UI to compute elapsed seconds at display rate.
+    pub recording_started_at_host: Option<Instant>,
+}
+
+/// Mirror of `bus::AppMode` that doesn't drag the bus module's serde
+/// derives into `frame_sink`. Kept in lockstep with `AppMode`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecordingMode {
+    Scanning,
+    RecordingStarting,
+    Recording,
+}
+
+impl Default for RecordingStateSlotData {
+    fn default() -> Self {
+        Self {
+            mode: RecordingMode::Scanning,
+            recording_started_at_host: None,
+        }
+    }
+}
+
+pub type RecordingStateSlot = Arc<Mutex<RecordingStateSlotData>>;
+
+pub fn new_recording_state() -> RecordingStateSlot {
+    Arc::new(Mutex::new(RecordingStateSlotData::default()))
+}
+
 #[cfg(feature = "media")]
 pub struct SlintFrameSink {
     slot: FrameSlot,

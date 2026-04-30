@@ -108,9 +108,27 @@ docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md
       VIDEO_COACH_NO_AUDIO env)
 
 
-## Phase 8+ — pending
+## Phase 8 — recording integration
+In progress. Plan:
+docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
+
+- [x] Task 0: Preflight — AppMode + new command shapes + tracing targets
+      StartClipRecording { playhead_snapshot_seconds }, StopClipRecording,
+      AppendStroke { points_json }. AppMode enum
+      (Scanning|RecordingStarting|Recording, snake_case serde).
+      RecordingStateSlot in frame_sink.rs alongside PlayerStateSlot.
+      "recording.lifecycle" added to FORWARDED_TARGETS. 4 new serde unit
+      tests. Stub handler arms return "not yet implemented" until Task 1.
+- [ ] Task 1: AppMode state machine + StartClipRecording handler
+- [ ] Task 2: PlatformDefault source factory
+- [ ] Task 3: UI — R key + REC indicator + elapsed timer
+- [ ] Task 4: Stroke event capture (events only, no drawing)
+- [ ] Task 5: Harness E2E — full record-clip flow against fixture
+- [ ] Task 6: Closeout
+
+
+## Phase 9+ — pending
 Per the design doc:
-  Phase 8  Recording integration (R-press, capture lifecycle, strokes)
   Phase 9  Clip preview integration + visual parity test
   Phase 10 Export sheet UI
   Phase 11 Polish, packaging, cross-platform CI green
