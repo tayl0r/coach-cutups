@@ -383,6 +383,87 @@ user sees the "← Source" button and clicks it, then clicks the new
 clip. Phase 10/11 can add auto-close-and-reopen; the cost of
 refusing is one extra click that's at least obvious.
 
+**23. Source decoder seek policy is restrictive — no per-tick
+re-seeks.** Task 2's 30 Hz driver step 3.e ("ensure source decoder
+is positioned at `source_time_at(...)`") is ambiguous and a naive
+implementer could re-seek every tick when there's any drift. On a
+long-GOP source (`fixtures/source-1080p.mp4`'s GOP is ~5s — see
+Phase 7 commit notes), every drift-correcting seek dumps 0–5s of
+decoded pre-roll and the next tick has no fresh frame. The driver
+must seek the source decoder ONLY in three cases:
+- (a) Initial mount in `PreviewPipeline::open` (seek to the first
+  segment's `source_start`).
+- (b) Entering a `Play` segment after a `Freeze` segment (seek to
+  the new Play's `source_start`, accurate=true).
+- (c) A user `Seek` command on the preview pipeline (seek to
+  `source_time_at(clip, target_record_time)`; if target lands in a
+  Freeze segment, NO source seek — switch to frozen-frame mode for
+  that segment).
+
+In steady-state `Play` the source pipeline runs at 1× rate and the
+driver consumes whatever the appsink slot holds at tick time. The
+appsink and the 30 Hz driver are running on independent clocks;
+brief drift between them (<= one tick of frame-time) is invisible
+and self-corrects on the next decoded frame. NEVER seek "to fix
+drift" inside a Play segment.
+
+During a `Freeze` segment the driver ignores the source appsink slot
+entirely and uses the cached frozen frame. The source pipeline can
+be left PLAYING during the Freeze (cheap; we throw the frames away)
+or paused as an optimization — pick one and document it; pausing
+adds state-transition latency at Freeze→Play boundaries (need to
+PLAY + seek before the first useful frame), so leaving it PLAYING
+and seeking on the boundary is simpler.
+
+**24. `compose_tick` is a free function, called by both the preview
+pipeline driver AND the parity test.** As specced, Task 6 builds a
+`PreviewPipeline` from synthetic `Frame`s, but `PreviewPipeline::
+open` takes file paths and spins up GStreamer chains. The two are
+incompatible. Fix: in Task 1, extract the per-tick compose+push
+logic out of any GStreamer wrapper into a free function:
+```rust
+pub fn compose_tick(
+    compositor: &Compositor,
+    source: &Frame,
+    webcam: &Frame,
+    strokes: &[VisibleStroke],
+) -> Result<Frame, CompositorError>;
+```
+This is essentially a thin wrapper around `compositor.compose(...)`
+— maybe identical to it — but naming it as the canonical "one tick
+of preview/export work" makes the parity test obvious: Path A and
+Path B both call `compose_tick(...)` with the SAME inputs, byte-for-
+byte equality is automatic. No GStreamer in the parity test.
+PreviewPipeline's driver also calls `compose_tick(...)` per tick.
+Phase 5's `compose.rs::compose_two_files` migrates to call
+`compose_tick(...)` too, so all three paths share one entry point.
+
+**25. Don't canonicalize paths per command — canonicalize once at
+OpenProject and join from there.** Task 3 step 5 originally said
+`canonicalize(folder.join(...))`. The project folder is already
+canonicalized at OpenProject/NewProject time (Phase 7 commit
+e107240 — required on macOS for `/var/folders → /private/var/
+folders`). Source/recording paths are derived by joining from the
+canonical folder; the joined paths are also canonical with no
+further work. Per-command canonicalize is wasted IO + risks
+spurious "file not found" failures during racy test teardown. State:
+`source_path = project_folder.join(source_ref.relative_path);
+recording_path = project_folder.join("recordings")
+.join(clip.recording_filename);` — no `.canonicalize()` on either.
+Validate file existence with `is_file()` if needed, but don't re-
+resolve symlinks.
+
+**26. Harness E2E asserts `frames_pushed > 0`.** Task 5's harness
+test currently ends at `wait_for_event("clip_preview.closed")`,
+which proves lifecycle round-trips but NOT that the bus correctly
+wired the FrameSink active-flag handover or that the preview
+pipeline actually pushed pixels. Add a `frames_pushed: u64` field
+on the `clip_preview.closed` event (counted by the FrameSink wrapper
+in the bus task — every `push_frame` call increments an
+`Arc<AtomicU64>`). Task 5 asserts the count is > 10 after a 1s
+preview play. Costs three lines; catches the entire class of "bus
+wiring works for control but the pixel path is broken" regressions.
+
 ---
 
 ## Tasks (~7 total — split across 4-5 sub-agent dispatches per fix #2)
@@ -437,11 +518,17 @@ shape as `RecordingStateSlot`). Hydration in handlers lands in
 Task 3 (per fix #13: OpenProject populates, NewProject clears,
 StopClipRecording appends).
 
-**FrameSink active flag (per fix #3).** Modify `SlintFrameSink` and
-`NullFrameSink` so each carries an `active: Arc<AtomicBool>` (default
-true). `push_frame` returns early when active is false. Add
-constructor that returns the sink + a clone of the flag handle so
-the bus can flip it.
+**FrameSink active flag (per fix #3) + frame counter (per fix #26).**
+Modify `SlintFrameSink` and `NullFrameSink` so each carries:
+- `active: Arc<AtomicBool>` (default true). `push_frame` returns
+  early when false.
+- `frames_pushed: Arc<AtomicU64>`. `push_frame` increments after the
+  active check passes, so the counter reflects "frames that landed in
+  the slot", not "frames the GStreamer thread tried to push".
+
+The mount handle exposes both: the bus can flip the flag and read
+the counter (drained on `clip_preview.closed` to populate the
+event's `frames_pushed` field).
 
 **`FrameSinkFactory` becomes `FrameMountFactory`** that returns
 `(Box<dyn FrameSink>, Arc<AtomicBool>)` — or wrap into a
@@ -481,6 +568,26 @@ pub fn compose(
     strokes: &[VisibleStroke],
 ) -> Result<Frame, CompositorError>;
 ```
+
+**Free function `compose_tick` (per fix #24):** export from
+`video-coach-compositor`'s lib.rs:
+```rust
+pub fn compose_tick(
+    compositor: &Compositor,
+    source: &Frame,
+    webcam: &Frame,
+    strokes: &[VisibleStroke],
+) -> Result<Frame, CompositorError> {
+    compositor.compose(source, webcam, strokes)
+}
+```
+Trivial wrapper today, but it's the **single canonical entry point**
+that `PreviewPipeline`'s 30 Hz driver, `compose.rs::compose_two_
+files`'s per-source-frame loop, and Task 6's parity test all call.
+Future per-tick orchestration (frame timing, stats counters, color-
+space conversions) lands here without forking. `compose.rs`'s
+existing call site updates to `compose_tick(&comp, &source_frame,
+&webcam_frame, &[])`.
 
 **Stroke pass:** new wgpu pipeline that takes stroke vertices in
 [0,1] space (per fix #4 — Phase 9 ships only 16:9→16:9, so no
@@ -627,10 +734,14 @@ playback. No display needed.
    from Phase 8 — extend `is_recording()` to `is_busy()` that returns
    true if mode != Scanning OR recording_clip is some.
 4. Find clip by id in `project.clips`. Error if missing.
-5. Resolve `source_path = canonicalize(folder.join(source_ref
-   .relative_path))`. Resolve `recording_path =
-   folder.join("recordings").join(clip.recording_filename)
-   .canonicalize()`. Look up `source_duration_seconds` from
+5. Per fix #25: resolve `source_path = project_folder.join(
+   source_ref.relative_path)` and `recording_path = project_folder
+   .join("recordings").join(clip.recording_filename)` — NO per-call
+   `.canonicalize()` (project_folder was canonicalized once at
+   OpenProject/NewProject time, joined paths inherit canonicality).
+   Validate `recording_path.is_file()` — if missing, fail with a
+   clean `clip_preview.failed` event before spawning the pipeline.
+   Look up `source_duration_seconds` from
    `project.source_videos[clip.source_index].duration_seconds`.
 6. **Flip player_mount.active=false** (per fix #3) BEFORE pausing —
    even if pause is async, no more frames reach the slot once the
@@ -654,9 +765,12 @@ playback. No display needed.
      #16) that Phase 7 uses — no separate slot.
    - `tracing::info!(target: "clip_preview.lifecycle", event =
      "clip_preview.opened", clip_id, source = ..., recording = ...)`.
-10. Failure: flip player_mount.active=true (rollback); emit
-    `clip_preview.failed` with the error; mode stays Scanning;
-    player stays paused (won't auto-resume per fix #9).
+10. Failure: flip player_mount.active=true (rollback);
+    `current_preview_mount = None` (defensive — don't leave a
+    stale mount handle that ClosePreview would later flip);
+    `current_preview = None`; emit `clip_preview.failed` with the
+    error; mode stays Scanning; player stays paused (won't auto-
+    resume per fix #9).
 
 **ClosePreview handler:**
 1. Refuse if mode isn't PreviewClip.
@@ -673,7 +787,10 @@ playback. No display needed.
    FrameSink can write again when the user resumes. Player is paused
    (fix #9); it won't push until the user re-presses Space, but the
    slot needs to be writable when they do.
-7. `tracing::info!(... event = "clip_preview.closed" ...)`.
+7. `tracing::info!(target: "clip_preview.lifecycle", event =
+   "clip_preview.closed", frames_pushed = preview_mount
+   .frames_pushed.load(SeqCst))`. Per fix #26 — the harness E2E
+   asserts this is > 10 after a 1s preview play.
 
 **Existing `Play` / `Pause` / `Seek` commands**: route to
 `current_preview` when in `PreviewClip` mode, to `current_player`
@@ -728,12 +845,18 @@ PreviewClip mode (otherwise no-op). FocusScope handles this.
 5. Send Play (Phase 7's `play` command).
 6. Sleep 1s.
 7. Send `close_preview`.
-8. Wait for `clip_preview.closed`.
+8. Wait for `clip_preview.closed`. Per fix #26: assert the event's
+   `frames_pushed` field is > 10 (≥ ~one third of a 1s play at the
+   pinned 30 fps driver rate, accounting for first-frame preroll +
+   tear-down). This catches end-to-end "bus wired the lifecycle but
+   the pixel path is broken" regressions that the unit-level smoke
+   misses (because the unit test bypasses the bus's mount handover).
 9. Quit cleanly.
 
-The full frame-counting parity is in the unit-level
-`preview_pipeline_smoke` (Task 2). The harness test just verifies the
-control-plane lifecycle works end-to-end.
+The full per-frame parity verification is in the unit-level
+`preview_pipeline_smoke` (Task 2) and `preview_export_parity`
+(Task 6). The harness test verifies the control plane PLUS that
+pixels actually flowed end-to-end.
 
 **Update PROGRESS.txt + commit.**
 
@@ -742,34 +865,46 @@ control-plane lifecycle works end-to-end.
 ### Task 6: Single-frame preview-vs-export parity check
 
 **Files:**
-- Create: `crates/video-coach-media/tests/preview_export_parity.rs`.
+- Create: `crates/video-coach-compositor/tests/parity_smoke.rs`
+  (lives in compositor crate now — the test no longer needs
+  GStreamer/media, only `compose_tick` from fix #24).
 
-Per fix #21: builds **one** `Arc<Compositor>` and passes it to both
-call sites so byte-for-byte equality is achievable.
+Per fixes #21 + #24: both call sites use the SAME `Compositor`
+instance AND the SAME `compose_tick(...)` entry point, so byte-for-
+byte equality is automatic. No GStreamer in this test.
 
-1. Construct `let compositor = Arc::new(Compositor::new_headless()?)`.
-2. Build a fixed source `Frame` + webcam `Frame` (same fixtures as
-   the compositor's existing tests, or hand-rolled solid-color
-   frames).
-3. Build a hand-rolled `Clip` with one Stroke event that places a
-   stroke at a known position.
-4. **Path A**: `compositor.compose(&source, &webcam,
-   &visible_strokes(&clip, t))` directly.
-5. **Path B**: Construct a `PreviewPipeline` whose driver is forced
-   to emit exactly one frame at record_time `t` and then stop, using
-   the SAME `compositor` Arc. Capture the FrameSink output.
-6. Assert `path_a.pixels == path_b.pixels` (byte-for-byte).
+1. `let compositor = Compositor::new_headless()?;`
+2. Build hand-rolled solid-color `source` + `webcam` Frames + a
+   `&[VisibleStroke]` slice with one stroke at a known position.
+3. **Path A**: `compose_tick(&compositor, &source, &webcam, &strokes)`.
+4. **Path B**: same call. (The "two paths" framing collapses now
+   that both preview and export funnel through one entry point;
+   the test verifies the entry point is deterministic on the same
+   instance + same inputs across two back-to-back calls.)
+5. Assert `path_a.pixels == path_b.pixels` (byte-for-byte).
 
-If byte-for-byte proves flaky in CI across runs (driver pipeline
-cache state can flip 1-bit RGB values), downgrade to a tolerance
-diff (`(a as i16 - b as i16).abs() <= 2` per channel, fail if any
-channel exceeds). Fix #21 says the single-instance design SHOULD
-make byte-for-byte hold; if it doesn't, that's data worth knowing
-before Phase 10's full N-frame parity lands.
+The earlier framing of this test ("preview pipeline frame 0 vs
+direct compose call") was unimplementable as written (PreviewPipeline
+takes file paths, not Frames). Fix #24's `compose_tick` extraction
+is what makes the parity test trivially correct: BOTH the preview
+driver AND the export pipeline call `compose_tick`, so any future
+divergence requires forking that function — and this test would
+catch it instantly.
 
-This is the **Phase 9 down-payment on the visual parity test**. The
-full N-frame "preview hash == export hash" lands in Phase 10 once
-batch export is wired up.
+If byte-for-byte proves flaky in CI across runs (very unlikely with
+two back-to-back calls on the same instance, but possible with
+driver pipeline-cache state), downgrade to a tolerance diff
+(`(a as i16 - b as i16).abs() <= 2` per channel, fail if any
+channel exceeds). Sample assertions on specific pixels (one inside
+the stroke, one outside) make failures more diagnostic than a
+buffer-wide compare.
+
+The full N-frame "preview hash == export hash" parity lands in
+Phase 10 once batch export is wired up. **Phase 10 prerequisite
+(per fix #N2 / new fix #27 below):** export must also pin to 30 fps
+so preview-vs-export hash equality is achievable — currently
+`compose.rs::compose_two_files` runs source-driven (60 fps source =
+60 fps export) while preview is pinned 30 fps.
 
 **Update PROGRESS.txt + commit.**
 
@@ -811,6 +946,17 @@ batch export is wired up.
   ~5s windows. Phase 9 ships static strokes (visible at the right
   time per `visible_strokes_at`, then disappear). Animation is a
   Phase 11 polish item.
+
+- **Framerate alignment between preview and export.** Phase 9 pins
+  preview to 30 fps internal driver (fix #17) but Phase 5's
+  `compose_two_files` still runs source-driven (e.g. 60 fps in →
+  60 fps out). The "preview hash == export hash" goal of the
+  rewrite is unreachable until the two agree on a sampling rate.
+  Phase 10's batch-export task must pin export to 30 fps too (or
+  source-rate, with preview matching). Phase 9's single-frame
+  parity test (Task 6) sidesteps this by comparing one frame
+  through one shared entry point; the N-frame variant in Phase 10
+  is blocked on this alignment landing.
 
 ---
 
