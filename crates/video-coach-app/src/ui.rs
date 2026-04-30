@@ -96,16 +96,28 @@ pub fn run(
                 slint::invoke_from_event_loop(move || {
                     if let Some(w) = weak.upgrade() {
                         w.set_project_title(path_for_title.into());
+                        w.set_error_message("".into());
                     }
                 })
                 .ok();
             } else {
+                let err_text = reply
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "open_project failed (no error detail)".into());
                 tracing::warn!(
                     target: "ui",
                     error = ?reply.error,
                     path = %path,
                     "open_project failed",
                 );
+                let display = format!("Couldn't open {path}\n{err_text}");
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_error_message(display.into());
+                    }
+                })
+                .ok();
             }
         });
     });

@@ -4,6 +4,7 @@ export component MainWindow inherits Window {
     preferred-height: 800px;
 
     in property <string> project-title: "No project open";
+    in property <string> error-message: "";
 
     callback open-project-clicked();
     callback quit-clicked();
@@ -27,6 +28,16 @@ export component MainWindow inherits Window {
         y: 16px;
         text: project-title;
         font-size: 18px;
+    }
+
+    if error-message != "": Text {
+        x: 16px;
+        y: 48px;
+        text: error-message;
+        font-size: 14px;
+        color: #ff6464;
+        wrap: word-wrap;
+        width: parent.width - 32px;
     }
 }
 
