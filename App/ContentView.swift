@@ -11,6 +11,11 @@ struct ContentView: View {
     @Bindable var deviceCatalog: DeviceCatalog
 
     @State private var workspace = Workspace()
+    @State private var skipCoordinator = SkipCoordinator(burstWindowSeconds: 0.15)
+    @State private var skipDebounceTask: Task<Void, Never>?
+    /// Identity of the AVPlayer that the coordinator's current state belongs
+    /// to. When the active player changes (clip swap, preview close), reset.
+    @State private var skipCoordinatorPlayerID: ObjectIdentifier?
     @State private var selectedClipID: Clip.ID?
     @State private var appMode: AppMode = .scanning
     @State private var openProjectError: String?
@@ -433,9 +438,62 @@ struct ContentView: View {
 
     private func handleSkip(_ delta: Double) {
         guard let player = currentPlayer else { return }
-        let target = player.currentTime() + CMTime(seconds: delta, preferredTimescale: 600)
-        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
         if appMode == .recording { recordingController?.appendSkip(delta: delta) }
+
+        let pid = ObjectIdentifier(player)
+        if skipCoordinatorPlayerID != pid {
+            skipCoordinator.reset()
+            skipDebounceTask?.cancel()
+            skipDebounceTask = nil
+            skipCoordinatorPlayerID = pid
+        }
+
+        let now = CACurrentMediaTime()
+        let curr = player.currentTime().seconds
+        let durRaw = player.currentItem?.duration.seconds ?? .infinity
+        let dur = (durRaw.isFinite && durRaw > 0) ? durRaw : .greatestFiniteMagnitude
+
+        let decision = skipCoordinator.requestSkip(
+            deltaSeconds: delta,
+            currentPlayerTimeSeconds: curr.isFinite ? curr : 0,
+            clipDurationSeconds: dur,
+            nowMonotonicSeconds: now
+        )
+        applySkipDecision(decision, on: player)
+    }
+
+    private func applySkipDecision(_ decision: SkipDecision, on player: AVPlayer) {
+        if let s = decision.seek {
+            let t = CMTime(seconds: s.targetSeconds, preferredTimescale: 600)
+            let tol: CMTime = s.exact ? .zero : .positiveInfinity
+            let pid = ObjectIdentifier(player)
+            player.seek(to: t, toleranceBefore: tol, toleranceAfter: tol) { _ in
+                // AVPlayer fires the completion on a private queue. Bounce
+                // back to the main actor before mutating coordinator state.
+                Task { @MainActor in
+                    // If the active player changed since this seek was issued,
+                    // ignore the late completion — coordinator was reset already.
+                    guard self.skipCoordinatorPlayerID == pid else { return }
+                    let next = self.skipCoordinator.seekCompleted(
+                        nowMonotonicSeconds: CACurrentMediaTime()
+                    )
+                    self.applySkipDecision(next, on: player)
+                }
+            }
+        }
+        if let after = decision.armDebounceSeconds {
+            skipDebounceTask?.cancel()
+            let pid = ObjectIdentifier(player)
+            skipDebounceTask = Task { @MainActor in
+                try? await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
+                if Task.isCancelled { return }
+                guard self.skipCoordinatorPlayerID == pid else { return }
+                let next = self.skipCoordinator.burstEnded(
+                    nowMonotonicSeconds: CACurrentMediaTime()
+                )
+                self.applySkipDecision(next, on: player)
+            }
+        }
     }
 
     private func handleTogglePlay() {
