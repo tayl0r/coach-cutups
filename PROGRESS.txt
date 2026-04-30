@@ -150,7 +150,16 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
       reads RecordingStateSlot BEFORE PlayerStateSlot (adversarial
       fix #8). on_record_toggled snapshots playhead from PlayerState
       slot BEFORE dispatch (adversarial fix #1).
-- [ ] Task 4: Stroke event capture (events only, no drawing)
+- [x] Task 4: Stroke event capture (events only, no drawing) (commit TBD)
+      main.slint adds a TouchArea overlay positioned over the source-frame
+      Image with full letterbox normalization (adversarial fix #5)
+      computing rendered-w/h/offset-x/offset-y from source-frame.width/.height
+      vs. container; press starts a stroke, moved appends a point,
+      release emits stroke-completed(points-json) — single JSON-string
+      callback per drag (adversarial fix #6). bus.rs AppendStroke handler
+      parses JSON, appends a CommentaryEvent { kind: Stroke } to
+      recording_clip.events; errors if current_mode != Recording. ui.rs
+      wires on_stroke_completed → bus.send. Serde roundtrip unit test.
 - [ ] Task 5: Harness E2E — full record-clip flow against fixture
 - [ ] Task 6: Closeout
 

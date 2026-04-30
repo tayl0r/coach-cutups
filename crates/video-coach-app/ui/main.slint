@@ -48,6 +48,14 @@ export component MainWindow inherits Window {
     // accordingly. While `recording_starting` the press is ignored
     // (mid-transition).
     callback record-toggled();
+    // Phase 8 Task 4. Fired once per stroke (mouse-down → drag →
+    // mouse-up) inside the source-frame area when mode == "recording".
+    // `points-json` is a JSON-encoded array of objects
+    // `{"x": float, "y": float, "t": float}` where x/y are normalized
+    // [0,1] against the displayed (post-letterbox) video rect and t is
+    // seconds since stroke-start. The Rust handler wraps this in a
+    // CommentaryEvent { kind: Stroke } via Command::AppendStroke.
+    callback stroke-completed(string);
 
     // Capture keyboard focus at root so Space / arrow keys hit the
     // transport handlers regardless of which TouchArea last clicked.
@@ -100,12 +108,111 @@ export component MainWindow inherits Window {
     }
 
     // Source video surface — fills above the transport bar.
-    Image {
+    source-frame-image := Image {
         x: 0; y: 0;
         width: parent.width;
         height: parent.height - 56px;
         image-fit: contain;
         source: source-frame;
+    }
+
+    // Phase 8 Task 4. Stroke capture overlay. Positioned identically to
+    // source-frame-image; enabled only while mode == "recording" so
+    // resting clicks during scanning don't accidentally accumulate
+    // points. Letterbox normalization is folded into pointer-event /
+    // moved handlers (adversarial fix #5): the rendered video rect
+    // (post `image-fit: contain`) is computed from the source image's
+    // pixel dimensions vs. the container, then the touch (cw, ch)
+    // touch coordinates are converted to [0,1] against that rect (NOT
+    // against the whole container) and clamped AFTER the conversion so
+    // strokes drawn on the letterbox boundary still land in the buffer.
+    //
+    // Per-point t is `animation-tick() - stroke-press-tick` in seconds
+    // (Slint's animation-tick returns a duration since process start;
+    // arithmetic on durations yields a duration, and dividing by `1s`
+    // yields seconds as float). The buffer is built incrementally as a
+    // JSON string (adversarial fix #6 — single callback per stroke,
+    // no Slint ModelRc plumbing); on release the closing `]` is
+    // appended and stroke-completed fires.
+    Rectangle {
+        x: source-frame-image.x;
+        y: source-frame-image.y;
+        width: source-frame-image.width;
+        height: source-frame-image.height;
+        background: transparent;
+
+        property <duration> stroke-press-tick: 0;
+        property <int> stroke-point-count: 0;
+        property <string> stroke-buf: "";
+
+        // Computed once per query; pure functions of the container size
+        // and source image's reported pixel dimensions. If the source
+        // image isn't yet decoded (size 0×0), the rect collapses to
+        // the container — strokes during that race window are
+        // dispatched normalized against the container, which is at
+        // worst a slight visual mismatch with no data integrity loss.
+        function video-aspect() -> float {
+            return source-frame.height > 0 ? (source-frame.width / source-frame.height) : 1;
+        }
+        function rendered-w() -> float {
+            return self.width / 1px >= self.height / 1px * video-aspect()
+                ? self.height / 1px * video-aspect()
+                : self.width / 1px;
+        }
+        function rendered-h() -> float {
+            return self.width / 1px >= self.height / 1px * video-aspect()
+                ? self.height / 1px
+                : self.width / 1px / video-aspect();
+        }
+        function offset-x() -> float {
+            return (self.width / 1px - rendered-w()) / 2;
+        }
+        function offset-y() -> float {
+            return (self.height / 1px - rendered-h()) / 2;
+        }
+        function clamp01(v: float) -> float {
+            return max(0, min(1, v));
+        }
+
+        stroke-area := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            // enabled stays false outside Recording so the underlying
+            // Image / window keyboard focus chain isn't blocked by a
+            // hot TouchArea during scanning.
+            enabled: root.mode == "recording";
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                    parent.stroke-press-tick = animation-tick();
+                    parent.stroke-point-count = 0;
+                    parent.stroke-buf = "[";
+                }
+                if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                    if (parent.stroke-point-count > 0) {
+                        parent.stroke-buf = parent.stroke-buf + "]";
+                        root.stroke-completed(parent.stroke-buf);
+                    }
+                    parent.stroke-buf = "";
+                    parent.stroke-point-count = 0;
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    // Letterbox-normalize. mouse-x / mouse-y are local
+                    // floats in px (Slint divides duration by px).
+                    parent.stroke-buf = parent.stroke-buf
+                        + (parent.stroke-point-count > 0 ? "," : "")
+                        + "{\"x\":"
+                        + parent.clamp01((self.mouse-x / 1px - parent.offset-x()) / parent.rendered-w())
+                        + ",\"y\":"
+                        + parent.clamp01((self.mouse-y / 1px - parent.offset-y()) / parent.rendered-h())
+                        + ",\"t\":"
+                        + ((animation-tick() - parent.stroke-press-tick) / 1s)
+                        + "}";
+                    parent.stroke-point-count = parent.stroke-point-count + 1;
+                }
+            }
+        }
     }
 
     Text {

@@ -286,6 +286,27 @@ pub fn run(
         }
     });
 
+    // Phase 8 Task 4. Stroke release → AppendStroke. The Slint TouchArea
+    // overlay collects points + builds the JSON in-place; we just
+    // forward the encoded array. Bus parses + appends to
+    // recording_clip.events. Errors come back on the reply but we don't
+    // surface them to the user UI — out-of-rect strokes are silently
+    // dropped by the bus (they're a UI dispatch artifact, not a user
+    // error).
+    let bus_for_stroke = bus.clone();
+    let rt_for_stroke = rt.clone();
+    window.on_stroke_completed(move |points_json: slint::SharedString| {
+        let bus = bus_for_stroke.clone();
+        let json = points_json.to_string();
+        rt_for_stroke.spawn(async move {
+            bus.send(
+                UI_COMMAND_ID.into(),
+                Command::AppendStroke { points_json: json },
+            )
+            .await;
+        });
+    });
+
     // File → Quit: dispatch through bus so the same shutdown path runs
     // as for the socket-driven Quit.
     let bus_for_quit = bus.clone();

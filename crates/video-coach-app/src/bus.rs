@@ -1252,12 +1252,103 @@ async fn handle(
             }
         }
         Command::AppendStroke { points_json } => {
-            // Task 4 stub: serde shape established in Task 0; semantic
-            // handler lands when stroke capture wires up.
-            let _ = points_json;
-            CommandReply {
-                ok: false,
-                error: Some("append_stroke: not yet implemented".into()),
+            #[cfg(not(feature = "media"))]
+            {
+                let _ = points_json;
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                if !matches!(*current_mode, AppMode::Recording) {
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!("cannot append stroke in mode {:?}", *current_mode)),
+                    };
+                }
+                let Some(clip) = recording_clip.as_mut() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no recording_clip in progress".into()),
+                    };
+                };
+                // Parse the UI's JSON-encoded array of points.
+                #[derive(serde::Deserialize)]
+                struct InPoint {
+                    x: f64,
+                    y: f64,
+                    t: f64,
+                }
+                let points: Vec<InPoint> = match serde_json::from_str(&points_json) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        return CommandReply {
+                            ok: false,
+                            error: Some(format!("parse stroke json: {e}")),
+                        };
+                    }
+                };
+                if points.is_empty() {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("stroke has no points".into()),
+                    };
+                }
+                // Drop strokes entirely outside the displayed video
+                // rect (likely a UI dispatch bug). Adversarial fix #5
+                // — clamp is already applied in Slint, so receiving an
+                // out-of-range point here means something is wrong;
+                // log + ignore.
+                let any_in_range = points
+                    .iter()
+                    .any(|p| (0.0..=1.0).contains(&p.x) && (0.0..=1.0).contains(&p.y));
+                if !any_in_range {
+                    tracing::warn!(
+                        target: "recording.lifecycle",
+                        event = "stroke.dropped_out_of_rect",
+                        count = points.len() as i64,
+                    );
+                    return CommandReply {
+                        ok: true,
+                        error: None,
+                    };
+                }
+                // recordTime on the event = wall-clock time since
+                // recording started, captured at the moment the stroke
+                // ended (per-point t is relative to stroke start).
+                let record_time = clip.t0_instant.elapsed().as_secs_f64();
+                let stroke_points: Vec<video_coach_core::stroke::StrokePoint> = points
+                    .iter()
+                    .map(|p| video_coach_core::stroke::StrokePoint {
+                        x: p.x.clamp(0.0, 1.0),
+                        y: p.y.clamp(0.0, 1.0),
+                        t: p.t.max(0.0),
+                    })
+                    .collect();
+                let stroke = video_coach_core::stroke::Stroke {
+                    id: uuid::Uuid::new_v4(),
+                    color: video_coach_core::stroke::Rgba::RED,
+                    line_width: 0.012,
+                    points: stroke_points,
+                    auto_clear_after_seconds: None,
+                };
+                let event = video_coach_core::event::CommentaryEvent {
+                    record_time,
+                    kind: video_coach_core::event::EventKind::Stroke(stroke),
+                };
+                clip.events.push(event);
+                tracing::info!(
+                    target: "recording.lifecycle",
+                    event = "stroke.appended",
+                    record_time,
+                    point_count = points.len() as i64,
+                );
+                CommandReply {
+                    ok: true,
+                    error: None,
+                }
             }
         }
     }
