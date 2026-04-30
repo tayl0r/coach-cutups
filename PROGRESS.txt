@@ -1,0 +1,72 @@
+video-coach — Rust rewrite progress
+====================================
+
+Format: each phase has its tasks listed in order. `[x]` = shipped (commit
+SHA in parens), `[ ]` = pending. Phases are sequential per the design doc.
+
+The convention: every implementer (main session or per-phase sub-agent)
+updates this file after each task completes — flips the `[ ]` to `[x]`,
+fills in the commit SHA, optionally adds a one-line note. At phase
+closeout, the implementer fills in the SHIPPED / CI marker.
+
+
+## Phase 1 — workspace skeleton + video-coach-core port
+SHIPPED. See git log: scaffold, project IO, source-time reconstruction,
+plan generation, tag aggregation, export settings, denormalize, stroke
+replay. Pure logic + cargo test only.
+
+
+## Phase 2 — testability foundation
+SHIPPED. tracing + bus + control socket + harness crate + fixture manifest.
+
+
+## Phase 3 — GStreamer capture pipeline
+SHIPPED. avfvideosrc + audio + fixture source variant + harness recording
+smoke test.
+
+
+## Phase 4 — wgpu compositor (PiP + stroke layer)
+SHIPPED. Golden-frame tests in CI; lavapipe on Linux runner.
+
+
+## Phase 5 — GStreamer compose bridge (decode → wgpu → encode → mux)
+SHIPPED 2026-04-29. CI run 25135671145 green on all 4 jobs.
+Visual verification: ffprobe + pixel sampling confirmed PiP overlay
+landed at the bottom-right corner. Final commit: 8a68e5d.
+
+
+## Phase 6 — Slint UI shell
+SHIPPED 2026-04-29. CI run 25140303830 green.
+Tasks 0–8 + bonus File→New Project menu.
+65 tests at phase close.
+
+
+## Phase 7 — source-video timeline + transport
+IN PROGRESS. Plan: docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md
+
+- [x] Task 0: Bus command shapes + path normalization (commit 46ed43b)
+      AddSourceVideo / Play / Pause / Seek / SetScanVolume serde + 6 unit tests.
+      OpenProject/NewProject path normalization. FORWARDED_TARGETS gain
+      player.lifecycle + player.state.
+- [x] Task 1: SourcePlayer in video-coach-media (commit 029de7d)
+      GStreamer pipeline filesrc → decodebin → tee → (RGBA appsink, audio
+      sink). 5 fixture tests. Empirical: source-1080p GOP ~5s.
+      Audio sink is platform-specific (osx/wasapi/pulse) — no mic prompt.
+- [x] Task 2: AddSourceVideo command + project mutation (commit bf90602)
+      probe_duration via Discoverer + pathdiff::diff_paths + project_store
+      ::write. State refactor current_project → current: (Project, PathBuf).
+      record_f64 added to event visitor. 1 new harness E2E.
+- [ ] Task 3: Wire bus → SourcePlayer (Play/Pause/Seek/SetScanVolume)
+- [ ] Task 4: Slint video surface (single-slot frame buffer + 30Hz pull)
+- [ ] Task 5: Transport UI (TouchArea-based scrubber, position polling)
+- [ ] Task 6: Skip buttons + keyboard shortcuts
+- [ ] Task 7: Audio + scan-volume slider
+- [ ] Task 8: Closeout (build matrix, push, verify CI green)
+
+
+## Phase 8+ — pending
+Per the design doc:
+  Phase 8  Recording integration (R-press, capture lifecycle, strokes)
+  Phase 9  Clip preview integration + visual parity test
+  Phase 10 Export sheet UI
+  Phase 11 Polish, packaging, cross-platform CI green
