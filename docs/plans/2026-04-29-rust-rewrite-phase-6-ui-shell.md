@@ -647,3 +647,59 @@ docs: Phase 6 closeout — UI shell shipped
 - New `open_project_smoke.rs` harness test passing.
 - New Slint component test passing.
 - No regressions in existing Phase 1–5 tests.
+
+---
+
+## Closeout (2026-04-29)
+
+**Status: shipped.** CI run 25140303830 green on all four jobs:
+
+| Job | Result |
+|---|---|
+| `test (windows-latest)` | ✅ |
+| `test (macos-latest)` | ✅ |
+| `test (ubuntu-latest)` | ✅ |
+| `media-tests` (Linux + GStreamer + lavapipe + Slint) | ✅ |
+
+**Commits (in order):**
+
+| Task | Commit | Title |
+|---|---|---|
+| 0 | `be474c4` | Preflight — un-gate bus, add `--headless`, log lagged broadcast |
+| 1 | `a89349c` | Add Slint 1.8 dependency + empty MainWindow |
+| 2 | `cda0355` | Slint owns main thread, tokio runs alongside |
+| 3 | `b3ce012` | Bidirectional shutdown plumbing |
+| 4 | `cf0bfb5` | OpenProject bus command + E2E harness coverage |
+| 5 | `81892d3` | File menu wires Open Project + Quit through bus |
+| 6 | `e195966` | Slint component test scaffold |
+| 7 | `463fe06` | CI install Slint Linux deps |
+| —  | `6a4167f` | (style) cargo fmt fixups |
+
+**Test counts:** 60 → 65 (+1 Slint component round-trip, +2 OpenProject serde unit, +2 OpenProject E2E harness).
+
+**Adversarial-review changes verified in code:**
+
+- ✅ Bidirectional shutdown — `bus.rs::Command::Quit` calls `slint::quit_event_loop()`; `ui.rs::on_close_requested` sends `shutdown_tx`; tokio watcher in `ui.rs` calls `slint::quit_event_loop()` when shutdown_rx fires.
+- ✅ `OpenProject` uses `tokio::task::spawn_blocking` for `ProjectStore::read`.
+- ✅ `--headless` and `--control-socket` are independent flags.
+- ✅ `broadcast::RecvError::Lagged` logs a `tracing::warn!` instead of silent continue.
+- ✅ `mod bus` and `mod protocol` no longer behind `control-socket` feature.
+- ✅ UI commands stamp `id="ui"`.
+- ✅ `app.launched`-vs-subscriber race documented in `main.rs`.
+- ✅ Component test scope explicitly excludes native `MenuBar` coverage in its docstring.
+
+**Manual smoke checklist** — outstanding for the user to walk through:
+
+- [ ] `cargo run -p video-coach-app` opens a window
+- [ ] File→Open Project shows a folder picker
+- [ ] Picking a valid project folder updates the title
+- [ ] Picking an invalid folder logs a warning, no crash
+- [ ] File→Quit exits the app
+- [ ] Cmd-Q exits the app
+- [ ] Window close button exits the app
+- [x] Headless `--control-socket=0` accepts socket commands (covered by `smoke.rs`)
+- [x] Headless socket-`quit` shuts down cleanly (covered by `smoke.rs`)
+
+A Phase 11 virtual-display strategy will flip the manual checks to automated ones; deferred per the design doc.
+
+**Phase 7 entry conditions met.** Next phase (Source-video timeline + transport) can build on the Slint shell, the bus, and the harness without further refactor.
