@@ -1,7 +1,6 @@
 import AVFoundation
 import CoreMedia
 import Foundation
-import VideoCoachCore
 
 /// Per-clip context for the Mode C preview compositor.
 ///
@@ -19,27 +18,27 @@ import VideoCoachCore
 /// `requiredSourceTrackIDs` is `readonly` on the parent class — we override
 /// with private backing storage, the same pattern `CompilationInstruction`
 /// uses.
-final class PreviewInstruction: AVMutableVideoCompositionInstruction, @unchecked Sendable {
-    var clipIndex: Int = 0
-    var sourceTrackID: CMPersistentTrackID = 1
-    var webcamTrackID: CMPersistentTrackID = 1000
-    var clipCompositionStart: CMTime = .zero
-    var segments: [PlaybackSegment] = []
+public final class PreviewInstruction: AVMutableVideoCompositionInstruction, @unchecked Sendable {
+    public var clipIndex: Int = 0
+    public var sourceTrackID: CMPersistentTrackID = 1
+    public var webcamTrackID: CMPersistentTrackID = 1000
+    public var clipCompositionStart: CMTime = .zero
+    public var segments: [PlaybackSegment] = []
     /// Pre-decoded frozen frame keyed by segment index where
     /// `segments[i].kind == .freeze`. Built once at composition build time;
     /// never mutated at render time. This lets backward scrubbing across a
     /// freeze segment display the correct frame instead of a stale runtime
     /// cache (which AVPlayer can poison with out-of-order seek requests).
-    var frozenFrames: [Int: CVPixelBuffer] = [:]
+    public var frozenFrames: [Int: CVPixelBuffer] = [:]
 
     private var _requiredSourceTrackIDs: [NSValue] = []
-    override var requiredSourceTrackIDs: [NSValue] {
+    public override var requiredSourceTrackIDs: [NSValue] {
         get { _requiredSourceTrackIDs }
     }
 
     /// Builder helper. Always prefer this over the bare initializer so that
     /// `timeRange` and `requiredSourceTrackIDs` are guaranteed set.
-    static func make(
+    public static func make(
         clipIndex: Int = 0,
         sourceTrackID: CMPersistentTrackID = 1,
         webcamTrackID: CMPersistentTrackID = 1000,
@@ -66,7 +65,7 @@ final class PreviewInstruction: AVMutableVideoCompositionInstruction, @unchecked
     /// Returns the index of the segment containing `t` (record-time, in
     /// seconds local to the clip). Walks `outDuration`s; clamps to the last
     /// segment if `t` falls past the walked range.
-    func segmentIndex(forRecordTime t: Double) -> Int {
+    public func segmentIndex(forRecordTime t: Double) -> Int {
         var elapsed = 0.0
         for (i, seg) in segments.enumerated() {
             let next = elapsed + seg.outDuration

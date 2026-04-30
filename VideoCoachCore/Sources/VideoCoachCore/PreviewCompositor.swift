@@ -24,11 +24,11 @@ import Foundation
 /// while scrubbing backward. This compositor instead reads the frozen frame
 /// from `inst.frozenFrames` (pre-decoded at composition build time, immutable
 /// thereafter), so the freeze frame is correct regardless of seek direction.
-final class PreviewCompositor: NSObject, AVVideoCompositing {
-    let sourcePixelBufferAttributes: [String: any Sendable]? = [
+public final class PreviewCompositor: NSObject, AVVideoCompositing {
+    public let sourcePixelBufferAttributes: [String: any Sendable]? = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
     ]
-    let requiredPixelBufferAttributesForRenderContext: [String: any Sendable] = [
+    public let requiredPixelBufferAttributesForRenderContext: [String: any Sendable] = [
         kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
     ]
 
@@ -43,15 +43,15 @@ final class PreviewCompositor: NSObject, AVVideoCompositing {
         .outputColorSpace: CGColorSpaceCreateDeviceRGB(),
     ])
 
-    override init() { super.init() }
+    public override init() { super.init() }
 
-    func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
+    public func renderContextChanged(_ newRenderContext: AVVideoCompositionRenderContext) {
         renderContext = newRenderContext
     }
 
-    func cancelAllPendingVideoCompositionRequests() {}
+    public func cancelAllPendingVideoCompositionRequests() {}
 
-    func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+    public func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
         // AVPlayer's playback path on modern macOS sometimes strips the
         // subclass from `videoCompositionInstruction` (the export-session path
         // preserves it; the playback path does not, at least in our testing
