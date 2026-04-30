@@ -48,4 +48,14 @@ final class SkipCoordinatorTests: XCTestCase {
         XCTAssertNil(burst2.seek)
         XCTAssertNil(burst2.armDebounceSeconds)
     }
+
+    func test_burstEndedDuringFlight_thenSeekCompletes_firesExactSeek() {
+        let c = SkipCoordinator(burstWindowSeconds: 0.15)
+        _ = c.requestSkip(deltaSeconds: 3, currentPlayerTimeSeconds: 10,
+                         clipDurationSeconds: 60, nowMonotonicSeconds: 100)
+        let mid = c.burstEnded(nowMonotonicSeconds: 100.15) // coarse seek still flying
+        XCTAssertNil(mid.seek)
+        let done = c.seekCompleted(nowMonotonicSeconds: 100.30)
+        XCTAssertEqual(done.seek, SeekParams(targetSeconds: 13.0, exact: true))
+    }
 }

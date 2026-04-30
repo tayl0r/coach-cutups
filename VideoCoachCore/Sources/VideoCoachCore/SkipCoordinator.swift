@@ -69,25 +69,33 @@ public final class SkipCoordinator {
 
     /// Notify the coordinator that the in-flight seek has completed.
     ///
-    /// Intended transitions (see plan section 1.3):
-    /// (a) clear `exactPending` unconditionally;
-    /// (b) if `exactPending && target != nil` → fire an exact seek to `target`;
-    /// (c) if the completed seek was coarse and `target` advanced during flight → refire coarse to the latest `target`;
-    /// (d) else if the completed seek landed exact, clear `target`; otherwise no-op.
-    // TODO(plan-1.4): implement branches (a) and (b) — exactPending handling.
+    /// Branches, in order:
+    /// (a) `exactPending` is cleared unconditionally on entry; if a `target`
+    ///     remains, an exact-frame seek is issued to settle on it (the burst
+    ///     ended while this seek was in flight).
+    /// (b) If the completed seek landed exact, clear `target` and no-op.
+    /// (c) If `target` advanced past the landed coarse position during flight,
+    ///     refire coarse to the latest `target`.
+    /// (d) Otherwise no-op (landed coarse on the user's current target; the
+    ///     pending burst-end debounce will issue the exact settle).
     public func seekCompleted(nowMonotonicSeconds: TimeInterval) -> SkipDecision {
         let landedTarget = flying
         let landedExact = flyingExact
         flying = nil
-        // Stale target → refire coarse to the latest.
-        // (Task 1.4 will add the exactPending and landedExact-clears-target
-        // branches above this one.)
-        if !landedExact, let tgt = target, tgt != landedTarget {
-            flying = tgt
-            flyingExact = false
+        if exactPending {
+            exactPending = false
+            if let t = target {
+                flying = t; flyingExact = true
+                target = nil
+                return SkipDecision(seek: .init(targetSeconds: t, exact: true))
+            }
+            return .none
+        }
+        if landedExact { target = nil; return .none }
+        if let tgt = target, tgt != landedTarget {
+            flying = tgt; flyingExact = false
             return SkipDecision(seek: .init(targetSeconds: tgt, exact: false))
         }
-        // Landed coarse on the same target the user wanted; debounce will fire exact.
         return .none
     }
 
