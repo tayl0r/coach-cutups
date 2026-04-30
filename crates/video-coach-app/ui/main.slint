@@ -20,6 +20,14 @@ export component MainWindow inherits Window {
     // each session. Phase 8+ can add a project-loaded → set this hook.
     in-out property <float> scan-volume: 1.0;
 
+    // Phase 8 Task 3. Recording mode + elapsed timer, written by the
+    // 30 Hz timer in ui.rs reading RecordingStateSlot. Mode is one of
+    // "scanning", "recording_starting", "recording" (matching
+    // bus::AppMode's snake_case serde). The REC indicator + M:SS
+    // label below switch on this string.
+    in property <string> mode: "scanning";
+    in property <float> recording-elapsed-seconds: 0;
+
     callback new-project-clicked();
     callback open-project-clicked();
     callback add-source-video-clicked();
@@ -35,6 +43,11 @@ export component MainWindow inherits Window {
     // position by adding delta to the current position-seconds.
     callback skip-clicked(int);
     callback scan-volume-changed(float);
+    // Phase 8 Task 3. R-press toggles between StartClipRecording and
+    // StopClipRecording; the Rust handler reads `mode` and dispatches
+    // accordingly. While `recording_starting` the press is ignored
+    // (mid-transition).
+    callback record-toggled();
 
     // Capture keyboard focus at root so Space / arrow keys hit the
     // transport handlers regardless of which TouchArea last clicked.
@@ -78,6 +91,10 @@ export component MainWindow inherits Window {
                 root.skip-clicked(event.modifiers.shift ? 10 : 3);
                 return accept;
             }
+            if (event.text == "r") {
+                root.record-toggled();
+                return accept;
+            }
             return reject;
         }
     }
@@ -97,6 +114,40 @@ export component MainWindow inherits Window {
         text: project-title;
         font-size: 18px;
         color: #ffffff;
+    }
+
+    // Phase 8 Task 3. REC indicator — top-left corner just below the
+    // project title. Visible only when mode != "scanning". Yellow +
+    // "Preparing…" while pipeline is constructing (RecordingStarting),
+    // red + "REC M:SS" once the capture pipeline is rolling.
+    if mode != "scanning": Rectangle {
+        x: 16px;
+        y: 44px;
+        width: 160px;
+        height: 28px;
+        background: transparent;
+        // Dot
+        Rectangle {
+            x: 0;
+            y: (parent.height - self.height) / 2;
+            width: 12px;
+            height: 12px;
+            border-radius: 6px;
+            background: mode == "recording" ? #e63946 : #f4c430;
+        }
+        // Label
+        Text {
+            x: 18px;
+            y: 0;
+            width: parent.width - 18px;
+            height: parent.height;
+            vertical-alignment: center;
+            font-size: 14px;
+            color: mode == "recording" ? #e63946 : #f4c430;
+            text: mode == "recording"
+                ? "REC " + format-mmss(root.recording-elapsed-seconds)
+                : "Preparing…";
+        }
     }
 
     if error-message != "": Text {

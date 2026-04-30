@@ -50,9 +50,6 @@ pub fn run(
     recording_state: RecordingStateSlot,
     startup_project: Option<String>,
 ) -> anyhow::Result<()> {
-    // Task 1 hands the slot through unchanged; the UI's REC indicator
-    // wires in Task 3. Suppress the unused-variable warning until then.
-    let _ = &recording_state;
     let window = MainWindow::new()?;
 
     // Phase 7 Task 4: drive `source-frame` from the shared frame slot at
@@ -64,6 +61,7 @@ pub fn run(
     let weak_for_frames = window.as_weak();
     let slot_for_timer = frame_slot.clone();
     let player_state_for_timer = player_state.clone();
+    let recording_state_for_timer = recording_state.clone();
     frame_timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(FRAME_TICK_MS),
@@ -71,6 +69,26 @@ pub fn run(
             let next_frame = {
                 let mut guard = slot_for_timer.lock().expect("frame slot poisoned");
                 guard.take()
+            };
+            // Phase 8 adversarial fix #8: read RecordingStateSlot
+            // BEFORE PlayerStateSlot so a transition out of Recording
+            // (REC indicator clears) lands in the same frame as the
+            // player resuming, not one tick later.
+            let (mode_str, elapsed) = {
+                use crate::frame_sink::RecordingMode;
+                let g = recording_state_for_timer
+                    .lock()
+                    .expect("recording_state poisoned");
+                let mode_str = match g.mode {
+                    RecordingMode::Scanning => "scanning",
+                    RecordingMode::RecordingStarting => "recording_starting",
+                    RecordingMode::Recording => "recording",
+                };
+                let elapsed = g
+                    .recording_started_at_host
+                    .map(|t0| t0.elapsed().as_secs_f32())
+                    .unwrap_or(0.0);
+                (mode_str, elapsed)
             };
             // Snapshot transport state. Drop the lock before touching
             // the window so we never block the position-poll task.
@@ -87,6 +105,8 @@ pub fn run(
                 w.set_position_seconds(pos as f32);
                 w.set_duration_seconds(dur as f32);
                 w.set_is_playing(playing);
+                w.set_mode(mode_str.into());
+                w.set_recording_elapsed_seconds(elapsed);
             }
         },
     );
@@ -216,6 +236,54 @@ pub fn run(
             )
             .await;
         });
+    });
+
+    // Phase 8 Task 3. R-press toggles clip recording. Read the current
+    // mode property + the live playhead BEFORE dispatching (adversarial
+    // fix #1: the bus uses the snapshotted seconds directly as
+    // start_source_seconds rather than re-reading after async
+    // player.pause() — which can take 10–200 ms during which the
+    // source has moved on).
+    let bus_for_record = bus.clone();
+    let rt_for_record = rt.clone();
+    let weak_for_record = window.as_weak();
+    let player_state_for_record = player_state.clone();
+    window.on_record_toggled(move || {
+        let bus = bus_for_record.clone();
+        let mode = weak_for_record
+            .upgrade()
+            .map(|w| w.get_mode().to_string())
+            .unwrap_or_default();
+        match mode.as_str() {
+            "scanning" => {
+                // Snapshot the playhead while we hold the slot lock,
+                // before crossing the await boundary. position_seconds
+                // is f64; the bus accepts the same type.
+                let playhead = {
+                    let g = player_state_for_record
+                        .lock()
+                        .expect("player_state poisoned");
+                    g.position_seconds
+                };
+                rt_for_record.spawn(async move {
+                    bus.send(
+                        UI_COMMAND_ID.into(),
+                        Command::StartClipRecording {
+                            playhead_snapshot_seconds: playhead,
+                        },
+                    )
+                    .await;
+                });
+            }
+            "recording" => {
+                rt_for_record.spawn(async move {
+                    bus.send(UI_COMMAND_ID.into(), Command::StopClipRecording)
+                        .await;
+                });
+            }
+            // "recording_starting" — mid-transition, ignore.
+            _ => {}
+        }
     });
 
     // File → Quit: dispatch through bus so the same shutdown path runs
