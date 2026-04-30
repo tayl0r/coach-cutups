@@ -468,9 +468,9 @@ struct ContentView: View {
         applySkipDecision(decision, on: player)
     }
 
-    /// Side-effecting executor for SkipCoordinator decisions. May call itself
-    /// recursively at most once per completion/debounce; the recursive call's
-    /// seek schedules an async completion that does not re-enter synchronously.
+    /// Side-effecting executor for SkipCoordinator decisions. Re-enters via
+    /// the seek-completion handler or debounce-fire Task; never synchronous
+    /// self-recursion.
     private func applySkipDecision(_ decision: SkipDecision, on player: AVPlayer) {
         let pid = ObjectIdentifier(player)
         if let s = decision.seek {
@@ -527,9 +527,9 @@ struct ContentView: View {
     }
 
     /// Cancels any in-flight debounce, resets coordinator state, and clears
-    /// the player-id guard. Idempotent. Call on close, sidebar selection
-    /// change, recording-state changes — anywhere the active preview player
-    /// might have flipped.
+    /// the player-id guard. Idempotent. Call on close and on every sidebar
+    /// selection change — anywhere the active preview player might have
+    /// flipped.
     private func resetSkipState() {
         skipDebounceTask?.cancel()
         skipDebounceTask = nil
