@@ -32,6 +32,13 @@ fn disable_vt_decoders() {
         "GST_PLUGIN_FEATURE_RANK",
         "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE",
     );
+    // Linux CI runners + sandboxed test environments don't have a
+    // reachable PulseAudio daemon. The real platform sinks build fine
+    // but fail PAUSED→PLAYING with a StateChangeError. Force fakesink.
+    // (Same env var the harness sets in App::launch for spawned
+    // binaries; these tests open SourcePlayer in-process so they need
+    // it directly.)
+    std::env::set_var("VIDEO_COACH_NO_AUDIO", "1");
 }
 
 struct CountingSink {
