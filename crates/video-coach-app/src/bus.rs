@@ -1044,7 +1044,7 @@ async fn handle(
                         });
                         tracing::info!(
                             target: "recording.lifecycle",
-                            event = "recording.started",
+                            event = "clip_recording.started",
                             clip_id = %clip_id,
                             filename = %filename,
                             source_index = source_index as i64,
@@ -1070,7 +1070,7 @@ async fn handle(
                         write_recording_state(recording_state, *current_mode, None);
                         tracing::warn!(
                             target: "recording.lifecycle",
-                            event = "recording.failed",
+                            event = "clip_recording.failed",
                             error = %e,
                         );
                         tracing::info!(
@@ -1152,7 +1152,7 @@ async fn handle(
                         write_recording_state(recording_state, *current_mode, None);
                         tracing::warn!(
                             target: "recording.lifecycle",
-                            event = "recording.failed",
+                            event = "clip_recording.failed",
                             phase = "stop",
                             error = %e,
                         );
@@ -1212,7 +1212,7 @@ async fn handle(
                         write_recording_state(recording_state, *current_mode, None);
                         tracing::info!(
                             target: "recording.lifecycle",
-                            event = "recording.stopped",
+                            event = "clip_recording.stopped",
                             clip_id = %clip_in_progress.clip_id,
                             duration_seconds = recording_duration,
                             output = %output_path.display(),

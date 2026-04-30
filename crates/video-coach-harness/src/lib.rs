@@ -22,6 +22,16 @@ pub struct Frame {
     pub other: serde_json::Map<String, serde_json::Value>,
 }
 
+#[derive(Debug, Default)]
+pub struct LaunchOptions {
+    /// Phase 8. When set, the spawned binary uses the given file as a
+    /// `FixtureSource` for any `start_clip_recording` request, in
+    /// place of the platform-default camera/mic. Lets CI exercise the
+    /// full clip-recording lifecycle without a webcam or audio
+    /// daemon.
+    pub fixture_recording_source: Option<String>,
+}
+
 pub struct App {
     child: Child,
     events: mpsc::UnboundedReceiver<Frame>,
@@ -56,7 +66,14 @@ impl App {
     }
 
     pub async fn launch() -> anyhow::Result<Self> {
+        Self::launch_with_options(LaunchOptions::default()).await
+    }
+
+    pub async fn launch_with_options(opts: LaunchOptions) -> anyhow::Result<Self> {
         let mut cmd = Command::new(Self::binary_path());
+        if let Some(ref fixture) = opts.fixture_recording_source {
+            cmd.arg("--fixture-recording-source").arg(fixture);
+        }
         // Phase 6: --headless is independent of --control-socket. The harness
         // tests the bus + socket without a real window — UI E2E coverage
         // waits for a virtual-display strategy (Phase 11). Without this flag

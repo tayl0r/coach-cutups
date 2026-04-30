@@ -160,7 +160,16 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
       parses JSON, appends a CommentaryEvent { kind: Stroke } to
       recording_clip.events; errors if current_mode != Recording. ui.rs
       wires on_stroke_completed → bus.send. Serde roundtrip unit test.
-- [ ] Task 5: Harness E2E — full record-clip flow against fixture
+- [x] Task 5: Harness E2E — full record-clip flow against fixture (commit TBD)
+      New crates/video-coach-harness/tests/record_clip_smoke.rs covering
+      open project → add source → start_clip_recording → append_stroke →
+      stop_clip_recording → verify clip in project.json + recording.mov
+      on disk. Required adding LaunchOptions to App::launch_with_options
+      so tests can pass --fixture-recording-source. Renamed bus
+      events recording.{started,stopped,failed} → clip_recording.{...}
+      since the lower-level recording.rs pipeline already used
+      "recording.started" — collision was making the harness's
+      wait_for_event pick the wrong event.
 - [ ] Task 6: Closeout
 
 
