@@ -121,11 +121,29 @@ pub fn start(
         .link(&filesink)
         .map_err(|e| RecordingError::Build(format!("link qtmux → filesink: {e}")))?;
 
-    // Source bin → convert chains. The source bin's ghost pads are added
-    // dynamically by its decodebin (fixture mode) or appear at construction
-    // (production mode); use sometimes-pad linking so both cases work.
+    // Source bin → convert chains. Two cases to handle:
+    //   1. PlatformDefaultSource: ghost pads exist at construction.
+    //      `connect_pad_added` would never fire for them (the signal
+    //      only fires on FUTURE pad-add events), so link them
+    //      synchronously now.
+    //   2. FixtureSource: pads appear dynamically when its internal
+    //      decodebin demuxes the file. Link them via `pad-added`.
+    // Failing to handle case 1 leaves the platform sources unlinked —
+    // they error out with "not-linked" the moment the pipeline goes
+    // PLAYING, the bus fills with errors no one's reading, and the
+    // app sits in a phantom Recording state until stop tears down a
+    // pipeline that never produced data.
     let videoconvert_sink = videoconvert.static_pad("sink").expect("videoconvert sink");
     let audioconvert_sink = audioconvert.static_pad("sink").expect("audioconvert sink");
+    for (pad_name, target_sink) in [
+        ("video-src", &videoconvert_sink),
+        ("audio-src", &audioconvert_sink),
+    ] {
+        if let Some(pad) = source_bin.static_pad(pad_name) {
+            pad.link(target_sink)
+                .map_err(|e| RecordingError::Build(format!("link {pad_name}: {e:?}")))?;
+        }
+    }
     source_bin.connect_pad_added(move |_bin, pad| {
         let pad_name = pad.name();
         let target_sink = if pad_name == "video-src" {
@@ -135,6 +153,9 @@ pub fn start(
         } else {
             return;
         };
+        if pad.is_linked() {
+            return;
+        }
         if let Err(e) = pad.link(target_sink) {
             tracing::warn!(
                 target: "recording",
@@ -173,40 +194,28 @@ impl Recording {
         let bus = self.pipeline.bus().expect("pipeline bus");
         self.pipeline.send_event(gstreamer::event::Eos::new());
 
-        // Wait for EOS to propagate (up to 5s).
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                tracing::warn!(target: "recording", "EOS timeout — file may be truncated");
-                break;
-            }
-            if let Some(msg) = bus.timed_pop_filtered(
-                gstreamer::ClockTime::from_nseconds(remaining.as_nanos() as u64),
-                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
-            ) {
-                if matches!(msg.view(), gstreamer::MessageView::Eos(_)) {
-                    break;
-                }
-                if let gstreamer::MessageView::Error(err) = msg.view() {
-                    return Err(RecordingError::Build(format!("eos wait: {err}")));
-                }
-            } else {
-                break;
-            }
-        }
+        // Wait for EOS, capturing any error WITHOUT returning early. The
+        // teardown below MUST run on every path: leaving the pipeline in
+        // PLAYING and dropping it triggers gst-plugins-good's
+        // `osxaudiosrc` to race CoreAudio's HAL IO callback against
+        // element disposal, crashing in `gst_osx_audio_src_io_proc`.
+        let eos_outcome = wait_for_eos(&bus, Duration::from_secs(5));
 
         // Step state down through Paused → Ready before Null, with a sync
-        // wait per transition. A direct Playing→Null jump can leave
-        // gst-plugins-good's `osxaudiosrc` racing CoreAudio's HAL IO
-        // callback against `gst_core_audio_close()`, crashing in
-        // `gst_osx_audio_src_io_proc` with a NULL deref of an internal
-        // ringbuffer field. Per-state waits force the pipeline to fully
-        // settle at each level before tearing the AudioUnit down.
+        // wait per transition. Per-state waits force the pipeline to
+        // fully settle at each level before tearing the AudioUnit down,
+        // serializing `gst_core_audio_close()` against the rest of
+        // teardown.
         for intermediate in [gstreamer::State::Paused, gstreamer::State::Ready] {
-            self.pipeline.set_state(intermediate).map_err(|e| {
-                RecordingError::StateChange(format!("{intermediate:?}: {e:?}"))
-            })?;
+            if let Err(e) = self.pipeline.set_state(intermediate) {
+                tracing::warn!(
+                    target: "recording",
+                    state = ?intermediate,
+                    error = ?e,
+                    "intermediate set_state failed; continuing teardown",
+                );
+                continue;
+            }
             let (res, _, _) = self
                 .pipeline
                 .state(Some(gstreamer::ClockTime::from_seconds(2)));
@@ -219,15 +228,46 @@ impl Recording {
                 );
             }
         }
-        self.pipeline
+        let null_result = self
+            .pipeline
             .set_state(gstreamer::State::Null)
-            .map_err(|e| RecordingError::StateChange(format!("NULL: {e:?}")))?;
+            .map_err(|e| RecordingError::StateChange(format!("NULL: {e:?}")));
 
         tracing::info!(
             target: "recording",
             event = "recording.stopped",
             output = %self.output_path.display(),
         );
+
+        // Surface the first failure: a busted EOS means the .mov may be
+        // truncated; a busted NULL transition is catastrophic. Either
+        // way, teardown ran.
+        eos_outcome?;
+        null_result?;
         Ok(())
+    }
+}
+
+fn wait_for_eos(bus: &gstreamer::Bus, timeout: Duration) -> Result<(), RecordingError> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            tracing::warn!(target: "recording", "EOS timeout — file may be truncated");
+            return Ok(());
+        }
+        match bus.timed_pop_filtered(
+            gstreamer::ClockTime::from_nseconds(remaining.as_nanos() as u64),
+            &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+        ) {
+            None => return Ok(()),
+            Some(msg) => match msg.view() {
+                gstreamer::MessageView::Eos(_) => return Ok(()),
+                gstreamer::MessageView::Error(err) => {
+                    return Err(RecordingError::Build(format!("eos wait: {err}")));
+                }
+                _ => continue,
+            },
+        }
     }
 }

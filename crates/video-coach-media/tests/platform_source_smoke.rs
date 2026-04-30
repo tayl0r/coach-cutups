@@ -34,7 +34,10 @@ fn platform_source_smoke_records_short_clip() {
 
         let factory = Arc::new(PlatformDefaultSource::new());
         let rec = start(factory, out_path.clone()).expect("start recording");
-        std::thread::sleep(Duration::from_millis(500));
+        // 1.5s gives vtenc_h264 + qtmux a real keyframe + audio frames to
+        // flush at EOS; shorter and qtmux errors with "Internal data
+        // stream error" instead of finalizing.
+        std::thread::sleep(Duration::from_millis(1500));
         rec.stop().expect("stop recording");
 
         let metadata = std::fs::metadata(&out_path).expect("output should exist");
