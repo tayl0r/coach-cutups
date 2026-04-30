@@ -133,7 +133,15 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
       Failure paths roll back to Scanning + emit recording.failed
       (adversarial fix #10). RecordingStateSlot threaded through
       bus::spawn_on + ui::run signatures; UI wiring lands in Task 3.
-- [ ] Task 2: PlatformDefault source factory
+- [x] Task 2: PlatformDefault source factory (commit bf91547)
+      New crates/video-coach-media/src/platform_source.rs.
+      cfg-gated platform elements: avfvideosrc+osxaudiosrc (macOS),
+      mfvideosrc+wasapisrc (Windows), v4l2src+pulsesrc (Linux).
+      VIDEO_COACH_NO_AUDIO=1 swaps in audiotestsrc (is-live=true,
+      volume=0) — adversarial fix #3, the source-side analog of Phase
+      7's platform_audio_sink_name. bus.rs PlatformDefault arm wires
+      it in. New ignored test platform_source_smoke (cfg macos +
+      #[ignore]); ran locally — see Task 6 closeout.
 - [ ] Task 3: UI — R key + REC indicator + elapsed timer
 - [ ] Task 4: Stroke event capture (events only, no drawing)
 - [ ] Task 5: Harness E2E — full record-clip flow against fixture
