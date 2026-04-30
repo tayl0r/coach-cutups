@@ -32,6 +32,12 @@ rfd = { workspace = true }
 # Phase 7. Cross-platform relative-path computation (handles `..`
 # traversal on Windows + Unix uniformly).
 pathdiff = "0.2"
+# Phase 8. Clip identity (UUIDs in clip filenames + project.json) and
+# `Clip.created_at` timestamps. Both already pulled in transitively
+# via video-coach-core; declared here directly so the bus's clip-
+# building code doesn't depend on transitive crates.
+uuid = { workspace = true }
+chrono = { workspace = true }
 
 [build-dependencies]
 slint-build = { workspace = true }

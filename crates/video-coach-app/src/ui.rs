@@ -20,7 +20,7 @@
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
 use crate::bus::{BusHandle, Command};
-use crate::frame_sink::{FrameSlot, PlayerStateSlot};
+use crate::frame_sink::{FrameSlot, PlayerStateSlot, RecordingStateSlot};
 use crate::last_project;
 use slint::ComponentHandle;
 
@@ -43,8 +43,16 @@ pub fn run(
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     frame_slot: FrameSlot,
     player_state: PlayerStateSlot,
+    // Phase 8: shared recording-mode state. Read by the 30 Hz timer to
+    // drive the REC indicator + elapsed M:SS label. UI does not write
+    // this slot; the bus owns mode transitions (Task 1) and the UI
+    // observes them (Task 3).
+    recording_state: RecordingStateSlot,
     startup_project: Option<String>,
 ) -> anyhow::Result<()> {
+    // Task 1 hands the slot through unchanged; the UI's REC indicator
+    // wires in Task 3. Suppress the unused-variable warning until then.
+    let _ = &recording_state;
     let window = MainWindow::new()?;
 
     // Phase 7 Task 4: drive `source-frame` from the shared frame slot at

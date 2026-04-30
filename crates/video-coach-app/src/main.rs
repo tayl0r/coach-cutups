@@ -74,12 +74,27 @@ fn main() -> anyhow::Result<()> {
     // and the data is dropped on next overwrite — harmless.
     let frame_slot = frame_sink::new_slot();
     let player_state = frame_sink::new_player_state();
+    // Phase 8: shared recording-mode state. Bus writer (mode
+    // transitions on R-press / stop), UI reader (REC indicator + M:SS
+    // elapsed in the 30 Hz timer).
+    let recording_state = frame_sink::new_recording_state();
 
     #[cfg(feature = "media")]
     let frame_sink_factory: bus::FrameSinkFactory = {
         let slot = frame_slot.clone();
         std::sync::Arc::new(move || Box::new(frame_sink::SlintFrameSink::new(slot.clone())))
     };
+
+    // Phase 8: harness E2E flag. CI runners pass
+    // `--fixture-recording-source=<fixture>` so the clip-recording
+    // pipeline doesn't try to open a real webcam (none in CI). Empty
+    // / non-existent paths are passed through; FixtureSource will
+    // surface the error at start time.
+    #[cfg(feature = "media")]
+    let fixture_recording_source = args
+        .fixture_recording_source
+        .clone()
+        .map(std::path::PathBuf::from);
 
     let bus = bus::spawn_on(
         runtime.handle(),
@@ -88,6 +103,10 @@ fn main() -> anyhow::Result<()> {
         frame_sink_factory,
         #[cfg(feature = "media")]
         player_state.clone(),
+        #[cfg(feature = "media")]
+        recording_state.clone(),
+        #[cfg(feature = "media")]
+        fixture_recording_source,
     );
     let _ = &bus;
 
@@ -138,6 +157,7 @@ fn main() -> anyhow::Result<()> {
             shutdown_tx,
             frame_slot,
             player_state,
+            recording_state,
             startup_project,
         )?;
     }

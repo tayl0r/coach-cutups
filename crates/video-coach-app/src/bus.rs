@@ -101,10 +101,11 @@ pub enum Command {
 /// land in Phase 9).
 ///
 /// Used by the bus task as `current_mode` (Task 1) and serialized as a
-/// string field on `mode.changed` events. The Task-0 stub for the new
-/// commands doesn't reference it yet; the `dead_code` allow keeps the
-/// no-default-features build warning-free until Task 1 lands.
-#[allow(dead_code)]
+/// string field on `mode.changed` events. The no-default-features
+/// build doesn't construct AppMode anywhere (the entire clip-recording
+/// stack is media-feature-gated), so `dead_code` is allowed in that
+/// build shape only.
+#[cfg_attr(not(feature = "media"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppMode {
@@ -187,11 +188,20 @@ pub type FrameSinkFactory =
 /// Spawn the bus task on the given tokio runtime handle. Phase 6 dropped
 /// `#[tokio::main]` so the bus runs on the same multi-threaded runtime
 /// that drives the control socket and any UI-dispatched async work.
+///
+/// `fixture_recording_source` (Phase 8) is the
+/// `--fixture-recording-source=PATH` CLI flag's value: when `Some`,
+/// `StartClipRecording` uses a `FixtureSource` against that path
+/// instead of the real platform camera/mic. CI's `record_clip_smoke`
+/// harness passes this so the test runs without webcam permissions.
+/// Production launches leave it `None` and get the platform default.
 pub fn spawn_on(
     rt: &tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] frame_sink_factory: FrameSinkFactory,
     #[cfg(feature = "media")] player_state: crate::frame_sink::PlayerStateSlot,
+    #[cfg(feature = "media")] recording_state: crate::frame_sink::RecordingStateSlot,
+    #[cfg(feature = "media")] fixture_recording_source: Option<std::path::PathBuf>,
 ) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
     #[cfg(feature = "media")]
@@ -222,6 +232,18 @@ pub fn spawn_on(
             std::sync::Arc<video_coach_media::source_player::SourcePlayer>,
         > = None;
 
+        // Phase 8: clip-recording mode + in-progress clip state. Mode
+        // mutations stay on this task (adversarial-review fix #2) — the
+        // spawn_blocking calls inside StartClipRecording / StopClipRecording
+        // run their GStreamer ops on a worker, but writes to
+        // `current_mode` / `recording_clip` happen here on the bus task
+        // after the await returns. Same pattern as Phase 7's
+        // try_spawn_current_player.
+        #[cfg(feature = "media")]
+        let mut current_mode: AppMode = AppMode::Scanning;
+        #[cfg(feature = "media")]
+        let mut recording_clip: Option<RecordingClipInProgress> = None;
+
         while let Some(env) = rx.recv().await {
             let reply = handle(
                 env.command,
@@ -239,6 +261,14 @@ pub fn spawn_on(
                 &shutdown_tx_for_poll,
                 #[cfg(feature = "media")]
                 &player_state,
+                #[cfg(feature = "media")]
+                &recording_state,
+                #[cfg(feature = "media")]
+                &mut current_mode,
+                #[cfg(feature = "media")]
+                &mut recording_clip,
+                #[cfg(feature = "media")]
+                fixture_recording_source.as_deref(),
             )
             .await;
             let _ = env.reply.send(reply);
@@ -294,6 +324,81 @@ fn spawn_position_poll(
     });
 }
 
+/// In-progress clip recording metadata. Built when `StartClipRecording`
+/// succeeds, mutated as stroke events arrive, taken + finalized into a
+/// `Clip` by `StopClipRecording`.
+#[cfg(feature = "media")]
+pub(crate) struct RecordingClipInProgress {
+    pub clip_id: uuid::Uuid,
+    pub filename: String,
+    pub output_path: std::path::PathBuf,
+    pub source_index: usize,
+    pub start_source_seconds: f64,
+    /// Host-clock anchor for `recordTime` computation on every
+    /// appended event AND for the final clip duration on stop.
+    /// (Adversarial-review fix #4: the public `Recording::stop()`
+    /// signature returns no duration; we compute it here as
+    /// `t0_instant.elapsed().as_secs_f64()` right before calling
+    /// stop().)
+    pub t0_instant: std::time::Instant,
+    pub events: Vec<video_coach_core::event::CommentaryEvent>,
+}
+
+/// Centralized "is the clip-recording subsystem busy?" check used by
+/// every command that would mutate it. Returns true if the lower-level
+/// `recording` slot OR the higher-level `recording_clip` slot OR the
+/// mode is anywhere in the recording state machine. Stops harness
+/// tests + future user inputs from accidentally double-starting.
+/// (Adversarial-review fix #7.)
+#[cfg(feature = "media")]
+fn is_recording(
+    recording: &Option<video_coach_media::recording::Recording>,
+    recording_clip: &Option<RecordingClipInProgress>,
+    current_mode: AppMode,
+) -> bool {
+    recording.is_some()
+        || recording_clip.is_some()
+        || matches!(
+            current_mode,
+            AppMode::Recording | AppMode::RecordingStarting
+        )
+}
+
+/// Default clip-name format: `<sourceIndex+1>-HH:MM:SS` where the time
+/// is the playhead within the source at R-press. Mirrors v1's
+/// `App/ContentView.swift::defaultClipName` 1:1.
+#[cfg(feature = "media")]
+fn default_clip_name(source_index: usize, start_source_seconds: f64) -> String {
+    let total = start_source_seconds.max(0.0).floor() as i64;
+    let h = total / 3600;
+    let m = (total % 3600) / 60;
+    let s = total % 60;
+    format!("{}-{:02}:{:02}:{:02}", source_index + 1, h, m, s)
+}
+
+/// Push the current `AppMode` into the shared `RecordingStateSlot`,
+/// stamping a host-time anchor when transitioning into a recording
+/// mode. The UI's 30 Hz timer reads this for the REC indicator +
+/// elapsed M:SS label.
+#[cfg(feature = "media")]
+fn write_recording_state(
+    slot: &crate::frame_sink::RecordingStateSlot,
+    mode: AppMode,
+    started_at: Option<std::time::Instant>,
+) {
+    use crate::frame_sink::{RecordingMode, RecordingStateSlotData};
+    let mode_local = match mode {
+        AppMode::Scanning => RecordingMode::Scanning,
+        AppMode::RecordingStarting => RecordingMode::RecordingStarting,
+        AppMode::Recording => RecordingMode::Recording,
+    };
+    let mut g = slot.lock().expect("recording_state poisoned");
+    *g = RecordingStateSlotData {
+        mode: mode_local,
+        recording_started_at_host: started_at,
+    };
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle(
     cmd: Command,
@@ -307,6 +412,10 @@ async fn handle(
     #[cfg(feature = "media")] rt_for_poll: &tokio::runtime::Handle,
     #[cfg(feature = "media")] shutdown_tx_for_poll: &tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] player_state: &crate::frame_sink::PlayerStateSlot,
+    #[cfg(feature = "media")] recording_state: &crate::frame_sink::RecordingStateSlot,
+    #[cfg(feature = "media")] current_mode: &mut AppMode,
+    #[cfg(feature = "media")] recording_clip: &mut Option<RecordingClipInProgress>,
+    #[cfg(feature = "media")] fixture_recording_source: Option<&std::path::Path>,
 ) -> CommandReply {
     match cmd {
         Command::Quit => {
@@ -346,7 +455,7 @@ async fn handle(
                 use video_coach_media::fixture_source::FixtureSource;
                 use video_coach_media::source::CaptureSourceFactory;
 
-                if recording.is_some() {
+                if is_recording(recording, recording_clip, *current_mode) {
                     return CommandReply {
                         ok: false,
                         error: Some("already recording".into()),
@@ -818,22 +927,336 @@ async fn handle(
         Command::StartClipRecording {
             playhead_snapshot_seconds,
         } => {
-            // Task 0 stub: serde shape only. Real handler lands in Task 1.
-            let _ = playhead_snapshot_seconds;
-            CommandReply {
-                ok: false,
-                error: Some("start_clip_recording: not yet implemented".into()),
+            #[cfg(not(feature = "media"))]
+            {
+                let _ = playhead_snapshot_seconds;
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                use std::sync::Arc;
+                use video_coach_media::source::CaptureSourceFactory;
+
+                // Adversarial-review fix #7: one centralized recording
+                // check, not three.
+                if is_recording(recording, recording_clip, *current_mode) {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("already recording".into()),
+                    };
+                }
+                if !matches!(*current_mode, AppMode::Scanning) {
+                    // Belt + suspenders. is_recording covers
+                    // RecordingStarting / Recording; this catches any
+                    // future intermediate mode (e.g. PreviewLoading)
+                    // we add later.
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!(
+                            "cannot start recording in mode {:?}",
+                            *current_mode
+                        )),
+                    };
+                }
+                let Some((project, project_folder)) = current.as_ref() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no project open".into()),
+                    };
+                };
+                if project.source_videos.is_empty() {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("project has no source videos".into()),
+                    };
+                }
+                // Source index for the clip = the active source. MVP:
+                // sourceVideos[0]. Phase 7.5+ will track an active
+                // index when multi-source lands.
+                let source_index = 0_usize;
+
+                // Pause the source on R-press. v1 ContentView.swift
+                // does this BEFORE the await on capture.startRecording
+                // so the source stays paused all the way to t0; we
+                // mirror that — and ignore failures, since pausing an
+                // already-paused or no-loaded player should not block
+                // the recording start.
+                if let Some(player) = current_player.as_ref() {
+                    let player = player.clone();
+                    let _ = tokio::task::spawn_blocking(move || player.pause()).await;
+                }
+
+                let clip_id = uuid::Uuid::new_v4();
+                let filename = format!("clip-{clip_id}.mov");
+                let recordings_dir =
+                    video_coach_core::project_store::recordings_dir(project_folder);
+                let output_path = recordings_dir.join(&filename);
+
+                // Build the source factory. CI / harness uses the
+                // fixture-source override (no webcam permissions);
+                // production gets the platform default. The
+                // PlatformDefault arm wires real GStreamer elements
+                // in Task 2.
+                let factory: Arc<dyn CaptureSourceFactory> = match fixture_recording_source {
+                    Some(p) => Arc::new(video_coach_media::fixture_source::FixtureSource::new(
+                        p.to_path_buf(),
+                    )),
+                    None => match build_platform_default_source() {
+                        Ok(f) => f,
+                        Err(e) => {
+                            return CommandReply {
+                                ok: false,
+                                error: Some(e),
+                            };
+                        }
+                    },
+                };
+
+                // Transition to RecordingStarting BEFORE the blocking
+                // recording::start so the UI's REC indicator can show
+                // "Preparing…" through the camera-permission prompt.
+                *current_mode = AppMode::RecordingStarting;
+                let t0_instant = std::time::Instant::now();
+                write_recording_state(recording_state, *current_mode, Some(t0_instant));
+
+                // recording::start runs the GStreamer pipeline build +
+                // PAUSED→PLAYING transition; on macOS first launch it
+                // can block on the camera-permission prompt. Off-load
+                // to a worker so the bus task isn't held.
+                let output_path_clone = output_path.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    video_coach_media::recording::start(factory, output_path_clone)
+                })
+                .await;
+                match result {
+                    Ok(Ok(rec)) => {
+                        *recording = Some(rec);
+                        *current_mode = AppMode::Recording;
+                        write_recording_state(recording_state, *current_mode, Some(t0_instant));
+                        *recording_clip = Some(RecordingClipInProgress {
+                            clip_id,
+                            filename: filename.clone(),
+                            output_path: output_path.clone(),
+                            source_index,
+                            start_source_seconds: playhead_snapshot_seconds.max(0.0),
+                            t0_instant,
+                            events: Vec::new(),
+                        });
+                        tracing::info!(
+                            target: "recording.lifecycle",
+                            event = "recording.started",
+                            clip_id = %clip_id,
+                            filename = %filename,
+                            source_index = source_index as i64,
+                            start_source_seconds = playhead_snapshot_seconds.max(0.0),
+                            output = %output_path.display(),
+                        );
+                        tracing::info!(
+                            target: "recording.lifecycle",
+                            event = "mode.changed",
+                            mode = "recording",
+                        );
+                        CommandReply {
+                            ok: true,
+                            error: None,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        // Adversarial-review fix #10: bus must NOT
+                        // panic, must NOT leave mode stuck at
+                        // RecordingStarting, must roll back the
+                        // transition. Source stays paused — match v1.
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        tracing::warn!(
+                            target: "recording.lifecycle",
+                            event = "recording.failed",
+                            error = %e,
+                        );
+                        tracing::info!(
+                            target: "recording.lifecycle",
+                            event = "mode.changed",
+                            mode = "scanning",
+                        );
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("start recording: {e}")),
+                        }
+                    }
+                    Err(join) => {
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("join: {join}")),
+                        }
+                    }
+                }
             }
         }
         Command::StopClipRecording => {
-            // Task 0 stub: serde shape only. Real handler lands in Task 1.
-            CommandReply {
-                ok: false,
-                error: Some("stop_clip_recording: not yet implemented".into()),
+            #[cfg(not(feature = "media"))]
+            {
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                if !matches!(*current_mode, AppMode::Recording) {
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!("cannot stop recording in mode {:?}", *current_mode)),
+                    };
+                }
+                let Some(clip_in_progress) = recording_clip.take() else {
+                    // Defensive — mode says Recording but there's no
+                    // in-progress clip. Reset mode so we don't get
+                    // stuck.
+                    *current_mode = AppMode::Scanning;
+                    write_recording_state(recording_state, *current_mode, None);
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no recording_clip; reset to scanning".into()),
+                    };
+                };
+                let Some(rec) = recording.take() else {
+                    *current_mode = AppMode::Scanning;
+                    write_recording_state(recording_state, *current_mode, None);
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no active capture pipeline".into()),
+                    };
+                };
+
+                // Adversarial-review fix #4: compute duration on the
+                // bus side from t0_instant.elapsed(). Recording::stop
+                // returns no duration.
+                let recording_duration = clip_in_progress.t0_instant.elapsed().as_secs_f64();
+
+                // Recording::stop blocks waiting for EOS; off-load to
+                // a worker. Adversarial-review fix #2: mode mutations
+                // happen on the bus task AFTER the await returns, NOT
+                // inside this closure.
+                let output_path = clip_in_progress.output_path.clone();
+                let stop_result = tokio::task::spawn_blocking(move || rec.stop()).await;
+                match stop_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        // Plan: leave the .mov on disk, clear state,
+                        // transition back to Scanning, surface the
+                        // error. Do NOT write project.json with a
+                        // half-finished clip.
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        tracing::warn!(
+                            target: "recording.lifecycle",
+                            event = "recording.failed",
+                            phase = "stop",
+                            error = %e,
+                        );
+                        return CommandReply {
+                            ok: false,
+                            error: Some(format!("stop recording: {e}")),
+                        };
+                    }
+                    Err(join) => {
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        return CommandReply {
+                            ok: false,
+                            error: Some(format!("join: {join}")),
+                        };
+                    }
+                }
+
+                // Build the Clip + persist. Project mutation runs on
+                // the bus task; project_store::write blocks (file IO
+                // + serde) so the write itself goes to spawn_blocking.
+                let Some((project, project_folder)) = current.as_mut() else {
+                    *current_mode = AppMode::Scanning;
+                    write_recording_state(recording_state, *current_mode, None);
+                    return CommandReply {
+                        ok: false,
+                        error: Some("project closed during recording".into()),
+                    };
+                };
+                let sort_index = project.clips.len() as i64;
+                let clip = video_coach_core::project::Clip {
+                    id: clip_in_progress.clip_id,
+                    name: default_clip_name(
+                        clip_in_progress.source_index,
+                        clip_in_progress.start_source_seconds,
+                    ),
+                    notes: String::new(),
+                    tags: Vec::new(),
+                    source_index: clip_in_progress.source_index,
+                    start_source_seconds: clip_in_progress.start_source_seconds,
+                    recording_duration,
+                    recording_filename: clip_in_progress.filename.clone(),
+                    events: clip_in_progress.events.clone(),
+                    sort_index,
+                    created_at: chrono::Utc::now(),
+                };
+                project.clips.push(clip);
+                let project_clone = project.clone();
+                let folder_clone = project_folder.clone();
+                let write_result = tokio::task::spawn_blocking(move || {
+                    video_coach_core::project_store::write(&project_clone, &folder_clone)
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        tracing::info!(
+                            target: "recording.lifecycle",
+                            event = "recording.stopped",
+                            clip_id = %clip_in_progress.clip_id,
+                            duration_seconds = recording_duration,
+                            output = %output_path.display(),
+                        );
+                        tracing::info!(
+                            target: "recording.lifecycle",
+                            event = "mode.changed",
+                            mode = "scanning",
+                        );
+                        CommandReply {
+                            ok: true,
+                            error: None,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        // Persistence failed; project.clips is ahead
+                        // of disk. Pop the just-pushed clip so memory
+                        // and disk match.
+                        project.clips.pop();
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("persist project.json: {e}")),
+                        }
+                    }
+                    Err(join) => {
+                        project.clips.pop();
+                        *current_mode = AppMode::Scanning;
+                        write_recording_state(recording_state, *current_mode, None);
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("join: {join}")),
+                        }
+                    }
+                }
             }
         }
         Command::AppendStroke { points_json } => {
-            // Task 0 stub: serde shape only. Real handler lands in Task 4.
+            // Task 4 stub: serde shape established in Task 0; semantic
+            // handler lands when stroke capture wires up.
             let _ = points_json;
             CommandReply {
                 ok: false,
@@ -841,6 +1264,18 @@ async fn handle(
             }
         }
     }
+}
+
+/// Phase 8 Task 1 (filled in by Task 2). Build the platform-default
+/// capture-source factory (avfvideosrc + osxaudiosrc on macOS, etc.).
+/// For Task 1 only: returns the not-yet-implemented error so the
+/// handler logic compiles + tests can drive the full flow via the
+/// fixture-source override. Task 2 swaps in the real
+/// `PlatformDefaultSource`.
+#[cfg(feature = "media")]
+fn build_platform_default_source(
+) -> Result<std::sync::Arc<dyn video_coach_media::source::CaptureSourceFactory>, String> {
+    Err("platform default source not yet implemented".into())
 }
 
 /// If `current` has a project with `sourceVideos[0]` and no player is
