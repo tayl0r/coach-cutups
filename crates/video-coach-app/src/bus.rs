@@ -31,6 +31,16 @@ pub enum Command {
     OpenProject {
         path: String,
     },
+    /// Create a fresh v2 project at `path`. Writes `<path>/project.json`
+    /// and ensures `<path>/recordings/` exists. Project name is derived
+    /// from the folder's basename. Refuses to overwrite if a
+    /// `project.json` is already present. After creating, the new
+    /// project becomes the current project (same effect as a subsequent
+    /// OpenProject) and a `project.opened` event fires so the UI's
+    /// post-open path can run unchanged.
+    NewProject {
+        path: String,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -234,6 +244,53 @@ async fn handle(
                 }
             }
         }
+        Command::NewProject { path } => {
+            let folder = std::path::PathBuf::from(&path);
+            let result = tokio::task::spawn_blocking(
+                move || -> Result<video_coach_core::project::Project, String> {
+                    if folder.join("project.json").exists() {
+                        return Err(format!(
+                            "{} already contains a project.json — refusing to overwrite",
+                            folder.display()
+                        ));
+                    }
+                    let name = folder
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("Untitled")
+                        .to_string();
+                    let project = video_coach_core::project::Project::new(name);
+                    video_coach_core::project_store::write(&project, &folder)
+                        .map_err(|e| e.to_string())?;
+                    Ok(project)
+                },
+            )
+            .await;
+            match result {
+                Ok(Ok(project)) => {
+                    tracing::info!(
+                        target: "project.lifecycle",
+                        event = "project.opened",
+                        path = %path,
+                        name = %project.name,
+                        created = true,
+                    );
+                    *current_project = Some(project);
+                    CommandReply {
+                        ok: true,
+                        error: None,
+                    }
+                }
+                Ok(Err(msg)) => CommandReply {
+                    ok: false,
+                    error: Some(msg),
+                },
+                Err(join) => CommandReply {
+                    ok: false,
+                    error: Some(format!("join: {join}")),
+                },
+            }
+        }
         Command::OpenProject { path } => {
             let folder = std::path::PathBuf::from(&path);
             // ProjectStore::read does sync file IO + serde_json::from_slice
@@ -312,6 +369,26 @@ mod tests {
         let cmd = Command::StopRecording;
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v, serde_json::json!({"cmd": "stop_recording"}));
+    }
+
+    #[test]
+    fn new_project_serializes_with_path() {
+        let cmd = Command::NewProject {
+            path: "/tmp/freshproj".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "new_project");
+        assert_eq!(v["path"], "/tmp/freshproj");
+    }
+
+    #[test]
+    fn new_project_deserializes_with_path() {
+        let v = serde_json::json!({"cmd": "new_project", "path": "/tmp/freshproj"});
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::NewProject { path } => assert_eq!(path, "/tmp/freshproj"),
+            _ => panic!("expected NewProject"),
+        }
     }
 
     #[test]

@@ -67,6 +67,63 @@ pub fn run(
         });
     });
 
+    // File → New Project: pop a folder picker. The picked folder will
+    // host the new project; ProjectStore::write creates the
+    // recordings/ subdir + project.json, then the bus auto-opens it
+    // (same project.opened event the open path uses, so the title
+    // updates by the same code below).
+    let bus_for_new = bus.clone();
+    let rt_for_new = rt.clone();
+    let weak_for_new = window.as_weak();
+    window.on_new_project_clicked(move || {
+        let bus = bus_for_new.clone();
+        let weak = weak_for_new.clone();
+        rt_for_new.spawn(async move {
+            let chosen = rfd::AsyncFileDialog::new()
+                .set_title("Choose a folder for the new project")
+                .pick_folder()
+                .await;
+            let Some(folder) = chosen else {
+                return;
+            };
+            let path = folder.path().to_string_lossy().into_owned();
+            let path_for_title = path.clone();
+            let reply = bus
+                .send(
+                    UI_COMMAND_ID.into(),
+                    Command::NewProject { path: path.clone() },
+                )
+                .await;
+            if reply.ok {
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_project_title(path_for_title.into());
+                        w.set_error_message("".into());
+                    }
+                })
+                .ok();
+            } else {
+                let err_text = reply
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "new_project failed (no error detail)".into());
+                tracing::warn!(
+                    target: "ui",
+                    error = ?reply.error,
+                    path = %path,
+                    "new_project failed",
+                );
+                let display = format!("Couldn't create project at {path}\n{err_text}");
+                slint::invoke_from_event_loop(move || {
+                    if let Some(w) = weak.upgrade() {
+                        w.set_error_message(display.into());
+                    }
+                })
+                .ok();
+            }
+        });
+    });
+
     // File → Open Project: pop a folder picker, dispatch OpenProject on
     // the user's choice, push the project's name back into the title-bar
     // label on success.

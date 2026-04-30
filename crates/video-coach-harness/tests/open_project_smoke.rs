@@ -66,6 +66,75 @@ async fn open_project_emits_event_with_name() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn new_project_creates_and_opens() -> anyhow::Result<()> {
+    let parent = TempDir::new()?;
+    let project_path = parent.path().join("Phase 6 New");
+    std::fs::create_dir(&project_path)?;
+
+    let mut app = App::launch().await?;
+    let reply = app
+        .send(serde_json::json!({
+            "cmd": "new_project",
+            "path": project_path.to_string_lossy(),
+        }))
+        .await?;
+    assert_eq!(
+        reply.ok,
+        Some(true),
+        "new_project failed: {:?}",
+        reply.error
+    );
+
+    let evt = app
+        .wait_for_event("project.opened", Duration::from_secs(2))
+        .await?;
+    assert_eq!(
+        evt.other.get("name").and_then(|v| v.as_str()),
+        Some("Phase 6 New"),
+    );
+    assert_eq!(
+        evt.other.get("created").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    // Verify the on-disk artifacts exist.
+    assert!(project_path.join("project.json").exists());
+    assert!(project_path.join("recordings").is_dir());
+
+    app.quit().await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_project_refuses_to_overwrite() -> anyhow::Result<()> {
+    let parent = TempDir::new()?;
+    let project_path = parent.path().join("AlreadyHere");
+    std::fs::create_dir(&project_path)?;
+    std::fs::write(project_path.join("project.json"), "{}")?; // existing sentinel
+
+    let mut app = App::launch().await?;
+    let reply = app
+        .send(serde_json::json!({
+            "cmd": "new_project",
+            "path": project_path.to_string_lossy(),
+        }))
+        .await?;
+    assert_eq!(reply.ok, Some(false));
+    assert!(
+        reply
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("already contains a project.json"),
+        "expected refuse-to-overwrite error, got: {:?}",
+        reply.error
+    );
+
+    app.quit().await?;
+    Ok(())
+}
+
+#[tokio::test]
 async fn open_project_missing_returns_error() -> anyhow::Result<()> {
     let dir = TempDir::new()?;
     // Don't create project.json — folder exists but is empty.

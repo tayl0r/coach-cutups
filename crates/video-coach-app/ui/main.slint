@@ -6,12 +6,17 @@ export component MainWindow inherits Window {
     in property <string> project-title: "No project open";
     in property <string> error-message: "";
 
+    callback new-project-clicked();
     callback open-project-clicked();
     callback quit-clicked();
 
     MenuBar {
         Menu {
             title: "File";
+            MenuItem {
+                title: "New Project…";
+                activated => { root.new-project-clicked(); }
+            }
             MenuItem {
                 title: "Open Project…";
                 activated => { root.open-project-clicked(); }
