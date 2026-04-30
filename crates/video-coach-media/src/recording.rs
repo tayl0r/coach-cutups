@@ -196,6 +196,29 @@ impl Recording {
             }
         }
 
+        // Step state down through Paused → Ready before Null, with a sync
+        // wait per transition. A direct Playing→Null jump can leave
+        // gst-plugins-good's `osxaudiosrc` racing CoreAudio's HAL IO
+        // callback against `gst_core_audio_close()`, crashing in
+        // `gst_osx_audio_src_io_proc` with a NULL deref of an internal
+        // ringbuffer field. Per-state waits force the pipeline to fully
+        // settle at each level before tearing the AudioUnit down.
+        for intermediate in [gstreamer::State::Paused, gstreamer::State::Ready] {
+            self.pipeline.set_state(intermediate).map_err(|e| {
+                RecordingError::StateChange(format!("{intermediate:?}: {e:?}"))
+            })?;
+            let (res, _, _) = self
+                .pipeline
+                .state(Some(gstreamer::ClockTime::from_seconds(2)));
+            if let Err(e) = res {
+                tracing::warn!(
+                    target: "recording",
+                    state = ?intermediate,
+                    error = ?e,
+                    "intermediate state wait failed; continuing teardown",
+                );
+            }
+        }
         self.pipeline
             .set_state(gstreamer::State::Null)
             .map_err(|e| RecordingError::StateChange(format!("NULL: {e:?}")))?;
