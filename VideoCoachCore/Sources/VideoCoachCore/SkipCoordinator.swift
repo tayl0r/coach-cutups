@@ -104,7 +104,9 @@ public final class SkipCoordinator {
             target = nil
             return SkipDecision(seek: .init(targetSeconds: t, exact: true))
         }
-        if flying != nil {
+        // Only set exactPending when there is a target to settle to — preserves
+        // the invariant that target is non-nil whenever exactPending is set.
+        if flying != nil, target != nil {
             exactPending = true
         }
         return .none

@@ -44,5 +44,8 @@ final class SkipCoordinatorTests: XCTestCase {
         let burst = c.burstEnded(nowMonotonicSeconds: 100.15)
         XCTAssertEqual(burst.seek, SeekParams(targetSeconds: 13.0, exact: true))
         XCTAssertNil(burst.armDebounceSeconds)
+        let burst2 = c.burstEnded(nowMonotonicSeconds: 100.20)
+        XCTAssertNil(burst2.seek)
+        XCTAssertNil(burst2.armDebounceSeconds)
     }
 }
