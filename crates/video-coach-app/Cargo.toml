@@ -13,7 +13,9 @@ control-socket = []
 # Recording machinery: pulls in video-coach-media + gstreamer system libs.
 # Without this feature, StartRecording / StopRecording return errors at
 # runtime and the binary builds with no GStreamer dependency.
-media = ["dep:video-coach-media"]
+# Phase 7 added video-coach-media's `media` feature gating around the
+# source_player + compose modules; propagate it through.
+media = ["dep:video-coach-media", "video-coach-media/media"]
 
 [dependencies]
 video-coach-core = { path = "../video-coach-core" }
@@ -27,6 +29,9 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 slint = { workspace = true }
 rfd = { workspace = true }
+# Phase 7. Cross-platform relative-path computation (handles `..`
+# traversal on Windows + Unix uniformly).
+pathdiff = "0.2"
 
 [build-dependencies]
 slint-build = { workspace = true }

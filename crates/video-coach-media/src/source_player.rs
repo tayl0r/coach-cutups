@@ -364,3 +364,34 @@ fn platform_audio_sink_name() -> &'static str {
         "pulsesink"
     }
 }
+
+/// Probe a media file's duration without opening a play pipeline. Used
+/// by the AddSourceVideo bus handler to populate
+/// `SourceRef.duration_seconds`. Backed by GStreamer's Discoverer,
+/// which is a brief preroll-only inspection — much cheaper than
+/// opening a full SourcePlayer.
+///
+/// Sequenced *before* any subsequent SourcePlayer::open on the same
+/// file (in the same process) so the two never race on platform
+/// hardware decoders.
+pub fn probe_duration(path: &Path) -> Result<f64, SourcePlayerError> {
+    crate::init().map_err(|e| SourcePlayerError::Construction(e.to_string()))?;
+
+    let timeout = gstreamer::ClockTime::from_seconds(10);
+    let discoverer = gstreamer_pbutils::Discoverer::new(timeout)
+        .map_err(|e| SourcePlayerError::Construction(format!("discoverer: {e}")))?;
+
+    let abs = path.canonicalize().map_err(SourcePlayerError::Io)?;
+    let uri = format!(
+        "file://{}",
+        abs.to_str().ok_or(SourcePlayerError::InvalidPath)?
+    );
+    let info = discoverer
+        .discover_uri(&uri)
+        .map_err(|e| SourcePlayerError::Construction(format!("discover {uri}: {e}")))?;
+
+    let duration = info.duration().ok_or_else(|| {
+        SourcePlayerError::Construction("no duration on discovered stream".into())
+    })?;
+    Ok(duration.nseconds() as f64 / 1_000_000_000.0)
+}

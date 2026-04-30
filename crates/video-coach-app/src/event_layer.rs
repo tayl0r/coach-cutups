@@ -113,6 +113,14 @@ impl tracing::field::Visit for JsonVisitor {
         self.fields
             .insert(field.name().to_string(), serde_json::Value::Bool(value));
     }
+    fn record_f64(&mut self, field: &tracing::field::Field, value: f64) {
+        // serde_json::Number::from_f64 returns None for NaN / Inf — fall
+        // back to a string in those cases so the field still shows up.
+        let v = serde_json::Number::from_f64(value)
+            .map(serde_json::Value::Number)
+            .unwrap_or_else(|| serde_json::Value::String(format!("{value}")));
+        self.fields.insert(field.name().to_string(), v);
+    }
 }
 
 #[cfg(all(test, feature = "control-socket"))]

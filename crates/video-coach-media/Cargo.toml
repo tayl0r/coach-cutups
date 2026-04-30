@@ -15,6 +15,9 @@ gstreamer = "0.23"
 gstreamer-app = "0.23"
 gstreamer-video = "0.23"
 gstreamer-audio = "0.23"
+# Phase 7 — Discoverer for source-video duration probing
+# (AddSourceVideo bus command).
+gstreamer-pbutils = "0.23"
 thiserror = { workspace = true }
 tracing = "0.1"
 video-coach-compositor = { path = "../video-coach-compositor", optional = true }

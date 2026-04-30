@@ -134,6 +134,86 @@ async fn new_project_refuses_to_overwrite() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "media")]
+#[tokio::test]
+async fn add_source_video_persists_to_disk() -> anyhow::Result<()> {
+    use std::path::PathBuf;
+
+    // Locate the source-1080p fixture relative to the workspace root.
+    let mut fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    fixture.push("../../fixtures/source-1080p.mp4");
+    let fixture = fixture.canonicalize()?;
+
+    let parent = TempDir::new()?;
+    let project_path = parent.path().join("phase7-source-test");
+    std::fs::create_dir(&project_path)?;
+
+    let mut app = App::launch().await?;
+
+    // Create the project so AddSourceVideo has something to mutate.
+    let create = app
+        .send(serde_json::json!({
+            "cmd": "new_project",
+            "path": project_path.to_string_lossy(),
+        }))
+        .await?;
+    assert_eq!(
+        create.ok,
+        Some(true),
+        "new_project failed: {:?}",
+        create.error
+    );
+    let _ = app
+        .wait_for_event("project.opened", Duration::from_secs(2))
+        .await?;
+
+    // Add the fixture as a source video.
+    let reply = app
+        .send(serde_json::json!({
+            "cmd": "add_source_video",
+            "absolute_path": fixture.to_string_lossy(),
+        }))
+        .await?;
+    assert_eq!(
+        reply.ok,
+        Some(true),
+        "add_source_video failed: {:?}",
+        reply.error
+    );
+
+    let evt = app
+        .wait_for_event("source.added", Duration::from_secs(5))
+        .await?;
+    let duration = evt.other.get("duration_seconds").and_then(|v| v.as_f64());
+    assert!(
+        duration.is_some_and(|d| (d - 60.0).abs() < 1.0),
+        "duration should be ~60s; got {:?}",
+        duration
+    );
+
+    // Inspect the on-disk project.json to verify the SourceRef landed.
+    let json = std::fs::read_to_string(project_path.join("project.json"))?;
+    let parsed: serde_json::Value = serde_json::from_str(&json)?;
+    let sources = parsed
+        .get("sourceVideos")
+        .and_then(|v| v.as_array())
+        .expect("sourceVideos array");
+    assert_eq!(sources.len(), 1, "expected exactly one source video");
+    let rel = sources[0]
+        .get("relativePath")
+        .and_then(|v| v.as_str())
+        .expect("relativePath");
+    // Fixture lives outside the temp project folder, so the path
+    // should start with `..` somewhere.
+    assert!(
+        rel.contains(".."),
+        "relativePath should traverse out of project folder; got {rel:?}",
+    );
+
+    app.quit().await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn open_project_missing_returns_error() -> anyhow::Result<()> {
     let dir = TempDir::new()?;

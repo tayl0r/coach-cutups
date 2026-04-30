@@ -140,11 +140,12 @@ pub fn spawn_on(
         #[cfg(feature = "media")]
         let mut recording: Option<video_coach_media::recording::Recording> = None;
 
-        // Per-task project state. `None` until OpenProject succeeds. Held
-        // here (vs in the UI module) because future bus commands —
-        // StartRecording-with-clip-metadata, ExportClip, etc. — need the
-        // project record without bouncing through the UI thread.
-        let mut current_project: Option<video_coach_core::project::Project> = None;
+        // Per-task project state. `None` until OpenProject / NewProject
+        // succeeds. Stored as (Project, project_folder) so subsequent
+        // commands (Phase 7 AddSourceVideo, future ExportClip, etc.)
+        // can resolve paths relative to the project folder and write
+        // back to the same `project.json`.
+        let mut current: Option<(video_coach_core::project::Project, std::path::PathBuf)> = None;
 
         while let Some(env) = rx.recv().await {
             let reply = handle(
@@ -152,7 +153,7 @@ pub fn spawn_on(
                 &shutdown_tx,
                 #[cfg(feature = "media")]
                 &mut recording,
-                &mut current_project,
+                &mut current,
             )
             .await;
             let _ = env.reply.send(reply);
@@ -165,7 +166,7 @@ async fn handle(
     cmd: Command,
     shutdown_tx: &tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] recording: &mut Option<video_coach_media::recording::Recording>,
-    current_project: &mut Option<video_coach_core::project::Project>,
+    current: &mut Option<(video_coach_core::project::Project, std::path::PathBuf)>,
 ) -> CommandReply {
     match cmd {
         Command::Quit => {
@@ -275,21 +276,22 @@ async fn handle(
         }
         Command::NewProject { path } => {
             let folder = normalize_project_folder(&path);
+            let folder_for_blocking = folder.clone();
             let result = tokio::task::spawn_blocking(
                 move || -> Result<video_coach_core::project::Project, String> {
-                    if folder.join("project.json").exists() {
+                    if folder_for_blocking.join("project.json").exists() {
                         return Err(format!(
                             "{} already contains a project.json — refusing to overwrite",
-                            folder.display()
+                            folder_for_blocking.display()
                         ));
                     }
-                    let name = folder
+                    let name = folder_for_blocking
                         .file_name()
                         .and_then(|s| s.to_str())
                         .unwrap_or("Untitled")
                         .to_string();
                     let project = video_coach_core::project::Project::new(name);
-                    video_coach_core::project_store::write(&project, &folder)
+                    video_coach_core::project_store::write(&project, &folder_for_blocking)
                         .map_err(|e| e.to_string())?;
                     Ok(project)
                 },
@@ -304,7 +306,7 @@ async fn handle(
                         name = %project.name,
                         created = true,
                     );
-                    *current_project = Some(project);
+                    *current = Some((project, folder));
                     CommandReply {
                         ok: true,
                         error: None,
@@ -322,13 +324,15 @@ async fn handle(
         }
         Command::OpenProject { path } => {
             let folder = normalize_project_folder(&path);
+            let folder_for_blocking = folder.clone();
             // ProjectStore::read does sync file IO + serde_json::from_slice
             // on potentially megabytes of stroke data. Same pattern as
             // StopRecording: spawn_blocking so the bus task isn't held
             // while disk reads complete.
-            let result =
-                tokio::task::spawn_blocking(move || video_coach_core::project_store::read(&folder))
-                    .await;
+            let result = tokio::task::spawn_blocking(move || {
+                video_coach_core::project_store::read(&folder_for_blocking)
+            })
+            .await;
             match result {
                 Ok(Ok(project)) => {
                     tracing::info!(
@@ -337,7 +341,7 @@ async fn handle(
                         path = %path,
                         name = %project.name,
                     );
-                    *current_project = Some(project);
+                    *current = Some((project, folder));
                     CommandReply {
                         ok: true,
                         error: None,
@@ -353,14 +357,116 @@ async fn handle(
                 },
             }
         }
-        // Phase 7 commands — stub handlers. Implemented in subsequent
-        // tasks (1–5). Until then, the bus reports the feature as
-        // pending so the harness sees a deterministic error rather than
-        // a panic on an unmatched arm.
-        Command::AddSourceVideo { absolute_path: _ } => CommandReply {
-            ok: false,
-            error: Some("add_source_video not yet implemented (Phase 7 Task 2)".into()),
-        },
+        Command::AddSourceVideo { absolute_path } => {
+            #[cfg(not(feature = "media"))]
+            {
+                let _ = absolute_path;
+                return CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                };
+            }
+            #[cfg(feature = "media")]
+            {
+                let Some((project, project_folder)) = current.as_mut() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no project open".into()),
+                    };
+                };
+                let abs = std::path::PathBuf::from(&absolute_path);
+                if !abs.is_file() {
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!("{} is not a regular file", abs.display())),
+                    };
+                }
+                let folder_for_blocking = project_folder.clone();
+                let abs_for_blocking = abs.clone();
+                // Discoverer + relative-path math both want to run off
+                // the bus task — Discoverer is a brief but blocking
+                // GStreamer call.
+                let result = tokio::task::spawn_blocking(
+                    move || -> Result<(String, String, f64), String> {
+                        let duration =
+                            video_coach_media::source_player::probe_duration(&abs_for_blocking)
+                                .map_err(|e| e.to_string())?;
+                        let rel = pathdiff::diff_paths(&abs_for_blocking, &folder_for_blocking)
+                            .ok_or_else(|| {
+                                "could not compute relative path (different drives?)".to_string()
+                            })?;
+                        let display_name = abs_for_blocking
+                            .file_name()
+                            .and_then(|s| s.to_str())
+                            .unwrap_or("source")
+                            .to_string();
+                        Ok((rel.to_string_lossy().into_owned(), display_name, duration))
+                    },
+                )
+                .await;
+                let (relative_path, display_name, duration_seconds) = match result {
+                    Ok(Ok(t)) => t,
+                    Ok(Err(msg)) => {
+                        return CommandReply {
+                            ok: false,
+                            error: Some(msg),
+                        }
+                    }
+                    Err(join) => {
+                        return CommandReply {
+                            ok: false,
+                            error: Some(format!("join: {join}")),
+                        }
+                    }
+                };
+                project
+                    .source_videos
+                    .push(video_coach_core::project::SourceRef {
+                        relative_path: relative_path.clone(),
+                        display_name: display_name.clone(),
+                        duration_seconds,
+                    });
+                // Persist. Failure here leaves the in-memory project
+                // ahead of disk — surface as an error and roll back the
+                // push so the user sees a consistent state.
+                let project_clone = project.clone();
+                let folder_for_write = project_folder.clone();
+                let write_result = tokio::task::spawn_blocking(move || {
+                    video_coach_core::project_store::write(&project_clone, &folder_for_write)
+                })
+                .await;
+                match write_result {
+                    Ok(Ok(())) => {
+                        tracing::info!(
+                            target: "project.lifecycle",
+                            event = "source.added",
+                            relative_path = %relative_path,
+                            display_name = %display_name,
+                            duration_seconds,
+                            count = project.source_videos.len(),
+                        );
+                        CommandReply {
+                            ok: true,
+                            error: None,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        project.source_videos.pop();
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("write project.json: {e}")),
+                        }
+                    }
+                    Err(join) => {
+                        project.source_videos.pop();
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("join: {join}")),
+                        }
+                    }
+                }
+            }
+        }
         Command::Play => CommandReply {
             ok: false,
             error: Some("play not yet implemented (Phase 7 Task 3)".into()),
