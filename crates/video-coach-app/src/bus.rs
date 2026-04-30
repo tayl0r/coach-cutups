@@ -135,11 +135,6 @@ impl BusHandle {
 pub type FrameSinkFactory =
     std::sync::Arc<dyn Fn() -> Box<dyn video_coach_media::source_player::FrameSink> + Send + Sync>;
 
-#[cfg(feature = "media")]
-pub fn null_frame_sink_factory() -> FrameSinkFactory {
-    std::sync::Arc::new(|| Box::new(video_coach_media::source_player::NullFrameSink))
-}
-
 /// Spawn the bus task on the given tokio runtime handle. Phase 6 dropped
 /// `#[tokio::main]` so the bus runs on the same multi-threaded runtime
 /// that drives the control socket and any UI-dispatched async work.

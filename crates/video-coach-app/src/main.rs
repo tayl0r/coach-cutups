@@ -1,6 +1,7 @@
 mod bus;
 mod cli;
 mod event_layer;
+mod frame_sink;
 mod logging;
 mod protocol;
 mod ui;
@@ -63,15 +64,26 @@ fn main() -> anyhow::Result<()> {
     // work. Phase 6 Task 5 will wire UI callbacks to bus.send() through this
     // same handle.
     //
-    // Phase 7 Task 3: the bus spawns SourcePlayer instances on its own and
-    // needs a way to mint a fresh `FrameSink` each time. For headless runs
-    // (`--headless`) and for the harness, we hand it a `NullFrameSink`
-    // factory; Task 4 swaps in a Slint-backed sink for the windowed path.
+    // Phase 7 Task 4: the bus's FrameSink factory is now Slint-aware in
+    // windowed builds. The shared `frame_slot` is created here so that
+    // both the bus's factory (which mints SlintFrameSink writers) and
+    // the UI thread's display-rate timer (which reads + clears) can
+    // reach the same `Arc<Mutex<...>>`. In `--headless` mode the slot
+    // is created but never read; SlintFrameSink still writes into it
+    // and the data is dropped on next overwrite — harmless.
+    let frame_slot = frame_sink::new_slot();
+
+    #[cfg(feature = "media")]
+    let frame_sink_factory: bus::FrameSinkFactory = {
+        let slot = frame_slot.clone();
+        std::sync::Arc::new(move || Box::new(frame_sink::SlintFrameSink::new(slot.clone())))
+    };
+
     let bus = bus::spawn_on(
         runtime.handle(),
         shutdown_tx.clone(),
         #[cfg(feature = "media")]
-        bus::null_frame_sink_factory(),
+        frame_sink_factory,
     );
     let _ = &bus;
 
@@ -112,7 +124,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         // Slint blocks the main thread until the window closes. Tokio
         // workers continue polling the socket / bus while the UI runs.
-        ui::run(bus, runtime.handle().clone(), shutdown_tx)?;
+        ui::run(bus, runtime.handle().clone(), shutdown_tx, frame_slot)?;
     }
 
     tracing::info!(target: "app.lifecycle", event = "app.shutdown");

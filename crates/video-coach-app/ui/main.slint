@@ -5,6 +5,10 @@ export component MainWindow inherits Window {
 
     in property <string> project-title: "No project open";
     in property <string> error-message: "";
+    // Phase 7 Task 4: video surface. Updated by the UI thread at 30Hz
+    // from the latest decoded frame written by SourcePlayer's Slint
+    // FrameSink. Source-fit "contain" keeps aspect ratio.
+    in property <image> source-frame;
 
     callback new-project-clicked();
     callback open-project-clicked();
@@ -28,11 +32,22 @@ export component MainWindow inherits Window {
         }
     }
 
+    // Source video surface fills the window; transport bar (Task 5)
+    // will land below this at the bottom edge.
+    Image {
+        x: 0; y: 0;
+        width: parent.width;
+        height: parent.height;
+        image-fit: contain;
+        source: source-frame;
+    }
+
     Text {
         x: 16px;
         y: 16px;
         text: project-title;
         font-size: 18px;
+        color: #ffffff;
     }
 
     if error-message != "": Text {

@@ -20,6 +20,7 @@
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
 use crate::bus::{BusHandle, Command};
+use crate::frame_sink::FrameSlot;
 use slint::ComponentHandle;
 
 slint::include_modules!();
@@ -28,12 +29,48 @@ slint::include_modules!();
 /// tracing bridge can route on this prefix.
 const UI_COMMAND_ID: &str = "ui";
 
+/// Display-rate timer interval. 30 Hz is the source's native rate for
+/// our test fixtures and the modal expectation for source-video
+/// playback. Slint's Timer fires on the UI thread, so the closure is
+/// allowed to call window setters directly — no `invoke_from_event_loop`
+/// hop.
+const FRAME_TICK_MS: u64 = 33;
+
 pub fn run(
     bus: BusHandle,
     rt: tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
+    frame_slot: FrameSlot,
 ) -> anyhow::Result<()> {
     let window = MainWindow::new()?;
+
+    // Phase 7 Task 4: drive `source-frame` from the shared frame slot at
+    // display rate. The slot is overwritten at GStreamer's frame rate
+    // (~30fps for our fixture) by SlintFrameSink on the streaming
+    // thread; this timer reads + applies on the main thread, dropping
+    // any frame the streaming thread has already replaced.
+    let frame_timer = slint::Timer::default();
+    let weak_for_frames = window.as_weak();
+    let slot_for_timer = frame_slot.clone();
+    frame_timer.start(
+        slint::TimerMode::Repeated,
+        std::time::Duration::from_millis(FRAME_TICK_MS),
+        move || {
+            let next_frame = {
+                let mut guard = slot_for_timer.lock().expect("frame slot poisoned");
+                guard.take()
+            };
+            if let Some(buf) = next_frame {
+                if let Some(w) = weak_for_frames.upgrade() {
+                    w.set_source_frame(slint::Image::from_rgba8(buf));
+                }
+            }
+        },
+    );
+    // Keep the timer alive for the lifetime of `run()`. Slint Timers
+    // stop and free their captured closure on drop; the local binding
+    // lives until window.run() returns at end of function.
+    let _frame_timer = frame_timer;
 
     // Path 1: window close button / Cmd-Q (winit dispatches CloseRequested).
     let shutdown_for_close = shutdown_tx.clone();
