@@ -68,12 +68,27 @@ public final class SkipCoordinator {
     }
 
     /// Notify the coordinator that the in-flight seek has completed.
+    ///
+    /// Intended transitions (see plan section 1.3):
+    /// (a) clear `exactPending` unconditionally;
+    /// (b) if `exactPending && target != nil` → fire an exact seek to `target`;
+    /// (c) if the completed seek was coarse and `target` advanced during flight → refire coarse to the latest `target`;
+    /// (d) else if the completed seek landed exact, clear `target`; otherwise no-op.
+    // TODO(plan-1.3): implement the seek-completion settle logic described above.
     public func seekCompleted(nowMonotonicSeconds: TimeInterval) -> SkipDecision { .none }
 
     /// Notify the coordinator that the burst-end debounce has fired.
+    ///
+    /// Intended transitions (see plan section 1.4):
+    /// if no seek is currently flying, fire an exact seek to `target`;
+    /// otherwise set `exactPending = true` and let `seekCompleted` issue the
+    /// exact-frame settle when the in-flight seek lands.
+    // TODO(plan-1.4): implement the burst-end debounce settle logic described above.
     public func burstEnded(nowMonotonicSeconds: TimeInterval) -> SkipDecision { .none }
 
-    /// Used when the active player swaps; full reset.
+    /// Used when the active player swaps. Clears transient skip state
+    /// (`target`, `flying`, `flyingExact`, `exactPending`) only; the
+    /// configured `burstWindow` is preserved across resets.
     public func reset() {
         target = nil; flying = nil; flyingExact = false; exactPending = false
     }
