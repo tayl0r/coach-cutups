@@ -109,7 +109,7 @@ docs/plans/2026-04-30-rust-rewrite-phase-7-source-transport.md
 
 
 ## Phase 8 — recording integration
-In progress. Plan:
+SHIPPED 2026-04-30. CI run 25180704128 green on all 4 jobs. Plan:
 docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
 
 - [x] Task 0: Preflight — AppMode + new command shapes + tracing targets (commit 3a95bcc)
@@ -170,7 +170,9 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
       since the lower-level recording.rs pipeline already used
       "recording.started" — collision was making the harness's
       wait_for_event pick the wrong event.
-- [ ] Task 6: Closeout
+- [x] Task 6: Closeout — CI run 25180704128 green; plan closeout
+      appended; sub-agent timeouts on Tasks 4-6 noted as a Phase-9+
+      lesson learned (split into smaller per-task agent prompts).
 
 
 ## Phase 9+ — pending

@@ -467,3 +467,114 @@ present in the shipped code.
 - No regressions in existing Phase 1–7 tests.
 - PROGRESS.txt reflects each task's completion + the phase SHIPPED
   line.
+
+---
+
+## Closeout (2026-04-30)
+
+**Status: shipped.** See `PROGRESS.txt` for the per-task commit map.
+
+**Implementation history:** Tasks 0+1 by sub-agent #1 (timed out
+after Task 1 due to a long-running per-test cargo cycle); Tasks 2+3
+by sub-agent #2 (also timed out, mid-Task-4); Tasks 4–6 finished in
+the main session. The plan stayed faithful — sub-agents picked up the
+adversarial-review fixes correctly; the timeouts were watchdog
+limits, not architectural problems.
+
+**Commits (in order):**
+
+| Task | Commit  | Title                                                       |
+|------|---------|-------------------------------------------------------------|
+| 0    | 3a95bcc | AppMode + clip-recording command shapes                     |
+| 1    | 249ade5 | clip-recording state machine + handlers                     |
+| 2    | bf91547 | PlatformDefaultSource capture factory                       |
+| 3    | c88bba6 | R key + REC indicator + elapsed timer                       |
+| 4    | c789fa0 | Stroke event capture (events only)                          |
+| 5    | 6034c50 | Record-clip lifecycle E2E + event renames                   |
+
+Plus `chore(progress)` follow-ups filling SHA references in
+PROGRESS.txt (the SHA can't be inlined in the same commit it
+references; pattern is documented in PROGRESS.txt's header).
+
+**Test counts (Phase 8 deltas):** 76 → 80 default (+4); 89 → 96 with
+media (+7: 4 bus serde + 2 platform_source + 1 record_clip_smoke).
+
+**Adversarial-review fixes verified in code:**
+
+- ✅ #1 Playhead snapshot in UI: `ui.rs::on_record_toggled` reads
+  `player_state_slot.lock().position_seconds` BEFORE dispatching
+  `StartClipRecording { playhead_snapshot_seconds }`.
+- ✅ #2 Mode mutations stay on bus task: every `*current_mode = ...`
+  in `bus.rs` runs in the `handle()` async chain after
+  spawn_blocking returns.
+- ✅ #3 `VIDEO_COACH_NO_AUDIO` propagation:
+  `platform_source.rs::platform_audio_source_name` swaps to
+  `audiotestsrc` when env is set; mirrors `source_player.rs`
+  exactly.
+- ✅ #4 Bus-side duration: `RecordingClipInProgress.t0_instant`
+  computed via `t0_instant.elapsed().as_secs_f64()` right before
+  `Recording::stop()`. `recording.rs` API untouched.
+- ✅ #5 Letterbox stroke math: `main.slint`'s stroke-area
+  TouchArea computes `rendered-w/h/offset-x/offset-y` from
+  `source-frame.width/.height` vs. container; clamps AFTER
+  letterbox compensation.
+- ✅ #6 JSON-string stroke callback: single `stroke-completed
+  (points-json: string)` callback per drag-release.
+- ✅ #7 Centralized `is_recording()` helper.
+- ✅ #8 UI timer reads `RecordingStateSlot` BEFORE `PlayerStateSlot`.
+- ✅ #9 Shutdown-during-recording accepted: not patched. Same
+  behavior as v1.
+- ✅ #10 Permission-deny path: `PlatformDefaultSource::build()`
+  returns Err on construction failure; bus rolls back to
+  `Scanning` + emits `clip_recording.failed`.
+
+**Empirical findings for future phases:**
+
+- The harness's `wait_for_event` matches by event name only, NOT by
+  target. Two events with the same name across different targets
+  collide. Phase 8 hit this when `recording.started` fired from BOTH
+  `recording.rs` (low-level pipeline) AND `bus.rs` (mode-level);
+  renamed bus events to `clip_recording.started` /
+  `clip_recording.stopped` / `clip_recording.failed` to disambiguate.
+  Future phases should namespace event names to their command flow,
+  not to a shared verb.
+
+- Sub-agent stream-watchdog timeout (~10 min idle) is real. For phases
+  that take 30+ min wall-clock to ship, prefer to either (a) split
+  into smaller scoped sub-agent prompts, or (b) take over in main
+  session for the remaining tasks. Phase 8's two sub-agents both
+  shipped solid work before timing out.
+
+- Renaming `recording.{started,stopped,failed}` → `clip_recording.*`
+  is an event-shape change but NOT a bus command shape change. Wire
+  format for `StartClipRecording` etc. is unaffected.
+
+**Outstanding follow-ups:**
+
+- **Phase 8.5: stroke rendering.** Phase 8 captures stroke events but
+  doesn't draw them on screen during recording. Slint Canvas/Path
+  layer or wgpu overlay; lands before Phase 9's clip-preview
+  visual-parity test (Phase 9 needs to replay strokes).
+- **`platform_source_smoke` not run locally.** Defer to user — needs
+  webcam permission grant, which is outside automation scope.
+  Documented in Task 6's checklist for the user to walk.
+- **Windows + Linux PlatformDefault never exercised in CI.** Code
+  compiles on those platforms but the `--fixture-recording-source`
+  path covers all CI testing. First time real recording is exercised
+  on those platforms is a manual smoke from the user.
+
+**Manual smoke checklist** (for the user to walk through):
+
+- [ ] Open a project, add a source, press R: red dot appears,
+      timer counts up.
+- [ ] Press R again: clip lands in `project.json`, .mov in
+      `<project>/recordings/`.
+- [ ] Drag a stroke during recording: events captured (verify by
+      reading project.json after stop).
+- [ ] Camera permission prompt fires on first launch (macOS).
+      Allow → recording works; Deny → bus emits
+      `clip_recording.failed` with the error and stays in Scanning.
+
+**Phase 9 entry conditions met.** Recording integration is the
+foundation for clip preview (Phase 9) — all the data shapes (Clip,
+events, recording.mov path) are in place.
