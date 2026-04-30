@@ -464,10 +464,7 @@ async fn handle(
                 let factory: Arc<dyn CaptureSourceFactory> = match source {
                     SourceConfig::Fixture { path } => Arc::new(FixtureSource::new(path)),
                     SourceConfig::PlatformDefault => {
-                        return CommandReply {
-                            ok: false,
-                            error: Some("platform default source not yet implemented".into()),
-                        };
+                        Arc::new(video_coach_media::platform_source::PlatformDefaultSource::new())
                     }
                 };
                 match video_coach_media::recording::start(factory, output.into()) {
@@ -1266,16 +1263,18 @@ async fn handle(
     }
 }
 
-/// Phase 8 Task 1 (filled in by Task 2). Build the platform-default
-/// capture-source factory (avfvideosrc + osxaudiosrc on macOS, etc.).
-/// For Task 1 only: returns the not-yet-implemented error so the
-/// handler logic compiles + tests can drive the full flow via the
-/// fixture-source override. Task 2 swaps in the real
-/// `PlatformDefaultSource`.
+/// Phase 8 Task 2. Build the platform-default capture-source factory.
+/// Wraps `PlatformDefaultSource` in an `Arc<dyn ...>` so the call site
+/// in `Command::StartClipRecording` matches the FixtureSource arm. The
+/// `Result` shape is preserved from the Task 1 stub so future failures
+/// (e.g. missing GStreamer plugins detected at construction) can land
+/// here without a signature churn.
 #[cfg(feature = "media")]
 fn build_platform_default_source(
 ) -> Result<std::sync::Arc<dyn video_coach_media::source::CaptureSourceFactory>, String> {
-    Err("platform default source not yet implemented".into())
+    Ok(std::sync::Arc::new(
+        video_coach_media::platform_source::PlatformDefaultSource::new(),
+    ))
 }
 
 /// If `current` has a project with `sourceVideos[0]` and no player is
