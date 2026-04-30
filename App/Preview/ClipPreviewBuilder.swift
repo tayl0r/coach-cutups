@@ -16,6 +16,7 @@ enum ClipPreviewBuilderError: Error {
     case noWebcamVideoTrack(URL)
     case pixelBufferAllocFailed
     case freezeFrameDecodeFailed(URL, CMTime, underlying: Error)
+    case invalidSourceNaturalSize(URL)
 }
 
 /// Builds the `AVPlayerItem` for Mode C clip preview.
@@ -158,10 +159,12 @@ enum ClipPreviewBuilder {
             let gen = AVAssetImageGenerator(asset: srcAsset)
             gen.appliesPreferredTrackTransform = true
             // Snap to the nearest keyframe — fine for a held frame, and the
-            // reason a 100–800ms decode window is acceptable here.
+            // reason a 100–800ms decode window is acceptable here. Cap at
+            // 1920×1080 to match the preview composition's renderSize ceiling
+            // so freeze frames don't appear softer than surrounding live frames.
             gen.requestedTimeToleranceBefore = .positiveInfinity
             gen.requestedTimeToleranceAfter = .positiveInfinity
-            gen.maximumSize = CGSize(width: 1280, height: 720)
+            gen.maximumSize = CGSize(width: 1920, height: 1080)
 
             for i in freezeIndices {
                 let priorPlayEnd = sourceTimeAtEndOfPlay(precedingSegment: i, in: segments)
@@ -193,6 +196,9 @@ enum ClipPreviewBuilder {
             width: abs(srcNatural.width),
             height: abs(srcNatural.height)
         )
+        guard nativeRender.width > 0, nativeRender.height > 0 else {
+            throw ClipPreviewBuilderError.invalidSourceNaturalSize(srcURL)
+        }
         // Preview is shown in a window — the source's full native dimensions
         // (often 4K) inflate every per-frame composite/output buffer with no
         // visible benefit. Cap the longer side to 1920px and preserve aspect.
