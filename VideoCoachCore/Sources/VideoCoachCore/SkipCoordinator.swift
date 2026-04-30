@@ -103,8 +103,8 @@ public final class SkipCoordinator {
     ///
     /// If no seek is currently flying, fires an exact seek to `target` and
     /// consumes `target` (transferring it to `flying`). If a seek is in
-    /// flight, sets `exactPending = true` so `seekCompleted` (Task 1.4) will
-    /// issue the exact-frame settle once the in-flight seek lands.
+    /// flight, sets `exactPending = true` so `seekCompleted` will issue the
+    /// exact-frame settle once the in-flight seek lands.
     public func burstEnded(nowMonotonicSeconds: TimeInterval) -> SkipDecision {
         if flying == nil, let t = target {
             flying = t
