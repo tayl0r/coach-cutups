@@ -35,3 +35,4 @@ slint-build = { workspace = true }
 # Slint's testing backend lets component tests run headless (no winit
 # window). Pinned to the same minor as the runtime slint dep.
 i-slint-backend-testing = "1.8"
+tempfile = "3"

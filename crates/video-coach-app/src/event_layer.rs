@@ -19,6 +19,10 @@ const FORWARDED_TARGETS: &[&str] = &[
     "preview",
     "export",
     "control_socket",
+    // Phase 7 — source-video transport. `player.lifecycle` covers
+    // open/close, `player.state` covers play/pause/seeked/position.
+    "player.lifecycle",
+    "player.state",
 ];
 
 #[cfg(feature = "control-socket")]

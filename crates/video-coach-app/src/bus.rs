@@ -41,6 +41,35 @@ pub enum Command {
     NewProject {
         path: String,
     },
+    /// Phase 7. Adds a source video to the currently-open project.
+    /// `absolute_path` points at the picked file on disk. The handler
+    /// computes a relative path against the project folder (with `..`
+    /// allowed), probes the file's duration, appends a SourceRef to
+    /// `project.source_videos`, and persists. If the project had no
+    /// active player yet, this also instantiates one.
+    AddSourceVideo {
+        absolute_path: String,
+    },
+    /// Phase 7. Resume the source player. Errors if no player is loaded.
+    Play,
+    /// Phase 7. Pause the source player. Errors if no player is loaded.
+    Pause,
+    /// Phase 7. Seek to absolute time `seconds` in the active source.
+    /// `accurate=true` requests frame-exact seek (GST_SEEK_FLAG_ACCURATE);
+    /// `accurate=false` snaps to the nearest keyframe (KEY_UNIT). The UI
+    /// uses `accurate=false` during live slider drag for snappy preview
+    /// and `accurate=true` on release / from skip buttons + keyboard.
+    Seek {
+        seconds: f64,
+        accurate: bool,
+    },
+    /// Phase 7. Set the scan volume (source-playback audio level) on the
+    /// active player. Range 0.0..=1.0. Live tick during slider drag;
+    /// persistence to project.json happens on slider release via a
+    /// separate command path.
+    SetScanVolume {
+        value: f64,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -245,7 +274,7 @@ async fn handle(
             }
         }
         Command::NewProject { path } => {
-            let folder = std::path::PathBuf::from(&path);
+            let folder = normalize_project_folder(&path);
             let result = tokio::task::spawn_blocking(
                 move || -> Result<video_coach_core::project::Project, String> {
                     if folder.join("project.json").exists() {
@@ -292,7 +321,7 @@ async fn handle(
             }
         }
         Command::OpenProject { path } => {
-            let folder = std::path::PathBuf::from(&path);
+            let folder = normalize_project_folder(&path);
             // ProjectStore::read does sync file IO + serde_json::from_slice
             // on potentially megabytes of stroke data. Same pattern as
             // StopRecording: spawn_blocking so the bus task isn't held
@@ -324,7 +353,49 @@ async fn handle(
                 },
             }
         }
+        // Phase 7 commands — stub handlers. Implemented in subsequent
+        // tasks (1–5). Until then, the bus reports the feature as
+        // pending so the harness sees a deterministic error rather than
+        // a panic on an unmatched arm.
+        Command::AddSourceVideo { absolute_path: _ } => CommandReply {
+            ok: false,
+            error: Some("add_source_video not yet implemented (Phase 7 Task 2)".into()),
+        },
+        Command::Play => CommandReply {
+            ok: false,
+            error: Some("play not yet implemented (Phase 7 Task 3)".into()),
+        },
+        Command::Pause => CommandReply {
+            ok: false,
+            error: Some("pause not yet implemented (Phase 7 Task 3)".into()),
+        },
+        Command::Seek {
+            seconds: _,
+            accurate: _,
+        } => CommandReply {
+            ok: false,
+            error: Some("seek not yet implemented (Phase 7 Task 3)".into()),
+        },
+        Command::SetScanVolume { value: _ } => CommandReply {
+            ok: false,
+            error: Some("set_scan_volume not yet implemented (Phase 7 Task 7)".into()),
+        },
     }
+}
+
+/// Resolve a user-supplied "project folder" path. If the user (or a
+/// frontend dialog) hands us a path that ends in `project.json` we want
+/// the directory containing it, not the file itself. This keeps later
+/// relative-path math (Phase 7 AddSourceVideo) from sprouting a stray
+/// `..` component.
+fn normalize_project_folder(path: &str) -> std::path::PathBuf {
+    let p = std::path::PathBuf::from(path);
+    if p.is_file() && p.file_name().and_then(|n| n.to_str()) == Some("project.json") {
+        if let Some(parent) = p.parent() {
+            return parent.to_path_buf();
+        }
+    }
+    p
 }
 
 #[cfg(test)]
@@ -389,6 +460,91 @@ mod tests {
             Command::NewProject { path } => assert_eq!(path, "/tmp/freshproj"),
             _ => panic!("expected NewProject"),
         }
+    }
+
+    #[test]
+    fn add_source_video_serde_roundtrips() {
+        let cmd = Command::AddSourceVideo {
+            absolute_path: "/Users/x/clip.mp4".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "add_source_video");
+        assert_eq!(v["absolute_path"], "/Users/x/clip.mp4");
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::AddSourceVideo { absolute_path } => {
+                assert_eq!(absolute_path, "/Users/x/clip.mp4")
+            }
+            _ => panic!("expected AddSourceVideo"),
+        }
+    }
+
+    #[test]
+    fn play_pause_serialize_to_bare_tags() {
+        assert_eq!(
+            serde_json::to_value(&Command::Play).unwrap(),
+            serde_json::json!({"cmd": "play"})
+        );
+        assert_eq!(
+            serde_json::to_value(&Command::Pause).unwrap(),
+            serde_json::json!({"cmd": "pause"})
+        );
+    }
+
+    #[test]
+    fn seek_serde_roundtrips() {
+        let cmd = Command::Seek {
+            seconds: 12.5,
+            accurate: true,
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "seek");
+        assert_eq!(v["seconds"], 12.5);
+        assert_eq!(v["accurate"], true);
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::Seek { seconds, accurate } => {
+                assert!((seconds - 12.5).abs() < f64::EPSILON);
+                assert!(accurate);
+            }
+            _ => panic!("expected Seek"),
+        }
+    }
+
+    #[test]
+    fn set_scan_volume_serde_roundtrips() {
+        let cmd = Command::SetScanVolume { value: 0.75 };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "set_scan_volume");
+        assert_eq!(v["value"], 0.75);
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::SetScanVolume { value } => assert!((value - 0.75).abs() < f64::EPSILON),
+            _ => panic!("expected SetScanVolume"),
+        }
+    }
+
+    #[test]
+    fn normalize_project_folder_passes_through_directory() {
+        // A directory path resolves to itself (whether it exists or not is
+        // irrelevant here — is_file() returns false for non-existent paths,
+        // so the `else` branch returns the original).
+        let p = std::path::PathBuf::from("/some/dir/that/does/not/exist");
+        assert_eq!(normalize_project_folder("/some/dir/that/does/not/exist"), p);
+    }
+
+    #[test]
+    fn normalize_project_folder_strips_project_json() {
+        // Build a real temp directory + project.json so is_file() returns
+        // true. Otherwise the function can't distinguish a hypothetical
+        // file path from a directory path.
+        let dir = tempfile::TempDir::new().unwrap();
+        let json = dir.path().join("project.json");
+        std::fs::write(&json, "{}").unwrap();
+        assert_eq!(normalize_project_folder(json.to_str().unwrap()), dir.path());
     }
 
     #[test]

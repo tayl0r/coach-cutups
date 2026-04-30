@@ -16,6 +16,28 @@
 
 ---
 
+## Adversarial review changes baked in (from feature-dev:code-reviewer round)
+
+1. **Single-slot frame buffer + display-rate pull, not per-frame `invoke_from_event_loop`.** At 30fps × 8MB the per-push pattern saturates the Slint event queue during slider drag and leaks unbounded memory. Replaced with `Arc<Mutex<Option<FrameSlot>>>` written by appsink (overwrites, drops old) and read by a 30Hz Slint timer that calls `set_source_frame` once per tick. (Task 4 hard requirement.)
+
+2. **Fixed-size frame pool (2 buffers).** Even with single-slot overwrite, 1080p RGBA at 30fps = 249 MB/s of `Vec<u8>` churn. Pre-allocate two reusable buffers; appsink rotates between them. (Task 1.)
+
+3. **`AddSourceVideo` spawns the player if it was empty.** After pushing a SourceRef, if `current_player.is_none() && project.source_videos.len() == 1`, instantiate the player. Without this, the first source added to an empty project never plays. (Task 2.)
+
+4. **OpenProject / NewProject normalize the folder path.** If user passes a path ending in `project.json`, treat it as the parent directory. Otherwise the relative-path math in AddSourceVideo writes paths with a stray `..`. Same fix on both handlers. (Task 0.)
+
+5. **Platform-specific audio sinks unconditionally.** `autoaudiosink` triggers macOS mic-permission dialog on first launch. Use `osxaudiosink` on macOS, `wasapisink` on Windows, `pulsesink` on Linux. Single match arm, gated by `cfg(target_os = ...)`. (Task 1.)
+
+6. **`SourcePlayer::open` accepts the source's duration as a parameter** rather than running a Discoverer at play time. The duration is already known from `SourceRef.duration_seconds` (probed once at AddSourceVideo time). Avoids the Discoverer + player double-open race that made VT decoders deadlock in Phase 5. (Task 1.)
+
+7. **Slint `Slider` cannot expose drag press/release** — the only API is `changed value =>` which fires per-tick. Use `TouchArea` + manual fill bar implementation. (Task 5 hard requirement, not a fallback.)
+
+8. **Position polling suppresses one cycle after a seek.** A keyframe seek's position-query lags the decoder's first post-seek buffer. Track `seeking_until: Option<Instant>` in the bus task; skip the position-event emission while we're inside that window. (Task 5.)
+
+9. **Position events emit from the poll task, which lives in Task 5.** Earlier-task harness tests don't assert on position events. (Clarification across Tasks 3 / 5.)
+
+---
+
 ## Task 0: Preflight — bus command shapes + tracing targets
 
 **Files:**
