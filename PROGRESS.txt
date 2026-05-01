@@ -175,8 +175,19 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
       lesson learned (split into smaller per-task agent prompts).
 
 
-## Phase 9+ — pending
+## Phase 9 — clip preview integration
+PENDING. Plan: docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
+- [x] Task 0: Preflight — bus shapes + AppMode + slots + FrameSink active flag (commit <SHA>)
+- [ ] Task 1: Compositor strokes — extend compose() API + new wgpu pass
+- [ ] Task 2: Preview pipeline — crates/video-coach-media/src/preview_pipeline.rs
+- [ ] Task 3: Bus wiring — OpenClipPreview / ClosePreview + ClipListSlot
+- [ ] Task 4: UI — clip sidebar + mode-aware transport + preview-close action
+- [ ] Task 5: Harness E2E — record + preview + verify frames
+- [ ] Task 6: Single-frame preview-vs-export parity check
+- [ ] Task 7: Closeout
+
+
+## Phase 10+ — pending
 Per the design doc:
-  Phase 9  Clip preview integration + visual parity test
   Phase 10 Export sheet UI
   Phase 11 Polish, packaging, cross-platform CI green

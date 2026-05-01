@@ -78,11 +78,33 @@ fn main() -> anyhow::Result<()> {
     // transitions on R-press / stop), UI reader (REC indicator + M:SS
     // elapsed in the 30 Hz timer).
     let recording_state = frame_sink::new_recording_state();
+    // Phase 9: shared clip list for the sidebar. Bus writer (Task 3
+    // hydrates on OpenProject/NewProject/StopClipRecording per fix
+    // #13), UI reader (Task 4's sidebar timer). Task 0 wires the slot
+    // through; the bus task receives but doesn't write yet.
+    let clip_list = frame_sink::new_clip_list();
 
     #[cfg(feature = "media")]
-    let frame_sink_factory: bus::FrameSinkFactory = {
+    let frame_mount_factory: bus::FrameMountFactory = {
         let slot = frame_slot.clone();
-        std::sync::Arc::new(move || Box::new(frame_sink::SlintFrameSink::new(slot.clone())))
+        std::sync::Arc::new(move || {
+            // Phase 9 (fix #3 + #26): each mount gets its own atomic
+            // active-flag + frames-pushed counter. The bus stashes the
+            // handles via `MountedSink` so it can flip `active` during
+            // pipeline handover and read the counter on ClosePreview.
+            let active = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let frames_pushed = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+            let sink = frame_sink::SlintFrameSink::with_handles(
+                slot.clone(),
+                active.clone(),
+                frames_pushed.clone(),
+            );
+            frame_sink::MountedSink {
+                sink: Box::new(sink),
+                active,
+                frames_pushed,
+            }
+        })
     };
 
     // Phase 8: harness E2E flag. CI runners pass
@@ -100,11 +122,13 @@ fn main() -> anyhow::Result<()> {
         runtime.handle(),
         shutdown_tx.clone(),
         #[cfg(feature = "media")]
-        frame_sink_factory,
+        frame_mount_factory,
         #[cfg(feature = "media")]
         player_state.clone(),
         #[cfg(feature = "media")]
         recording_state.clone(),
+        #[cfg(feature = "media")]
+        clip_list.clone(),
         #[cfg(feature = "media")]
         fixture_recording_source,
     );
@@ -158,6 +182,7 @@ fn main() -> anyhow::Result<()> {
             frame_slot,
             player_state,
             recording_state,
+            clip_list,
             startup_project,
         )?;
     }

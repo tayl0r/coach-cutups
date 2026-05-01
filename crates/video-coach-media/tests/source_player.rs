@@ -56,7 +56,7 @@ fn open_prerolls_at_zero() {
     disable_vt_decoders();
     let player = SourcePlayer::open(
         &fixture("source-1080p.mp4"),
-        Box::new(NullFrameSink),
+        Box::new(NullFrameSink::new()),
         FIXTURE_DURATION_SECS,
     )
     .expect("open should succeed");
@@ -124,7 +124,7 @@ fn accurate_seek_lands_within_half_a_second() {
     disable_vt_decoders();
     let player = SourcePlayer::open(
         &fixture("source-1080p.mp4"),
-        Box::new(NullFrameSink),
+        Box::new(NullFrameSink::new()),
         FIXTURE_DURATION_SECS,
     )
     .unwrap();
@@ -145,7 +145,7 @@ fn keyframe_seek_lands_within_two_seconds() {
     disable_vt_decoders();
     let player = SourcePlayer::open(
         &fixture("source-1080p.mp4"),
-        Box::new(NullFrameSink),
+        Box::new(NullFrameSink::new()),
         FIXTURE_DURATION_SECS,
     )
     .unwrap();
@@ -177,7 +177,7 @@ fn set_volume_does_not_panic_when_audio_present() {
     disable_vt_decoders();
     let player = SourcePlayer::open(
         &fixture("source-1080p.mp4"),
-        Box::new(NullFrameSink),
+        Box::new(NullFrameSink::new()),
         FIXTURE_DURATION_SECS,
     )
     .unwrap();

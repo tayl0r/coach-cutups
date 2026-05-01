@@ -28,6 +28,13 @@ const FORWARDED_TARGETS: &[&str] = &[
     // from the lower-level "recording" target which carries the
     // capture-pipeline lifecycle events (recording.encoder_picked etc).
     "recording.lifecycle",
+    // Phase 9 — clip preview lifecycle (clip_preview.opened,
+    // clip_preview.closed, clip_preview.failed, clip_preview.completed).
+    // Per adversarial-review fix #1, every Phase 9 event names under
+    // `clip_preview.*` so the harness's wait_for_event (which matches by
+    // event name only, not target) can't collide with `recording.*` or
+    // `clip_recording.*`.
+    "clip_preview.lifecycle",
 ];
 
 #[cfg(feature = "control-socket")]

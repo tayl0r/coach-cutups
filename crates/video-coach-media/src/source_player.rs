@@ -30,7 +30,7 @@ use gstreamer::prelude::*;
 use gstreamer_app::AppSink;
 use std::path::Path;
 use std::str::FromStr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use thiserror::Error;
 
@@ -64,11 +64,55 @@ pub trait FrameSink: Send + Sync + 'static {
 
 /// Drops every frame. Used by headless tests and by the bus task while
 /// no UI consumer is attached.
-#[derive(Default)]
-pub struct NullFrameSink;
+///
+/// Phase 9: carries the same `active` flag + `frames_pushed` counter as
+/// `SlintFrameSink` so the `FrameMountFactory` can return a uniform
+/// `MountedSink` shape regardless of whether a UI is attached. The
+/// active flag still gates the (no-op) push so headless tests can
+/// observe handover semantics; the counter still increments so
+/// harness-style "frames flowed" assertions work even without a UI.
+pub struct NullFrameSink {
+    active: Arc<AtomicBool>,
+    frames_pushed: Arc<AtomicU64>,
+}
+
+impl NullFrameSink {
+    pub fn new() -> Self {
+        Self {
+            active: Arc::new(AtomicBool::new(true)),
+            frames_pushed: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    pub fn with_handles(active: Arc<AtomicBool>, frames_pushed: Arc<AtomicU64>) -> Self {
+        Self {
+            active,
+            frames_pushed,
+        }
+    }
+
+    pub fn active_handle(&self) -> Arc<AtomicBool> {
+        self.active.clone()
+    }
+
+    pub fn frames_pushed_handle(&self) -> Arc<AtomicU64> {
+        self.frames_pushed.clone()
+    }
+}
+
+impl Default for NullFrameSink {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl FrameSink for NullFrameSink {
-    fn push_frame(&self, _w: u32, _h: u32, _data: &[u8]) {}
+    fn push_frame(&self, _w: u32, _h: u32, _data: &[u8]) {
+        if !self.active.load(Ordering::Acquire) {
+            return;
+        }
+        self.frames_pushed.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone)]

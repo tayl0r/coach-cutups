@@ -94,19 +94,44 @@ pub enum Command {
     AppendStroke {
         points_json: String,
     },
+    /// Phase 9. Open the named clip in the preview pipeline. The bus
+    /// pauses the current source player, mounts a preview FrameSink,
+    /// and spins up a `PreviewPipeline` (see Task 2/3). `clip_id` is a
+    /// stringified UUID; the bus parses it on entry and looks it up in
+    /// `project.clips`. Refuses if `current_mode` isn't `Scanning` —
+    /// per fix #22, opening a second preview while one is open is a
+    /// no-op + a `clip_preview.failed` event. Task 0 lands the command
+    /// shape only; Task 3 lands the handler.
+    OpenClipPreview {
+        clip_id: String,
+    },
+    /// Phase 9. Tear down the active preview pipeline and return mode
+    /// to `Scanning`. Source player stays paused (matches v1 + fix #9
+    /// — the user re-presses Space to resume). Task 0 lands the command
+    /// shape only; Task 3 lands the handler.
+    ClosePreview,
 }
 
 /// Phase 8. Mutually-exclusive UI/bus modes. Mirrors v1's
-/// `App/Models/AppMode.swift` enum 1:1 (modulo preview cases which
-/// land in Phase 9).
+/// `App/Models/AppMode.swift` enum 1:1.
 ///
 /// Used by the bus task as `current_mode` (Task 1) and serialized as a
 /// string field on `mode.changed` events. The no-default-features
 /// build doesn't construct AppMode anywhere (the entire clip-recording
 /// stack is media-feature-gated), so `dead_code` is allowed in that
 /// build shape only.
+///
+/// Phase 9: gains `PreviewClip(Uuid)`. The Uuid carries the in-flight
+/// clip id so the bus + tracing layer can include it in events
+/// (`clip_preview.opened` / `clip_preview.closed`). The variant payload
+/// breaks `Copy` (Uuid isn't Copy across all crate versions / build
+/// shapes), so the derive drops `Copy` in favor of plain `Clone` — see
+/// adversarial-review fix #8. Every read site that previously assumed
+/// `*current_mode` produced a `Copy` was updated to either pass
+/// `&AppMode` (`is_busy`, `write_recording_state`) or `current_mode
+/// .clone()` where ownership is required.
 #[cfg_attr(not(feature = "media"), allow(dead_code))]
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum AppMode {
     /// Idle: source player is mounted, transport runs, R-press starts a
@@ -120,6 +145,12 @@ pub enum AppMode {
     /// Capture pipeline is recording; stroke events accumulate into the
     /// in-progress clip; second `R` press stops + finalizes the clip.
     Recording,
+    /// Phase 9: a clip is in preview. Source player is paused; the
+    /// preview pipeline owns frame writes. Transport (Play/Pause/Seek)
+    /// routes to the preview pipeline. ClosePreview returns to
+    /// Scanning. Serializes as `"preview_clip": "<uuid-string>"` per
+    /// serde's snake_case tuple-variant default.
+    PreviewClip(uuid::Uuid),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -175,15 +206,26 @@ impl BusHandle {
     }
 }
 
-/// Build a fresh `FrameSink` for a newly-spawned `SourcePlayer`. The bus
-/// task can't hold a `slint::Weak` directly (UI types are not always
-/// `Send`-friendly to bind to), so the UI hands the bus a factory at
-/// startup which the bus invokes whenever it spawns a new player. For
-/// headless builds (no UI), the factory yields `NullFrameSink` and frames
-/// are dropped on the GStreamer streaming thread.
+/// Build a fresh `FrameSink` (paired with the atomics needed to control
+/// it) for a newly-spawned playback pipeline. The bus task can't hold a
+/// `slint::Weak` directly (UI types are not always `Send`-friendly to
+/// bind to), so the UI hands the bus a factory at startup which the bus
+/// invokes whenever it spawns a new player or mounts a preview
+/// pipeline. For headless builds (no UI), the factory yields a
+/// `NullFrameSink` (frames dropped on the GStreamer streaming thread).
+///
+/// Phase 9 (fix #3 + #26): renamed from `FrameSinkFactory` and its
+/// return type widened to `MountedSink`, which carries the active
+/// flag and frames-pushed counter alongside the trait object. The bus
+/// task stashes the atomic handles per pipeline so it can flip
+/// `active=false` BEFORE pause/teardown (preventing straggler frames
+/// from the GStreamer streaming thread from racing the next mount's
+/// first frame) and read `frames_pushed` on ClosePreview to populate
+/// the `clip_preview.closed` event for the harness E2E pixel-flow
+/// check.
 #[cfg(feature = "media")]
-pub type FrameSinkFactory =
-    std::sync::Arc<dyn Fn() -> Box<dyn video_coach_media::source_player::FrameSink> + Send + Sync>;
+pub type FrameMountFactory =
+    std::sync::Arc<dyn Fn() -> crate::frame_sink::MountedSink + Send + Sync>;
 
 /// Spawn the bus task on the given tokio runtime handle. Phase 6 dropped
 /// `#[tokio::main]` so the bus runs on the same multi-threaded runtime
@@ -198,9 +240,10 @@ pub type FrameSinkFactory =
 pub fn spawn_on(
     rt: &tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
-    #[cfg(feature = "media")] frame_sink_factory: FrameSinkFactory,
+    #[cfg(feature = "media")] frame_mount_factory: FrameMountFactory,
     #[cfg(feature = "media")] player_state: crate::frame_sink::PlayerStateSlot,
     #[cfg(feature = "media")] recording_state: crate::frame_sink::RecordingStateSlot,
+    #[cfg(feature = "media")] clip_list: crate::frame_sink::ClipListSlot,
     #[cfg(feature = "media")] fixture_recording_source: Option<std::path::PathBuf>,
 ) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
@@ -244,6 +287,19 @@ pub fn spawn_on(
         #[cfg(feature = "media")]
         let mut recording_clip: Option<RecordingClipInProgress> = None;
 
+        // Phase 9 (fix #3 + #26): per-pipeline mount handles. Set when a
+        // pipeline mounts; cleared when it tears down. The bus uses
+        // `current_player_mount.active` to gate frame writes during the
+        // OpenClipPreview/ClosePreview handover, and reads
+        // `current_preview_mount.frames_pushed` on ClosePreview to
+        // populate the `clip_preview.closed` event for the harness E2E
+        // pixel-flow assertion. Task 0 declares the fields; Task 3
+        // populates `current_preview_mount` when OpenClipPreview lands.
+        #[cfg(feature = "media")]
+        let mut current_player_mount: Option<crate::frame_sink::MountHandles> = None;
+        #[cfg(feature = "media")]
+        let mut current_preview_mount: Option<crate::frame_sink::MountHandles> = None;
+
         while let Some(env) = rx.recv().await {
             let reply = handle(
                 env.command,
@@ -254,7 +310,11 @@ pub fn spawn_on(
                 #[cfg(feature = "media")]
                 &mut current_player,
                 #[cfg(feature = "media")]
-                &frame_sink_factory,
+                &mut current_player_mount,
+                #[cfg(feature = "media")]
+                &mut current_preview_mount,
+                #[cfg(feature = "media")]
+                &frame_mount_factory,
                 #[cfg(feature = "media")]
                 &rt_for_poll,
                 #[cfg(feature = "media")]
@@ -263,6 +323,8 @@ pub fn spawn_on(
                 &player_state,
                 #[cfg(feature = "media")]
                 &recording_state,
+                #[cfg(feature = "media")]
+                &clip_list,
                 #[cfg(feature = "media")]
                 &mut current_mode,
                 #[cfg(feature = "media")]
@@ -344,24 +406,24 @@ pub(crate) struct RecordingClipInProgress {
     pub events: Vec<video_coach_core::event::CommentaryEvent>,
 }
 
-/// Centralized "is the clip-recording subsystem busy?" check used by
-/// every command that would mutate it. Returns true if the lower-level
-/// `recording` slot OR the higher-level `recording_clip` slot OR the
-/// mode is anywhere in the recording state machine. Stops harness
-/// tests + future user inputs from accidentally double-starting.
-/// (Adversarial-review fix #7.)
+/// Centralized "is the clip-recording / preview subsystem busy?" check
+/// used by every command that would mutate either. Returns true if the
+/// lower-level `recording` slot OR the higher-level `recording_clip`
+/// slot OR the mode is anywhere outside of `Scanning`. Stops harness
+/// tests + future user inputs from accidentally double-starting (Phase
+/// 8 adversarial-review fix #7) AND stops a recording from kicking off
+/// while a preview is open (Phase 9 fix #22).
+///
+/// Phase 9 generalises the Phase 8 `is_recording` helper to cover
+/// `PreviewClip` too; signature takes `&AppMode` since `AppMode`
+/// dropped `Copy` (fix #8).
 #[cfg(feature = "media")]
-fn is_recording(
+fn is_busy(
     recording: &Option<video_coach_media::recording::Recording>,
     recording_clip: &Option<RecordingClipInProgress>,
-    current_mode: AppMode,
+    current_mode: &AppMode,
 ) -> bool {
-    recording.is_some()
-        || recording_clip.is_some()
-        || matches!(
-            current_mode,
-            AppMode::Recording | AppMode::RecordingStarting
-        )
+    recording.is_some() || recording_clip.is_some() || !matches!(*current_mode, AppMode::Scanning)
 }
 
 /// Default clip-name format: `<sourceIndex+1>-HH:MM:SS` where the time
@@ -380,10 +442,14 @@ fn default_clip_name(source_index: usize, start_source_seconds: f64) -> String {
 /// stamping a host-time anchor when transitioning into a recording
 /// mode. The UI's 30 Hz timer reads this for the REC indicator +
 /// elapsed M:SS label.
+///
+/// Phase 9 (fix #8): takes `&AppMode` since `AppMode` dropped `Copy`
+/// for the `PreviewClip(Uuid)` variant. Maps `PreviewClip(_)` to
+/// `RecordingMode::PreviewClip`; the UUID stays on the bus task.
 #[cfg(feature = "media")]
 fn write_recording_state(
     slot: &crate::frame_sink::RecordingStateSlot,
-    mode: AppMode,
+    mode: &AppMode,
     started_at: Option<std::time::Instant>,
 ) {
     use crate::frame_sink::{RecordingMode, RecordingStateSlotData};
@@ -391,6 +457,7 @@ fn write_recording_state(
         AppMode::Scanning => RecordingMode::Scanning,
         AppMode::RecordingStarting => RecordingMode::RecordingStarting,
         AppMode::Recording => RecordingMode::Recording,
+        AppMode::PreviewClip(_) => RecordingMode::PreviewClip,
     };
     let mut g = slot.lock().expect("recording_state poisoned");
     *g = RecordingStateSlotData {
@@ -408,11 +475,14 @@ async fn handle(
     #[cfg(feature = "media")] current_player: &mut Option<
         std::sync::Arc<video_coach_media::source_player::SourcePlayer>,
     >,
-    #[cfg(feature = "media")] frame_sink_factory: &FrameSinkFactory,
+    #[cfg(feature = "media")] current_player_mount: &mut Option<crate::frame_sink::MountHandles>,
+    #[cfg(feature = "media")] current_preview_mount: &mut Option<crate::frame_sink::MountHandles>,
+    #[cfg(feature = "media")] frame_mount_factory: &FrameMountFactory,
     #[cfg(feature = "media")] rt_for_poll: &tokio::runtime::Handle,
     #[cfg(feature = "media")] shutdown_tx_for_poll: &tokio::sync::watch::Sender<bool>,
     #[cfg(feature = "media")] player_state: &crate::frame_sink::PlayerStateSlot,
     #[cfg(feature = "media")] recording_state: &crate::frame_sink::RecordingStateSlot,
+    #[cfg(feature = "media")] clip_list: &crate::frame_sink::ClipListSlot,
     #[cfg(feature = "media")] current_mode: &mut AppMode,
     #[cfg(feature = "media")] recording_clip: &mut Option<RecordingClipInProgress>,
     #[cfg(feature = "media")] fixture_recording_source: Option<&std::path::Path>,
@@ -455,7 +525,7 @@ async fn handle(
                 use video_coach_media::fixture_source::FixtureSource;
                 use video_coach_media::source::CaptureSourceFactory;
 
-                if is_recording(recording, recording_clip, *current_mode) {
+                if is_busy(recording, recording_clip, current_mode) {
                     return CommandReply {
                         ok: false,
                         error: Some("already recording".into()),
@@ -573,12 +643,19 @@ async fn handle(
                         try_spawn_current_player(
                             current,
                             current_player,
-                            frame_sink_factory,
+                            current_player_mount,
+                            frame_mount_factory,
                             rt_for_poll,
                             shutdown_tx_for_poll,
                             player_state,
                         )
                         .await;
+                        // Phase 9 (fix #13): clip-list hydration sites
+                        // (OpenProject/NewProject/StopClipRecording)
+                        // land in Task 3. Task 0 just keeps the slot
+                        // wired through so the UI's reader has a
+                        // typed contract from the get-go.
+                        let _ = clip_list;
                     }
                     CommandReply {
                         ok: true,
@@ -622,12 +699,15 @@ async fn handle(
                         try_spawn_current_player(
                             current,
                             current_player,
-                            frame_sink_factory,
+                            current_player_mount,
+                            frame_mount_factory,
                             rt_for_poll,
                             shutdown_tx_for_poll,
                             player_state,
                         )
                         .await;
+                        // Phase 9: clip_list hydration in Task 3.
+                        let _ = clip_list;
                     }
                     CommandReply {
                         ok: true,
@@ -739,7 +819,8 @@ async fn handle(
                         try_spawn_current_player(
                             current,
                             current_player,
-                            frame_sink_factory,
+                            current_player_mount,
+                            frame_mount_factory,
                             rt_for_poll,
                             shutdown_tx_for_poll,
                             player_state,
@@ -937,25 +1018,23 @@ async fn handle(
                 use std::sync::Arc;
                 use video_coach_media::source::CaptureSourceFactory;
 
-                // Adversarial-review fix #7: one centralized recording
-                // check, not three.
-                if is_recording(recording, recording_clip, *current_mode) {
+                // Adversarial-review fix #7 (Phase 8) + fix #22 (Phase
+                // 9): one centralized busy check that also covers
+                // PreviewClip — opening a recording while a preview is
+                // open is rejected here.
+                if is_busy(recording, recording_clip, current_mode) {
                     return CommandReply {
                         ok: false,
                         error: Some("already recording".into()),
                     };
                 }
-                if !matches!(*current_mode, AppMode::Scanning) {
-                    // Belt + suspenders. is_recording covers
-                    // RecordingStarting / Recording; this catches any
-                    // future intermediate mode (e.g. PreviewLoading)
-                    // we add later.
+                if !matches!(current_mode, AppMode::Scanning) {
+                    // Belt + suspenders. is_busy covers
+                    // RecordingStarting / Recording / PreviewClip; this
+                    // catches any future intermediate mode we add later.
                     return CommandReply {
                         ok: false,
-                        error: Some(format!(
-                            "cannot start recording in mode {:?}",
-                            *current_mode
-                        )),
+                        error: Some(format!("cannot start recording in mode {:?}", current_mode)),
                     };
                 }
                 let Some((project, project_folder)) = current.as_ref() else {
@@ -1017,7 +1096,7 @@ async fn handle(
                 // "Preparing…" through the camera-permission prompt.
                 *current_mode = AppMode::RecordingStarting;
                 let t0_instant = std::time::Instant::now();
-                write_recording_state(recording_state, *current_mode, Some(t0_instant));
+                write_recording_state(recording_state, current_mode, Some(t0_instant));
 
                 // recording::start runs the GStreamer pipeline build +
                 // PAUSED→PLAYING transition; on macOS first launch it
@@ -1032,7 +1111,7 @@ async fn handle(
                     Ok(Ok(rec)) => {
                         *recording = Some(rec);
                         *current_mode = AppMode::Recording;
-                        write_recording_state(recording_state, *current_mode, Some(t0_instant));
+                        write_recording_state(recording_state, current_mode, Some(t0_instant));
                         *recording_clip = Some(RecordingClipInProgress {
                             clip_id,
                             filename: filename.clone(),
@@ -1067,7 +1146,7 @@ async fn handle(
                         // RecordingStarting, must roll back the
                         // transition. Source stays paused — match v1.
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         tracing::warn!(
                             target: "recording.lifecycle",
                             event = "clip_recording.failed",
@@ -1085,7 +1164,7 @@ async fn handle(
                     }
                     Err(join) => {
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         CommandReply {
                             ok: false,
                             error: Some(format!("join: {join}")),
@@ -1104,10 +1183,10 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                if !matches!(*current_mode, AppMode::Recording) {
+                if !matches!(current_mode, AppMode::Recording) {
                     return CommandReply {
                         ok: false,
-                        error: Some(format!("cannot stop recording in mode {:?}", *current_mode)),
+                        error: Some(format!("cannot stop recording in mode {:?}", current_mode)),
                     };
                 }
                 let Some(clip_in_progress) = recording_clip.take() else {
@@ -1115,7 +1194,7 @@ async fn handle(
                     // in-progress clip. Reset mode so we don't get
                     // stuck.
                     *current_mode = AppMode::Scanning;
-                    write_recording_state(recording_state, *current_mode, None);
+                    write_recording_state(recording_state, current_mode, None);
                     return CommandReply {
                         ok: false,
                         error: Some("no recording_clip; reset to scanning".into()),
@@ -1123,7 +1202,7 @@ async fn handle(
                 };
                 let Some(rec) = recording.take() else {
                     *current_mode = AppMode::Scanning;
-                    write_recording_state(recording_state, *current_mode, None);
+                    write_recording_state(recording_state, current_mode, None);
                     return CommandReply {
                         ok: false,
                         error: Some("no active capture pipeline".into()),
@@ -1149,7 +1228,7 @@ async fn handle(
                         // error. Do NOT write project.json with a
                         // half-finished clip.
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         tracing::warn!(
                             target: "recording.lifecycle",
                             event = "clip_recording.failed",
@@ -1163,7 +1242,7 @@ async fn handle(
                     }
                     Err(join) => {
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         return CommandReply {
                             ok: false,
                             error: Some(format!("join: {join}")),
@@ -1176,7 +1255,7 @@ async fn handle(
                 // + serde) so the write itself goes to spawn_blocking.
                 let Some((project, project_folder)) = current.as_mut() else {
                     *current_mode = AppMode::Scanning;
-                    write_recording_state(recording_state, *current_mode, None);
+                    write_recording_state(recording_state, current_mode, None);
                     return CommandReply {
                         ok: false,
                         error: Some("project closed during recording".into()),
@@ -1209,7 +1288,7 @@ async fn handle(
                 match write_result {
                     Ok(Ok(())) => {
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         tracing::info!(
                             target: "recording.lifecycle",
                             event = "clip_recording.stopped",
@@ -1233,7 +1312,7 @@ async fn handle(
                         // and disk match.
                         project.clips.pop();
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         CommandReply {
                             ok: false,
                             error: Some(format!("persist project.json: {e}")),
@@ -1242,7 +1321,7 @@ async fn handle(
                     Err(join) => {
                         project.clips.pop();
                         *current_mode = AppMode::Scanning;
-                        write_recording_state(recording_state, *current_mode, None);
+                        write_recording_state(recording_state, current_mode, None);
                         CommandReply {
                             ok: false,
                             error: Some(format!("join: {join}")),
@@ -1262,10 +1341,10 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                if !matches!(*current_mode, AppMode::Recording) {
+                if !matches!(current_mode, AppMode::Recording) {
                     return CommandReply {
                         ok: false,
-                        error: Some(format!("cannot append stroke in mode {:?}", *current_mode)),
+                        error: Some(format!("cannot append stroke in mode {:?}", current_mode)),
                     };
                 }
                 let Some(clip) = recording_clip.as_mut() else {
@@ -1351,6 +1430,71 @@ async fn handle(
                 }
             }
         }
+        Command::OpenClipPreview { clip_id } => {
+            // Phase 9 Task 0: command + variant + serde shape only.
+            // Full handler — pause player, mount preview pipeline,
+            // transition mode, emit `clip_preview.opened` — lands in
+            // Task 3.
+            #[cfg(not(feature = "media"))]
+            {
+                let _ = clip_id;
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                let _ = (
+                    clip_id,
+                    &recording,
+                    &recording_clip,
+                    &current,
+                    &current_player,
+                    &current_player_mount,
+                    &current_preview_mount,
+                    frame_mount_factory,
+                    rt_for_poll,
+                    shutdown_tx_for_poll,
+                    player_state,
+                    recording_state,
+                    clip_list,
+                    &current_mode,
+                    fixture_recording_source,
+                );
+                CommandReply {
+                    ok: false,
+                    error: Some("not yet implemented (phase 9 task 3)".into()),
+                }
+            }
+        }
+        Command::ClosePreview => {
+            // Phase 9 Task 0: command + variant + serde shape only.
+            // Full handler — abort poll, flip preview_mount.active=false,
+            // tear down PreviewPipeline, restore player_mount.active=true,
+            // emit `clip_preview.closed` with frames_pushed — lands in
+            // Task 3.
+            #[cfg(not(feature = "media"))]
+            {
+                CommandReply {
+                    ok: false,
+                    error: Some("media feature disabled in this build".into()),
+                }
+            }
+            #[cfg(feature = "media")]
+            {
+                let _ = (
+                    &current_player_mount,
+                    &current_preview_mount,
+                    recording_state,
+                    &current_mode,
+                );
+                CommandReply {
+                    ok: false,
+                    error: Some("not yet implemented (phase 9 task 3)".into()),
+                }
+            }
+        }
     }
 }
 
@@ -1384,7 +1528,8 @@ fn build_platform_default_source(
 async fn try_spawn_current_player(
     current: &Option<(video_coach_core::project::Project, std::path::PathBuf)>,
     current_player: &mut Option<std::sync::Arc<video_coach_media::source_player::SourcePlayer>>,
-    frame_sink_factory: &FrameSinkFactory,
+    current_player_mount: &mut Option<crate::frame_sink::MountHandles>,
+    frame_mount_factory: &FrameMountFactory,
     rt_for_poll: &tokio::runtime::Handle,
     shutdown_tx_for_poll: &tokio::sync::watch::Sender<bool>,
     player_state: &crate::frame_sink::PlayerStateSlot,
@@ -1407,7 +1552,13 @@ async fn try_spawn_current_player(
     let abs = joined.canonicalize().unwrap_or(joined);
     let duration = first.duration_seconds;
     let display_name = first.display_name.clone();
-    let frame_sink = frame_sink_factory();
+    // Phase 9 (fix #3): build the FrameSink + mount handles together. The
+    // bus stashes the handles AFTER SourcePlayer::open returns so a
+    // failed open doesn't leave a dangling mount entry that ClosePreview
+    // would later flip.
+    let mounted = frame_mount_factory();
+    let mount_handles = mounted.handles();
+    let frame_sink = mounted.sink;
     let abs_for_blocking = abs.clone();
     let result = tokio::task::spawn_blocking(move || {
         video_coach_media::source_player::SourcePlayer::open(
@@ -1443,6 +1594,7 @@ async fn try_spawn_current_player(
                 shutdown_tx_for_poll.subscribe(),
             );
             *current_player = Some(player);
+            *current_player_mount = Some(mount_handles);
         }
         Ok(Err(e)) => {
             tracing::warn!(
@@ -1738,5 +1890,57 @@ mod tests {
             }
             _ => panic!("expected StartRecording with Fixture source"),
         }
+    }
+
+    #[test]
+    fn open_clip_preview_serde_roundtrips() {
+        let cmd = Command::OpenClipPreview {
+            clip_id: "11111111-2222-3333-4444-555555555555".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "open_clip_preview");
+        assert_eq!(v["clip_id"], "11111111-2222-3333-4444-555555555555");
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::OpenClipPreview { clip_id } => {
+                assert_eq!(clip_id, "11111111-2222-3333-4444-555555555555");
+            }
+            _ => panic!("expected OpenClipPreview"),
+        }
+    }
+
+    #[test]
+    fn close_preview_serializes_to_bare_tag() {
+        let v = serde_json::to_value(&Command::ClosePreview).unwrap();
+        assert_eq!(v, serde_json::json!({"cmd": "close_preview"}));
+        let cmd: Command =
+            serde_json::from_value(serde_json::json!({"cmd": "close_preview"})).unwrap();
+        assert!(matches!(cmd, Command::ClosePreview));
+    }
+
+    #[test]
+    fn app_mode_preview_clip_serializes_with_uuid() {
+        // Per the plan: PreviewClip(Uuid) serializes as
+        // `{"preview_clip": "<uuid-string>"}` per serde's default for
+        // tuple variants under `#[serde(rename_all = "snake_case")]`.
+        let id = uuid::Uuid::parse_str("01020304-0506-0708-090a-0b0c0d0e0f10").unwrap();
+        let v = serde_json::to_value(AppMode::PreviewClip(id)).unwrap();
+        assert_eq!(
+            v,
+            serde_json::json!({"preview_clip": "01020304-0506-0708-090a-0b0c0d0e0f10"}),
+        );
+
+        // Roundtrip back to the same variant + Uuid.
+        let m: AppMode = serde_json::from_value(v).expect("preview_clip roundtrip");
+        assert_eq!(m, AppMode::PreviewClip(id));
+
+        // The unit variants still serialize as bare strings; PreviewClip
+        // is the only externally-tagged variant. Sanity-check that the
+        // tagging shapes haven't crossed.
+        assert_eq!(
+            serde_json::to_value(AppMode::Scanning).unwrap(),
+            serde_json::Value::String("scanning".into()),
+        );
     }
 }

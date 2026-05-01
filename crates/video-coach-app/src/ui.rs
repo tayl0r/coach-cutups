@@ -20,7 +20,7 @@
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
 use crate::bus::{BusHandle, Command};
-use crate::frame_sink::{FrameSlot, PlayerStateSlot, RecordingStateSlot};
+use crate::frame_sink::{ClipListSlot, FrameSlot, PlayerStateSlot, RecordingStateSlot};
 use crate::last_project;
 use slint::ComponentHandle;
 
@@ -37,6 +37,13 @@ const UI_COMMAND_ID: &str = "ui";
 /// hop.
 const FRAME_TICK_MS: u64 = 33;
 
+// Phase 9: ui::run plumbs ClipListSlot for Task 4's sidebar; signature
+// crosses the clippy too-many-arguments threshold. Splitting into a
+// builder/struct is mechanical churn that the wider rewrite already
+// rules out (every signature in this crate gets these slots passed
+// directly), so allow it here the same way Phase 8 did for the bus
+// handler.
+#[allow(clippy::too_many_arguments)]
 pub fn run(
     bus: BusHandle,
     rt: tokio::runtime::Handle,
@@ -48,8 +55,15 @@ pub fn run(
     // this slot; the bus owns mode transitions (Task 1) and the UI
     // observes them (Task 3).
     recording_state: RecordingStateSlot,
+    // Phase 9: shared clip list for the sidebar. UI reader, bus writer
+    // (Task 3 hydrates per fix #13). Task 0 just plumbs the slot in;
+    // Task 4 will wire the sidebar UI + 30 Hz pull. Held here to keep
+    // the slot alive for the lifetime of the UI process.
+    clip_list: ClipListSlot,
     startup_project: Option<String>,
 ) -> anyhow::Result<()> {
+    // Suppress dead-code warnings until Task 4 wires the sidebar.
+    let _ = &clip_list;
     let window = MainWindow::new()?;
 
     // Phase 7 Task 4: drive `source-frame` from the shared frame slot at
@@ -83,6 +97,10 @@ pub fn run(
                     RecordingMode::Scanning => "scanning",
                     RecordingMode::RecordingStarting => "recording_starting",
                     RecordingMode::Recording => "recording",
+                    // Phase 9 Task 0: surface as a stable string for
+                    // the harness; Task 4 wires the sidebar + mode-
+                    // aware transport that actually consumes this.
+                    RecordingMode::PreviewClip => "preview_clip",
                 };
                 let elapsed = g
                     .recording_started_at_host
