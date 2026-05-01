@@ -11,6 +11,8 @@ bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.3"
 thiserror = { workspace = true }
 tracing = "0.1"
+video-coach-core = { path = "../video-coach-core" }
 
 [dev-dependencies]
 sha2 = "0.10"
+uuid = { workspace = true }

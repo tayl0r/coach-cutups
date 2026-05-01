@@ -1,5 +1,6 @@
 use crate::frame::Frame;
 use thiserror::Error;
+use video_coach_core::stroke_replay::VisibleStroke;
 use wgpu::util::DeviceExt;
 
 #[derive(Debug, Error)]
@@ -11,6 +12,35 @@ pub enum CompositorError {
     #[error("readback failed: {0}")]
     Readback(String),
 }
+
+/// Per-vertex layout for the stroke pass. See `shaders/strokes.wgsl` for the
+/// matching `VertexIn` struct. Each rendered line segment emits 4 vertices
+/// (two triangles) with the same `segment_a/b` + `half_width` + `color`; the
+/// `position` differs per corner of the quad.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct StrokeVertex {
+    position: [f32; 2],
+    segment_a: [f32; 2],
+    segment_b: [f32; 2],
+    half_width: f32,
+    _pad: f32, // align color to 16 bytes
+    color: [f32; 4],
+}
+
+/// Phase 9 fixed line width: 4 pixels at 1080p output ≈ 0.0037 in [0,1] space.
+/// Phase 10/11 may make this resolution-aware via a uniform; for now a fixed
+/// value keeps the API surface small. Captured strokes' own `line_width` field
+/// is normalized to frame height too — we use the larger of the two so that
+/// captured widths still scale up if the user authored them wide, but never
+/// shrink below the minimum-readable threshold.
+const PHASE9_MIN_HALF_WIDTH: f32 = 0.0037 / 2.0;
+
+/// AA quad expansion in [0,1] space — vertices are pushed slightly past the
+/// half-width on each side so the fragment shader's smoothstep falloff has
+/// room to fade. Must exceed the shader's `feather` constant; 2× is a safe
+/// margin without making the quads visibly oversized.
+const STROKE_QUAD_AA_PAD: f32 = 0.0025;
 
 pub struct Compositor {
     pub(crate) device: wgpu::Device,
@@ -104,7 +134,12 @@ impl Compositor {
         Ok(Self { device, queue })
     }
 
-    pub fn compose(&self, source: &Frame, webcam: &Frame) -> Result<Frame, CompositorError> {
+    pub fn compose(
+        &self,
+        source: &Frame,
+        webcam: &Frame,
+        strokes: &[VisibleStroke],
+    ) -> Result<Frame, CompositorError> {
         let w = source.width;
         let h = source.height;
 
@@ -326,6 +361,19 @@ impl Compositor {
             rpass.draw(0..3, 0..1);
         }
 
+        // 4b. Stroke pass — only build resources + encode if there's something
+        // to draw. Per fix #4, we render in [0,1] space directly (Phase 9
+        // ships only 16:9 → 16:9). EARLY-RETURN-style guard: when no strokes
+        // are present we skip pipeline construction entirely so the
+        // no-strokes path is byte-identical to the pre-Phase-9 PiP-only
+        // output (this is what keeps the macOS golden hash stable).
+        if !strokes.is_empty() {
+            let vertices = build_stroke_vertices(strokes);
+            if !vertices.is_empty() {
+                self.encode_stroke_pass(&mut encoder, &target, &vertices);
+            }
+        }
+
         // 5. Copy render target → staging buffer (with row alignment).
         let bytes_per_row = padded_bytes_per_row(w);
         let staging = self.device.create_buffer(&wgpu::BufferDescriptor {
@@ -383,6 +431,188 @@ impl Compositor {
 
         Ok(Frame::new(w, h, pixels))
     }
+
+    /// Encodes the stroke render pass onto `encoder`, writing into `target`
+    /// using `LoadOp::Load` so the previous PiP pass's pixels are preserved
+    /// and the strokes blend on top via `ALPHA_BLENDING`. Caller MUST ensure
+    /// `vertices` is non-empty.
+    fn encode_stroke_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        target: &wgpu::Texture,
+        vertices: &[StrokeVertex],
+    ) {
+        let vbo = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("stroke-vbo"),
+                contents: bytemuck::cast_slice(vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let shader = self
+            .device
+            .create_shader_module(wgpu::include_wgsl!("shaders/strokes.wgsl"));
+        let pl_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("stroke-layout"),
+                bind_group_layouts: &[],
+                push_constant_ranges: &[],
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("stroke-pipeline"),
+                layout: Some(&pl_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_stroke",
+                    compilation_options: Default::default(),
+                    buffers: &[wgpu::VertexBufferLayout {
+                        array_stride: std::mem::size_of::<StrokeVertex>() as u64,
+                        step_mode: wgpu::VertexStepMode::Vertex,
+                        attributes: &[
+                            // position
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 0,
+                                shader_location: 0,
+                            },
+                            // segment_a
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 8,
+                                shader_location: 1,
+                            },
+                            // segment_b
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x2,
+                                offset: 16,
+                                shader_location: 2,
+                            },
+                            // half_width (single f32; the _pad slot is skipped)
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32,
+                                offset: 24,
+                                shader_location: 3,
+                            },
+                            // color (16-byte aligned via _pad)
+                            wgpu::VertexAttribute {
+                                format: wgpu::VertexFormat::Float32x4,
+                                offset: 32,
+                                shader_location: 4,
+                            },
+                        ],
+                    }],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_stroke",
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState {
+                    topology: wgpu::PrimitiveTopology::TriangleList,
+                    ..Default::default()
+                },
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                cache: None,
+            });
+
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("stroke-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rpass.set_pipeline(&pipeline);
+        rpass.set_vertex_buffer(0, vbo.slice(..));
+        let vertex_count = vertices.len() as u32;
+        rpass.draw(0..vertex_count, 0..1);
+    }
+}
+
+/// Builds a flat triangle-list vertex buffer (6 vertices per segment) from
+/// the visible portion of every stroke. Returns an empty vec if no strokes
+/// have ≥ 2 drawable points or if all points coincide (degenerate segments).
+fn build_stroke_vertices(strokes: &[VisibleStroke]) -> Vec<StrokeVertex> {
+    let mut out = Vec::new();
+    for vs in strokes {
+        let n = vs.drawn_point_count.min(vs.stroke.points.len());
+        if n < 2 {
+            continue;
+        }
+        // Per fix #4: stroke captured.color is in 0..1 floats already; pass
+        // through. Captured stroke also carries its own line_width (also
+        // normalized to frame height); we take the larger of (captured,
+        // Phase-9 minimum) so faint strokes still hit the AA threshold.
+        let color = [
+            vs.stroke.color.r as f32,
+            vs.stroke.color.g as f32,
+            vs.stroke.color.b as f32,
+            vs.stroke.color.a as f32,
+        ];
+        let captured_half = (vs.stroke.line_width as f32) * 0.5;
+        let half_width = captured_half.max(PHASE9_MIN_HALF_WIDTH);
+
+        for pair in vs.stroke.points[..n].windows(2) {
+            let a = [pair[0].x as f32, pair[0].y as f32];
+            let b = [pair[1].x as f32, pair[1].y as f32];
+            let dx = b[0] - a[0];
+            let dy = b[1] - a[1];
+            let len = (dx * dx + dy * dy).sqrt();
+            if len < 1e-7 {
+                continue; // degenerate segment
+            }
+            // Unit perpendicular (rotated 90°). Quad expansion along this
+            // axis covers the line width + AA falloff; expansion along the
+            // tangent extends past the endpoints so round caps fade cleanly.
+            let nx = -dy / len;
+            let ny = dx / len;
+            let tx = dx / len;
+            let ty = dy / len;
+            let pad = half_width + STROKE_QUAD_AA_PAD;
+            // 4 corners: a + (-tangent*pad ± perp*pad), b + (+tangent*pad ± perp*pad).
+            let a_minus_t = [a[0] - tx * pad, a[1] - ty * pad];
+            let b_plus_t = [b[0] + tx * pad, b[1] + ty * pad];
+            let c0 = [a_minus_t[0] - nx * pad, a_minus_t[1] - ny * pad];
+            let c1 = [a_minus_t[0] + nx * pad, a_minus_t[1] + ny * pad];
+            let c2 = [b_plus_t[0] - nx * pad, b_plus_t[1] - ny * pad];
+            let c3 = [b_plus_t[0] + nx * pad, b_plus_t[1] + ny * pad];
+
+            let make = |position: [f32; 2]| StrokeVertex {
+                position,
+                segment_a: a,
+                segment_b: b,
+                half_width,
+                _pad: 0.0,
+                color,
+            };
+            // Two triangles (c0, c1, c2) and (c1, c3, c2) → triangle list.
+            out.push(make(c0));
+            out.push(make(c1));
+            out.push(make(c2));
+            out.push(make(c1));
+            out.push(make(c3));
+            out.push(make(c2));
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -394,7 +624,7 @@ mod tests {
         let comp = Compositor::new_headless().expect("compositor");
         let source = Frame::solid(64, 64, [200, 100, 50, 255]);
         let webcam = Frame::solid(32, 32, [0, 0, 0, 255]); // unused in passthrough
-        let out = comp.compose(&source, &webcam).expect("compose");
+        let out = comp.compose(&source, &webcam, &[]).expect("compose");
         assert_eq!(out.width, 64);
         assert_eq!(out.height, 64);
         // Sample the top-left corner: it's well outside the PiP rect (which
@@ -420,7 +650,7 @@ mod tests {
         // should be blue.
         let source = Frame::solid(640, 360, [255, 0, 0, 255]);
         let webcam = Frame::solid(160, 90, [0, 0, 255, 255]);
-        let out = comp.compose(&source, &webcam).expect("compose");
+        let out = comp.compose(&source, &webcam, &[]).expect("compose");
 
         let sample = |x: u32, y: u32| -> [u8; 4] {
             let i = ((y * out.width + x) * 4) as usize;
@@ -443,6 +673,125 @@ mod tests {
             "bottom-right should be webcam blue, got {:?}",
             br
         );
+    }
+
+    #[test]
+    fn compose_with_no_strokes_matches_phase5_baseline() {
+        // Regression guard for fix #5: passing &[] strokes must produce the
+        // same pixels as the original PiP-only path. We can't call the OLD
+        // signature (it's gone), so we re-assert the same red-source +
+        // blue-webcam sampling expectations from `pip_places_webcam_in_
+        // bottom_right` to prove the no-strokes path is unaffected by the
+        // new API.
+        let comp = Compositor::new_headless().expect("compositor");
+        let source = Frame::solid(640, 360, [255, 0, 0, 255]);
+        let webcam = Frame::solid(160, 90, [0, 0, 255, 255]);
+        let out = comp.compose(&source, &webcam, &[]).expect("compose");
+
+        let sample = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * out.width + x) * 4) as usize;
+            [
+                out.pixels[i],
+                out.pixels[i + 1],
+                out.pixels[i + 2],
+                out.pixels[i + 3],
+            ]
+        };
+
+        let tl = sample(8, 8);
+        assert_eq!(tl[..3], [255, 0, 0], "top-left should be red, got {:?}", tl);
+        let br = sample(out.width - 12, out.height - 12);
+        assert!(
+            (br[2] as i32 - 255).abs() <= 4,
+            "bottom-right should be webcam blue, got {:?}",
+            br
+        );
+    }
+
+    #[test]
+    fn stroke_pass_changes_pixels_along_path() {
+        use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
+
+        let comp = Compositor::new_headless().expect("compositor");
+        // Solid red source so any non-red pixel proves the stroke pass ran.
+        // PiP webcam goes to the bottom-right; we sample on the centerline.
+        let source = Frame::solid(640, 360, [255, 0, 0, 255]);
+        let webcam = Frame::solid(160, 90, [0, 0, 0, 255]);
+
+        // Horizontal line across the middle, [0.2, 0.5] → [0.8, 0.5].
+        let stroke = Stroke {
+            id: uuid::Uuid::nil(),
+            color: Rgba::RED, // captured red — but with PHASE9 alpha blending the (1,0.2,0.2)
+            // color blends measurably on top of pure (1,0,0). Even if alpha=1
+            // the stroke color (255, 51, 51) differs in green/blue channels
+            // by 51, which is well above the ±2 tolerance.
+            line_width: 0.01,
+            points: vec![
+                StrokePoint {
+                    x: 0.2,
+                    y: 0.5,
+                    t: 0.0,
+                },
+                StrokePoint {
+                    x: 0.8,
+                    y: 0.5,
+                    t: 1.0,
+                },
+            ],
+            auto_clear_after_seconds: None,
+        };
+        let visible = VisibleStroke {
+            stroke,
+            first_point_record_time: 0.0,
+            drawn_point_count: 2,
+        };
+        let out = comp
+            .compose(&source, &webcam, std::slice::from_ref(&visible))
+            .expect("compose");
+
+        let sample = |x: u32, y: u32| -> [u8; 4] {
+            let i = ((y * out.width + x) * 4) as usize;
+            [
+                out.pixels[i],
+                out.pixels[i + 1],
+                out.pixels[i + 2],
+                out.pixels[i + 3],
+            ]
+        };
+
+        // On the stroke (mid-x, mid-y): not the source color. Source is
+        // (255, 0, 0); the stroke is RED (1.0, 0.2, 0.2) → green channel
+        // should rise above 0.
+        let on_stroke = sample(out.width / 2, out.height / 2);
+        assert!(
+            on_stroke[1] > 8,
+            "expected stroke to lift green channel; got {:?}",
+            on_stroke
+        );
+
+        // Off the stroke (mid-x, near top): IS the source color.
+        let off_stroke = sample(out.width / 2, out.height / 10);
+        assert!(
+            (off_stroke[0] as i32 - 255).abs() <= 2 && off_stroke[1] <= 2 && off_stroke[2] <= 2,
+            "expected source red off the stroke path; got {:?}",
+            off_stroke
+        );
+    }
+
+    #[test]
+    fn compose_tick_matches_compose_method() {
+        // Locks in fix #24's contract: `compose_tick` is a thin wrapper
+        // around `Compositor::compose`. Same instance, same inputs, byte-
+        // for-byte equality. If this ever drifts, the parity test in
+        // Task 6 (and the preview-vs-export hash equality goal) fail.
+        let comp = Compositor::new_headless().expect("compositor");
+        let source = Frame::solid(128, 72, [50, 200, 100, 255]);
+        let webcam = Frame::solid(64, 36, [0, 0, 0, 255]);
+        let via_method = comp.compose(&source, &webcam, &[]).expect("method");
+        let via_free = crate::compose_tick(&comp, &source, &webcam, &[]).expect("free fn");
+        assert_eq!(via_method.width, via_free.width);
+        assert_eq!(via_method.height, via_free.height);
+        assert_eq!(via_method.pixels, via_free.pixels);
     }
 
     #[cfg(target_os = "macos")]
@@ -468,7 +817,7 @@ mod tests {
         let comp = Compositor::new_headless().expect("compositor");
         let source = pixel_grid(320, 180, 1);
         let webcam = pixel_grid(160, 90, 3);
-        let out = comp.compose(&source, &webcam).expect("compose");
+        let out = comp.compose(&source, &webcam, &[]).expect("compose");
 
         let hex = format!("{:x}", Sha256::digest(&out.pixels));
         eprintln!("pip_320x180 hash on this machine: {hex}");

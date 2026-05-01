@@ -219,9 +219,13 @@ pub fn compose_two_files(
                     .clone()
                     .unwrap_or_else(|| video_coach_compositor::Frame::solid(2, 2, [0, 0, 0, 255]));
 
-                let composed = comp
-                    .compose(&source_frame, &webcam_frame)
-                    .map_err(|_| gstreamer::FlowError::Error)?;
+                // Per phase-9 adversarial fixes #5 + #24: route through the
+                // canonical `compose_tick` entry point so export and preview
+                // share one path. Phase 5 export passes `&[]` strokes;
+                // Phase 10's export sheet will populate this.
+                let composed =
+                    video_coach_compositor::compose_tick(&comp, &source_frame, &webcam_frame, &[])
+                        .map_err(|_| gstreamer::FlowError::Error)?;
 
                 let mut out_buf = gstreamer::Buffer::with_size(composed.pixels.len())
                     .map_err(|_| gstreamer::FlowError::Error)?;
