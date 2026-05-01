@@ -628,3 +628,107 @@ SEPARATE commits as `docs: PROGRESS.txt — task N done <SHA>`.)
 | `PROGRESS.txt` | 2 | Phase 11 Plan #2 → SHIPPED line. |
 
 Total LOC budget: ~150-300, well under the 700-per-task hard cap.
+
+---
+
+## Closeout — Phase 11 Plan #2 SHIPPED 2026-05-01
+
+**CI run**: TBD (placeholder; orchestrator's `CI_DONE` stage replaces this
+with the real run id once the post-push GitHub Actions workflow goes
+green on all 4 jobs — `test (ubuntu-latest)`, `test (windows-latest)`,
+`test (macos-latest)`, `media-tests`).
+
+### Commits (in shipping order)
+
+| Stage | SHA | Summary |
+|---|---|---|
+| Plan first pass | `ff359af` | Initial plan + 5 baked-in fixes (slot shape, throttle policy, aggregation, Slint UI, 3 tasks) |
+| Plan adversarial pass | `4a8ecc8` | Plan fixes #1-#9 from inline adversarial review (cumulative `frames_pushed`, `Arc<Mutex<(f32,Instant)>>` not Cell/RefCell, captured `i`+`total_tags` locals, post-success snap to `(1.0, (i+1)/total)`, throttle mutex poison-recovery, single 0.5%-delta gate without time floor, f64 divide → f32 cast, per-arm UI defaults across all 5 ExportRunOutcome arms, Slint `.round()` method form) |
+| Task 0 | `9ac71f7` | Preflight — `ExportProgressSlotData` extended with `current_tag_progress` + `batch_progress` f32 fields; bus's `Box::new(\|_\| {})` replaced with throttled writer (Arc<Mutex<(f32,Instant)>>, cumulative frames_pushed/total_frames in f64, captured i + total_tags locals, poison-recovering throttle lock, 0.5%-delta single gate); per-tag progress reset; snap to (1.0, (i+1)/total) after Ok(Ok(_)) |
+| Task 0 progress flip | `86b559f` | PROGRESS.txt — Phase 11 Plan #2 Task 0 row [x] + Phase 11 progress block scaffolded |
+| Task 1 | `44c3bc5` | Slint UI — `export-current-tag-progress` + `export-batch-progress` float properties added to main.slint; InProgress static "(N of M)" replaced with "(N of M) — XX%" via `(root.export-batch-progress * 100).round()` (method form accepted by pinned Slint 1.8) plus 200ms eased horizontal Rectangle progress bar; ui.rs 10-tuple → 12-tuple destructure with explicit per-arm defaults (None=(0,0), InProgress=slot, SucceededAll=(1,1), PartialFailure=slot, Cancelled=slot) |
+| Task 1 progress flip | `33772c3` | PROGRESS.txt — Phase 11 Plan #2 Task 1 row [x] |
+| Code-review fix [2] | `efcac5b` | Empty-plan skip leaves stale tag — moved slot-update block in 'outer for loop to BEFORE `plan.entries.is_empty()` → `continue`, so a skipped tag updates current_tag to the new label and bumps batch_progress to (i / total_tags).min(1.0) segment-start floor |
+| Code-review fix [4] | `c1eb44e` | Terminal-state slot writes drop progress fields — extended end-of-batch terminal block to compute (current_tag_progress, batch_progress) per outcome: SucceededAll → (1.0, 1.0); PartialFailure / Cancelled → (0.0, completed_tags / total_tags.max(1)); None / InProgress defensively (0.0, 0.0). Aligns with frame_sink.rs:227-229 docstring contract |
+| Closeout | this commit | Plan closeout section + PROGRESS.txt Plan #2 SHIPPED |
+
+### Adversarial-fix coverage (Fixes #1-#9)
+
+All 9 fixes shipped; each verified present in shipped code.
+
+- ✅ #1 cumulative `frames_pushed / total_frames` (not per-entry `frame_index`) → `bus.rs` closure uses `progress.frames_pushed as f64 / progress.total_frames.max(1) as f64`
+- ✅ #2 `Arc<Mutex<(f32, Instant)>>` throttle storage (not Cell/RefCell, which are `!Sync` and would fail the `Box<dyn Fn + Send + Sync>` trait bound on `on_progress`)
+- ✅ #3 captured `i` + `total_tags` as locals (`i_for_closure`, `total_tags_for_closure`) avoiding lock-order race against the 30 Hz UI poller reading `completed_tags` from the slot
+- ✅ #4 snap to `(current_tag_progress=1.0, batch_progress=((i+1)/total_tags).min(1.0))` after `Ok(Ok(_))` BEFORE `completed_tags += 1`, so the bar reaches 100% of the just-completed segment before the next tag's reset
+- ✅ #5 throttle lock uses poison-recovering pattern (`lock().unwrap_or_else(|e| e.into_inner())`); slot lock matches plan's "panic on slot poison — slot is source of truth" rationale
+- ✅ #6 single 0.5%-delta gate, no time-floor (export.rs's `frame_idx % 30 == 0` already provides ~1 Hz cadence)
+- ✅ #7 f64 divide → f32 cast → clamp `[0.0, 1.0]` (avoids 2^24 frame precision ceiling within plan-supported session lengths)
+- ✅ #8 per-arm UI defaults spelled explicitly across all 5 ExportRunOutcome arms in ui.rs's 12-tuple destructure
+- ✅ #9 Slint `.round()` method form accepted by pinned Slint 1.8; no `Math.round(...)` fallback needed
+
+### Code-review findings
+
+Inline code-review pass on the `fa98ed5..HEAD` diff (851 insertions /
+2 deletions) produced 12 findings:
+
+| Triage | Count | Findings |
+|---|---|---|
+| **REAL fix-worthy** | 2 | [2] empty-plan skip stale tag; [4] terminal-state slot writes drop progress fields |
+| **REAL accepted** | 3 | [1] tokio JoinHandle ownership protects snap-after-await; [9] mfh264enc cold-start gap is documented plan deviation; [12] closure slot-lock panic on poison matches plan's Fix #5 rationale |
+| **OVERSTATED** | 3 | [3] f32 precision past 2^24 frames is below throttle gate; [6] throttle Instant field is dead-code-but-defensive; [7] redundant `i_for_closure` copy is plan-mandated for clarity |
+| **SPECULATIVE** | 4 | [5] n/n f32 precision; [8] animate width hop visibility; [10] >100% display can't trigger (closure clamps); [11] slot-lock contention at ~31 events/sec is microsecond-scale |
+
+The 2 REAL fix-worthy findings shipped as 2 separate fix-up commits
+(`efcac5b`, `c1eb44e`) for git-blame clarity — see Commits table above.
+Total fix-up LOC: +57 / -20.
+
+### Deferred to Phase 11+
+
+- **Windows mfh264enc cold-start position-query overlay.** Finding [9]
+  from code review: on Windows, mfh264enc takes 5-10 s before pushing
+  its first frame; during that window the bar sits at the segment-start
+  floor `i/total_tags` and the percentage display reads the same value
+  for the duration of the warmup. Visually indistinguishable from a
+  frozen UI on a single-tag batch. Plan #2 deliberately defers a
+  GStreamer position-query 1 Hz overlay or a "warming up encoder…"
+  spinner that would bridge this gap. The frame-counter signal is
+  sufficient for the steady-state case (>=2 tags or any per-tag progress
+  past the cold-start) and ETA estimates remain out of scope. A
+  follow-up plan should add a per-iteration "tag started, waiting for
+  first frame" indicator that the throttled writer flips to "encoding"
+  on the first on_progress fire.
+- **Across-tag smoothing weighted by per-tag `total_frames`.** Current
+  equal-weight aggregation (`(i + tag_p) / total_tags`) gives each tag
+  the same batch-progress slice regardless of its frame count. A 2-min
+  tag and a 30-min tag advance the bar by the same amount per tag. The
+  simpler mental model wins for now; weighted aggregation is a
+  follow-up if the disparity is reported as confusing.
+- **ETA estimate.** Out of scope for Plan #2.
+
+### Known coverage gaps (acceptable for shipping)
+
+- **Multi-tag batch UI exercise.** Tasks 0+1 unit-test the slot shape
+  and the bus throttled writer's f64 math; the harness E2E
+  (`export_smoke`) exercises a single AllClips selection. The
+  per-iteration reset, segment-start snap, and `i/total_tags` floor are
+  exercised by the bus closure path but no integration test runs 3+
+  tags through the slot → Slint UI in one batch. Manual smoke confirms
+  the bar advances visibly on a synthetic 3-tag batch.
+- **PartialFailure / Cancelled UI rendering of the new fields.** Code
+  review finding [4] is fixed (terminal block now writes both fields)
+  but no fixture forces `export_compilation` to error after one tag has
+  succeeded; the new bar values on PartialFailure / Cancelled are
+  exercised only via unit tests of the slot shape, not via UI render.
+- **Throttle gate boundary edge cases.** The 0.5%-delta gate is unit-
+  tested in concept (`bus.rs` closure tests check the f64 math) but no
+  test specifically asserts that two consecutive on_progress fires <
+  0.5% apart are coalesced into one slot write. Behaviour is governed
+  by `export.rs`'s `frame_idx % 30 == 0` cadence, so in practice ≤ 1
+  fire per second per tag.
+- **Slint `animate width` interaction with rapid updates.** Code review
+  finding [8] is SPECULATIVE — animation duration (200 ms) is much
+  smaller than the ~1 Hz update cadence, so each fire animates fully
+  before the next. No regression test covers a hypothetical future
+  speed-up of the throttle cadence.
+
+These gaps are noted for future regression sweeps; they don't block shipping.

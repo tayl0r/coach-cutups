@@ -398,9 +398,9 @@ under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
 own SHIPPED line + CI run id once green.
 
 - [ ] Plan #1: HEVC encoder
-- [ ] Plan #2: real-progress-pct — replace indeterminate spinner with
-      a real 0..1 progress bar fed from export.rs's existing
-      ExportProgress callback. Plan:
+- [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run TBD.
+      Replaced indeterminate spinner with a real 0..1 progress bar fed
+      from export.rs's existing ExportProgress callback. Plan:
       docs/plans/2026-05-01-rust-rewrite-phase-11-real-progress-pct.md
   - [x] Task 0: Preflight — ExportProgressSlotData fields + bus
         throttled writer (commit 9ac71f7)
@@ -422,7 +422,12 @@ own SHIPPED line + CI run id once green.
         batch_progress; extends ui.rs 10-tuple to 12, hydrates per-arm
         defaults explicitly (Fix #8: None=(0,0), InProgress=slot,
         SucceededAll=(1,1), PartialFailure=slot, Cancelled=slot).
-  - [ ] Task 2: Closeout — Plan #2 SHIPPED
+  - [x] Task 2: Closeout — Plan #2 SHIPPED (closeout commit pending —
+        this commit). Code-review fixes folded in: efcac5b (empty-plan
+        skip stale tag), c1eb44e (terminal-state slot writes drop
+        progress fields). Deferred: Windows mfh264enc cold-start
+        position-query overlay → Phase 11+.
+  - Closeout: <SHA — this commit>
 - [ ] Plan #3: source/commentary audio mix in export + preview
 - [ ] Plan #4: freeze-segment compose caching
 - [ ] Plan #5: per-frame pipeline rebuild optimization
