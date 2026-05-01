@@ -14,6 +14,10 @@ targets:
   VideoCoach:
     type: application
     platform: macOS
+    scheme:
+      testTargets:
+        - VideoCoachTests
+        - VideoCoachUITests
     sources:
       - App
     dependencies:
@@ -54,3 +58,18 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachUITests
         CODE_SIGN_ENTITLEMENTS: AppUITests/VideoCoachUITests.entitlements
         ENABLE_APP_SANDBOX: NO
+  VideoCoachTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/AppTests
+      - path: App/Source/GLMetalBridge.swift
+    settings:
+      base:
+        SWIFT_VERSION: 5.9
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachTests
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""
