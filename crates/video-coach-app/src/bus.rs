@@ -2315,6 +2315,10 @@ async fn handle_export_compilations(
             current_tag: None,
             completed_tags: 0,
             total_tags,
+            // Phase 11 Plan #2: per-tag and batch progress start at 0.0;
+            // the throttled `on_progress` writer below ticks them up.
+            current_tag_progress: 0.0,
+            batch_progress: 0.0,
         };
     }
 
@@ -2393,12 +2397,23 @@ async fn handle_export_compilations(
             let _ = std::fs::remove_file(&output_path);
 
             // Update slot for this iteration.
+            //
+            // Phase 11 Plan #2: also reset `current_tag_progress` to 0.0
+            // and recompute `batch_progress` from `i`, NOT
+            // `completed_tags`. `completed_tags` only ticks AFTER a tag
+            // finishes — `i` is the index of the tag about to start,
+            // which equals the count of tags fully done before this one.
+            // The encoder cold-start gap (mfh264enc 5–10 s before any
+            // frame is pushed) is bridged by this reset: the bar shows
+            // the segment-start value immediately on tag begin.
             {
                 let mut g = export_progress_for_task
                     .lock()
                     .expect("export_progress poisoned");
                 g.current_tag = Some(label.clone());
                 g.completed_tags = i;
+                g.current_tag_progress = 0.0;
+                g.batch_progress = i as f32 / total_tags as f32;
             }
 
             tracing::info!(
@@ -2420,6 +2435,79 @@ async fn handle_export_compilations(
             let compositor_for_export = compositor_for_task.clone();
             let cancel_for_export = cancel_flag.clone();
             let output_path_for_export = output_path.clone();
+
+            // ── Phase 11 Plan #2: throttled on_progress writer. ──
+            //
+            // Capture loop-local immutables (`i`, `total_tags`) by value
+            // BEFORE constructing the closure (Fix #3). The closure
+            // must NOT read `completed_tags` from the slot — only
+            // write into it — so that any future refactor that
+            // parallelises tags (or any straggler progress event firing
+            // after `spawn_blocking` returns) can't race a concurrent
+            // batch_progress recomputation against the wrong tag index.
+            let i_for_closure: usize = i;
+            let total_tags_for_closure: usize = total_tags;
+            // Throttle state: `(last_batch_progress, last_write_at)`.
+            // `Arc<Mutex<...>>` not `Cell`/`RefCell` because
+            // `export.rs:149` types the callback as
+            // `Box<dyn Fn(ExportProgress) + Send + Sync>` and
+            // `Cell`/`RefCell` are `!Sync` (Fix #2). The initial
+            // `Instant::now() - 1s` ensures the first event always
+            // passes the time check (defence-in-depth — the gate is
+            // currently delta-only, but starting "in the past" is
+            // robust to future re-introduction of a time floor).
+            let last_progress = Arc::new(std::sync::Mutex::new((
+                0.0_f32,
+                std::time::Instant::now() - std::time::Duration::from_millis(1000),
+            )));
+            let slot_for_closure = export_progress_for_task.clone();
+            let last_progress_for_closure = last_progress.clone();
+            let on_progress: Box<dyn Fn(video_coach_media::export::ExportProgress) + Send + Sync> =
+                Box::new(move |progress| {
+                    // frames_pushed is monotonic across entries; frame_index
+                    // resets per entry (export.rs:1306) and would tick
+                    // backward at every entry boundary on multi-entry tags
+                    // (Fix #1). f64 divide → f32 cast avoids precision loss
+                    // past 2^24 frames (~155 h at 30 fps); `.max(1)`
+                    // defensively guards div-by-zero (Fix #7).
+                    let tag_p_raw =
+                        progress.frames_pushed as f64 / progress.total_frames.max(1) as f64;
+                    let tag_p = (tag_p_raw as f32).clamp(0.0, 1.0);
+                    let batch_p = ((i_for_closure as f32 + tag_p) / total_tags_for_closure as f32)
+                        .clamp(0.0, 1.0);
+
+                    // Throttle gate. Recover from poison instead of
+                    // panicking (Fix #5): the throttle is best-effort
+                    // state, and a panicking closure would kill the
+                    // `spawn_blocking` task and bypass export.rs:317-320's
+                    // stepped Paused → Ready → Null teardown. We DO panic
+                    // on the slot lock below, because the slot is the
+                    // source of truth and silent corruption there would be
+                    // worse than a loud crash.
+                    let now = std::time::Instant::now();
+                    {
+                        let mut last = last_progress_for_closure
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        let (last_p, _last_at) = *last;
+                        // Single delta gate, no time floor (Fix #6) —
+                        // `export.rs:1353` already caps invocations at ~1 Hz
+                        // via `frame_idx % 30 == 0`; the 0.5% delta gate
+                        // de-dupes within slow tags and is defence-in-depth
+                        // if that call-site cap is ever loosened.
+                        if (batch_p - last_p).abs() < 0.005 {
+                            return;
+                        }
+                        *last = (batch_p, now);
+                        // Drop the throttle guard before locking the slot —
+                        // two locks acquired in series, never nested.
+                    }
+
+                    let mut g = slot_for_closure.lock().expect("export_progress poisoned");
+                    g.current_tag_progress = tag_p;
+                    g.batch_progress = batch_p;
+                });
+
             let join = tokio::task::spawn_blocking(move || {
                 video_coach_media::export::export_compilation(
                     inputs,
@@ -2430,7 +2518,7 @@ async fn handle_export_compilations(
                     commentary_volume,
                     compositor_for_export,
                     cancel_for_export,
-                    Box::new(|_progress| {}),
+                    on_progress,
                 )
             })
             .await;
@@ -2443,6 +2531,24 @@ async fn handle_export_compilations(
                         selection = %label,
                         frames_pushed = summary.frames_pushed as i64,
                     );
+                    // Phase 11 Plan #2 (Fix #4): snap to segment
+                    // boundary on tag success BEFORE bumping
+                    // `completed_tags`. The on_progress callback only
+                    // fires at `frame_idx % 30 == 0` (export.rs:1353),
+                    // so the very last frame of a tag often does NOT
+                    // fire — without this snap, batch_progress would
+                    // visibly stop short of the segment boundary (e.g.
+                    // 96% on a 5-tag batch where the last tag's last
+                    // entry is 150 frames). No race: the closure for
+                    // tag `i` is dropped when `spawn_blocking`
+                    // returns, so we're between iterations.
+                    {
+                        let mut g = export_progress_for_task
+                            .lock()
+                            .expect("export_progress poisoned");
+                        g.current_tag_progress = 1.0;
+                        g.batch_progress = ((i + 1) as f32 / total_tags as f32).min(1.0);
+                    }
                     completed_tags += 1;
                 }
                 Ok(Err(video_coach_media::export::ExportError::Cancelled)) => {

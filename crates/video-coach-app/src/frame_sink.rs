@@ -198,6 +198,14 @@ pub enum ExportRunOutcome {
 /// transitions, the UI observes. Lock duration is short — read +
 /// `clone()` of the small enum + a few `usize`/`Option<String>` fields,
 /// no I/O or window calls under the lock.
+///
+/// Phase 11 Plan #2 (real-progress-pct): the slot gains
+/// `current_tag_progress` and `batch_progress` `f32`s, fed by the bus's
+/// throttled `on_progress` writer (lineage: Phase 10 fix #23 wired
+/// `frames_pushed` through `ExportProgress`; this plan turns it into a
+/// 0..1 bar). `Default` derivation keeps both fields at 0.0 for the
+/// initial / `None` outcome — see the per-arm defaults in `ui.rs`'s
+/// timer block.
 #[derive(Debug, Clone, Default)]
 pub struct ExportProgressSlotData {
     /// Where the run is in its life cycle. See `ExportRunOutcome`.
@@ -213,6 +221,20 @@ pub struct ExportProgressSlotData {
     /// terminal states so the summary view can show "5 of 5
     /// rendered".
     pub total_tags: usize,
+    /// Phase 11 Plan #2. 0..1 progress of the currently-rendering tag.
+    /// Set whenever `outcome == InProgress`; clamped to [0.0, 1.0].
+    /// Reset to 0.0 at the top of each tag iteration before the
+    /// per-frame push loop starts. Held at its last value through
+    /// terminal-state transitions so a snapshot at completion isn't
+    /// visually weird, but the UI ignores this field outside
+    /// `InProgress`. Default is 0.0.
+    pub current_tag_progress: f32,
+    /// Phase 11 Plan #2. 0..1 progress of the entire batch. Computed
+    /// in the throttled writer as
+    /// `(i as f32 + current_tag_progress) / total_tags as f32`,
+    /// clamped to [0.0, 1.0]. Same lifecycle notes as
+    /// `current_tag_progress`. Default is 0.0.
+    pub batch_progress: f32,
 }
 
 pub type ExportProgressSlot = Arc<Mutex<ExportProgressSlotData>>;
@@ -378,12 +400,16 @@ mod tests {
     fn export_progress_slot_defaults_to_none_outcome() {
         // Phase 10 Task 0 (fix #17). Fresh slot is the form-view state:
         // outcome=None, no current tag, zero counts.
+        // Phase 11 Plan #2: also verify the new f32 progress fields
+        // default to 0.0 cleanly (Default-derive).
         let slot = new_export_progress();
         let g = slot.lock().unwrap();
         assert!(matches!(g.outcome, ExportRunOutcome::None));
         assert!(g.current_tag.is_none());
         assert_eq!(g.completed_tags, 0);
         assert_eq!(g.total_tags, 0);
+        assert_eq!(g.current_tag_progress, 0.0);
+        assert_eq!(g.batch_progress, 0.0);
     }
 
     #[test]
