@@ -227,7 +227,8 @@ docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
 
 
 ## Phase 10 — export sheet UI + batch compilation export
-Plan: docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
+SHIPPED 2026-05-01. CI run 25232573975 green on all 4 jobs. Plan:
+docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
 
 - [x] Task 0: Preflight — Command shapes, AppMode::Exporting,
       ExportProgressSlot, TagSelection, sanitize_filename helper,
@@ -386,9 +387,15 @@ Plan: docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
       "preview pipeline frame N vs export pipeline frame N" framing
       (preview's sync=true real-time decode races the deterministic
       walk).
-- [ ] Task 6: Closeout
+- [x] Task 6: Closeout — appended to plan file (this commit); CI run
+      25232573975 green on all 4 jobs. Phase 10 SHIPPED.
 
 
-## Phase 11+ — pending
+## Phase 11 — pending
 Per the design doc:
   Phase 11 Polish, packaging, cross-platform CI green
+Plus the Phase 10 closeout's deferred items: HEVC encoder, real progress
+percentage, source/commentary audio mix in export+preview, freeze-segment
+compose caching, per-frame pipeline rebuild optimization, VBO churn for
+strokes, resume failed exports, drag-reorder tag rows, custom filename
+templates.
