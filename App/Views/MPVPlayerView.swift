@@ -129,6 +129,8 @@ final class MPVRenderingNSView: NSView {
         // shared ref. The owned-player path (bring-up window) is handled
         // by tearDown() on viewWillMove(toWindow: nil) and is mutually
         // exclusive with this code path.
+        // Note: bridge is intentionally retained across updatePlayer swaps — it's
+        // a view-scoped GPU resource. Only tearDown() (view leaving window) drops it.
         if sharedPlayer != nil {
             if let link = displayLink {
                 CVDisplayLinkStop(link)
@@ -208,6 +210,9 @@ final class MPVRenderingNSView: NSView {
             sharedPlayer?.detachRender()
             sharedPlayer = nil
         }
+        // Release the bridge AFTER the render context is freed; the render context
+        // referenced our FBO via the GL callbacks, so order matters.
+        bridge = nil
     }
 
     deinit { tearDown() }
