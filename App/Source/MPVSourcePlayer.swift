@@ -37,6 +37,11 @@ public final class MPVSourcePlayer {
     public private(set) var timePos: Double = 0
     public private(set) var generation: UInt64 = 0
 
+    /// True when at least one file is loaded in the playlist. `playlistPos`
+    /// is clamped to 0 even when mpv would report -1 (no file), so callers
+    /// must check this instead of `playlistPos >= 0`.
+    public var hasLoadedFile: Bool { playlistCount > 0 }
+
     // Single-slot pending-seek tracking (Task 3.7).
     fileprivate struct PendingSeek {
         let replyID: UInt64
@@ -97,36 +102,40 @@ public final class MPVSourcePlayer {
                 if id == MPV_EVENT_COMMAND_REPLY {
                     let replyID = evt.pointee.reply_userdata
                     let cmdError = evt.pointee.error
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        guard var p = self.pending, p.replyID == replyID else { return }
-                        // Free the strdup'd argv — mpv has consumed them by now.
-                        for c in p.cstrings { if let c { free(c) } }
-                        p.cstrings = []
-                        if cmdError < 0 {
-                            // Command rejected. Drop the pending entry; SkipCoordinator
-                            // will time out via its debounce. Don't fire completion, or
-                            // it would advance the coordinator on a non-event.
-                            self.pending = nil
-                        } else {
-                            p.commandReplied = true
-                            self.pending = p
+                    DispatchQueue.main.async { [weak self] in
+                        MainActor.assumeIsolated {
+                            guard let self else { return }
+                            guard var p = self.pending, p.replyID == replyID else { return }
+                            // Free the strdup'd argv — mpv has consumed them by now.
+                            for c in p.cstrings { if let c { free(c) } }
+                            p.cstrings = []
+                            if cmdError < 0 {
+                                // Command rejected. Drop the pending entry; SkipCoordinator
+                                // will time out via its debounce. Don't fire completion, or
+                                // it would advance the coordinator on a non-event.
+                                self.pending = nil
+                            } else {
+                                p.commandReplied = true
+                                self.pending = p
+                            }
                         }
                     }
                     continue
                 }
                 if id == MPV_EVENT_PLAYBACK_RESTART {
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        // Only fire when (a) a pending seek exists, (b) its command
-                        // already replied (so this PLAYBACK_RESTART is for our seek,
-                        // not for a natural playlist auto-advance with no seek in
-                        // flight), and (c) the generation matches.
-                        guard let p = self.pending,
-                              p.commandReplied,
-                              p.generation == self.generation else { return }
-                        self.pending = nil
-                        p.completion()
+                    DispatchQueue.main.async { [weak self] in
+                        MainActor.assumeIsolated {
+                            guard let self else { return }
+                            // Only fire when (a) a pending seek exists, (b) its command
+                            // already replied (so this PLAYBACK_RESTART is for our seek,
+                            // not for a natural playlist auto-advance with no seek in
+                            // flight), and (c) the generation matches.
+                            guard let p = self.pending,
+                                  p.commandReplied,
+                                  p.generation == self.generation else { return }
+                            self.pending = nil
+                            p.completion()
+                        }
                     }
                     continue
                 }
@@ -134,27 +143,29 @@ public final class MPVSourcePlayer {
                     let prop = UnsafeMutableRawPointer(evt.pointee.data)?
                         .assumingMemoryBound(to: mpv_event_property.self).pointee
                     let userdata = evt.pointee.reply_userdata
-                    Task { @MainActor [weak self] in
-                        guard let self else { return }
-                        switch userdata {
-                        case 1:
-                            if let data = prop?.data {
-                                self.isPaused = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                    DispatchQueue.main.async { [weak self] in
+                        MainActor.assumeIsolated {
+                            guard let self else { return }
+                            switch userdata {
+                            case 1:
+                                if let data = prop?.data {
+                                    self.isPaused = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                                }
+                            case 2:
+                                if let data = prop?.data {
+                                    self.playlistCount = Int(data.assumingMemoryBound(to: Int64.self).pointee)
+                                }
+                            case 3:
+                                if let data = prop?.data {
+                                    self.playlistPos = Int(max(0, data.assumingMemoryBound(to: Int64.self).pointee))
+                                }
+                            case 4:
+                                if let data = prop?.data {
+                                    let v = data.assumingMemoryBound(to: Double.self).pointee
+                                    if v.isFinite { self.timePos = v }
+                                }
+                            default: break
                             }
-                        case 2:
-                            if let data = prop?.data {
-                                self.playlistCount = Int(data.assumingMemoryBound(to: Int64.self).pointee)
-                            }
-                        case 3:
-                            if let data = prop?.data {
-                                self.playlistPos = Int(max(0, data.assumingMemoryBound(to: Int64.self).pointee))
-                            }
-                        case 4:
-                            if let data = prop?.data {
-                                let v = data.assumingMemoryBound(to: Double.self).pointee
-                                if v.isFinite { self.timePos = v }
-                            }
-                        default: break
                         }
                     }
                     continue
@@ -168,8 +179,12 @@ public final class MPVSourcePlayer {
 
     deinit {
         // mpv_terminate_destroy makes mpv_wait_event return MPV_EVENT_SHUTDOWN
-        // which the pump (Task 3.2) uses to exit its loop. The render context
-        // is freed by detachRender (called from MPVPlayerView's tearDown).
+        // which the pump (Task 3.2) uses to exit its loop. detachRender is
+        // normally called from MPVPlayerView's tearDown; we defensively call
+        // it here too in case a code path nils Workspace.sourcePlayer while
+        // a view is still on screen — without this, mpv_terminate_destroy
+        // would leak the render context. detachRender is idempotent.
+        detachRender()
         mpv_terminate_destroy(handle)
     }
 
@@ -177,8 +192,8 @@ public final class MPVSourcePlayer {
         generation &+= 1
         // Drop any pending completion that hasn't fired — the bump means
         // we're transitioning to a state where the completion is no
-        // longer meaningful.
-        pending = nil
+        // longer meaningful. dropPending also frees the strdup'd argv.
+        dropPending()
     }
 
     public func setPlaylist(_ paths: [String]) {
@@ -243,7 +258,8 @@ public final class MPVSourcePlayer {
         // one pending. Any prior pending entry was either fired (and would
         // have caused SkipCoordinator to issue this new seek) or was
         // dropped via bumpGeneration — either way it's gone here.
-        pending = nil
+        // dropPending also frees the strdup'd argv if any was held.
+        dropPending()
 
         if targetPos == playlistPos {
             let flags = exact ? "absolute+exact" : "absolute+keyframes"
@@ -292,14 +308,14 @@ public final class MPVSourcePlayer {
         }
     }
 
-    /// Called from the event-pump's COMMAND_REPLY branch (Task 3.7) to free
-    /// the strdup'd args.
-    fileprivate func freePendingCstrings() {
+    /// Free the strdup'd argv currently held by `pending`, then clear it.
+    /// Idempotent against `pending == nil`.
+    private func dropPending() {
         if var p = pending {
             for c in p.cstrings { if let c { free(c) } }
             p.cstrings = []
-            pending = p
         }
+        pending = nil
     }
 
     // MARK: - Render lifecycle (Task 3.5)
