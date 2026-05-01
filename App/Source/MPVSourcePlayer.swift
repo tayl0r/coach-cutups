@@ -43,6 +43,8 @@ public final class MPVSourcePlayer {
     fileprivate var pending: PendingSeek?
     fileprivate var nextReplyID: UInt64 = 100
 
+    private var pumpThread: Thread?
+
     public init() throws {
         guard let h = mpv_create() else { throw MPVSourcePlayerError.createFailed }
         for (k, v) in [
@@ -69,6 +71,18 @@ public final class MPVSourcePlayer {
             throw MPVSourcePlayerError.initializeFailed(code: Int(rc))
         }
         self.handle = h
+        let pump = Thread { [handle = h] in
+            while true {
+                guard let evt = mpv_wait_event(handle, 0.1) else { continue }
+                let id = evt.pointee.event_id
+                if id == MPV_EVENT_NONE { continue }
+                if id == MPV_EVENT_SHUTDOWN { return }
+                // Property + command-reply + playback-restart handlers added in 3.3 / 3.7.
+            }
+        }
+        pump.name = "mpv-event-pump"
+        pump.start()
+        self.pumpThread = pump
     }
 
     deinit {
