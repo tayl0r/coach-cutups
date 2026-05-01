@@ -4,12 +4,31 @@ import Metal
 import QuartzCore
 import Libmpv
 
-enum MPVRenderBackend {
+enum MPVRenderBackend: String {
     case sw
     case glToMetal
 
-    /// Production default; flip back to .sw if a regression appears.
-    static let production: MPVRenderBackend = .glToMetal
+    /// UserDefaults key the Debug menu writes to. Read at view-init time —
+    /// the production representable picks up the value when SwiftUI rebuilds
+    /// the view (e.g. on app relaunch); the bring-up window picks it up next
+    /// time it's opened. Default is `.glToMetal`.
+    static let userDefaultsKey = "VideoCoach.mpvRenderBackend"
+
+    /// Production default. Reads from UserDefaults; falls back to GL.
+    static var production: MPVRenderBackend {
+        if let raw = UserDefaults.standard.string(forKey: userDefaultsKey),
+           let value = MPVRenderBackend(rawValue: raw) {
+            return value
+        }
+        return .glToMetal
+    }
+
+    var displayName: String {
+        switch self {
+        case .sw:        return "Software (legacy)"
+        case .glToMetal: return "GL → IOSurface → Metal"
+        }
+    }
 }
 
 /// `@convention(c)` GL proc-address resolver for libmpv's render-context.

@@ -32,6 +32,8 @@ struct VideoCoachApp: App {
 
 struct DebugMenu: Commands {
     @Environment(\.openWindow) private var openWindow
+    @AppStorage(MPVRenderBackend.userDefaultsKey) private var renderBackendRaw: String = MPVRenderBackend.glToMetal.rawValue
+
     var body: some Commands {
         CommandMenu("Debug") {
             Button("Open MPV Bring-up Window") {
@@ -40,6 +42,19 @@ struct DebugMenu: Commands {
             Button("GL Bridge Demo (Red)") {
                 openWindow(id: "gl-bridge-demo")
             }
+            Divider()
+            Menu("Render Backend (relaunch to apply to main view)") {
+                Button(checkmark(.glToMetal) + MPVRenderBackend.glToMetal.displayName) {
+                    renderBackendRaw = MPVRenderBackend.glToMetal.rawValue
+                }
+                Button(checkmark(.sw) + MPVRenderBackend.sw.displayName) {
+                    renderBackendRaw = MPVRenderBackend.sw.rawValue
+                }
+            }
         }
+    }
+
+    private func checkmark(_ backend: MPVRenderBackend) -> String {
+        renderBackendRaw == backend.rawValue ? "✓ " : "  "
     }
 }
