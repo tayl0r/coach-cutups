@@ -4,6 +4,28 @@ import Metal
 import QuartzCore
 import Libmpv
 
+enum MPVRenderBackend {
+    case sw
+    case glToMetal
+
+    /// Production default; flip back to .sw if a regression appears.
+    static let production: MPVRenderBackend = .glToMetal
+}
+
+/// `@convention(c)` GL proc-address resolver for libmpv's render-context.
+/// Defined as a closure (not a reference to the `@_cdecl`-marked
+/// `vcGLGetProcAddress` in GLMetalBridge.swift) because referencing that
+/// function as a value from another file causes the Swift compiler to
+/// re-emit the C symbol here, producing a linker duplicate-symbol error.
+/// The C inline `vc_cgl_get_proc_address` is in the bridging header and
+/// emits no symbol, so this closure has no link-level conflict.
+private let mpvGetProcAddress:
+    @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> UnsafeMutableRawPointer? =
+{ _, name in
+    guard let name else { return nil }
+    return vc_cgl_get_proc_address(name)
+}
+
 /// NSView that renders an MPVSourcePlayer's output into a CAMetalLayer.
 /// Phase 3.5: render-context lifecycle now lives on MPVSourcePlayer; this
 /// view just owns the CAMetalLayer + CVDisplayLink and delegates per-frame
@@ -12,6 +34,8 @@ final class MPVRenderingNSView: NSView {
     private let metalLayer = CAMetalLayer()
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
+    private let backend: MPVRenderBackend
+    private var bridge: GLMetalBridge?
 
     /// Phase-1 bring-up path owns its player; production path takes a shared one.
     private var ownedPlayer: MPVSourcePlayer?
@@ -19,13 +43,14 @@ final class MPVRenderingNSView: NSView {
     private var player: MPVSourcePlayer? { ownedPlayer ?? sharedPlayer }
     private var displayLink: CVDisplayLink?
 
-    override init(frame: NSRect) {
+    init(frame: NSRect, backend: MPVRenderBackend = .production) {
         guard let dev = MTLCreateSystemDefaultDevice(),
               let q = dev.makeCommandQueue() else {
             fatalError("Metal device unavailable")
         }
         self.device = dev
         self.commandQueue = q
+        self.backend = backend
         super.init(frame: frame)
         wantsLayer = true
         layer = metalLayer
@@ -125,7 +150,18 @@ final class MPVRenderingNSView: NSView {
 
     @MainActor
     private func attachRenderAndStart(player: MPVSourcePlayer) throws {
-        try player.attachRender()
+        switch backend {
+        case .sw:
+            try player.attachRender()
+        case .glToMetal:
+            if bridge == nil {
+                bridge = try GLMetalBridge(device: device)
+            }
+            try player.attachRenderGL(
+                glContext: bridge!.glContext,
+                getProcAddress: mpvGetProcAddress
+            )
+        }
         var link: CVDisplayLink?
         CVDisplayLinkCreateWithActiveCGDisplays(&link)
         if let link {
@@ -146,7 +182,13 @@ final class MPVRenderingNSView: NSView {
         let size = layer.drawableSize
         let queue = self.commandQueue
         guard let player = self.player else { return }
-        player.renderInto(layer: layer, drawableSize: size, commandQueue: queue)
+        switch backend {
+        case .sw:
+            player.renderInto(layer: layer, drawableSize: size, commandQueue: queue)
+        case .glToMetal:
+            guard let bridge = self.bridge else { return }
+            player.renderIntoGL(layer: layer, drawableSize: size, commandQueue: queue, bridge: bridge)
+        }
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
