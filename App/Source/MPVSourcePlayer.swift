@@ -131,6 +131,47 @@ public final class MPVSourcePlayer {
         // longer meaningful.
         pending = nil
     }
+
+    public func setPlaylist(_ paths: [String]) {
+        // Bump generation FIRST so any in-flight pending seek's completion
+        // is dropped before we issue the playlist-clear (which itself can
+        // generate a PLAYBACK_RESTART that we don't want fired). See
+        // adversarial review history in plan front-matter.
+        bumpGeneration()
+        playlistPaths = paths
+        runCommandSync(["playlist-clear"])
+        for p in paths {
+            runCommandSync(["loadfile", p, "append"])
+        }
+    }
+
+    public func play() {
+        var flag: Int32 = 0
+        mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
+    }
+
+    public func pause() {
+        var flag: Int32 = 1
+        mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
+    }
+
+    public func togglePlay() {
+        if isPaused { play() } else { pause() }
+    }
+
+    public func setVolume(_ v: Double) {
+        var mpvVolume = max(0, min(100, v * 100))
+        mpv_set_property(handle, "volume", MPV_FORMAT_DOUBLE, &mpvVolume)
+    }
+
+    private func runCommandSync(_ args: [String]) {
+        var cstrings = args.map { strdup($0) } + [UnsafeMutablePointer<CChar>?(nil)]
+        defer { cstrings.forEach { if let p = $0 { free(p) } } }
+        cstrings.withUnsafeMutableBufferPointer { buf in
+            let p = UnsafeMutableRawPointer(buf.baseAddress!).assumingMemoryBound(to: UnsafePointer<CChar>?.self)
+            _ = mpv_command(handle, p)
+        }
+    }
 }
 
 public enum MPVSourcePlayerError: Error {
