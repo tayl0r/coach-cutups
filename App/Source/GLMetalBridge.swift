@@ -45,6 +45,10 @@ final class GLMetalBridge {
         let h = max(1, Int(size.height))
         if w == surfaceWidth, h == surfaceHeight, surface != nil { return }
 
+        #if DEBUG
+        NSLog("[GLMetalBridge] resize: \(surfaceWidth)x\(surfaceHeight) → \(w)x\(h)")
+        #endif
+
         teardownGLObjects()
 
         let props: [IOSurfacePropertyKey: Any] = [
