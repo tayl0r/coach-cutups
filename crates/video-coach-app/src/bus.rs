@@ -2375,6 +2375,35 @@ async fn handle_export_compilations(
                 ),
             };
 
+            // Update slot for this iteration.
+            //
+            // Phase 11 Plan #2: also reset `current_tag_progress` to 0.0
+            // and recompute `batch_progress` from `i`, NOT
+            // `completed_tags`. `completed_tags` only ticks AFTER a tag
+            // finishes — `i` is the index of the tag about to start,
+            // which equals the count of tags fully done before this one.
+            // The encoder cold-start gap (mfh264enc 5–10 s before any
+            // frame is pushed) is bridged by this reset: the bar shows
+            // the segment-start value immediately on tag begin.
+            //
+            // Phase 11 Plan #2 code-review fix [2]: this write happens
+            // BEFORE the empty-plan skip below so a skipped tag still
+            // updates `current_tag` to the new label and bumps
+            // `batch_progress` to the segment-start floor. Otherwise the
+            // UI's "Exporting {current_tag} … N of M — XX%" line would
+            // render the prior tag's name + stale percentage for the
+            // duration of the skip (a one-frame flicker today; visibly
+            // wrong if multiple consecutive tags skip).
+            {
+                let mut g = export_progress_for_task
+                    .lock()
+                    .expect("export_progress poisoned");
+                g.current_tag = Some(label.clone());
+                g.completed_tags = i;
+                g.current_tag_progress = 0.0;
+                g.batch_progress = (i as f32 / total_tags as f32).min(1.0);
+            }
+
             // Empty plan → skip (per fix #26).
             if plan.entries.is_empty() {
                 tracing::info!(
@@ -2395,26 +2424,6 @@ async fn handle_export_compilations(
 
             // Silently delete prior output (per fix #13).
             let _ = std::fs::remove_file(&output_path);
-
-            // Update slot for this iteration.
-            //
-            // Phase 11 Plan #2: also reset `current_tag_progress` to 0.0
-            // and recompute `batch_progress` from `i`, NOT
-            // `completed_tags`. `completed_tags` only ticks AFTER a tag
-            // finishes — `i` is the index of the tag about to start,
-            // which equals the count of tags fully done before this one.
-            // The encoder cold-start gap (mfh264enc 5–10 s before any
-            // frame is pushed) is bridged by this reset: the bar shows
-            // the segment-start value immediately on tag begin.
-            {
-                let mut g = export_progress_for_task
-                    .lock()
-                    .expect("export_progress poisoned");
-                g.current_tag = Some(label.clone());
-                g.completed_tags = i;
-                g.current_tag_progress = 0.0;
-                g.batch_progress = i as f32 / total_tags as f32;
-            }
 
             tracing::info!(
                 target: "export.lifecycle",
