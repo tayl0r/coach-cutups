@@ -108,12 +108,7 @@ async fn preview_clip_full_lifecycle() -> anyhow::Result<()> {
             "clip_id": clip_id,
         }))
         .await?;
-    assert_eq!(
-        open.ok,
-        Some(true),
-        "open_clip_preview: {:?}",
-        open.error
-    );
+    assert_eq!(open.ok, Some(true), "open_clip_preview: {:?}", open.error);
     let opened = app
         .wait_for_event("clip_preview.opened", Duration::from_secs(15))
         .await?;
@@ -124,9 +119,7 @@ async fn preview_clip_full_lifecycle() -> anyhow::Result<()> {
     );
 
     // Start playback.
-    let play = app
-        .send(serde_json::json!({"cmd": "play"}))
-        .await?;
+    let play = app.send(serde_json::json!({"cmd": "play"})).await?;
     assert_eq!(play.ok, Some(true), "play: {:?}", play.error);
 
     // Let the 30 Hz driver push frames for ~1s. On Apple Silicon
