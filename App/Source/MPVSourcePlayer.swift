@@ -535,7 +535,13 @@ public final class MPVSourcePlayer {
             w: w, h: h,
             internal_format: 0  // 0 = "unknown / default"; mpv tolerates this for our case
         )
-        var flipY: Int32 = 1  // GL framebuffer is flipped vs mpv's natural orientation
+        // 0 = no flip. We render into a GL_TEXTURE_RECTANGLE-backed FBO via
+        // CGLTexImageIOSurface2D — that path uses top-left origin, matching
+        // what the Metal blit destination expects. flipY=1 (the conventional
+        // value for a default GL framebuffer with bottom-left origin) inverts
+        // the picture for this IOSurface route. Phase 3.2 manual screencap
+        // verification caught the upside-down rendering.
+        var flipY: Int32 = 0
 
         let _: CInt = withUnsafeMutablePointer(to: &fbo) { fboPtr -> CInt in
             return withUnsafeMutablePointer(to: &flipY) { flipPtr -> CInt in
