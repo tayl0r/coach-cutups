@@ -291,7 +291,35 @@ Plan: docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
       in ~9s combined. 3 export-module unit tests (segment_index_at,
       fix #39 frame-count rounding, audio-window byte calc) + the 2
       smoke tests = 5 new green tests at this point.
-- [ ] Task 2: Bus wiring — ExportCompilations / CancelExport handlers
+- [x] Task 2: Bus wiring — ExportCompilations / CancelExport handlers
+      (commit 8000c70)
+      Replaced Task 0's stub handlers with real implementations.
+      ExportCompilations handler: input validation + busy-mode refusal
+      (per fix #9, with already_recording/close_preview_first/
+      already_exporting reason strings per fix #22), no-project-open
+      check, output-folder writability check BEFORE preference
+      persistence (per second-pass fix), persists last_export_resolution
+      + last_export_quality (per fix #11), AppMode::Exporting transition
+      + fresh Arc<AtomicBool> cancel flag (per fix #10), sequential
+      per-tag loop (per fix #24 — NEVER join_all): TagSelection dispatch
+      (per fix #33), empty-plan skip with export.tag.skipped (per fix
+      #26), sanitize_filename for label + project_name (per fix #31),
+      silent delete of prior output (per fix #13), spawn_blocking into
+      video_coach_media::export::export_compilation with the shared
+      Arc<Compositor> (per fix #15). Outcome state machine: SucceededAll/
+      PartialFailure/Cancelled per fix #34 — the latter two carry
+      `folder` so Task 3's UI can show Reveal-in-Finder per fix #36.
+      Events under target "export.lifecycle" (per fix #1): export.batch.
+      {started,completed,failed,cancelled}, export.tag.{started,
+      completed,failed,skipped} with frames_pushed on completed per fix
+      #23. Cleanup-on-every-exit-path discipline (per fix #38) — chosen
+      over Drop-guard because the cleanup needs `&mut` to two refs the
+      bus loop also uses (documented inline). CancelExport handler:
+      returns ok=false + "not_exporting" unless mode == Exporting;
+      otherwise flips the AtomicBool. Three new tests:
+      export_with_no_project_open_returns_no_project_open,
+      export_while_recording_refuses_with_already_recording,
+      cancel_export_when_not_exporting_replies_not_exporting.
 - [ ] Task 3: UI — Slint export-sheet modal
 - [ ] Task 4: Harness E2E — record + export + verify
 - [ ] Task 5: N-frame parity test (compose_entry_frame determinism)
