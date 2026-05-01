@@ -65,7 +65,7 @@ use uuid::Uuid;
 use video_coach_compositor::{compose_tick, Compositor, Frame};
 use video_coach_core::compilation_plan::{CompilationEntry, CompilationPlan};
 use video_coach_core::export_settings::{bitrate, pixel_size};
-use video_coach_core::project::{Clip, Quality, Resolution};
+use video_coach_core::project::{Clip, Codec, Quality, Resolution};
 use video_coach_core::stroke_replay::visible_strokes;
 use video_coach_core::timeline::{PlaybackSegment, SegmentKind};
 
@@ -243,7 +243,7 @@ pub fn export_compilation(
         source_h,
         target_size.0,
         target_size.1,
-        bitrate(resolution, quality),
+        bitrate(resolution, quality, Codec::H264),
     )?;
 
     // ── Step 5: build the shared audio-appsrc → encoder → qtmux chain. ──

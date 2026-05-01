@@ -19,6 +19,19 @@ pub enum Quality {
     High,
 }
 
+/// Output codec selection for compilation export.
+///
+/// Default is `H264` so an existing v2 project.json (post-Phase 10,
+/// pre-Plan #3) without a `lastExportCodec` field deserializes cleanly
+/// when combined with `#[serde(default)]` on `Preferences::last_export_codec`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum Codec {
+    #[default]
+    H264,
+    Hevc,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
@@ -27,6 +40,10 @@ pub struct Preferences {
     pub preview_commentary_volume: f64,
     pub last_export_resolution: Resolution,
     pub last_export_quality: Quality,
+    /// `#[serde(default)]` so a pre-Plan #3 project.json without this
+    /// field deserializes to `Codec::H264` (preserves Phase 10 behavior).
+    #[serde(default)]
+    pub last_export_codec: Codec,
     pub preferred_camera_id: Option<String>,
     pub preferred_mic_id: Option<String>,
 }
@@ -39,6 +56,7 @@ impl Default for Preferences {
             preview_commentary_volume: 1.0,
             last_export_resolution: Resolution::R1080,
             last_export_quality: Quality::Medium,
+            last_export_codec: Codec::H264,
             preferred_camera_id: None,
             preferred_mic_id: None,
         }
@@ -152,6 +170,29 @@ mod tests {
         let s = serde_json::to_string(&p).unwrap();
         let back: Project = serde_json::from_str(&s).unwrap();
         assert_eq!(p, back);
+    }
+
+    #[test]
+    fn preferences_default_codec_is_h264() {
+        assert_eq!(Preferences::default().last_export_codec, Codec::H264);
+    }
+
+    #[test]
+    fn preferences_deserializes_without_codec_field() {
+        // A legacy v2 project.json (post-Phase 10, pre-Plan #3) lacks the
+        // `lastExportCodec` key. Confirm `#[serde(default)]` fills in H264.
+        let legacy_json = r#"{
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "preferredCameraId": null,
+            "preferredMicId": null
+        }"#;
+        let prefs: Preferences = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(prefs.last_export_codec, Codec::H264);
+        assert_eq!(prefs, Preferences::default());
     }
 
     #[test]
