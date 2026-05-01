@@ -88,3 +88,21 @@ public struct Project: Codable, Hashable, Sendable {
     public var preferences: Preferences = .init()
     public init(name: String) { self.name = name }
 }
+
+public extension Project {
+    /// Sum of all sourceVideos' durations.
+    var totalSourceDuration: Double {
+        sourceVideos.reduce(0) { $0 + $1.durationSeconds }
+    }
+
+    /// Cumulative offset of the source at `forSourceIndex` within the
+    /// virtual concat. Equal to `sum(durations[0..<i])` clamped to
+    /// `[0, totalSourceDuration]`.
+    func cumulativeOffset(forSourceIndex i: Int) -> Double {
+        if sourceVideos.isEmpty { return 0 }
+        let clamped = max(0, min(i, sourceVideos.count))
+        var sum: Double = 0
+        for k in 0..<clamped { sum += sourceVideos[k].durationSeconds }
+        return sum
+    }
+}
