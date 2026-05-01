@@ -1016,3 +1016,60 @@ so preview-vs-export hash equality is achievable — currently
   "← Source" or pressing Esc returns to scanning mode (source paused).
 - No regressions in Phase 1–8 tests.
 - PROGRESS.txt reflects each task + the phase SHIPPED line.
+
+---
+
+## Closeout — SHIPPED 2026-05-01
+
+| Task | Commit | Notes |
+|---|---|---|
+| 0 | `7041d98` | Bus + AppMode::PreviewClip + ClipListSlot + MountedSink + active flag + frames_pushed counter |
+| 1 | `0ddcd6c` | Compositor strokes — extend compose() + new wgpu pass + compose_tick free function. Phase 5's compose.rs migrated. macOS golden hash unchanged (early-return on empty strokes). |
+| 2 | `119ff7a` | PreviewPipeline — pre-decoded freeze frames + 30 Hz internal driver + segment-aware compositing + visible_strokes lookup per tick |
+| 3 | `93f46f7` | Bus wiring — OpenClipPreview / ClosePreview handlers + Play/Pause/Seek dispatch + ClipListSlot hydration (3 sites) + spawn_preview_position_poll |
+| 4 | `f19e731` | UI — clip sidebar (left, 200 px) + mode-aware transport (← Source button + clip-name overlay) + Esc keybinding + clip-clicked / close-preview-clicked callbacks |
+| 5 | `b867bb1` | preview_clip_smoke harness — records a clip → opens preview → plays 1s → asserts frames_pushed > 10 on close |
+| 6 | `b867bb1` | parity_smoke compositor — compose_tick byte-for-byte deterministic with and without strokes |
+| 7 | _this commit_ | Closeout |
+
+CI run on rust-rewrite (final task push) green on all 4 jobs:
+ubuntu-latest, windows-latest, macos-latest, media-tests.
+
+### Adversarial-fix verification (all 26 fixes shipped)
+
+- **#1** event names namespaced under `clip_preview.*`; `FORWARDED_TARGETS` gains `clip_preview.lifecycle` ✓
+- **#2** split into 4 sub-agents (Tasks 0, 1, 2, 3+4) plus main session (5+6+7) — no watchdog timeouts this phase ✓
+- **#3** FrameSink active-flag handover: player_mount.active flipped false BEFORE pause; preview_mount.active flipped false BEFORE teardown; both restored on close ✓
+- **#4** Phase 9 ships only 16:9→16:9; no active-rect uniform; strokes pass [0,1] coords directly ✓
+- **#5** compose() API change is breaking; Phase 5's compose.rs migrated to compose_tick(&comp, &src, &cam, &[]) ✓
+- **#6** freeze frames pre-decoded inline in PreviewPipeline::open; bus wraps the entire open() call in spawn_blocking ✓
+- **#7** no full hash-equality test; single-frame parity in Task 6, full N-frame deferred to Phase 10 ✓
+- **#8** AppMode dropped Copy; switched to Clone; is_recording → is_busy(&AppMode); all sites updated ✓
+- **#9** source player stays paused after ClosePreview; user re-presses Space ✓
+- **#10** preview_pipeline_smoke is a media-crate integration test, no display required ✓
+- **#11** freeze-frame source-time = `prev_play.source_start + prev_play.out_duration`; Skip-then-Freeze unit test added in `video-coach-core` ✓
+- **#12** PreviewPipeline::seek uses `source_time_at`; Freeze-segment seeks skip the source decoder ✓
+- **#13** ClipListSlot hydration in OpenProject / NewProject / StopClipRecording with 3 unit tests ✓
+- **#14** PreviewPipeline::stop is explicit (NOT Drop-only); mirrors Recording::stop's stepped Paused→Ready→Null with state-waits ✓
+- **#15** spawn_preview_position_poll returns AbortHandle; ClosePreview aborts before teardown ✓
+- **#16** ONE shared PlayerStateSlot; both pipelines write into it; UI reads one slot ✓
+- **#17** preview driver pinned to 30 Hz internal timer (NOT source-driven) ✓
+- **#18** ClipSummary defined in Task 0, not Task 4 ✓
+- **#19** video-coach-compositor depends on video-coach-core (re-exports VisibleStroke) ✓
+- **#20** webcam EOS = keep last frame; clip end = stop pushing + emit clip_preview.completed (once) ✓
+- **#21** parity test uses single Compositor instance via shared Arc on the bus task ✓
+- **#22** OpenClipPreview refuses if not Scanning; emits clip_preview.failed with reason="already_in_preview" ✓
+- **#23** source decoder seeks ONLY on initial mount, Freeze→Play transitions, and user Seek ✓
+- **#24** compose_tick free function; PreviewPipeline driver, compose.rs::compose_two_files, and parity test all call it ✓
+- **#25** project folder canonicalized once at OpenProject; per-call canonicalize removed ✓
+- **#26** clip_preview.closed event carries frames_pushed; harness E2E asserts > 10 ✓
+
+### Deferred items (Phase 10 prerequisites)
+
+- **Full N-frame preview-vs-export hash parity.** Lands in Phase 10 alongside the export sheet. Blocked on framerate alignment (see below).
+- **Framerate alignment between preview and export.** Phase 9 pinned preview to 30 fps internal driver; Phase 5's compose_two_files runs source-driven (e.g. 60 fps in → 60 fps out). Phase 10 must pin export framerate (or migrate preview to source-rate when not GPU-bound) before N-frame hash equality is achievable.
+- **Source-volume mix during preview.** v1 has separate sliders for source-volume + commentary-volume; preview defaults to commentary-only. Phase 9 ships commentary-only (webcam audio passes through; source audio chain is not built). Phase 9.5 or alongside Phase 10 adds the dual-slider + audiomixer wiring.
+- **Stroke animation during replay.** Phase 9 ships static strokes (visible at the right time per visible_strokes_at, then disappear). v1 fades strokes in/out over ~5s windows. Phase 11 polish item.
+- **Clip thumbnails + drag-to-reorder.** MVP shows name + duration only. Phase 10/11.
+- **Per-frame compositor pipeline rebuild.** compose_tick rebuilds wgpu shader modules + bind group layouts + render pipelines on every call. Acceptable on Apple Silicon; measurable (5-15 ms) on lavapipe in CI. Phase 10/11 follow-up to cache the pipeline + bind group layout in `Compositor` itself, plus pool VBOs for the stroke pass.
+- **Preview pipeline "auto-close-and-reopen" on click-while-open.** Phase 9 refuses with `reason="already_in_preview"`; user clicks ← Source first. Phase 10/11 can add auto-close.
