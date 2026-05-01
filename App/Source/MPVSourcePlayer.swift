@@ -94,6 +94,42 @@ public final class MPVSourcePlayer {
                 let id = evt.pointee.event_id
                 if id == MPV_EVENT_NONE { continue }
                 if id == MPV_EVENT_SHUTDOWN { return }
+                if id == MPV_EVENT_COMMAND_REPLY {
+                    let replyID = evt.pointee.reply_userdata
+                    let cmdError = evt.pointee.error
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        guard var p = self.pending, p.replyID == replyID else { return }
+                        // Free the strdup'd argv — mpv has consumed them by now.
+                        for c in p.cstrings { if let c { free(c) } }
+                        p.cstrings = []
+                        if cmdError < 0 {
+                            // Command rejected. Drop the pending entry; SkipCoordinator
+                            // will time out via its debounce. Don't fire completion, or
+                            // it would advance the coordinator on a non-event.
+                            self.pending = nil
+                        } else {
+                            p.commandReplied = true
+                            self.pending = p
+                        }
+                    }
+                    continue
+                }
+                if id == MPV_EVENT_PLAYBACK_RESTART {
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        // Only fire when (a) a pending seek exists, (b) its command
+                        // already replied (so this PLAYBACK_RESTART is for our seek,
+                        // not for a natural playlist auto-advance with no seek in
+                        // flight), and (c) the generation matches.
+                        guard let p = self.pending,
+                              p.commandReplied,
+                              p.generation == self.generation else { return }
+                        self.pending = nil
+                        p.completion()
+                    }
+                    continue
+                }
                 if id == MPV_EVENT_PROPERTY_CHANGE {
                     let prop = UnsafeMutableRawPointer(evt.pointee.data)?
                         .assumingMemoryBound(to: mpv_event_property.self).pointee
