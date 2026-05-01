@@ -67,6 +67,22 @@ struct TransportBar: View {
 struct ScanningTransport: View {
     @Bindable var workspace: Workspace
     @Binding var openProjectError: String?
+    /// While the user is dragging the scrubber, we hold the slider's value
+    /// at `sliderValue` so live `timePos` updates don't fight the drag. On
+    /// release (`onEditingChanged(false)`), we seek and stop holding.
+    @State private var sliderValue: Double = 0
+    @State private var isDragging: Bool = false
+
+    /// Player position in cumulative-concat seconds. Reads `playlistPos`
+    /// and `timePos` (both `@Observable`) so SwiftUI redraws as playback
+    /// advances.
+    private var cumulativeCurrent: Double {
+        guard let p = workspace.sourcePlayer, p.hasLoadedFile else { return 0 }
+        return workspace.project.cumulativeOffset(forSourceIndex: p.playlistPos) + p.timePos
+    }
+    private var totalDuration: Double {
+        workspace.project.totalSourceDuration
+    }
 
     var body: some View {
         HStack(spacing: 12) {
@@ -83,6 +99,28 @@ struct ScanningTransport: View {
             .buttonStyle(.borderless)
             .disabled(workspace.sourcePlayer == nil)
             .help(isPlaying ? "Pause" : "Play")
+
+            // Scrubber. Bound to a "lifted" value so the user's drag isn't
+            // fought by live timePos updates. While dragging, the slider
+            // holds the user's value; on release we seek and stop holding.
+            Slider(
+                value: Binding(
+                    get: { isDragging ? sliderValue : cumulativeCurrent },
+                    set: { sliderValue = $0 }
+                ),
+                in: 0...max(totalDuration, 0.001),
+                onEditingChanged: { editing in
+                    isDragging = editing
+                    if !editing { seekTo(sliderValue) }
+                }
+            )
+            .disabled(workspace.sourcePlayer == nil || totalDuration <= 0)
+            .frame(maxWidth: .infinity)
+
+            Text(formatDurationHMS(cumulativeCurrent) + " / " + formatDurationHMS(totalDuration))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
 
             HStack(spacing: 6) {
                 Image(systemName: "speaker.wave.2.fill")
@@ -117,6 +155,25 @@ struct ScanningTransport: View {
         } else {
             player.pause()
         }
+    }
+
+    /// Drag-release seek. Mirrors the cumulative→per-file translation used
+    /// in `ContentView.handleSkip`'s source branch. We bump the player's
+    /// generation so any in-flight FF/RW seek from the SkipCoordinator path
+    /// is dropped — the user's drag is the new authoritative target.
+    private func seekTo(_ cumulativeSeconds: Double) {
+        guard let player = workspace.sourcePlayer else { return }
+        let endEpsilon: Double = 0.05
+        let total = totalDuration
+        let clamped = max(0, min(cumulativeSeconds, max(0, total - endEpsilon)))
+        let mapped = workspace.sourceTime(at: clamped)
+        player.bumpGeneration()
+        player.seek(
+            playlistPos: mapped.sourceIndex,
+            timeSeconds: mapped.sourceLocalSeconds,
+            exact: true,
+            completion: {}
+        )
     }
 
     private func openProjectFolder() {
@@ -353,6 +410,22 @@ struct PreviewTransport: View {
         }
         observerBinding = nil
     }
+}
+
+/// `H:MM:SS` when hours > 0, else `M:SS`. Used by the source-mode scrubber
+/// because the cumulative concat timeline frequently exceeds an hour. The
+/// module-internal `formatDuration` (in `ClipSidebar.swift`) emits M:SS
+/// only and is kept for short clip durations.
+fileprivate func formatDurationHMS(_ seconds: Double) -> String {
+    guard seconds.isFinite, seconds > 0 else { return "0:00" }
+    let total = Int(seconds.rounded(.down))
+    let h = total / 3600
+    let m = (total % 3600) / 60
+    let s = total % 60
+    if h > 0 {
+        return String(format: "%d:%02d:%02d", h, m, s)
+    }
+    return String(format: "%d:%02d", m, s)
 }
 
 private struct VolumeSlider: View {
