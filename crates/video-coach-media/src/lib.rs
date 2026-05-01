@@ -5,6 +5,8 @@ pub mod compose;
 pub mod fixture_source;
 #[cfg(feature = "media")]
 pub mod platform_source;
+#[cfg(feature = "media")]
+pub mod preview_pipeline;
 pub mod recording;
 pub mod source;
 #[cfg(feature = "media")]

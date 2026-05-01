@@ -179,7 +179,17 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
 PENDING. Plan: docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
 - [x] Task 0: Preflight — bus shapes + AppMode + slots + FrameSink active flag (commit 7041d98)
 - [x] Task 1: Compositor strokes — extend compose() API + new wgpu pass (commit 0ddcd6c)
-- [ ] Task 2: Preview pipeline — crates/video-coach-media/src/preview_pipeline.rs
+- [x] Task 2: Preview pipeline — crates/video-coach-media/src/preview_pipeline.rs (commit __PENDING__)
+      PreviewPipeline {open, play, pause, seek, snapshot, stop} with pre-decoded
+      freeze frames (fix #6+#11), 30 Hz driver thread (fix #17), source-decoder
+      seek policy (fix #23), webcam-EOS-tolerant slot (fix #20), compose_tick
+      entry point (fix #24), stepped Paused→Ready→Null teardown (fix #14).
+      New unit test in video-coach-core::timeline for Skip-then-Freeze
+      (fix #11 unit-level guard). Two integration tests in
+      crates/video-coach-media/tests/preview_pipeline_smoke.rs:
+      preview_pipeline_pushes_frames_for_a_simple_clip (≥10 frames in 1s
+      assertion — actual: 25 frames) and preview_pipeline_opens_clip_with_
+      freeze_segment (pre-decode path doesn't panic on a Pause/Play clip).
 - [ ] Task 3: Bus wiring — OpenClipPreview / ClosePreview + ClipListSlot
 - [ ] Task 4: UI — clip sidebar + mode-aware transport + preview-close action
 - [ ] Task 5: Harness E2E — record + preview + verify frames

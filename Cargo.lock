@@ -5937,6 +5937,7 @@ dependencies = [
 name = "video-coach-media"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "gstreamer",
  "gstreamer-app",
  "gstreamer-audio",
@@ -5945,7 +5946,9 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.18",
  "tracing",
+ "uuid",
  "video-coach-compositor",
+ "video-coach-core",
 ]
 
 [[package]]

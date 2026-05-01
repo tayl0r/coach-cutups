@@ -226,4 +226,79 @@ mod tests {
         let segs = playback_segments(&c, 1000.0);
         assert!((segs[1].source_start - 1000.0).abs() < 1e-9);
     }
+
+    /// Phase 9 fix #11. Skip-then-Freeze: when a `Skip` event lands at the
+    /// same record_time as a subsequent `Pause`, the resulting Freeze
+    /// segment's `source_start` must reflect the post-skip position. The
+    /// preview pipeline's pre-decode helper relies on this — it computes
+    /// the freeze frame's source-time as
+    /// `prev_play.source_start + prev_play.out_duration`, which on this
+    /// shape equals the post-skip position (i.e. `start + delta`).
+    #[test]
+    fn skip_then_freeze_freeze_segment_source_start_reflects_skip() {
+        let evs = vec![
+            // Skip forward 5s at t=2.0 — bumps source_cursor without
+            // advancing record_cursor. The preceding Play segment closes
+            // out with out_duration=2.0 and source_start = clip start.
+            CommentaryEvent {
+                record_time: 2.0,
+                kind: EventKind::Skip { delta: 5.0 },
+            },
+            // Pause at the same record_time → opens a Freeze segment.
+            // The freeze's source_start must be the post-skip cursor, NOT
+            // the pre-skip cursor.
+            CommentaryEvent {
+                record_time: 2.0,
+                kind: EventKind::Pause,
+            },
+            CommentaryEvent {
+                record_time: 4.0,
+                kind: EventKind::Play,
+            },
+        ];
+        let c = clip_with(evs, 10.0, 100.0);
+        let segs = playback_segments(&c, 1000.0);
+        // 1: Play (0 → 2), 2: Freeze (2 → 4), 3: Play (4 → 10).
+        assert_eq!(segs.len(), 3);
+        assert_eq!(segs[0].kind, SegmentKind::Play);
+        assert_eq!(segs[1].kind, SegmentKind::Freeze);
+        assert_eq!(segs[2].kind, SegmentKind::Play);
+        // The Play immediately preceding the Freeze ends at source_start=100,
+        // out_duration=2 → end-of-Play = source 102. After the skip(+5),
+        // source_cursor jumps to 107. The Freeze's own source_start
+        // is the POST-skip position, 107.
+        assert!(
+            (segs[0].source_start - 100.0).abs() < 1e-9,
+            "first Play source_start: {}",
+            segs[0].source_start
+        );
+        assert!(
+            (segs[0].out_duration - 2.0).abs() < 1e-9,
+            "first Play out_duration: {}",
+            segs[0].out_duration
+        );
+        assert!(
+            (segs[1].source_start - 107.0).abs() < 1e-9,
+            "Freeze source_start should reflect post-skip cursor; got {}",
+            segs[1].source_start
+        );
+        // For the preview pipeline's freeze-frame pre-decode (fix #11):
+        // the helper picks `prev_play.source_start + prev_play.out_duration`
+        // = 100 + 2 = 102. Note this DIFFERS from the freeze segment's
+        // own source_start (107). That's the whole point of fix #11.
+        let prev_play_end = segs[0].source_start + segs[0].out_duration;
+        assert!(
+            (prev_play_end - 102.0).abs() < 1e-9,
+            "prev-Play end-of-Play time should be 102; got {}",
+            prev_play_end
+        );
+        assert!(
+            (segs[1].source_start - prev_play_end).abs() > 1e-3,
+            "Skip-then-Freeze: freeze.source_start ({}) must DIFFER from \
+             prev_play.source_start + out_duration ({}) — that's exactly the \
+             scenario fix #11 protects against",
+            segs[1].source_start,
+            prev_play_end
+        );
+    }
 }

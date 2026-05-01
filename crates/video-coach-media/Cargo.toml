@@ -7,8 +7,10 @@ license.workspace = true
 
 [features]
 # Phase 4 added a stub `media = []`. Phase 5 expands it: enabling `media`
-# also pulls in video-coach-compositor (and transitively wgpu).
-media = ["dep:video-coach-compositor"]
+# also pulls in video-coach-compositor (and transitively wgpu). Phase 9
+# Task 2 adds video-coach-core (Clip, playback_segments, source_time_at,
+# visible_strokes) which the preview pipeline needs.
+media = ["dep:video-coach-compositor", "dep:video-coach-core"]
 
 [dependencies]
 gstreamer = "0.23"
@@ -21,6 +23,15 @@ gstreamer-pbutils = "0.23"
 thiserror = { workspace = true }
 tracing = "0.1"
 video-coach-compositor = { path = "../video-coach-compositor", optional = true }
+# Phase 9 Task 2. The preview pipeline consumes Clip + playback_segments
+# + source_time_at + visible_strokes. Optional + gated by `media` so the
+# no-media build stays free of the compositor/wgpu transitive deps.
+video-coach-core = { path = "../video-coach-core", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
+# Phase 9 Task 2. The preview-pipeline smoke test builds a Clip directly.
+# Always-available regardless of feature gates — `cargo test --features
+# media` is the only configuration that exercises the test.
+uuid = { workspace = true }
+chrono = { workspace = true }
