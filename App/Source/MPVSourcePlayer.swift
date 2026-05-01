@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import Metal
 import QuartzCore
 import Libmpv  // module name confirmed in Phase 1 (NOT "MPVKit"; MPVKit's modulemap names the umbrella module Libmpv)
 
@@ -15,7 +16,13 @@ public final class MPVSourcePlayer {
     private static let hwdecOption = "videotoolbox"
 
     fileprivate let handle: OpaquePointer
-    fileprivate var renderContext: OpaquePointer?
+    // Render-context state lives outside the actor so the CVDisplayLink
+    // thread can call renderInto without hopping to the main actor. The
+    // NSLock guards both renderContext lifecycle and reads.
+    // @ObservationIgnored so the @Observable macro doesn't wrap accesses
+    // (which would defeat nonisolated(unsafe)).
+    @ObservationIgnored
+    nonisolated(unsafe) fileprivate var renderContext: OpaquePointer?
     fileprivate let renderLock = NSLock()
 
     /// Cached playlist paths in the order setPlaylist received them.
@@ -45,7 +52,7 @@ public final class MPVSourcePlayer {
 
     private var pumpThread: Thread?
 
-    public init() throws {
+    public init(audioOff: Bool = false) throws {
         guard let h = mpv_create() else { throw MPVSourcePlayerError.createFailed }
         for (k, v) in [
             ("vo", "libmpv"),
@@ -64,6 +71,12 @@ public final class MPVSourcePlayer {
             // mpv's "volume" property is already linear by default.
         ] {
             mpv_set_option_string(h, k, v)
+        }
+        if audioOff {
+            // The debug window passes audioOff=true so it doesn't fight
+            // CoreAudio with the production source player. ao=null must
+            // be set BEFORE mpv_initialize — it's not a runtime property.
+            mpv_set_option_string(h, "ao", "null")
         }
         let rc = mpv_initialize(h)
         guard rc >= 0 else {
@@ -170,6 +183,105 @@ public final class MPVSourcePlayer {
         cstrings.withUnsafeMutableBufferPointer { buf in
             let p = UnsafeMutableRawPointer(buf.baseAddress!).assumingMemoryBound(to: UnsafePointer<CChar>?.self)
             _ = mpv_command(handle, p)
+        }
+    }
+
+    // MARK: - Render lifecycle (Task 3.5)
+    //
+    // The render context is created/freed here so the production
+    // MPVPlayerView(player:) path can attach/detach against the shared
+    // player. The CVDisplayLink lives on the view; renderInto is called
+    // from that link's callback.
+
+    public func attachRender() throws {
+        renderLock.lock(); defer { renderLock.unlock() }
+        guard renderContext == nil else { throw MPVSourcePlayerError.alreadyAttached }
+
+        // MPV_RENDER_PARAM_API_TYPE wants a `char *` pointing to "sw".
+        // Hold the C buffer in a local so the pointer survives the call.
+        var apiTypeBuf = Array("sw".utf8CString)
+        var advancedControl: Int32 = 0  // SW backend; advancedControl=1 risks deadlock per render.h
+
+        let rc: CInt = apiTypeBuf.withUnsafeMutableBufferPointer { apiBuf -> CInt in
+            var params = [
+                mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE,
+                                 data: UnsafeMutableRawPointer(apiBuf.baseAddress)),
+                mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL,
+                                 data: withUnsafeMutableBytes(of: &advancedControl) { $0.baseAddress }),
+                mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
+            ]
+            var ctx: OpaquePointer?
+            let r = params.withUnsafeMutableBufferPointer {
+                mpv_render_context_create(&ctx, handle, $0.baseAddress)
+            }
+            if r >= 0, let ctx { self.renderContext = ctx }
+            return r
+        }
+        guard rc >= 0, renderContext != nil else {
+            throw MPVSourcePlayerError.renderContextFailed(code: Int(rc))
+        }
+    }
+
+    public nonisolated func detachRender() {
+        renderLock.lock(); defer { renderLock.unlock() }
+        if let ctx = renderContext {
+            mpv_render_context_free(ctx)
+            renderContext = nil
+        }
+    }
+
+    /// Called by MPVRenderingNSView's CVDisplayLink. Try-locks to avoid
+    /// blocking the display-link thread on a teardown in flight; nil
+    /// renderContext means a teardown happened, so we skip this frame.
+    public nonisolated func renderInto(layer: CAMetalLayer, drawableSize: CGSize, commandQueue: MTLCommandQueue) {
+        guard renderLock.try() else { return }
+        defer { renderLock.unlock() }
+        guard let renderContext else { return }
+
+        let w = Int32(drawableSize.width)
+        let h = Int32(drawableSize.height)
+        guard w > 0, h > 0 else { return }
+
+        let bytesPerRow = Int(w) * 4
+        let bufferSize = bytesPerRow * Int(h)
+        let pixelBuffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
+        defer { pixelBuffer.deallocate() }
+
+        var size: [Int32] = [w, h]
+        var stride = Int(bytesPerRow)
+        var format = "bgr0".utf8CString  // matches Metal bgra8Unorm memory order
+
+        format.withUnsafeMutableBufferPointer { fmtBuf in
+            size.withUnsafeMutableBufferPointer { sizeBuf in
+                withUnsafeMutablePointer(to: &stride) { stridePtr in
+                    var params = [
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE,
+                                         data: UnsafeMutableRawPointer(sizeBuf.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT,
+                                         data: UnsafeMutableRawPointer(fmtBuf.baseAddress)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE,
+                                         data: UnsafeMutableRawPointer(stridePtr)),
+                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER,
+                                         data: pixelBuffer),
+                        mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
+                    ]
+                    _ = params.withUnsafeMutableBufferPointer {
+                        mpv_render_context_render(renderContext, $0.baseAddress)
+                    }
+                }
+            }
+        }
+
+        guard let drawable = layer.nextDrawable() else { return }
+        drawable.texture.replace(
+            region: MTLRegionMake2D(0, 0, Int(w), Int(h)),
+            mipmapLevel: 0,
+            withBytes: pixelBuffer,
+            bytesPerRow: bytesPerRow
+        )
+        if let cmdBuf = commandQueue.makeCommandBuffer() {
+            cmdBuf.present(drawable)
+            cmdBuf.commit()
         }
     }
 }

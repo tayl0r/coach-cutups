@@ -4,19 +4,20 @@ import Metal
 import QuartzCore
 import Libmpv
 
-/// NSView that hosts a CAMetalLayer and drives an mpv render context.
-/// Phase 1 bring-up creates a private mpv_handle inside this view; Phase
-/// 3 refactors `attach(player:)` to delegate to a shared MPVSourcePlayer.
+/// NSView that renders an MPVSourcePlayer's output into a CAMetalLayer.
+/// Phase 3.5: render-context lifecycle now lives on MPVSourcePlayer; this
+/// view just owns the CAMetalLayer + CVDisplayLink and delegates per-frame
+/// rendering to the (owned or shared) player.
 final class MPVRenderingNSView: NSView {
     private let metalLayer = CAMetalLayer()
     private let device: MTLDevice
     private let commandQueue: MTLCommandQueue
 
-    /// Phase-1-private handle. Phase 3.5 replaces with shared MPVSourcePlayer.
-    private var mpv: OpaquePointer?
-    private var renderContext: OpaquePointer?
+    /// Phase-1 bring-up path owns its player; production path takes a shared one.
+    private var ownedPlayer: MPVSourcePlayer?
+    private weak var sharedPlayer: MPVSourcePlayer?
+    private var player: MPVSourcePlayer? { ownedPlayer ?? sharedPlayer }
     private var displayLink: CVDisplayLink?
-    private let renderLock = NSLock()
 
     override init(frame: NSRect) {
         guard let dev = MTLCreateSystemDefaultDevice(),
@@ -58,78 +59,30 @@ final class MPVRenderingNSView: NSView {
         )
     }
 
-    /// Phase 1 bring-up entry point.
-    func bringUp(filePath: String, hwdec: String, audioOff: Bool = false) throws {
-        let h = mpv_create()
-        guard let h else { throw NSError(domain: "MPV", code: -1) }
-
-        for (k, v) in [
-            ("vo", "libmpv"),
-            ("hwdec", hwdec),
-            ("prefetch-playlist", "yes"),
-            ("keep-open", "yes"),
-            ("keep-open-pause", "no"),
-            ("pause", "no"),
-            // Phase 1 only: vd=info lets the "Using video decoder: hevc"
-            // log line through for gate (e). MPVSourcePlayer (Phase 3)
-            // pins all=warn for production.
-            ("msg-level", "all=warn,vd=info"),
-            ("audio-display", "no"),
-            ("osc", "no"),
-            ("osd-level", "0"),
-            ("target-colorspace-hint", "yes"),
-        ] {
-            mpv_set_option_string(h, k, v)
-        }
-        if audioOff {
-            // For the debug window — avoid fighting CoreAudio with the
-            // production source player when both are open simultaneously.
-            mpv_set_option_string(h, "ao", "null")
-        }
-
-        // Phase 1 bring-up: surface log lines to Console.app so gate (e)
-        // can verify "Using hardware decoding (videotoolbox)".
-        mpv_request_log_messages(h, "info")
-
-        let rc = mpv_initialize(h)
-        guard rc >= 0 else {
-            mpv_destroy(h)
-            throw NSError(domain: "MPV", code: Int(rc))
-        }
-        self.mpv = h
-        try attachRenderContext()
-
-        // Single loadfile — bring-up plays one file.
-        runCommand(handle: h, args: ["loadfile", filePath, "replace"])
+    /// Phase 1 bring-up entry — owns its own MPVSourcePlayer with audio off
+    /// and a single-file playlist. The hwdec parameter is recorded here for
+    /// historical reasons (Phase 1 gate (a)); MPVSourcePlayer hardcodes the
+    /// chosen value at compile time after Phase 1 ships.
+    @MainActor
+    func bringUp(filePath: String, hwdec: String) throws {
+        NSLog("[MPV-debug] bringUp hwdec=\(hwdec) (note: MPVSourcePlayer hardcodes its own at this point)")
+        let p = try MPVSourcePlayer(audioOff: true)
+        try attachRenderAndStart(player: p)
+        p.setPlaylist([filePath])
+        p.play()
+        self.ownedPlayer = p
     }
 
-    private func attachRenderContext() throws {
-        renderLock.lock(); defer { renderLock.unlock() }
-        guard let mpv else { return }
+    /// Production entry — view does not own the player.
+    @MainActor
+    func attach(player: MPVSourcePlayer) throws {
+        try attachRenderAndStart(player: player)
+        self.sharedPlayer = player
+    }
 
-        // MPV_RENDER_PARAM_API_TYPE wants a `char *` pointing to "sw".
-        // We hold the C buffer here so the pointer stays alive across
-        // the create call.
-        var apiTypeBuf = Array("sw".utf8CString)
-        var advancedControl: Int32 = 0
-
-        let rc: CInt = apiTypeBuf.withUnsafeMutableBufferPointer { apiBuf -> CInt in
-            var params = [
-                mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE,
-                                 data: UnsafeMutableRawPointer(apiBuf.baseAddress)),
-                mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL,
-                                 data: withUnsafeMutableBytes(of: &advancedControl) { $0.baseAddress }),
-                mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-            ]
-            var ctx: OpaquePointer?
-            let r = params.withUnsafeMutableBufferPointer {
-                mpv_render_context_create(&ctx, mpv, $0.baseAddress)
-            }
-            if r >= 0, let ctx { self.renderContext = ctx }
-            return r
-        }
-        guard rc >= 0, renderContext != nil else { throw NSError(domain: "MPVRender", code: Int(rc)) }
-
+    @MainActor
+    private func attachRenderAndStart(player: MPVSourcePlayer) throws {
+        try player.attachRender()
         var link: CVDisplayLink?
         CVDisplayLinkCreateWithActiveCGDisplays(&link)
         if let link {
@@ -142,57 +95,15 @@ final class MPVRenderingNSView: NSView {
         }
     }
 
+    /// Called from the CVDisplayLink callback (off-main). We capture the
+    /// layer/queue on whatever thread the link callback runs on; the
+    /// player's renderInto is thread-safe via its renderLock try-lock.
     private func renderTick() {
-        guard renderLock.try() else { return }
-        defer { renderLock.unlock() }
-        guard let renderContext else { return }
-
-        let drawableSize = metalLayer.drawableSize
-        let w = Int32(drawableSize.width)
-        let h = Int32(drawableSize.height)
-        guard w > 0, h > 0 else { return }
-
-        let bytesPerRow = Int(w) * 4
-        let bufferSize = bytesPerRow * Int(h)
-        let pixelBuffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
-        defer { pixelBuffer.deallocate() }
-
-        var size: [Int32] = [w, h]
-        var stride = Int(bytesPerRow)
-        var format = "bgr0".utf8CString
-
-        format.withUnsafeMutableBufferPointer { fmtBuf in
-            size.withUnsafeMutableBufferPointer { sizeBuf in
-                withUnsafeMutablePointer(to: &stride) { stridePtr in
-                    var params = [
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE,
-                                         data: UnsafeMutableRawPointer(sizeBuf.baseAddress)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT,
-                                         data: UnsafeMutableRawPointer(fmtBuf.baseAddress)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE,
-                                         data: UnsafeMutableRawPointer(stridePtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER,
-                                         data: pixelBuffer),
-                        mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-                    ]
-                    _ = params.withUnsafeMutableBufferPointer {
-                        mpv_render_context_render(renderContext, $0.baseAddress)
-                    }
-                }
-            }
-        }
-
-        guard let drawable = metalLayer.nextDrawable() else { return }
-        drawable.texture.replace(
-            region: MTLRegionMake2D(0, 0, Int(w), Int(h)),
-            mipmapLevel: 0,
-            withBytes: pixelBuffer,
-            bytesPerRow: bytesPerRow
-        )
-        if let cmdBuf = commandQueue.makeCommandBuffer() {
-            cmdBuf.present(drawable)
-            cmdBuf.commit()
-        }
+        let layer = self.metalLayer
+        let size = layer.drawableSize
+        let queue = self.commandQueue
+        guard let player = self.player else { return }
+        player.renderInto(layer: layer, drawableSize: size, commandQueue: queue)
     }
 
     override func viewWillMove(toWindow newWindow: NSWindow?) {
@@ -205,40 +116,45 @@ final class MPVRenderingNSView: NSView {
             CVDisplayLinkStop(link)
             displayLink = nil
         }
-        renderLock.lock()
-        if let ctx = renderContext {
-            mpv_render_context_free(ctx)
-            renderContext = nil
-        }
-        renderLock.unlock()
-        if let h = mpv {
-            mpv_terminate_destroy(h)
-            mpv = nil
+        if let owned = ownedPlayer {
+            owned.detachRender()
+            ownedPlayer = nil
+        } else {
+            sharedPlayer?.detachRender()
+            sharedPlayer = nil
         }
     }
 
     deinit { tearDown() }
 }
 
-fileprivate func runCommand(handle: OpaquePointer, args: [String]) {
-    var cstrings = args.map { strdup($0) } + [UnsafeMutablePointer<CChar>?(nil)]
-    defer { cstrings.forEach { if let p = $0 { free(p) } } }
-    cstrings.withUnsafeMutableBufferPointer { buf in
-        let p = UnsafeMutableRawPointer(buf.baseAddress!).assumingMemoryBound(to: UnsafePointer<CChar>?.self)
-        _ = mpv_command(handle, p)
-    }
-}
-
-/// SwiftUI bridge for the bring-up window.
+/// SwiftUI bridge for the bring-up window (Phase 1).
 struct MPVDebugRepresentable: NSViewRepresentable {
     let filePath: String
     let hwdec: String
     let overlayTint: Bool
     func makeNSView(context: Context) -> MPVRenderingNSView {
         let v = MPVRenderingNSView(frame: .zero)
-        do { try v.bringUp(filePath: filePath, hwdec: hwdec, audioOff: true) }
+        do { try v.bringUp(filePath: filePath, hwdec: hwdec) }
         catch { NSLog("[MPV-debug] bringUp failed: \(error)") }
         return v
     }
     func updateNSView(_ nsView: MPVRenderingNSView, context: Context) {}
+}
+
+/// Production representable — used by ContentView in Phase 4.
+struct MPVPlayerView: NSViewRepresentable {
+    let player: MPVSourcePlayer?
+    func makeNSView(context: Context) -> MPVRenderingNSView {
+        let v = MPVRenderingNSView(frame: .zero)
+        if let player {
+            do { try v.attach(player: player) }
+            catch { NSLog("[MPV] attach failed: \(error)") }
+        }
+        return v
+    }
+    func updateNSView(_ nsView: MPVRenderingNSView, context: Context) {
+        // No-op; the view recreates if the player identity changes (the
+        // parent uses .id(player.generation) — see Phase 4).
+    }
 }
