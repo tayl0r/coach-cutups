@@ -90,7 +90,7 @@ final class MPVRenderingNSView: NSView {
                 self?.renderTick()
                 return kCVReturnSuccess
             }
-            CVDisplayLinkStart(link)
+            _ = CVDisplayLinkStart(link)
             self.displayLink = link
         }
     }

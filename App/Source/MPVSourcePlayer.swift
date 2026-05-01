@@ -152,8 +152,16 @@ public final class MPVSourcePlayer {
         // adversarial review history in plan front-matter.
         bumpGeneration()
         playlistPaths = paths
-        runCommandSync(["playlist-clear"])
-        for p in paths {
+        if paths.isEmpty {
+            runCommandSync(["playlist-clear"])
+            return
+        }
+        // `loadfile <path> replace` clears + loads + auto-starts (matches
+        // Phase 1's working bring-up). Bare `append` after a `playlist-clear`
+        // leaves no current entry, so mpv won't begin playback even with
+        // pause=no — that's what produced the black bring-up window.
+        runCommandSync(["loadfile", paths[0], "replace"])
+        for p in paths.dropFirst() {
             runCommandSync(["loadfile", p, "append"])
         }
     }
@@ -214,7 +222,9 @@ public final class MPVSourcePlayer {
             let r = params.withUnsafeMutableBufferPointer {
                 mpv_render_context_create(&ctx, handle, $0.baseAddress)
             }
-            if r >= 0, let ctx { self.renderContext = ctx }
+            if r >= 0, let ctx {
+                self.renderContext = ctx
+            }
             return r
         }
         guard rc >= 0, renderContext != nil else {
@@ -234,13 +244,19 @@ public final class MPVSourcePlayer {
     /// blocking the display-link thread on a teardown in flight; nil
     /// renderContext means a teardown happened, so we skip this frame.
     public nonisolated func renderInto(layer: CAMetalLayer, drawableSize: CGSize, commandQueue: MTLCommandQueue) {
-        guard renderLock.try() else { return }
+        guard renderLock.try() else {
+            return
+        }
         defer { renderLock.unlock() }
-        guard let renderContext else { return }
+        guard let renderContext else {
+            return
+        }
 
         let w = Int32(drawableSize.width)
         let h = Int32(drawableSize.height)
-        guard w > 0, h > 0 else { return }
+        guard w > 0, h > 0 else {
+            return
+        }
 
         let bytesPerRow = Int(w) * 4
         let bufferSize = bytesPerRow * Int(h)
@@ -272,7 +288,9 @@ public final class MPVSourcePlayer {
             }
         }
 
-        guard let drawable = layer.nextDrawable() else { return }
+        guard let drawable = layer.nextDrawable() else {
+            return
+        }
         drawable.texture.replace(
             region: MTLRegionMake2D(0, 0, Int(w), Int(h)),
             mipmapLevel: 0,
