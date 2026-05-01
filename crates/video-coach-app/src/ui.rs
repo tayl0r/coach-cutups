@@ -295,10 +295,15 @@ pub fn run(
                 error_text,
                 failed_tag,
                 cancelled_completed,
+                current_tag_progress,
+                batch_progress,
             ) = {
                 let g = export_progress_for_timer
                     .lock()
                     .expect("export_progress poisoned");
+                // Phase 11 Plan #2 (Fix #8): per-arm
+                // (current_tag_progress, batch_progress) defaults
+                // spelled out for all 5 ExportRunOutcome arms.
                 match &g.outcome {
                     ExportRunOutcome::None => (
                         "none",
@@ -311,6 +316,8 @@ pub fn run(
                         String::new(),
                         String::new(),
                         0_i32,
+                        0.0_f32,
+                        0.0_f32,
                     ),
                     ExportRunOutcome::InProgress => (
                         "in_progress",
@@ -323,6 +330,8 @@ pub fn run(
                         String::new(),
                         String::new(),
                         0,
+                        g.current_tag_progress,
+                        g.batch_progress,
                     ),
                     ExportRunOutcome::SucceededAll { folder, tag_count } => (
                         "succeeded_all",
@@ -335,6 +344,8 @@ pub fn run(
                         String::new(),
                         String::new(),
                         0,
+                        1.0_f32,
+                        1.0_f32,
                     ),
                     ExportRunOutcome::PartialFailure {
                         folder,
@@ -352,6 +363,8 @@ pub fn run(
                         error.clone(),
                         failed_tag.clone(),
                         0,
+                        g.current_tag_progress,
+                        g.batch_progress,
                     ),
                     ExportRunOutcome::Cancelled { folder, completed } => (
                         "cancelled",
@@ -364,6 +377,8 @@ pub fn run(
                         String::new(),
                         String::new(),
                         *completed as i32,
+                        g.current_tag_progress,
+                        g.batch_progress,
                     ),
                 }
             };
@@ -473,6 +488,9 @@ pub fn run(
                 w.set_export_error(error_text.into());
                 w.set_export_failed_tag(failed_tag.into());
                 w.set_export_cancelled_completed(cancelled_completed);
+                // Phase 11 Plan #2: hydrate the real-progress fields.
+                w.set_export_current_tag_progress(current_tag_progress);
+                w.set_export_batch_progress(batch_progress);
             }
             if clips_changed {
                 cached_clips = clip_snapshot;

@@ -135,6 +135,9 @@ export component MainWindow inherits Window {
     in property <int> export-summary-file-count: 0;
     in property <string> export-failed-tag: "";
     in property <int> export-cancelled-completed: 0;
+    // Phase 11 Plan #2: real progress %.
+    in property <float> export-current-tag-progress: 0.0;
+    in property <float> export-batch-progress: 0.0;
 
     // True when a project is open. Gates the File→Export
     // Compilations menu item's `activated` body so a stray click on
@@ -1293,10 +1296,37 @@ export component MainWindow inherits Window {
                         y: 96px;
                         width: parent.width - 48px;
                         height: 22px;
-                        text: (root.export-completed-tags + 1) + " of " + root.export-total-tags;
+                        // Phase 11 Plan #2 (Fix #9: `.round()` method
+                        // form, NOT free `round(...)`).
+                        text: (root.export-completed-tags + 1) + " of "
+                            + root.export-total-tags + " — "
+                            + (root.export-batch-progress * 100).round() + "%";
                         font-size: 12px;
                         color: #aaaaaa;
                         horizontal-alignment: center;
+                    }
+
+                    // Phase 11 Plan #2: horizontal progress bar bound to
+                    // `export-batch-progress`. 200ms ease-out tween
+                    // smooths the ~1 Hz throttled writer cadence into
+                    // visually continuous motion.
+                    Rectangle {
+                        x: 80px;
+                        y: 130px;
+                        width: parent.width - 160px;
+                        height: 8px;
+                        background: #303030;
+                        border-radius: 4px;
+
+                        Rectangle {
+                            x: 0;
+                            y: 0;
+                            width: parent.width * root.export-batch-progress;
+                            height: parent.height;
+                            background: #4a90e2;
+                            border-radius: 4px;
+                            animate width { duration: 200ms; easing: ease-out; }
+                        }
                     }
 
                     // Cancel button.
