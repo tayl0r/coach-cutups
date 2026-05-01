@@ -633,10 +633,9 @@ Total LOC budget: ~150-300, well under the 700-per-task hard cap.
 
 ## Closeout — Phase 11 Plan #2 SHIPPED 2026-05-01
 
-**CI run**: TBD (placeholder; orchestrator's `CI_DONE` stage replaces this
-with the real run id once the post-push GitHub Actions workflow goes
+**CI run**: [25237628702](https://github.com/tayl0r/coach-cutups/actions/runs/25237628702)
 green on all 4 jobs — `test (ubuntu-latest)`, `test (windows-latest)`,
-`test (macos-latest)`, `media-tests`).
+`test (macos-latest)`, `media-tests`.
 
 ### Commits (in shipping order)
 

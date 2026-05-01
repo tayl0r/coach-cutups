@@ -398,7 +398,7 @@ under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
 own SHIPPED line + CI run id once green.
 
 - [ ] Plan #1: HEVC encoder
-- [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run TBD.
+- [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run 25237628702 green on all 4 jobs.
       Replaced indeterminate spinner with a real 0..1 progress bar fed
       from export.rs's existing ExportProgress callback. Plan:
       docs/plans/2026-05-01-rust-rewrite-phase-11-real-progress-pct.md
