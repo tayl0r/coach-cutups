@@ -20,7 +20,7 @@ struct VideoCoachApp: App {
             DebugMenu()
         }
 
-        WindowGroup("MPV Bring-up", id: "mpv-debug") {
+        Window("MPV Bring-up", id: "mpv-debug") {
             MPVDebugWindow()
         }
     }

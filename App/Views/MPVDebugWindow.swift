@@ -40,5 +40,25 @@ struct MPVDebugWindow: View {
             .frame(minWidth: 640, minHeight: 360)
         }
         .frame(minWidth: 800, minHeight: 480)
+        .background(WindowAccessor { window in
+            window.isRestorable = false
+        })
     }
+}
+
+/// Locates the SwiftUI window's underlying NSWindow and runs a closure
+/// against it. Used here to mark the bring-up window non-restorable so
+/// it doesn't auto-reopen at next app launch.
+private struct WindowAccessor: NSViewRepresentable {
+    let configure: (NSWindow) -> Void
+    func makeNSView(context: Context) -> NSView {
+        let v = NSView()
+        DispatchQueue.main.async { [weak v] in
+            if let window = v?.window {
+                configure(window)
+            }
+        }
+        return v
+    }
+    func updateNSView(_ nsView: NSView, context: Context) {}
 }
