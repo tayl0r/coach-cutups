@@ -344,8 +344,48 @@ Plan: docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
       `explorer`, Linux `xdg-open`), close (resets the slot to
       default on terminal states so re-open returns to the form).
       One unit test for aggregate_tag_rows.
-- [ ] Task 4: Harness E2E — record + export + verify
-- [ ] Task 5: N-frame parity test (compose_entry_frame determinism)
+- [x] Bus refactor for cancel-during-export (commit 90638cf)
+      Pre-Task-4 architecture fix. Task 2's ExportCompilations handler
+      awaited tokio::task::spawn_blocking inline within the bus task's
+      handle() call, blocking the bus's `while let Some(env) = rx.recv()
+      .await` loop for the entire export duration — CancelExport (and any
+      other command) queued in mpsc but couldn't be processed until the
+      export finished. Refactored: bus's main loop is now `loop { tokio::
+      select! { rx.recv() ⋯, export_cleanup_rx.recv() ⋯ } }`. Internal
+      mpsc<()> carries the "I'm done" signal from the spawned export task
+      back to the bus; the bus's select!-arm resets current_mode →
+      Scanning + current_export_cancel → None. handle_export_compilations
+      now does the synchronous setup phase inline and spawns the per-tag
+      for-loop into a detached tokio::spawn task that returns ok=true
+      immediately. Spawned task gains a top-of-iteration cancel-flag
+      check so cancel arriving between tags breaks out cleanly without
+      spinning up the next pipeline.
+- [x] Task 4: Harness E2E — record + export + verify (commit e927970)
+      crates/video-coach-harness/tests/export_smoke.rs adds two
+      #[tokio::test]s. export_full_lifecycle: launch with
+      --fixture-recording-source, new_project, add_source_video, record
+      a 1.2s clip, dispatch ExportCompilations { selections: [AllClips],
+      r720, low }. Wait for export.batch.started → export.tag.started →
+      export.tag.completed (timeout 60s, frames_pushed >= 20 per fix
+      #23) → export.batch.completed. Verify
+      <tmp>/all-clips - <name>.mp4 exists + > 50 KB + ISO BMFF "ftyp"
+      magic at offset 4. export_cancel_deletes_partial_output: same
+      setup, sleep 100ms, dispatch Command::CancelExport, assert reply
+      ok=true (only possible because of the bus refactor above), wait
+      for export.batch.cancelled with tags_completed=0, verify partial
+      .mp4 is absent.
+- [x] Task 5: N-frame parity test (commit 97ff9b0)
+      crates/video-coach-media/tests/parity_n_frames.rs proves
+      compose_entry_frame is deterministic across N=30 record_times
+      (1 second at 30 fps). Hand-rolled Clip with Pause + Play + Stroke
+      events; loops record_time twice through compose_entry_frame,
+      asserts the two Vec<Frame> sequences are byte-equal frame-for-
+      frame. Frame gains derive(PartialEq, Eq) per fix #40 — Vec<u8>
+      already implements PartialEq so the derive is structurally free.
+      Per fix #21 (revised), this replaces the original infeasible
+      "preview pipeline frame N vs export pipeline frame N" framing
+      (preview's sync=true real-time decode races the deterministic
+      walk).
 - [ ] Task 6: Closeout
 
 
