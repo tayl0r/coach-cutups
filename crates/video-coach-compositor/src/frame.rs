@@ -2,7 +2,12 @@
 /// no padding (bytes_per_row == width * 4). All compositor inputs and outputs
 /// use this format; format conversion to/from GStreamer's NV12/I420 happens
 /// in the bridge layer (Phase 5+).
-#[derive(Debug, Clone)]
+///
+/// `PartialEq` derive (Phase 10 Task 5, fix #40) lets the N-frame parity
+/// test compare `Vec<Frame>` byte-equal across two `compose_entry_frame`
+/// calls. `Vec<u8>` already implements `PartialEq` so the derive is free;
+/// the derived comparison is field-by-field equality on width/height/pixels.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub width: u32,
     pub height: u32,
