@@ -179,7 +179,7 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
 PENDING. Plan: docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
 - [x] Task 0: Preflight — bus shapes + AppMode + slots + FrameSink active flag (commit 7041d98)
 - [x] Task 1: Compositor strokes — extend compose() API + new wgpu pass (commit 0ddcd6c)
-- [x] Task 2: Preview pipeline — crates/video-coach-media/src/preview_pipeline.rs (commit __PENDING__)
+- [x] Task 2: Preview pipeline — crates/video-coach-media/src/preview_pipeline.rs (commit 119ff7a)
       PreviewPipeline {open, play, pause, seek, snapshot, stop} with pre-decoded
       freeze frames (fix #6+#11), 30 Hz driver thread (fix #17), source-decoder
       seek policy (fix #23), webcam-EOS-tolerant slot (fix #20), compose_tick
