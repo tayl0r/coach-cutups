@@ -107,6 +107,23 @@ struct ContentView: View {
             .onChange(of: selectedClipID) { _, newID in
                 handleSelectionChange(newID)
             }
+            .task {
+                // Auto-restore last project on launch. Silently skip on any error
+                // (folder deleted, permissions changed, project.json corrupt).
+                guard workspace.folder == nil else { return }
+                guard let path = UserDefaults.standard.string(forKey: "VideoCoach.lastProjectFolder") else { return }
+                let url = URL(fileURLWithPath: path)
+                guard FileManager.default.fileExists(atPath: path) else {
+                    // Folder is gone; clear the stale key.
+                    UserDefaults.standard.removeObject(forKey: "VideoCoach.lastProjectFolder")
+                    return
+                }
+                do {
+                    try await workspace.openProject(folder: url)
+                } catch {
+                    UserDefaults.standard.removeObject(forKey: "VideoCoach.lastProjectFolder")
+                }
+            }
             // Publish the delete handler to the top-level Clip menu — nil
             // when no clip is selected or we're recording, so the menu item
             // (and its Cmd+Delete shortcut) auto-disable in those states.

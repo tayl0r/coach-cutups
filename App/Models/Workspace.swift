@@ -65,6 +65,7 @@ final class Workspace {
         lastDeletedClip = nil
         shredTrashDirectory()
         try await rebuildSourcePlayer()
+        UserDefaults.standard.set(folder.path(percentEncoded: false), forKey: "VideoCoach.lastProjectFolder")
     }
 
     func saveProject() throws {
