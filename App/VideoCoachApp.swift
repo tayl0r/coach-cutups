@@ -17,6 +17,22 @@ struct VideoCoachApp: App {
         .commands {
             DevicesCommands(catalog: deviceCatalog)
             ClipCommands()
+            DebugMenu()
+        }
+
+        WindowGroup("MPV Bring-up", id: "mpv-debug") {
+            MPVDebugWindow()
+        }
+    }
+}
+
+struct DebugMenu: Commands {
+    @Environment(\.openWindow) private var openWindow
+    var body: some Commands {
+        CommandMenu("Debug") {
+            Button("Open MPV Bring-up Window") {
+                openWindow(id: "mpv-debug")
+            }
         }
     }
 }
