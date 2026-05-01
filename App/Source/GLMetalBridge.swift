@@ -1,6 +1,7 @@
 import Foundation
 import AppKit
 import Metal
+import QuartzCore
 import OpenGL.GL3
 import IOSurface
 import CoreVideo
@@ -95,6 +96,25 @@ final class GLMetalBridge {
         glViewport(0, 0, GLsizei(surfaceWidth), GLsizei(surfaceHeight))
         glClearColor(GLfloat(red), GLfloat(green), GLfloat(blue), GLfloat(alpha))
         glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+    }
+
+    func present(into layer: CAMetalLayer, commandQueue: MTLCommandQueue) {
+        guard let mtl = metalTexture, let drawable = layer.nextDrawable() else { return }
+        let target = drawable.texture
+        guard let cmd = commandQueue.makeCommandBuffer(),
+              let blit = cmd.makeBlitCommandEncoder() else { return }
+        let copyW = min(mtl.width, target.width)
+        let copyH = min(mtl.height, target.height)
+        blit.copy(
+            from: mtl, sourceSlice: 0, sourceLevel: 0,
+            sourceOrigin: MTLOriginMake(0, 0, 0),
+            sourceSize: MTLSizeMake(copyW, copyH, 1),
+            to: target, destinationSlice: 0, destinationLevel: 0,
+            destinationOrigin: MTLOriginMake(0, 0, 0)
+        )
+        blit.endEncoding()
+        cmd.present(drawable)
+        cmd.commit()
     }
 
     private func teardownGLObjects() {

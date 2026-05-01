@@ -23,6 +23,10 @@ struct VideoCoachApp: App {
         Window("MPV Bring-up", id: "mpv-debug") {
             MPVDebugWindow()
         }
+
+        Window("GL Bridge Demo", id: "gl-bridge-demo") {
+            GLBridgeDemoRepresentable(r: 1, g: 0, b: 0)
+        }
     }
 }
 
@@ -32,6 +36,9 @@ struct DebugMenu: Commands {
         CommandMenu("Debug") {
             Button("Open MPV Bring-up Window") {
                 openWindow(id: "mpv-debug")
+            }
+            Button("GL Bridge Demo (Red)") {
+                openWindow(id: "gl-bridge-demo")
             }
         }
     }
