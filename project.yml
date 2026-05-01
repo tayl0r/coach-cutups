@@ -39,6 +39,7 @@ targets:
         SWIFT_VERSION: 5.9
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ARCHS: arm64
+        SWIFT_OBJC_BRIDGING_HEADER: App/VideoCoach-Bridging-Header.h
   VideoCoachUITests:
     type: bundle.ui-testing
     platform: macOS
@@ -73,3 +74,4 @@ targets:
         PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachTests
         TEST_HOST: ""
         BUNDLE_LOADER: ""
+        SWIFT_OBJC_BRIDGING_HEADER: App/VideoCoach-Bridging-Header.h

@@ -135,3 +135,10 @@ enum GLMetalBridgeError: Error {
     case fboIncomplete
     case metalTextureFailed
 }
+
+// At file scope, outside the class.
+@_cdecl("vcGLGetProcAddress")
+func vcGLGetProcAddress(_ ctx: UnsafeMutableRawPointer?, _ name: UnsafePointer<CChar>?) -> UnsafeMutableRawPointer? {
+    guard let name else { return nil }
+    return vc_cgl_get_proc_address(name)
+}
