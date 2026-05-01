@@ -177,7 +177,7 @@ docs/plans/2026-04-30-rust-rewrite-phase-8-recording.md
 
 ## Phase 9 — clip preview integration
 PENDING. Plan: docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
-- [x] Task 0: Preflight — bus shapes + AppMode + slots + FrameSink active flag (commit <SHA>)
+- [x] Task 0: Preflight — bus shapes + AppMode + slots + FrameSink active flag (commit 7041d98)
 - [ ] Task 1: Compositor strokes — extend compose() API + new wgpu pass
 - [ ] Task 2: Preview pipeline — crates/video-coach-media/src/preview_pipeline.rs
 - [ ] Task 3: Bus wiring — OpenClipPreview / ClosePreview + ClipListSlot
