@@ -218,22 +218,38 @@ new behavior through `compose_tick`'s parameters. Phase 10's
 encode-side perf optimizations (caching wgpu pipeline rebuild — see
 Phase 9 closeout) belong inside `Compositor`, not as a forked path.
 
-**4. Pinned 30 fps export driver — NOT source-driven.** Phase 5's
-`compose_two_files` is source-driven (one compose per source frame).
-Phase 9's preview is pinned 30 fps. Phase 10's export MUST match
-preview at 30 fps for hash parity. This means:
-- A 60 fps source video produces a 30 fps output (every other
-  source frame composed; appsink slot holds the latest, driver
-  samples at 30 Hz).
-- A 24 fps source produces a 30 fps output (some frames repeat in
-  the output — driver doesn't care about source rate, just samples
-  whatever's in the slot).
+**4. Output framerate pinned 30/1 — but driver is encoder-throttled,
+NOT wall-clock-pinned.** Phase 9's preview pins driver pace to 30 Hz
+*wall-clock* because the user is watching it. For export, we want to
+encode AS FAST AS the encoder accepts (often 1-3× realtime on Apple
+Silicon, 0.3× on lavapipe). The output framerate is still 30/1, but
+the driver pumps frames as fast as appsrc back-pressure allows —
+NOT `std::thread::sleep(33ms)` between ticks.
+
+Concretely:
+- Input appsinks (source + recording) use `sync=false` (NOT preview's
+  `sync=true`). Decoders run as fast as they can.
+- Driver loop: pull source frame at deterministic source-time per
+  fix #6, pull webcam frame at deterministic record-time, compose,
+  push to appsrc. No sleep. The push blocks until appsrc has room
+  (back-pressure from encoder).
 - Output PTS increments by `1/30 s = 33,333,333 ns` per pushed
-  frame.
+  frame regardless of how long compose+encode took.
+- A 60 fps source produces a 30 fps output (driver only pulls every
+  other source frame deterministically).
+- A 24 fps source produces a 30 fps output (some frames repeat in
+  the output; driver computes source_time_at(record_time) and
+  fetches the corresponding frame).
 
 The encoder's negotiated framerate is 30/1; downstream qtmux
-records that as the output framerate. v1's `CompilationExporter`
-likely lets AVFoundation pick; we explicitly pin.
+records that as the output framerate.
+
+Why this matters for the parity test (Task 5): both preview and
+export must produce *the same composed frame for the same record_
+time*. Preview's wall-clock-paced sync=true decode races against
+deterministic frame fetching. Per fix #21 below, the parity test
+calls a deterministic per-record-time helper, NOT the live preview
+pipeline.
 
 **5. Strokes per frame via `visible_strokes(clip, record_time)`.**
 The driver knows which entry it's on (and therefore the Clip) plus
@@ -266,26 +282,52 @@ prev_play.out_duration` (per fix #11). Run pre-decodes in
 segment_index), Frame>`. The export pipeline `open()` blocks the bus
 task; bus must wrap it in `spawn_blocking`.
 
-**8. Audio mix via GStreamer `audiomixer`.** Two volume elements
-named `source_vol` and `commentary_vol`. Both feed `audiomixer`
-which feeds `audioconvert → audioresample → audio_enc (aac) →
-qtmux`. The volumes are set from `project.preferences.
-preview_source_volume` and `preview_commentary_volume` (despite the
-"preview" naming, these are the canonical mix preferences per v1's
-ExportSheet line 438). Range 0..=1.0; set at `volume::set_volume`
-property time, NOT per-frame.
+**8. Phase 10 ships RECORDING AUDIO ONLY — no source/commentary
+audiomixer.** GStreamer's `audiomixer` aggregates audio sample
+timestamps; it has no awareness of the appsrc's video PTS clock.
+With per-source independent decoders that play their full real-time
+audio, the output .mp4 will have audio that drifts vs the encoder-
+throttled video timeline. v1 used AVMutableComposition which
+compose-edits audio per-clip-segment; GStreamer in Rust has no
+direct equivalent without gst-editing-services (heavyweight) or
+per-segment seek+valve gating (complex). 
 
-**Edge case**: source has no audio chain (rare but possible).
-audiomixer tolerates a missing input; just don't add the source-
-audio chain in that case.
+The simpler path: each entry in the compilation plays the
+recording.mov's audio (commentary), no mix. Per entry:
+- Recording audio chain: `decodebin's audio pad → audioconvert →
+  audioresample → aacenc → qtmux's audio sink-pad.`
+- Source audio: not built. (Decodebin's audio pad → fakesink to
+  avoid stall, mirrors `compose.rs::build_input_chain`.)
+
+The recording audio is already temporally aligned with the clip's
+record_time (Phase 8 captured them together at t0). Cross-entry
+boundaries: the recording chain seeks at each entry transition to
+that entry's clip's recording.mov starting at 0 (or builds a fresh
+recording chain per entry; pick whichever GStreamer handles more
+cleanly).
+
+This matches Phase 9 preview's "commentary-only" decision.
+
+Source-volume + commentary-volume MIX is explicitly DEFERRED to
+Phase 11 (gst-editing-services migration or per-segment seek+valve
+implementation). The deferred items section at the bottom of this
+plan documents this.
 
 **9. AppMode::Exporting + Clone, not Copy.** Phase 9 dropped Copy
-on AppMode. Adding `Exporting { tag_count: usize, completed: usize }`
-or just `Exporting` (state details ride on `ExportProgressSlot`,
-not the mode) keeps Clone semantics. Pick the simpler shape:
-`Exporting` with no payload, since the slot carries the details.
-Update `is_busy` to cover `Exporting` so a second
-ExportCompilations request returns `reason="already_exporting"`.
+on AppMode. Adding `Exporting` with no payload (state details ride
+on `ExportProgressSlot`) keeps Clone semantics. `is_busy` covers
+all non-Scanning modes (Phase 9 already generalized this). For
+ExportCompilations specifically:
+- If mode is Recording / RecordingStarting → reply with
+  `reason="already_recording"`.
+- If mode is PreviewClip → reply with `reason="close_preview_first"`.
+  The user must explicitly close the preview before exporting (no
+  auto-close, mirrors Phase 9 fix #22's "close-then-reopen" UX).
+- If mode is Exporting → reply with `reason="already_exporting"`.
+- Otherwise (Scanning) → proceed.
+
+The reason strings flow into the `export.batch.failed` event so
+the UI's progress slot can display the precise refusal cause.
 
 **10. Cancel mechanism is a polled `Arc<AtomicBool>`.** GStreamer
 has no true mid-pipeline abort. `Command::CancelExport` flips a
@@ -466,6 +508,167 @@ matching clips emits `export.tag.skipped` with reason="empty_plan"
 and proceeds to the next tag. Don't crash; don't delete the output
 folder; just skip and continue. v1 ExportSheet line 420.
 
+**27. Multi-source decoder state — Pause-inactive / Play-active.**
+"All decoders kept alive in one pipeline, only one writes useful
+data" is NOT a valid GStreamer state — inactive `sync=false`
+appsinks free-run and exhaust memory; `sync=true` appsinks back-
+pressure decodebin's multiqueue and stall the GStreamer task
+scheduler. Phase 10 implementation:
+- Build all source decoder chains in the pipeline (one per unique
+  source_index in the plan).
+- Set the pipeline state to PAUSED initially. All chains are
+  paused.
+- Set the *active* chain (the one for the current entry's source_
+  index) to PLAYING via `Element::set_state(Playing)` on the
+  filesrc/decodebin/videoconvert/appsink. Inactive chains stay
+  PAUSED.
+- On entry boundary if source_index changes: PAUSED on old, PLAYING
+  on new + seek to new entry's first segment source_start.
+
+For most projects there's only ONE source_index, so this is a no-
+op (the single chain is always Playing). For multi-source
+projects, the cross-entry pause/seek/play sequence costs ~50-200ms
+per transition — acceptable.
+
+Webcam (recording.mov) chains: same pattern. One per unique clip
+in the plan (typically all entries are unique clips, so N chains
+for an N-entry plan). Active chain Playing, others Paused. Switch
+on entry boundary.
+
+**28. Compositor-output-size + videoscale stage — appsrc caps NOT
+pinned to target resolution.** `Compositor::compose` outputs at
+SOURCE size (it copies source.width / source.height to the render
+target). Pinning the appsrc capsfilter to `pixel_size(resolution)`
+breaks negotiation when source isn't already that size. Pipeline
+shape:
+```
+appsrc(caps=source-w×source-h, RGBA, 30/1)
+  → videoconvert
+  → videoscale
+  → capsfilter(caps=target-w×target-h, NV12, 30/1)  // resolution applied here
+  → encoder
+  → h264parse → qtmux → filesink
+```
+The videoscale handles aspect-preserving downscale; videoconvert
+handles RGBA→NV12. Pin appsrc caps to the *source*'s actual width
+and height + 30/1 framerate. Pin the post-scale capsfilter to
+target dimensions. The driver doesn't need to know the target
+size; it just pushes source-sized RGBA buffers.
+
+For Phase 10's "all sources are 16:9" constraint, aspect ratio
+matches automatically; videoscale just downscales linearly.
+
+**29. `Resolution::Source` requires probing the first source's
+dimensions at export time.** `pixel_size(Resolution::Source)`
+returns the sentinel value `1920×1080` (not the source's actual
+size — the comment in export_settings.rs says the export pipeline
+overrides). Task 1 must:
+- For `resolution == Resolution::Source`: probe the first
+  `source_paths` entry via `gstreamer_pbutils::Discoverer` to get
+  natural width × height. Use those for the post-scale capsfilter.
+- For `R1080` / `R720`: use `pixel_size(resolution)` directly.
+
+Probing adds ~50-200ms to export start; acceptable. Cache the
+probed value across tags within one batch (it doesn't change).
+
+**30. Cancel during pre-decode — flag-check between freezes, NOT
+mid-decode.** `decode_one_frame_at` (the per-Freeze decoder) is one
+synchronous `set_state(Paused) → state(timeout=5s) → seek →
+state(timeout=5s) → pull_preroll` sequence. The 5s state-wait can't
+be aborted mid-call without leaking a half-built pipeline. Cancel
+discipline:
+- The pre-decode loop iterates over (entry, freeze_segment)
+  pairs.
+- Check `cancel.load(Acquire)` at the top of each iteration.
+- If set: drop any half-built pre-decode pipeline (its Drop runs
+  the safety teardown), return `Err(ExportError::Cancelled)`.
+- Mid-iteration cancel waits up to ~5s for the in-flight
+  decode_one_frame_at to complete before returning. Acceptable;
+  document explicitly.
+
+**31. Filename sanitization — Windows + reserved names.** v1 was
+macOS-only. Phase 10's CI matrix includes Windows. Sanitize:
+- Replace `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|` with `-`.
+- Trim leading/trailing whitespace + dots.
+- If the result (case-insensitive) matches a Windows reserved
+  name (`CON`, `PRN`, `AUX`, `NUL`, `COM1`-`COM9`, `LPT1`-`LPT9`),
+  prefix with `_` (e.g. `con` → `_con`).
+- If the result is empty after sanitization, fall back to
+  `untitled`.
+
+Add unit tests in `crates/video-coach-app/src/bus.rs` (or
+wherever the helper lands).
+
+**32. Slint sheet focus discipline + Escape + click-outside.**
+The plan's Task 3 originally said "FocusScope handles this if the
+sheet's outer Rectangle steals focus on show" — Slint's FocusScope
+does NOT auto-steal focus on visibility change. Explicit:
+- Sheet's outer Rectangle contains a `FocusScope` named
+  `sheet-focus-scope`.
+- When `export-sheet-visible` becomes true, call
+  `sheet-focus-scope.focus()` (Slint exposes this on FocusScope).
+  Either via a Slint `changed` callback or explicitly from ui.rs
+  in the on-File-menu-Export handler.
+- The existing top-level `keyscope` FocusScope's key handler gates
+  ALL existing shortcuts (Space / R / Esc / arrow keys) on
+  `!root.export-sheet-visible`. Without the gate, pressing R while
+  the sheet is open starts a clip recording.
+- Sheet's FocusScope handles Escape: dispatches
+  `export-close-clicked()` (which sets visible=false + clears
+  state).
+- Click-outside (TouchArea on the dim layer): closes the sheet
+  ONLY if `!export-active && !exporting-error-displayed` —
+  otherwise no-op. Standard sheet UX: can't accidentally dismiss
+  a running export.
+
+**33. Typed `TagSelection` enum in `Command::ExportCompilations`,
+NOT `Vec<String>`.** The `__all-clips__` magic string would collide
+with a real user tag (current schema: `Tag = String`, no
+restrictions on contents). Replace:
+```rust
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TagSelection {
+    AllClips,
+    Tag { name: String },
+}
+
+// In Command:
+ExportCompilations {
+    selections: Vec<TagSelection>,
+    ...
+}
+```
+The bus dispatches on the variant, not a string. UI sends the
+appropriate variant per row (the synthetic "all-clips" row →
+`AllClips`; a real tag row → `Tag { name: "..." }`).
+
+**34. ExportProgressSlotData distinguishes success-summary from
+error-state.** Per the reviewer's nit: a 5-tag batch where tags
+1-3 succeed and tag 4 fails should NOT show "Wrote 3 file(s)" as
+if the run completed. Slot shape:
+```rust
+pub enum ExportRunOutcome {
+    None,                                      // never run
+    InProgress,                                // batch active
+    SucceededAll { folder: PathBuf, tag_count: usize },
+    PartialFailure { folder: PathBuf, completed: usize, failed_tag: String, error: String },
+    Cancelled { folder: PathBuf, completed: usize },
+}
+
+pub struct ExportProgressSlotData {
+    pub outcome: ExportRunOutcome,
+    pub current_tag: Option<String>,           // populated when InProgress
+    pub completed_tags: usize,                 // running count, also for InProgress
+    pub total_tags: usize,                     // total in batch
+}
+```
+The UI's three-state form/progress/summary view becomes a four-
+state via the outcome enum. `SucceededAll` shows the green summary
++ Reveal. `PartialFailure` shows a red error with the failed tag
+name + Done button (user can re-open File→Export to retry).
+`Cancelled` shows a neutral "cancelled, N tags written" + Done.
+
 ---
 
 ## Tasks (~7 total — split across 4-5 sub-agent dispatches per fix #2)
@@ -478,10 +681,23 @@ folder; just skip and continue. v1 ExportSheet line 420.
 - Modify: `crates/video-coach-app/src/frame_sink.rs`.
 - Modify: `crates/video-coach-app/src/main.rs`.
 
-**Add to `Command`:**
-- `ExportCompilations { tags: Vec<String>, output_folder: String,
-  resolution: video_coach_core::project::Resolution, quality:
-  video_coach_core::project::Quality, project_name: String }`.
+**Add to `Command`** (per fix #33):
+```rust
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TagSelection {
+    AllClips,
+    Tag { name: String },
+}
+```
+Then:
+- `ExportCompilations {
+    selections: Vec<TagSelection>,
+    output_folder: String,
+    resolution: video_coach_core::project::Resolution,
+    quality: video_coach_core::project::Quality,
+    project_name: String,
+  }`.
 - `CancelExport`.
 
 Stub handlers return "not yet implemented (phase 10 task 2)".
@@ -496,18 +712,29 @@ Update `bus::write_recording_state` to map `AppMode::Exporting` →
 
 **`FORWARDED_TARGETS` gains `"export.lifecycle"`** (per fix #1).
 
-**`ExportProgressSlot` (per fix #17)**:
+**`ExportProgressSlot` (per fix #17 + #34)**:
 ```rust
+use std::path::PathBuf;
+
+#[derive(Debug, Clone)]
+pub enum ExportRunOutcome {
+    None,
+    InProgress,
+    SucceededAll { folder: PathBuf, tag_count: usize },
+    PartialFailure { folder: PathBuf, completed: usize, failed_tag: String, error: String },
+    Cancelled { folder: PathBuf, completed: usize },
+}
+
+impl Default for ExportRunOutcome {
+    fn default() -> Self { Self::None }
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct ExportProgressSlotData {
-    pub is_active: bool,
-    pub total_tags: usize,
-    pub completed_tags: usize,
-    pub current_tag: Option<String>,
-    pub current_tag_progress: f32, // 0..1, indeterminate-friendly
-    pub last_error: Option<String>,
-    pub last_summary_folder: Option<String>,
-    pub last_summary_file_count: usize,
+    pub outcome: ExportRunOutcome,
+    pub current_tag: Option<String>,            // populated when InProgress
+    pub completed_tags: usize,                  // running count, also for InProgress
+    pub total_tags: usize,                      // total in batch
 }
 pub type ExportProgressSlot = Arc<Mutex<ExportProgressSlotData>>;
 pub fn new_export_progress() -> ExportProgressSlot { ... }
@@ -522,8 +749,14 @@ checked by the driver in `export.rs`.
 
 **Bus serde tests**: `export_compilations_serde_roundtrips`,
 `cancel_export_serializes_to_bare_tag`, `app_mode_exporting_
-serializes_with_snake_case` (`{"exporting"}` as a string variant
-value).
+serializes_with_snake_case`, `tag_selection_all_clips_serializes`,
+`tag_selection_tag_with_name_serializes`,
+`tag_selection_round_trips_through_command`.
+
+**Filename sanitization helper** (per fix #31): write
+`fn sanitize_filename(s: &str) -> String` in a small module
+(probably `bus.rs` or a new `filename.rs`). Cover Windows reserved
+names + illegal chars + empty-fallback. Add unit tests.
 
 **Update PROGRESS.txt** with a Phase 10 section + Task 0 row marked
 shipped + commit SHA.
@@ -584,39 +817,102 @@ pub struct ExportSummary {
 ```
 
 **Inside the function:**
-1. Build per-source decoders (one per unique `source_index` in
-   plan) — per fix #19. Reuse `compose.rs::build_input_chain` if the
-   helper signature matches.
-2. Build per-clip webcam decoders (one per unique `clip_id` in
-   plan).
-3. Build audio chains: per-source `volume(name="source_vol_<i>")`,
-   per-clip `volume(name="commentary_vol_<id>")`, both feeding a
-   shared `audiomixer`. Set both volumes to the supplied values.
-   (Per fix #8.)
-4. Build the output chain: `appsrc → videoconvert → capsfilter(NV12)
-   → encoder(picked) → h264parse → qtmux → filesink`. Mirror
-   `compose.rs::compose_two_files`'s output chain. Pin output caps
-   to `width × height` per `pixel_size(resolution)` and framerate
-   to `30/1` per fix #4.
-5. Pre-decode freeze frames per entry per fix #7.
-6. Set pipeline state to PLAYING.
-7. **Driver loop**: per-entry, walk segments, compose each output
-   frame at 30 fps, push to appsrc with monotonic PTS.
-   - Check cancel flag before each push (per fix #10).
-   - Compute `record_time` from the per-entry cursor.
-   - Resolve segment + source_time.
-   - Pull source frame (live decode for Play, cached for Freeze).
-   - Pull webcam frame (latest in slot).
+
+1. **Probe first source's natural dimensions** (per fix #29) for
+   `Resolution::Source`. For other resolutions use
+   `pixel_size(resolution)`. Stash as `output_size`.
+2. **Pre-decode freeze frames per entry** (per fix #7 + #30). Run
+   inline; the bus task wraps the entire `export_compilation` call
+   in `spawn_blocking`. Check cancel flag at each (entry,
+   freeze_segment) iteration boundary.
+3. Build per-source-index decoder chains, all with `appsink.sync=
+   false` (per fix #4 — encoder-throttled driver, NOT wall-clock-
+   paced). Reuse `compose.rs::build_input_chain` shape if the
+   helper signature matches; otherwise inline. All chains start
+   in PAUSED state per fix #27.
+4. Build per-clip webcam decoder chains (one per unique clip in
+   plan). Each chain includes the recording's audio path:
+   `decodebin's audio → audioconvert → audioresample → aacenc`,
+   linked to qtmux's audio sink-pad. Per fix #8: NO audiomixer,
+   NO source-vol/commentary-vol mix in Phase 10. Recording audio
+   only.
+5. Build the output chain (per fix #28):
+   ```
+   appsrc(caps=source-w × source-h, RGBA, 30/1)
+     → videoconvert
+     → videoscale
+     → capsfilter(caps=output-w × output-h, NV12, 30/1)
+     → encoder(picked)
+     → h264parse
+     → qtmux
+     → filesink
+   ```
+   Encoder bitrate from `bitrate(resolution, quality)`. The
+   appsrc receives source-sized RGBA buffers; videoconvert +
+   videoscale handle the output transform.
+6. Set pipeline state to PLAYING. Audio chains begin streaming
+   (paused chains stay quiet via fix #27's per-element state
+   control).
+7. Activate the first entry's source + clip chains:
+   `source_chain[entry.source_index].set_state(Playing)`,
+   `webcam_chain[entry.clip_id].set_state(Playing)`. Seek both
+   to entry start. Other chains remain Paused.
+8. **Driver loop**: per-entry, walk segments, compose each output
+   frame, push to appsrc as fast as encoder accepts. NO wall-clock
+   pacing. The encoder's back-pressure naturally throttles us.
+   - Check cancel flag at the top of each loop iteration (per
+     fix #10). On cancel: break out, skip EOS, transition Null,
+     delete output, return `Cancelled`.
+   - Compute `record_time` from the per-entry cursor (cumulative
+     `frame_index_in_entry × 33,333,333 ns`).
+   - Resolve segment via `source_time_at(clip, record_time)` +
+     a segment walker (mirror `preview_pipeline.rs`'s segment
+     resolver).
+   - Pull source frame: for Play segments, fetch from active
+     source chain's appsink slot; for Freeze segments, use cached
+     pre-decoded frozen frame.
+   - Pull webcam frame: latest in active webcam chain's appsink
+     slot.
    - Compute `visible_strokes(&clip, record_time)` (per fix #5).
-   - Call `compose_tick` (per fix #3).
-   - Push to appsrc with PTS = `composition_start + record_time`
-     in nanoseconds.
+   - Call `compose_tick(&compositor, &source_frame, &webcam_frame,
+     &strokes)` (per fix #3).
+   - Push composed RGBA to appsrc with PTS =
+     `composition_start_ns + frame_index_in_entry × 33_333_333_ns`
+     and duration = `33_333_333_ns`. PTS is monotonic across
+     entries.
    - Increment `frames_pushed`.
-   - Emit `on_progress` callback every ~30 frames (1s wall-time).
-8. End-of-batch: send EOS to appsrc, wait for filesink EOS via
-   bus message, transition to Null per fix #14.
-9. Cancel path: skip EOS, transition Null directly, delete output
-   file, return `ExportError::Cancelled`.
+   - Emit `on_progress` callback every ~30 frames.
+9. **Entry transitions** (per fix #20):
+   - Pause the previous entry's source + webcam chains (per fix
+     #27). If the next entry uses the same source_index, KEEP
+     the source chain Playing and just seek; pause the previous
+     webcam chain and play the next one.
+   - Resolve `frozen_frames` lookup for the new entry.
+   - Reset per-entry record_time cursor to 0. composition_start_ns
+     advances by `prev_entry.recording_duration × 1e9`.
+10. **End-of-batch**: send EOS to appsrc, wait for filesink EOS
+    via bus message, transition to Null per fix #14 (stepped
+    Paused → Ready → Null).
+11. **Cancel path**: skip EOS, transition Null directly, delete
+    output file, return `ExportError::Cancelled`.
+
+**`compose_entry_frame` helper** (exported, for fix #21's parity
+test):
+```rust
+pub fn compose_entry_frame(
+    compositor: &Compositor,
+    entry: &CompilationEntry,
+    clip: &Clip,
+    record_time: f64,
+    source_frame: &Frame,
+    webcam_frame: &Frame,
+    frozen_frames: &HashMap<usize, Frame>,
+) -> Result<Frame, ExportError>;
+```
+Pure function: resolves the segment for `record_time`, picks
+source vs frozen frame, computes strokes, calls `compose_tick`.
+The driver loop calls this; Task 5's parity test calls this too,
+feeding hand-rolled inputs. NO GStreamer in this function.
 
 **Smoke test** (`tests/export_smoke.rs`):
 - Build a Clip + plan with 1 entry + Pause/Play + 1 stroke event.
@@ -637,32 +933,43 @@ pub struct ExportSummary {
 - Modify: `crates/video-coach-app/src/bus.rs`.
 
 **`ExportCompilations` handler**:
-1. Parse + validate inputs (tags non-empty, output_folder non-
-   empty).
-2. Refuse if `is_busy` (per fix #9): emit `export.batch.failed`
-   with `reason="already_busy"` (or `"already_exporting"` if
-   specifically Exporting mode). Match Phase 9 fix #22's pattern.
-3. Resolve all paths from `current.0` (project) + folder per fix
+1. Validate inputs (selections non-empty, output_folder non-empty,
+   project_name non-empty after trim).
+2. Refuse if `is_busy` per fix #9: emit `export.batch.failed`
+   with the matching reason string (`already_recording`,
+   `close_preview_first`, `already_exporting`). Reply ok=false +
+   error.
+3. Refuse if no project open: reply with `no_project_open`.
+4. Resolve all paths from `current.0` (project) + folder per fix
    #16. Build `ExportInputs::source_paths` (deduplicate by
-   source_index per fix #19), `recording_paths` (per clip).
-4. Persist `project.preferences.last_export_resolution` +
-   `last_export_quality` per fix #11; if write fails, emit
-   `export.batch.failed` and abort.
-5. Create output folder if missing (`std::fs::create_dir_all`).
+   source_index per fix #27 + #19), `recording_paths` (per clip).
+5. **Persist `project.preferences.last_export_resolution` +
+   `last_export_quality` per fix #11 — AFTER step 2's busy check
+   and step 3's no-project check** (per the second-pass review's
+   M9 fix). If persistence fails, emit `export.batch.failed` with
+   `reason="persist_prefs_failed"` and abort BEFORE setting up the
+   export.
+6. Create output folder if missing (`std::fs::create_dir_all`).
 6. Set `current_mode = AppMode::Exporting`. Build cancel flag.
    Stash `current_export_cancel = Some(flag.clone())`.
-7. Update `ExportProgressSlot` with `is_active=true, total_tags=
-   tags.len()`.
-8. Emit `export.batch.started` with `tag_count=tags.len()`,
+7. Update `ExportProgressSlot` with
+   `outcome=InProgress, total_tags=selections.len(),
+   completed_tags=0`.
+8. Emit `export.batch.started` with `tag_count=selections.len()`,
    `output_folder`, `resolution`, `quality`.
-9. **Sequential loop** per fix #24: for each tag (in supplied
-   order — UI sends them sorted; bus doesn't re-sort):
-   - Build the `CompilationPlan` (`compilation_plan_for(tag,
-     source_durations)` or `all_clips_compilation_plan` for the
-     "all-clips" sentinel `__all-clips__`).
+9. **Sequential loop** per fix #24: for each `selection` in supplied
+   order (UI sends them sorted; bus doesn't re-sort):
+   - Resolve display label and plan via TagSelection (per fix #33):
+     - `TagSelection::AllClips` → label `"all-clips"`, plan via
+       `project.all_clips_compilation_plan(source_durations)`.
+     - `TagSelection::Tag { name }` → label `name`, plan via
+       `project.compilation_plan_for(&name, source_durations)`.
    - If plan is empty, emit `export.tag.skipped` with
      `reason="empty_plan"` per fix #26 and continue.
-   - Sanitize filename per fix #12. Build output path.
+   - Sanitize filename per fix #31 (Windows-safe): apply
+     `sanitize_filename` to both the label and the project_name.
+     Build output path: `<output_folder>/<sanitized-label> -
+     <sanitized-project-name>.mp4`.
    - Delete prior output file silently per fix #13.
    - Update slot (`current_tag = Some(tag.clone()), completed_tags=
      i`).
@@ -676,10 +983,17 @@ pub struct ExportSummary {
    - On other error: emit `export.tag.failed` with `error`.
      Update slot (`last_error`); break the loop, emit `export.
      batch.failed`.
-10. End: clear `current_export_cancel`. Set `current_mode =
-    AppMode::Scanning`. Update slot (`is_active=false,
-    last_summary_folder=Some(...), last_summary_file_count=
-    completed`). Emit `export.batch.completed`.
+10. End-of-batch outcome write per fix #34:
+    - All tags succeeded → `outcome = SucceededAll { folder,
+      tag_count: completed }`. Emit `export.batch.completed`.
+    - Cancel flag set → `outcome = Cancelled { folder,
+      completed }`. Emit `export.batch.cancelled` with
+      `tags_completed=completed`.
+    - One tag failed → `outcome = PartialFailure { folder,
+      completed, failed_tag, error }`. Emit `export.batch.failed`.
+    - Clear `current_export_cancel`. Set `current_mode =
+      AppMode::Scanning`. `write_recording_state(...)` to mirror
+      the mode change (per Phase 9 pattern).
 
 **`CancelExport` handler**:
 1. Refuse if mode isn't `Exporting`.
@@ -740,16 +1054,49 @@ pub struct ExportSummary {
   sidebar/transport are still rendered but unclickable (TouchArea
   on the dim layer absorbs clicks).
 
-- Three states inside the sheet (mutually exclusive):
-  - **Form** (`!export-active && export-summary-file-count == 0`):
-    project name, output folder, tag list, resolution/quality
-    pickers, "Cancel" + "Export" buttons.
-  - **Progress** (`export-active`): "Exporting <tag> (N of M)…",
-    indeterminate spinner, "Cancel" button.
-  - **Summary** (`!export-active && export-summary-file-count > 0`):
-    "Wrote N file(s) to <folder>", "Reveal in Finder" button (macOS
-    only — gated on cfg in ui.rs to call `xdg-open` on Linux,
-    `explorer` on Windows, or just hide the button), "Done" button.
+- **Focus discipline (per fix #32)**:
+  - Sheet's outer Rectangle holds a named `sheet-focus-scope`
+    FocusScope. `ui.rs` calls `.focus()` on it when the sheet
+    becomes visible (handler on the File menu Export item, OR a
+    Slint `changed` callback on `export-sheet-visible`).
+  - Top-level `keyscope`'s key handler gates ALL existing shortcuts
+    (Space, R, arrow keys) on `!root.export-sheet-visible`. Esc
+    still propagates — it's the close-sheet shortcut.
+  - Sheet `sheet-focus-scope` handles Esc → fires
+    `export-close-clicked()`.
+  - Click-outside (TouchArea on the dim layer) closes the sheet
+    ONLY if the sheet's outcome state is Form, SucceededAll, or
+    PartialFailure (NOT InProgress — can't accidentally dismiss
+    a running export).
+
+- **Four outcome states** (per fix #34, derived from
+  `ExportProgressSlot.outcome`):
+  - **Form** (`outcome == None`): project name, output folder,
+    tag list, resolution/quality pickers, "Cancel" + "Export"
+    buttons. Cancel here = close the sheet (no export in flight).
+  - **Progress** (`outcome == InProgress`): "Exporting <tag>
+    (N of M)…", indeterminate spinner, "Cancel" button. Cancel
+    here = dispatches `Command::CancelExport`.
+  - **Success summary** (`outcome == SucceededAll { folder,
+    tag_count }`): "Wrote N file(s) to <folder>", "Reveal in
+    Finder" button (per fix #N15 — see below), "Done" button.
+  - **Error / partial** (`outcome == PartialFailure { folder,
+    completed, failed_tag, error }` OR `Cancelled`): red error
+    text with the failed tag's name + folder path + error
+    message; "Done" button. User clicks Done, sheet returns to
+    Form state for retry.
+
+- **Reveal-in-Finder cross-platform** (per fix #N15):
+  - macOS: `Command::new("open").arg(&folder).status()` (no `-R`
+    flag — that reveals a file; for folders use plain `open`).
+  - Windows: `Command::new("explorer").arg(&folder).status()`.
+    For revealing a specific file (not used in Phase 10 since
+    we batch-write multiple files): `explorer /select,<path>`.
+  - Linux: `Command::new("xdg-open").arg(&folder).status()`.
+
+  cfg-gated dispatch in `ui.rs::on_export_reveal_clicked`. If the
+  command spawn fails (no xdg-open on minimal distros), log a
+  warning + leave the path label visible for the user to copy.
 
 **ui.rs additions:**
 - New 30 Hz timer reads from `ExportProgressSlot` and updates
@@ -801,25 +1148,23 @@ boolean is better).
 **Test flow:**
 1. Open temp project + add a fixture source video.
 2. Use `--fixture-recording-source` to record a 1.5s clip.
-3. Send a (new) `Command::TagClip { clip_id, tags: Vec<String> }`
-   to add a tag — wait, this command doesn't exist. Plan options:
-   - Skip this and send a `Command::SetClipTags { clip_id,
-     tags }` that's added in Task 0 alongside ExportCompilations.
-   - OR: write the test against the "all-clips" synthetic tag
-     (no clip-tag mutation needed).
-   - **Pick the second**: simpler, doesn't add scope. Use the
-     `__all-clips__` sentinel.
+3. Skip clip-tagging — use the `TagSelection::AllClips` variant
+   (per fix #33). This avoids needing a new `SetClipTags` bus
+   command in Phase 10's scope.
 4. Set the project's output preferences (`last_export_resolution =
    r720` for speed) by hand-writing project.json — or just use
    defaults.
-5. Send `Command::ExportCompilations { tags: vec!["__all-clips__"
-   .into()], output_folder: tmp.path().to_string(), resolution:
-   R720, quality: Low, project_name: "test".into() }`.
-6. Wait for `export.batch.started`.
-7. Wait for `export.tag.started` with `tag="__all-clips__"`.
-8. Wait for `export.tag.completed` (with timeout ≥ 30s — encoders
-   are slow on CI). Assert `frames_pushed > 30` (per fix #23 — at
-   30 fps × 1s ≈ 30 frames; allow >30 for safety).
+5. Send `Command::ExportCompilations { selections:
+   vec![TagSelection::AllClips], output_folder:
+   tmp.path().to_string(), resolution: R720, quality: Low,
+   project_name: "test".into() }`.
+6. Wait for `export.batch.started` (timeout 5s).
+7. Wait for `export.tag.started` with `selection_kind="all_clips"`.
+8. Wait for `export.tag.completed` (timeout 60s — Windows
+   mfh264enc cold-start can take 5-10s and lavapipe runs 0.3-0.5×
+   realtime, so a 1.5s clip can take 5-15s of GPU work plus
+   stepped teardown). Assert `frames_pushed >= 30` (a 1.5s clip
+   at 30 fps produces ~45 frames; allow >= 30 for safety).
 9. Wait for `export.batch.completed`.
 10. Verify `<tmp>/all-clips - test.mp4` exists, size > 50 KB.
 11. ffprobe-equivalent (use `gstreamer_pbutils::Discoverer`) to
@@ -838,28 +1183,53 @@ boolean is better).
 
 ---
 
-### Task 5: Full N-frame preview-vs-export parity
+### Task 5: Full N-frame parity via deterministic `compose_entry_frame`
 
 **Files:**
-- Create: `crates/video-coach-compositor/tests/parity_n_frames.rs`
-  (or `crates/video-coach-media/tests/parity_n_frames.rs` if it
-  needs the export pipeline's frame-extraction hook from fix #21).
+- Create: `crates/video-coach-media/tests/parity_n_frames.rs`.
 
-Test architecture per fix #21:
-1. Construct hand-rolled Clip + plan with 1 entry, Pause + Play +
-   1 stroke event.
-2. Build minimal `ExportInputs` with fixture source/recording.
-3. Run `PreviewPipeline` through to N=30 frames captured into
-   `Vec<Frame>` via a `CountingFrameSink` that stashes every
-   frame.
-4. Run the export pipeline's per-tick compose-only function
-   (factored out in Task 1 per fix #21's `compose_entry_frame`)
-   for the same N frames, captured into `Vec<Frame>`.
-5. Assert `preview_frames == export_frames` byte-for-byte.
+Per fix #21 (revised): the parity test does NOT compare preview's
+live-decoded frames against export's. Preview's `appsink.sync=true`
+real-time decode produces a *race* against the deterministic frame-
+by-record-time path — same clip can produce different captured
+frames at preview-tick N depending on decoder warmup, GPU clock
+state, etc.
 
-If byte-for-byte proves flaky in CI (driver pipeline cache state),
-fall back to ±2/channel tolerance per pixel sampling — same shape
-as Phase 9's parity_smoke tolerance fallback.
+The right contract: **`compose_entry_frame` is deterministic given
+the same inputs.** Both preview's driver and export's driver call
+it. The parity test calls it twice over N record_times and asserts
+the two output sequences match.
+
+Test architecture:
+1. `let compositor = Arc::new(Compositor::new_headless()?)`.
+2. Build a hand-rolled `Clip` with Pause + Play + a stroke event.
+3. Build a `CompilationPlan` with one entry referring to that
+   clip.
+4. Pre-decode fixture source frames at the segment-relevant
+   source_times into a `HashMap<f64, Frame>` (test scaffold —
+   doesn't need to live in production code).
+5. Hand-roll a webcam Frame (solid color, fixed dimensions).
+6. Resolve the entry's freeze-frame map per fix #11 logic.
+7. **Path A**: loop record_time from 0 to N×33.3ms, call
+   `compose_entry_frame(&compositor, &entry, &clip, record_time,
+   &source_frame, &webcam_frame, &frozen_frames)`. Collect into
+   `Vec<Frame>`.
+8. **Path B**: same loop, same inputs. Collect into Vec<Frame>.
+9. Assert `path_a == path_b` byte-for-byte for all N frames.
+
+If byte-for-byte proves flaky (wgpu pipeline cache state across
+back-to-back composes — Phase 9 closeout flagged this), downgrade
+to ±2/channel tolerance per sampled pixel.
+
+**N=30** (1 second of preview at 30 fps) is sufficient for catching
+divergence regressions; longer runs hit diminishing returns. If
+the future Phase 11 adds an end-to-end "render preview to file +
+render export to file + bit-compare the two .mp4s" check, that's a
+fundamentally different test and lives separately.
+
+**This rework removes the architectural infeasibility flagged in
+Phase 10's adversarial review** (preview's sync=true real-time
+decode vs export's deterministic walk).
 
 **Update PROGRESS.txt + commit.**
 
@@ -897,10 +1267,17 @@ as Phase 9's parity_smoke tolerance fallback.
   alphabetically (after the "all-clips" pinned row); v1 same.
 - **Custom output filename templates.** Filename format is fixed:
   `<tag-sanitized> - <project-name-sanitized>.mp4`. v1 same.
-- **Source-volume mix during PREVIEW.** Phase 10's audiomixer is
-  in the export pipeline only. Wiring the same audiomixer into
-  `PreviewPipeline` is an OPTIONAL sub-deliverable; if it slips,
-  it lives as a Phase 9.5 follow-up.
+- **Source-volume + commentary-volume MIX entirely.** Phase 10
+  ships RECORDING AUDIO ONLY in export (per fix #8). v1's dual-
+  slider mix requires per-entry audio segment editing
+  (gst-editing-services or seek+valve gating) which is its own
+  scope. Phase 11 picks up the mix.
+
+- **Per-frame compose caching during Freeze segments.** Within a
+  Freeze segment, every output frame composes the same source +
+  webcam (modulo strokes). The redundant GPU work is acceptable
+  for Phase 10; Phase 11 follow-up could memoize per (Freeze
+  segment, stroke set hash).
 
 ---
 
@@ -928,17 +1305,15 @@ as Phase 9's parity_smoke tolerance fallback.
    focus-stealing may be fiddly. If the sub-agent runs into Slint-
    API friction, the alternative is a separate Slint window opened
    by File → Export Compilations — heavier but clean.
-2. **`audiomixer` element availability on all platforms.** Standard
-   gst-plugins-base; ships with the macOS/Linux/Windows GStreamer
-   distributions used in CI. If a platform doesn't have it, fall
-   back to `liveadder` or `adder`. Mention in error message.
-3. **gstreamer source seek + audio seek synchronization.** When
-   transitioning between entries in a multi-source plan, both
-   video and audio chains for each source need to be seeked
-   together. GStreamer's `seek_simple` on the pipeline applies to
-   all elements; should "just work". If audio drift appears in
-   testing, the fallback is per-element seeks via `Element::send_
-   event(Event::Seek)`.
+2. **(removed — audiomixer dropped from Phase 10 scope per fix #8.)**
+3. **Per-element seek for entry transitions.** For multi-source
+   compilations (rare), `pipeline.seek_simple` flushes ALL
+   elements — including the previous source's chain that we don't
+   want to flush. Phase 10 implementation must use per-element
+   seeks via `Element::send_event(gstreamer::event::Seek::new(
+   ...))` on the active source's filesrc/decodebin specifically.
+   Single-source compilations (the common case) tolerate
+   pipeline-level seek fine.
 4. **Output PTS continuity across entries.** The plan calls for
    monotonic PTS = `composition_start + record_time` in
    nanoseconds. If the encoder rejects non-zero starting PTS, the
