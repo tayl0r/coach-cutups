@@ -2646,10 +2646,38 @@ async fn handle_export_compilations(
             let mut g = export_progress_for_task
                 .lock()
                 .expect("export_progress poisoned");
+            // Phase 11 Plan #2 code-review fix [4]: hydrate the f32
+            // progress fields per outcome so a snapshot at completion
+            // matches the docstring on
+            // `ExportProgressSlotData::current_tag_progress` /
+            // `batch_progress` ("Held at its last value through
+            // terminal-state transitions so a snapshot at completion
+            // isn't visually weird"). Without this, PartialFailure /
+            // Cancelled would leave whatever mid-tag value the closure
+            // last wrote (e.g. 0.62 on a 5-tag run failing in tag 3),
+            // out of sync with `completed_tags`.
+            //
+            // - SucceededAll → (1.0, 1.0): bar fully filled.
+            // - PartialFailure / Cancelled → batch held at the
+            //   segment-boundary floor `completed_tags / total_tags`,
+            //   current_tag reset to 0.0 (the failed tag's progress is
+            //   muddled and a partial fill would misrepresent it).
+            let (next_tag_progress, next_batch_progress) = match &outcome {
+                ExportRunOutcome::SucceededAll { .. } => (1.0_f32, 1.0_f32),
+                ExportRunOutcome::PartialFailure { .. } | ExportRunOutcome::Cancelled { .. } => (
+                    0.0_f32,
+                    (completed_tags as f32 / total_tags.max(1) as f32).min(1.0),
+                ),
+                // Defensive: end-of-batch is reached only via the three
+                // arms above (None / InProgress are never written here).
+                ExportRunOutcome::None | ExportRunOutcome::InProgress => (0.0_f32, 0.0_f32),
+            };
             g.outcome = outcome;
             g.current_tag = None;
             g.completed_tags = completed_tags;
             g.total_tags = total_tags;
+            g.current_tag_progress = next_tag_progress;
+            g.batch_progress = next_batch_progress;
         }
 
         // ── 12. Signal cleanup back to the bus task. ─────────────────────
