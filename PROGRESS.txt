@@ -391,6 +391,37 @@ docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
       25232573975 green on all 4 jobs. Phase 10 SHIPPED.
 
 
+## Phase 11 — Polish + deferred items from Phase 10 closeout
+Plans dispatched per `/tmp/phase11-plans/orchestrator-prompt.md` state-
+machine processor; one plan per deferred item. Each plan ships a slug
+under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
+own SHIPPED line + CI run id once green.
+
+- [ ] Plan #1: HEVC encoder
+- [ ] Plan #2: real-progress-pct — replace indeterminate spinner with
+      a real 0..1 progress bar fed from export.rs's existing
+      ExportProgress callback. Plan:
+      docs/plans/2026-05-01-rust-rewrite-phase-11-real-progress-pct.md
+  - [x] Task 0: Preflight — ExportProgressSlotData fields + bus
+        throttled writer (commit 9ac71f7)
+        Extends ExportProgressSlotData with current_tag_progress +
+        batch_progress f32 fields; replaces bus's Box::new(|_| {})
+        on_progress with a throttled writer using
+        Arc<Mutex<(f32, Instant)>> (Fix #2), cumulative
+        frames_pushed/total_frames in f64 (Fix #1+#7), captured i +
+        total_tags locals (Fix #3), poison-recovering throttle lock
+        (Fix #5), 0.5%-delta single gate (Fix #6); resets progress at
+        top of each tag iteration; snaps to (1.0, (i+1)/total) after
+        Ok(Ok(_)) before completed_tags += 1 (Fix #4).
+  - [ ] Task 1: Slint progress bar + ui.rs hydration
+  - [ ] Task 2: Closeout — Plan #2 SHIPPED
+- [ ] Plan #3: source/commentary audio mix in export + preview
+- [ ] Plan #4: freeze-segment compose caching
+- [ ] Plan #5: per-frame pipeline rebuild optimization
+- [ ] Plan #6: VBO churn for strokes / resume failed exports
+- [ ] Plan #7: drag-reorder tag rows / custom filename templates
+
+
 ## Phase 11 — pending
 Per the design doc:
   Phase 11 Polish, packaging, cross-platform CI green
