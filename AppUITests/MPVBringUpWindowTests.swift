@@ -5,9 +5,26 @@ final class MPVBringUpWindowTests: XCTestCase {
 
     override func setUpWithError() throws {
         continueAfterFailure = false
+
+        // Ensure the test fixture is available at a non-TCC-gated location.
+        // The original lives in ~/Downloads which prompts every cdhash change
+        // in dev builds; copy once to /tmp so the test runs uninterrupted.
+        let fixturePath = "/tmp/mpv-test-fixture.mp4"
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: fixturePath) {
+            let source = "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4"
+            if fm.fileExists(atPath: source) {
+                try fm.copyItem(atPath: source, toPath: fixturePath)
+            } else {
+                throw XCTSkip("Test fixture not available at \(source)")
+            }
+        }
+
         app = XCUIApplication()
-        // Launch arg lets the app know it's under test if needed later.
-        app.launchArguments = ["--ui-testing"]
+        app.launchArguments = [
+            "--ui-testing",
+            "--mpv-default-file=\(fixturePath)",
+        ]
         app.launch()
     }
 

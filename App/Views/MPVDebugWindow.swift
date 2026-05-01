@@ -5,10 +5,21 @@ import SwiftUI
 /// toggle drives gate (d). Both are permanent debug affordances.
 struct MPVDebugWindow: View {
     @State private var hwdec: String = "videotoolbox"
-    @State private var filePath: String =
-        "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4"
+    @State private var filePath: String = MPVDebugWindow.defaultFilePath()
     @State private var overlayTint: Bool = false
     @State private var revision: Int = 0
+
+    private static func defaultFilePath() -> String {
+        // Look for --mpv-default-file=<path> in launch args. Used by UI
+        // tests to point at /tmp fixtures instead of the TCC-gated default.
+        let args = ProcessInfo.processInfo.arguments
+        for arg in args {
+            if arg.hasPrefix("--mpv-default-file=") {
+                return String(arg.dropFirst("--mpv-default-file=".count))
+            }
+        }
+        return "/Users/taylor/Downloads/VID_20260425_090418_01_01.mp4"
+    }
 
     var body: some View {
         VStack(spacing: 8) {
