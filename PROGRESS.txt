@@ -320,7 +320,30 @@ Plan: docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
       export_with_no_project_open_returns_no_project_open,
       export_while_recording_refuses_with_already_recording,
       cancel_export_when_not_exporting_replies_not_exporting.
-- [ ] Task 3: UI — Slint export-sheet modal
+- [x] Task 3: UI — Slint export-sheet modal (commit 3dee9af)
+      main.slint: full-screen overlay sheet (per fix #18) with
+      centered card, four outcome views (Form / InProgress /
+      SucceededAll / PartialFailure / Cancelled per fix #34) keyed
+      off export-outcome-kind. File→Export Compilations menu item
+      gated on project-open. Top-level keyscope short-circuits ALL
+      existing key bindings while export-sheet-visible (per fix
+      #32). Sheet-local sheet-focus-scope handles Esc; dim-layer
+      TouchArea click-outside dismisses only when outcome !=
+      in_progress. Reveal-in-Finder shown on success and on
+      partial_failure / cancelled when completed > 0 (per fix #36).
+      ui.rs: 30 Hz timer hydrates ExportProgressSlot → outcome-kind
+      + summary-folder / summary-file-count / error / failed-tag /
+      cancelled-completed Slint props. ClipListSlot → tag rows via
+      new aggregate_tag_rows helper (synthetic __all__ pinned
+      first, real tags alphabetized, selected flag mirrored from
+      selected-export-tags so the Slint side doesn't need a
+      contains() helper). Callbacks: start (TagSelection +
+      Resolution + Quality build per fix #33), cancel (does NOT
+      close the sheet), folder-pick (rfd::AsyncFileDialog), reveal
+      (cross-platform per fix #35: macOS `open`, Windows
+      `explorer`, Linux `xdg-open`), close (resets the slot to
+      default on terminal states so re-open returns to the form).
+      One unit test for aggregate_tag_rows.
 - [ ] Task 4: Harness E2E — record + export + verify
 - [ ] Task 5: N-frame parity test (compose_entry_frame determinism)
 - [ ] Task 6: Closeout
