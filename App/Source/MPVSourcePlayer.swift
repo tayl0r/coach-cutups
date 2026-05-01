@@ -3,6 +3,7 @@ import Observation
 import AppKit  // NSOpenGLContext for attachRenderGL (Task 2.1)
 import Metal
 import QuartzCore
+import OpenGL.GL3  // glBindFramebuffer / glViewport / glFlush / GL_FRAMEBUFFER for renderIntoGL (Task 2.2)
 import Libmpv  // module name confirmed in Phase 1 (NOT "MPVKit"; MPVKit's modulemap names the umbrella module Libmpv)
 
 /// Wraps a persistent mpv_handle for source-playback (D2 in the design).
@@ -489,6 +490,70 @@ public final class MPVSourcePlayer {
             cmdBuf.present(drawable)
             cmdBuf.commit()
         }
+    }
+
+    /// GL render path — parallel to `renderInto(...)` (SW path). mpv writes
+    /// into `bridge.fbo`; the bridge then blits its IOSurface-backed Metal
+    /// texture into the layer's drawable. Unreferenced for now; Phase 3 wires
+    /// the call site.
+    ///
+    /// Internal (not public) because `GLMetalBridge` is internal — Phase 3
+    /// wires this from inside the same module, so cross-module visibility
+    /// isn't needed. `nonisolated` is what actually matters: the CVDisplayLink
+    /// callback runs off the main actor and must be able to call this.
+    nonisolated func renderIntoGL(
+        layer: CAMetalLayer,
+        drawableSize: CGSize,
+        commandQueue: MTLCommandQueue,
+        bridge: GLMetalBridge
+    ) {
+        guard renderLock.try() else { return }
+        defer { renderLock.unlock() }
+        guard let renderContext else { return }
+
+        let w = Int32(drawableSize.width)
+        let h = Int32(drawableSize.height)
+        guard w > 0, h > 0 else { return }
+
+        // GL context MUST be current before any GL call — bridge.resize() issues
+        // glGenTextures/glDeleteTextures/glGenFramebuffers internally, so the
+        // makeCurrent has to happen before resize, not after. (v1 had this
+        // backwards; the first frame would have silently no-op'd or crashed.)
+        bridge.glContext.makeCurrentContext()
+
+        do {
+            try bridge.resize(to: drawableSize)
+        } catch {
+            return  // resize failed; skip this frame, log handled at bridge layer
+        }
+
+        glBindFramebuffer(GLenum(GL_FRAMEBUFFER), bridge.fbo)
+        glViewport(0, 0, GLsizei(w), GLsizei(h))
+
+        var fbo = mpv_opengl_fbo(
+            fbo: Int32(bridge.fbo),
+            w: w, h: h,
+            internal_format: 0  // 0 = "unknown / default"; mpv tolerates this for our case
+        )
+        var flipY: Int32 = 1  // GL framebuffer is flipped vs mpv's natural orientation
+
+        let _: CInt = withUnsafeMutablePointer(to: &fbo) { fboPtr -> CInt in
+            return withUnsafeMutablePointer(to: &flipY) { flipPtr -> CInt in
+                var params = [
+                    mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO,
+                                     data: UnsafeMutableRawPointer(fboPtr)),
+                    mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y,
+                                     data: UnsafeMutableRawPointer(flipPtr)),
+                    mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
+                ]
+                return params.withUnsafeMutableBufferPointer {
+                    mpv_render_context_render(renderContext, $0.baseAddress)
+                }
+            }
+        }
+        glFlush()  // ensure GL writes are visible to Metal via IOSurface before the blit
+
+        bridge.present(into: layer, commandQueue: commandQueue)
     }
 }
 
