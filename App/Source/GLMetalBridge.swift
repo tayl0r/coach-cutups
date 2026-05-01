@@ -89,6 +89,14 @@ final class GLMetalBridge {
         self.surfaceHeight = h
     }
 
+    func clearTo(red: Float, green: Float, blue: Float, alpha: Float) {
+        glContext.makeCurrentContext()
+        glBindFramebuffer(GLenum(GL_FRAMEBUFFER), fbo)
+        glViewport(0, 0, GLsizei(surfaceWidth), GLsizei(surfaceHeight))
+        glClearColor(GLfloat(red), GLfloat(green), GLfloat(blue), GLfloat(alpha))
+        glClear(GLbitfield(GL_COLOR_BUFFER_BIT))
+    }
+
     private func teardownGLObjects() {
         glContext.makeCurrentContext()
         if fbo != 0 { glDeleteFramebuffers(1, &fbo); fbo = 0 }
