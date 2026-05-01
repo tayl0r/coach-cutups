@@ -398,7 +398,41 @@ pub fn spawn_on(
             std::sync::Arc<std::sync::atomic::AtomicBool>,
         > = None;
 
-        while let Some(env) = rx.recv().await {
+        // Phase 10 Task 4 prep (architecture fix). Internal cleanup
+        // channel: the spawned export-batch task signals "I'm done"
+        // by sending `()` here. The bus's main `select!` loop picks
+        // it up and resets `current_mode` + `current_export_cancel`
+        // (which the spawned task can't borrow because they're
+        // bus-task-local). Without this, the bus task would have to
+        // `.await` the export inline — blocking it from receiving
+        // CancelExport / any other command until the batch finishes.
+        #[cfg(feature = "media")]
+        let (export_cleanup_tx, mut export_cleanup_rx) =
+            tokio::sync::mpsc::unbounded_channel::<()>();
+
+        loop {
+            #[cfg(feature = "media")]
+            let next_env = tokio::select! {
+                env = rx.recv() => env,
+                cleanup = export_cleanup_rx.recv() => {
+                    if cleanup.is_some() {
+                        // Spawned export task signaled completion.
+                        // Reset bus-local state. The slot's outcome
+                        // was already written by the spawned task.
+                        current_export_cancel = None;
+                        if matches!(current_mode, AppMode::Exporting) {
+                            current_mode = AppMode::Scanning;
+                            write_recording_state(&recording_state, &current_mode, None);
+                        }
+                    }
+                    continue;
+                }
+            };
+            #[cfg(not(feature = "media"))]
+            let next_env = rx.recv().await;
+
+            let Some(env) = next_env else { break };
+
             let reply = handle(
                 env.command,
                 &shutdown_tx,
@@ -437,6 +471,8 @@ pub fn spawn_on(
                 &mut recording_clip,
                 #[cfg(feature = "media")]
                 &mut current_export_cancel,
+                #[cfg(feature = "media")]
+                &export_cleanup_tx,
                 #[cfg(feature = "media")]
                 fixture_recording_source.as_deref(),
             )
@@ -683,6 +719,7 @@ async fn handle(
     #[cfg(feature = "media")] current_export_cancel: &mut Option<
         std::sync::Arc<std::sync::atomic::AtomicBool>,
     >,
+    #[cfg(feature = "media")] export_cleanup_tx: &tokio::sync::mpsc::UnboundedSender<()>,
     #[cfg(feature = "media")] fixture_recording_source: Option<&std::path::Path>,
 ) -> CommandReply {
     match cmd {
@@ -2048,6 +2085,7 @@ async fn handle(
                     export_progress,
                     current_export_cancel,
                     compositor,
+                    export_cleanup_tx,
                 )
                 .await
             }
@@ -2081,23 +2119,26 @@ async fn handle(
     }
 }
 
-/// Phase 10 Task 2 (per the plan section starting at line 1097).
+/// Phase 10 Task 2 + Task 4-prep (per the plan section starting at line
+/// 1097, with the architecture refactor described below).
 ///
-/// Drives the in-process batch export. Refactored out of `handle()` so
-/// the borrow-checker has clean scoping for the run-cleanup discipline
-/// (per fix #38 — every exit path of this function clears
-/// `current_export_cancel` and resets `current_mode` to `Scanning`
-/// before returning, so a panic / break / early-return can't leak a
-/// stale flag into the next command's busy check).
+/// **Architecture (Task 4 prep, post-Task-2 refactor):** the synchronous
+/// setup phase (validation, busy check, no-project check, path resolve,
+/// folder validation, prefs persistence, mode flip, slot init,
+/// batch.started event) runs inline on the bus task. The actual per-tag
+/// for-loop is then spawned into a detached `tokio::spawn` task so the
+/// bus loop returns to receive new commands — most importantly,
+/// `Command::CancelExport` mid-export (without this, the bus task is
+/// blocked awaiting `spawn_blocking` for the entire export duration and
+/// cancel can't be processed). The spawned task signals "I'm done" via
+/// `export_cleanup_tx`, which the bus's `select!` loop picks up and
+/// resets `current_mode` + `current_export_cancel` (which the spawned
+/// task can't borrow because they're bus-task-local `&mut` refs).
 ///
-/// **Cleanup choice (per the plan's prompt — "Document your choice in a
-/// comment")**: this function uses an explicit cleanup-on-every-exit-path
-/// discipline (not an `ExportGuard` Drop type). Reasoning: the cleanup
-/// needs to write to two `&mut` references (`current_mode`,
-/// `current_export_cancel`) which a Drop type would have to hold for its
-/// lifetime, blocking the rest of the function from also using them.
-/// The two cleanup mutations sit in a single tail block reached from
-/// every loop break + the success path; tests confirm the discipline.
+/// **Cleanup discipline (per fix #38)**: the spawned task writes the
+/// final outcome to the slot before sending the cleanup signal. The bus's
+/// select!-arm for cleanup resets the mutable bus-local state. Both
+/// success and error paths converge on the same cleanup signal.
 #[cfg(feature = "media")]
 #[allow(clippy::too_many_arguments)]
 async fn handle_export_compilations(
@@ -2114,6 +2155,7 @@ async fn handle_export_compilations(
     export_progress: &crate::frame_sink::ExportProgressSlot,
     current_export_cancel: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     compositor: &std::sync::Arc<video_coach_compositor::Compositor>,
+    export_cleanup_tx: &tokio::sync::mpsc::UnboundedSender<()>,
 ) -> CommandReply {
     use crate::filename::sanitize_filename;
     use crate::frame_sink::{ExportProgressSlotData, ExportRunOutcome};
@@ -2286,102 +2328,25 @@ async fn handle_export_compilations(
         quality = ?quality,
     );
 
-    // ── 10. Sequential loop (per fix #24). ───────────────────────────────
-    let mut completed_tags: usize = 0;
-    let mut final_outcome: Option<ExportRunOutcome> = None;
+    // ── 10. Spawn the per-tag for-loop into a detached tokio task. ───────
+    // The bus task returns to its select! loop after this point so that
+    // CancelExport (and any other command) can be processed mid-export.
+    // The spawned task signals completion via `export_cleanup_tx`; the
+    // bus's select!-arm resets bus-local state.
+    let compositor_for_task = compositor.clone();
+    let export_progress_for_task = export_progress.clone();
+    let cleanup_tx_for_task = export_cleanup_tx.clone();
 
-    'outer: for (i, selection) in selections.iter().enumerate() {
-        // Resolve label + plan via TagSelection (per fix #33).
-        let (label, plan) = match selection {
-            TagSelection::AllClips => (
-                "all-clips".to_string(),
-                project_snapshot.all_clips_compilation_plan(&source_durations),
-            ),
-            TagSelection::Tag { name } => (
-                name.clone(),
-                project_snapshot.compilation_plan_for(name, &source_durations),
-            ),
-        };
+    tokio::spawn(async move {
+        let mut completed_tags: usize = 0;
+        let mut final_outcome: Option<ExportRunOutcome> = None;
 
-        // Empty plan → skip (per fix #26).
-        if plan.entries.is_empty() {
-            tracing::info!(
-                target: "export.lifecycle",
-                event = "export.tag.skipped",
-                selection = %label,
-                reason = "empty_plan",
-            );
-            continue;
-        }
-
-        // Build output path (per fix #31).
-        let output_path = output_folder_path.join(format!(
-            "{} - {}.mp4",
-            sanitize_filename(&label),
-            sanitize_filename(&project_name_trimmed),
-        ));
-
-        // Silently delete prior output (per fix #13).
-        let _ = std::fs::remove_file(&output_path);
-
-        // Update slot for this iteration.
-        {
-            let mut g = export_progress.lock().expect("export_progress poisoned");
-            g.current_tag = Some(label.clone());
-            g.completed_tags = i;
-        }
-
-        tracing::info!(
-            target: "export.lifecycle",
-            event = "export.tag.started",
-            selection = %label,
-            output_path = %output_path.display(),
-        );
-
-        // Build fresh ExportInputs per tag (plan changes per selection).
-        let inputs = video_coach_media::export::ExportInputs {
-            plan,
-            clips_by_id: clips_by_id.clone(),
-            source_paths: source_paths.clone(),
-            recording_paths: recording_paths.clone(),
-            source_durations: source_durations.clone(),
-        };
-
-        let compositor_for_export = compositor.clone();
-        let cancel_for_export = cancel_flag.clone();
-        let output_path_for_export = output_path.clone();
-        let join = tokio::task::spawn_blocking(move || {
-            video_coach_media::export::export_compilation(
-                inputs,
-                &output_path_for_export,
-                resolution,
-                quality,
-                source_volume,
-                commentary_volume,
-                compositor_for_export,
-                cancel_for_export,
-                Box::new(|_progress| {}),
-            )
-        })
-        .await;
-
-        match join {
-            Ok(Ok(summary)) => {
-                tracing::info!(
-                    target: "export.lifecycle",
-                    event = "export.tag.completed",
-                    selection = %label,
-                    frames_pushed = summary.frames_pushed as i64,
-                );
-                completed_tags += 1;
-            }
-            Ok(Err(video_coach_media::export::ExportError::Cancelled)) => {
-                tracing::warn!(
-                    target: "export.lifecycle",
-                    event = "export.tag.failed",
-                    selection = %label,
-                    error = "cancelled",
-                );
+        'outer: for (i, selection) in selections.iter().enumerate() {
+            // Cancel-flag check at the top of each tag iteration: cancel
+            // arriving between tags (e.g. tag 1 finished, cancel before
+            // tag 2 starts) breaks out cleanly without spinning up the
+            // pipeline.
+            if cancel_flag.load(std::sync::atomic::Ordering::Acquire) {
                 tracing::info!(
                     target: "export.lifecycle",
                     event = "export.batch.cancelled",
@@ -2393,83 +2358,193 @@ async fn handle_export_compilations(
                 });
                 break 'outer;
             }
-            Ok(Err(other)) => {
-                let err_str = other.to_string();
-                tracing::warn!(
-                    target: "export.lifecycle",
-                    event = "export.tag.failed",
-                    selection = %label,
-                    error = %err_str,
-                );
-                tracing::warn!(
-                    target: "export.lifecycle",
-                    event = "export.batch.failed",
-                    reason = "tag_failed",
-                    selection = %label,
-                    error = %err_str,
-                );
-                final_outcome = Some(ExportRunOutcome::PartialFailure {
-                    folder: output_folder_path.clone(),
-                    completed: completed_tags,
-                    failed_tag: label.clone(),
-                    error: err_str,
-                });
-                break 'outer;
-            }
-            Err(join_err) => {
-                let err_str = format!("export task panicked: {join_err}");
-                tracing::warn!(
-                    target: "export.lifecycle",
-                    event = "export.tag.failed",
-                    selection = %label,
-                    error = %err_str,
-                );
-                tracing::warn!(
-                    target: "export.lifecycle",
-                    event = "export.batch.failed",
-                    reason = "panic",
-                    selection = %label,
-                    error = %err_str,
-                );
-                final_outcome = Some(ExportRunOutcome::PartialFailure {
-                    folder: output_folder_path.clone(),
-                    completed: completed_tags,
-                    failed_tag: label.clone(),
-                    error: err_str,
-                });
-                break 'outer;
-            }
-        }
-    }
 
-    // ── 11. End-of-batch outcome (per fix #34). ──────────────────────────
-    let outcome = match final_outcome {
-        Some(o) => o,
-        None => {
+            // Resolve label + plan via TagSelection (per fix #33).
+            let (label, plan) = match selection {
+                TagSelection::AllClips => (
+                    "all-clips".to_string(),
+                    project_snapshot.all_clips_compilation_plan(&source_durations),
+                ),
+                TagSelection::Tag { name } => (
+                    name.clone(),
+                    project_snapshot.compilation_plan_for(name, &source_durations),
+                ),
+            };
+
+            // Empty plan → skip (per fix #26).
+            if plan.entries.is_empty() {
+                tracing::info!(
+                    target: "export.lifecycle",
+                    event = "export.tag.skipped",
+                    selection = %label,
+                    reason = "empty_plan",
+                );
+                continue;
+            }
+
+            // Build output path (per fix #31).
+            let output_path = output_folder_path.join(format!(
+                "{} - {}.mp4",
+                sanitize_filename(&label),
+                sanitize_filename(&project_name_trimmed),
+            ));
+
+            // Silently delete prior output (per fix #13).
+            let _ = std::fs::remove_file(&output_path);
+
+            // Update slot for this iteration.
+            {
+                let mut g = export_progress_for_task
+                    .lock()
+                    .expect("export_progress poisoned");
+                g.current_tag = Some(label.clone());
+                g.completed_tags = i;
+            }
+
             tracing::info!(
                 target: "export.lifecycle",
-                event = "export.batch.completed",
-                tag_count = completed_tags as i64,
+                event = "export.tag.started",
+                selection = %label,
+                output_path = %output_path.display(),
             );
-            ExportRunOutcome::SucceededAll {
-                folder: output_folder_path.clone(),
-                tag_count: completed_tags,
+
+            // Build fresh ExportInputs per tag (plan changes per selection).
+            let inputs = video_coach_media::export::ExportInputs {
+                plan,
+                clips_by_id: clips_by_id.clone(),
+                source_paths: source_paths.clone(),
+                recording_paths: recording_paths.clone(),
+                source_durations: source_durations.clone(),
+            };
+
+            let compositor_for_export = compositor_for_task.clone();
+            let cancel_for_export = cancel_flag.clone();
+            let output_path_for_export = output_path.clone();
+            let join = tokio::task::spawn_blocking(move || {
+                video_coach_media::export::export_compilation(
+                    inputs,
+                    &output_path_for_export,
+                    resolution,
+                    quality,
+                    source_volume,
+                    commentary_volume,
+                    compositor_for_export,
+                    cancel_for_export,
+                    Box::new(|_progress| {}),
+                )
+            })
+            .await;
+
+            match join {
+                Ok(Ok(summary)) => {
+                    tracing::info!(
+                        target: "export.lifecycle",
+                        event = "export.tag.completed",
+                        selection = %label,
+                        frames_pushed = summary.frames_pushed as i64,
+                    );
+                    completed_tags += 1;
+                }
+                Ok(Err(video_coach_media::export::ExportError::Cancelled)) => {
+                    tracing::warn!(
+                        target: "export.lifecycle",
+                        event = "export.tag.failed",
+                        selection = %label,
+                        error = "cancelled",
+                    );
+                    tracing::info!(
+                        target: "export.lifecycle",
+                        event = "export.batch.cancelled",
+                        tags_completed = completed_tags as i64,
+                    );
+                    final_outcome = Some(ExportRunOutcome::Cancelled {
+                        folder: output_folder_path.clone(),
+                        completed: completed_tags,
+                    });
+                    break 'outer;
+                }
+                Ok(Err(other)) => {
+                    let err_str = other.to_string();
+                    tracing::warn!(
+                        target: "export.lifecycle",
+                        event = "export.tag.failed",
+                        selection = %label,
+                        error = %err_str,
+                    );
+                    tracing::warn!(
+                        target: "export.lifecycle",
+                        event = "export.batch.failed",
+                        reason = "tag_failed",
+                        selection = %label,
+                        error = %err_str,
+                    );
+                    final_outcome = Some(ExportRunOutcome::PartialFailure {
+                        folder: output_folder_path.clone(),
+                        completed: completed_tags,
+                        failed_tag: label.clone(),
+                        error: err_str,
+                    });
+                    break 'outer;
+                }
+                Err(join_err) => {
+                    let err_str = format!("export task panicked: {join_err}");
+                    tracing::warn!(
+                        target: "export.lifecycle",
+                        event = "export.tag.failed",
+                        selection = %label,
+                        error = %err_str,
+                    );
+                    tracing::warn!(
+                        target: "export.lifecycle",
+                        event = "export.batch.failed",
+                        reason = "panic",
+                        selection = %label,
+                        error = %err_str,
+                    );
+                    final_outcome = Some(ExportRunOutcome::PartialFailure {
+                        folder: output_folder_path.clone(),
+                        completed: completed_tags,
+                        failed_tag: label.clone(),
+                        error: err_str,
+                    });
+                    break 'outer;
+                }
             }
         }
-    };
-    {
-        let mut g = export_progress.lock().expect("export_progress poisoned");
-        g.outcome = outcome;
-        g.current_tag = None;
-        g.completed_tags = completed_tags;
-        g.total_tags = total_tags;
-    }
 
-    // ── 12. Cleanup (per fix #38 — every exit path converges here). ──────
-    *current_export_cancel = None;
-    *current_mode = AppMode::Scanning;
-    write_recording_state(recording_state, current_mode, None);
+        // ── 11. End-of-batch outcome (per fix #34). ──────────────────────
+        let outcome = match final_outcome {
+            Some(o) => o,
+            None => {
+                tracing::info!(
+                    target: "export.lifecycle",
+                    event = "export.batch.completed",
+                    tag_count = completed_tags as i64,
+                );
+                ExportRunOutcome::SucceededAll {
+                    folder: output_folder_path.clone(),
+                    tag_count: completed_tags,
+                }
+            }
+        };
+        {
+            let mut g = export_progress_for_task
+                .lock()
+                .expect("export_progress poisoned");
+            g.outcome = outcome;
+            g.current_tag = None;
+            g.completed_tags = completed_tags;
+            g.total_tags = total_tags;
+        }
 
+        // ── 12. Signal cleanup back to the bus task. ─────────────────────
+        // Bus task's select! arm resets `current_mode` and
+        // `current_export_cancel` (which we can't borrow from here).
+        let _ = cleanup_tx_for_task.send(());
+    });
+
+    // Bus returns to its select! loop immediately. CancelExport (and any
+    // other command) can now be processed while the export task runs.
     CommandReply {
         ok: true,
         error: None,
@@ -3200,6 +3275,7 @@ mod tests {
         let compositor = std::sync::Arc::new(
             video_coach_compositor::Compositor::new_headless().expect("compositor"),
         );
+        let (export_cleanup_tx, _export_cleanup_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let reply = handle_export_compilations(
             vec![TagSelection::AllClips],
@@ -3215,6 +3291,7 @@ mod tests {
             &export_progress,
             &mut current_export_cancel,
             &compositor,
+            &export_cleanup_tx,
         )
         .await;
 
@@ -3250,6 +3327,7 @@ mod tests {
         let compositor = std::sync::Arc::new(
             video_coach_compositor::Compositor::new_headless().expect("compositor"),
         );
+        let (export_cleanup_tx, _export_cleanup_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
 
         let reply = handle_export_compilations(
             vec![TagSelection::AllClips],
@@ -3265,6 +3343,7 @@ mod tests {
             &export_progress,
             &mut current_export_cancel,
             &compositor,
+            &export_cleanup_tx,
         )
         .await;
 
