@@ -681,29 +681,20 @@ struct ContentView: View {
         let filename = "clip-\(clipID).mov"
         let url = recordingsDir.appendingPathComponent(filename)
 
+        // Capture source-time anchor synchronously at R-press. Pause doesn't
+        // move the playhead, so the cached (@Observable) values reflect the
+        // on-screen frame.
+        pendingRecording = PendingRecording(
+            clipID: clipID,
+            filename: filename,
+            sourceIndex: player.playlistPos,
+            startSourceSeconds: player.timePos
+        )
+
         let preferredCameraID = deviceCatalog.selectedCameraID
         let preferredMicID = deviceCatalog.selectedMicID
 
         Task {
-            // One event-pump tick to flush pause / playlist-pos / time-pos
-            // events so the cached @Observable fields reflect the post-pause
-            // state. Without this we may capture a pre-pause prefetch state.
-            await Task.yield()
-
-            // Capture (sourceIndex, startSourceSeconds) from the cached
-            // @Observable fields — the playhead at R-press, anchored before
-            // any subsequent user input moves it.
-            let mappedSourceIndex = player.playlistPos
-            let mappedSourceLocal = player.timePos
-            await MainActor.run {
-                pendingRecording = PendingRecording(
-                    clipID: clipID,
-                    filename: filename,
-                    sourceIndex: mappedSourceIndex,
-                    startSourceSeconds: mappedSourceLocal
-                )
-            }
-
             do {
                 // Lazy configure: the capture session is paused (stopRunning)
                 // between recordings so the indicator light is off while the

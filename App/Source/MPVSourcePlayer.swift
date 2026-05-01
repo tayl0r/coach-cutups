@@ -64,7 +64,7 @@ public final class MPVSourcePlayer {
             ("hwdec", Self.hwdecOption),
             ("prefetch-playlist", "yes"),
             ("keep-open", "yes"),
-            ("keep-open-pause", "no"),
+            ("keep-open-pause", "yes"),
             ("pause", "yes"),
             ("msg-level", "all=warn"),
             ("audio-display", "no"),
@@ -220,11 +220,13 @@ public final class MPVSourcePlayer {
     public func play() {
         var flag: Int32 = 0
         mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
+        isPaused = false  // local truth; pump's pause event will be redundant
     }
 
     public func pause() {
         var flag: Int32 = 1
         mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
+        isPaused = true  // local truth; pump's pause event will be redundant
     }
 
     public func togglePlay() {
@@ -311,9 +313,8 @@ public final class MPVSourcePlayer {
     /// Free the strdup'd argv currently held by `pending`, then clear it.
     /// Idempotent against `pending == nil`.
     private func dropPending() {
-        if var p = pending {
+        if let p = pending {
             for c in p.cstrings { if let c { free(c) } }
-            p.cstrings = []
         }
         pending = nil
     }
