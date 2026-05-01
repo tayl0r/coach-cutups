@@ -20,7 +20,9 @@
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
 use crate::bus::{BusHandle, Command};
-use crate::frame_sink::{ClipListSlot, FrameSlot, PlayerStateSlot, RecordingStateSlot};
+use crate::frame_sink::{
+    ClipListSlot, ExportProgressSlot, FrameSlot, PlayerStateSlot, RecordingStateSlot,
+};
 use crate::last_project;
 use slint::ComponentHandle;
 
@@ -60,8 +62,18 @@ pub fn run(
     // to a Slint model, and pushes via `set_clips`. Held alive for the
     // lifetime of the UI process.
     clip_list: ClipListSlot,
+    // Phase 10 Task 0: export-progress slot. Plumbed through the
+    // signature now so main.rs can wire it; Task 3's UI work hydrates
+    // the export-sheet view from this slot. Task 0 holds the
+    // reference for the lifetime of `run` but does not yet read it
+    // (per the plan's hard scope guardrails).
+    export_progress: ExportProgressSlot,
     startup_project: Option<String>,
 ) -> anyhow::Result<()> {
+    // Hold the slot alive for the lifetime of `run`. Task 3 reads it
+    // in the 30 Hz timer; Task 0 just keeps the reference rooted so
+    // the bus-side writer's Arc clone stays valid.
+    let _export_progress = export_progress;
     let window = MainWindow::new()?;
 
     // Phase 7 Task 4: drive `source-frame` from the shared frame slot at
@@ -104,6 +116,10 @@ pub fn run(
                     // property; sidebar/transport bar conditionals key
                     // off this string.
                     RecordingMode::PreviewClip => "preview_clip",
+                    // Phase 10 Task 0: the export-sheet UI in Task 3
+                    // reads this string to swap to the progress view.
+                    // Match the AppMode serde rename for consistency.
+                    RecordingMode::Exporting => "exporting",
                 };
                 let elapsed = g
                     .recording_started_at_host

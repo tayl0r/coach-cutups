@@ -1,6 +1,7 @@
 mod bus;
 mod cli;
 mod event_layer;
+mod filename;
 mod frame_sink;
 mod last_project;
 mod logging;
@@ -83,6 +84,11 @@ fn main() -> anyhow::Result<()> {
     // #13), UI reader (Task 4's sidebar timer). Task 0 wires the slot
     // through; the bus task receives but doesn't write yet.
     let clip_list = frame_sink::new_clip_list();
+    // Phase 10 Task 0: shared export-progress slot. Bus writer (mode
+    // + outcome transitions), UI reader (Task 3's export-sheet
+    // hydration). Task 0 wires the slot through; bus + UI consumers
+    // arrive in Tasks 2 + 3.
+    let export_progress = frame_sink::new_export_progress();
 
     #[cfg(feature = "media")]
     let frame_mount_factory: bus::FrameMountFactory = {
@@ -129,6 +135,8 @@ fn main() -> anyhow::Result<()> {
         recording_state.clone(),
         #[cfg(feature = "media")]
         clip_list.clone(),
+        #[cfg(feature = "media")]
+        export_progress.clone(),
         #[cfg(feature = "media")]
         fixture_recording_source,
     );
@@ -183,6 +191,7 @@ fn main() -> anyhow::Result<()> {
             player_state,
             recording_state,
             clip_list,
+            export_progress,
             startup_project,
         )?;
     }

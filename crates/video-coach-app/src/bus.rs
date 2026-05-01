@@ -110,6 +110,56 @@ pub enum Command {
     /// — the user re-presses Space to resume). Task 0 lands the command
     /// shape only; Task 3 lands the handler.
     ClosePreview,
+    /// Phase 10. Batch-export the selected tags' compilations into
+    /// `output_folder`. Each `TagSelection` writes one `.mp4`; runs
+    /// sequentially per fix #4 (VideoToolbox saturates on a single
+    /// export). The bus task transitions
+    /// `current_mode = AppMode::Exporting`, loops through selections
+    /// (UI sends them sorted; bus doesn't re-sort), and emits
+    /// `export.batch.started` / `export.tag.started` / `export.tag.
+    /// completed` / `export.batch.completed` events per fix #1.
+    ///
+    /// Phase 10 Task 0 lands only the command shape + a stub handler
+    /// returning "not yet implemented (phase 10 task 2)". Task 2 lands
+    /// the real handler; Task 1 lands the underlying export pipeline.
+    ExportCompilations {
+        selections: Vec<TagSelection>,
+        output_folder: String,
+        resolution: video_coach_core::project::Resolution,
+        quality: video_coach_core::project::Quality,
+        project_name: String,
+    },
+    /// Phase 10. Request cancellation of the in-flight batch export.
+    /// The bus flips its `current_export_cancel` AtomicBool; the export
+    /// driver checks before each frame push, transitions to Null when
+    /// the flag flips, and deletes the partial output. Per fix #6,
+    /// cancel does its best — GStreamer pipelines have no instantaneous
+    /// abort.
+    ///
+    /// Phase 10 Task 0 lands only the command shape + a stub handler
+    /// returning "not yet implemented (phase 10 task 2)".
+    CancelExport,
+}
+
+/// Phase 10 Task 0 (fix #33). Tag selection for `ExportCompilations`.
+/// The UI sends `Vec<TagSelection>` so the synthetic "All Clips" row
+/// can sit alongside real tag names without a magic string overlap
+/// with a real tag literally named "all-clips".
+///
+/// Serializes with serde's internally-tagged shape (`{"kind":
+/// "all_clips"}` / `{"kind": "tag", "name": "basketball"}`) — same
+/// pattern as `SourceConfig`, so the control socket protocol stays
+/// internally consistent.
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum TagSelection {
+    /// The synthetic "All Clips" compilation — every clip in the
+    /// project, sorted by `sort_index`. Resolved by the bus to
+    /// `Project::all_clips_compilation_plan(...)`.
+    AllClips,
+    /// A real tag name. Resolved by the bus to
+    /// `Project::compilation_plan_for(&name, ...)`.
+    Tag { name: String },
 }
 
 /// Phase 8. Mutually-exclusive UI/bus modes. Mirrors v1's
@@ -151,6 +201,16 @@ pub enum AppMode {
     /// Scanning. Serializes as `"preview_clip": "<uuid-string>"` per
     /// serde's snake_case tuple-variant default.
     PreviewClip(uuid::Uuid),
+    /// Phase 10: a batch export is mid-flight. Source player + preview
+    /// pipeline are both inert (preview was closed by the UI before
+    /// dispatching `ExportCompilations`); the export driver owns the
+    /// encoder. State details (current tag, completed/total) ride on
+    /// `ExportProgressSlot` — this variant carries no payload so the
+    /// `Clone` cost stays trivial. Per fix #9, `is_busy` returns true
+    /// for this mode; per fix #22, `OpenClipPreview` /
+    /// `StartClipRecording` / `ExportCompilations` itself all refuse
+    /// while `Exporting`.
+    Exporting,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -237,6 +297,7 @@ pub type FrameMountFactory =
 /// instead of the real platform camera/mic. CI's `record_clip_smoke`
 /// harness passes this so the test runs without webcam permissions.
 /// Production launches leave it `None` and get the platform default.
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_on(
     rt: &tokio::runtime::Handle,
     shutdown_tx: tokio::sync::watch::Sender<bool>,
@@ -244,6 +305,12 @@ pub fn spawn_on(
     #[cfg(feature = "media")] player_state: crate::frame_sink::PlayerStateSlot,
     #[cfg(feature = "media")] recording_state: crate::frame_sink::RecordingStateSlot,
     #[cfg(feature = "media")] clip_list: crate::frame_sink::ClipListSlot,
+    // Phase 10 Task 0 (fix #17 + #34). Shared export-progress state.
+    // Bus writer at mode/outcome transitions; UI reader (30 Hz timer)
+    // drives the export-sheet view (form/progress/summary). Task 0
+    // wires the slot through; Task 2's real
+    // `ExportCompilations` handler writes to it.
+    #[cfg(feature = "media")] export_progress: crate::frame_sink::ExportProgressSlot,
     #[cfg(feature = "media")] fixture_recording_source: Option<std::path::PathBuf>,
 ) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
@@ -319,6 +386,18 @@ pub fn spawn_on(
             video_coach_compositor::Compositor::new_headless().expect("compositor init"),
         );
 
+        // Phase 10 Task 0 (fix #10). Cancel-flag for the in-flight
+        // batch export. Held while `current_mode == Exporting`; set to
+        // true by `Command::CancelExport`; the export driver in
+        // `video-coach-media::export` checks it before each frame
+        // push, transitions to Null on flip, and deletes the partial
+        // output. Initialized to `None` here; Task 1 + Task 2 will
+        // populate / consume it.
+        #[cfg(feature = "media")]
+        let mut current_export_cancel: Option<
+            std::sync::Arc<std::sync::atomic::AtomicBool>,
+        > = None;
+
         while let Some(env) = rx.recv().await {
             let reply = handle(
                 env.command,
@@ -351,9 +430,13 @@ pub fn spawn_on(
                 #[cfg(feature = "media")]
                 &clip_list,
                 #[cfg(feature = "media")]
+                &export_progress,
+                #[cfg(feature = "media")]
                 &mut current_mode,
                 #[cfg(feature = "media")]
                 &mut recording_clip,
+                #[cfg(feature = "media")]
+                &mut current_export_cancel,
                 #[cfg(feature = "media")]
                 fixture_recording_source.as_deref(),
             )
@@ -472,6 +555,11 @@ fn write_clip_list(
             name: c.name.clone(),
             recording_duration: c.recording_duration,
             source_index: c.source_index,
+            // Phase 10 (Task 3 plan's "pick (b)"): UI's tag-aggregation
+            // step for the export sheet runs from this slot, so we
+            // copy `Clip::tags` through. Cheap (a few short Strings
+            // per clip; cloned only at hydration sites).
+            tags: c.tags.clone(),
         })
         .collect();
     let mut g = slot.lock().expect("clip_list poisoned");
@@ -498,17 +586,21 @@ pub(crate) struct RecordingClipInProgress {
     pub events: Vec<video_coach_core::event::CommentaryEvent>,
 }
 
-/// Centralized "is the clip-recording / preview subsystem busy?" check
-/// used by every command that would mutate either. Returns true if the
-/// lower-level `recording` slot OR the higher-level `recording_clip`
-/// slot OR the mode is anywhere outside of `Scanning`. Stops harness
-/// tests + future user inputs from accidentally double-starting (Phase
-/// 8 adversarial-review fix #7) AND stops a recording from kicking off
-/// while a preview is open (Phase 9 fix #22).
+/// Centralized "is the clip-recording / preview / export subsystem
+/// busy?" check used by every command that would mutate any of them.
+/// Returns true if the lower-level `recording` slot OR the higher-level
+/// `recording_clip` slot OR the mode is anywhere outside of `Scanning`.
+/// Stops harness tests + future user inputs from accidentally
+/// double-starting (Phase 8 adversarial-review fix #7), stops a
+/// recording from kicking off while a preview is open (Phase 9 fix
+/// #22), and stops `OpenClipPreview` / `StartClipRecording` /
+/// `ExportCompilations` from kicking off while another export is
+/// in flight (Phase 10 fix #9).
 ///
 /// Phase 9 generalises the Phase 8 `is_recording` helper to cover
-/// `PreviewClip` too; signature takes `&AppMode` since `AppMode`
-/// dropped `Copy` (fix #8).
+/// `PreviewClip`; Phase 10 covers `Exporting` for free via the
+/// `!matches!(_, Scanning)` predicate. Signature takes `&AppMode`
+/// since `AppMode` dropped `Copy` (fix #8).
 #[cfg(feature = "media")]
 fn is_busy(
     recording: &Option<video_coach_media::recording::Recording>,
@@ -550,6 +642,11 @@ fn write_recording_state(
         AppMode::RecordingStarting => RecordingMode::RecordingStarting,
         AppMode::Recording => RecordingMode::Recording,
         AppMode::PreviewClip(_) => RecordingMode::PreviewClip,
+        // Phase 10 Task 0 — UI's 30 Hz timer reads this to swap the
+        // export-sheet between form / progress / summary views; the
+        // `current_tag` / `completed_tags` state rides on
+        // `ExportProgressSlot`, not here.
+        AppMode::Exporting => RecordingMode::Exporting,
     };
     let mut g = slot.lock().expect("recording_state poisoned");
     *g = RecordingStateSlotData {
@@ -580,8 +677,12 @@ async fn handle(
     #[cfg(feature = "media")] player_state: &crate::frame_sink::PlayerStateSlot,
     #[cfg(feature = "media")] recording_state: &crate::frame_sink::RecordingStateSlot,
     #[cfg(feature = "media")] clip_list: &crate::frame_sink::ClipListSlot,
+    #[cfg(feature = "media")] export_progress: &crate::frame_sink::ExportProgressSlot,
     #[cfg(feature = "media")] current_mode: &mut AppMode,
     #[cfg(feature = "media")] recording_clip: &mut Option<RecordingClipInProgress>,
+    #[cfg(feature = "media")] current_export_cancel: &mut Option<
+        std::sync::Arc<std::sync::atomic::AtomicBool>,
+    >,
     #[cfg(feature = "media")] fixture_recording_source: Option<&std::path::Path>,
 ) -> CommandReply {
     match cmd {
@@ -1916,6 +2017,44 @@ async fn handle(
                 }
             }
         }
+        Command::ExportCompilations {
+            selections,
+            output_folder,
+            resolution,
+            quality,
+            project_name,
+        } => {
+            // Phase 10 Task 0: command shape only. Task 2 lands the
+            // real handler that walks `selections`, transitions
+            // `current_mode` to `Exporting`, populates
+            // `current_export_cancel`, writes to `export_progress`,
+            // and dispatches to the export pipeline (Task 1).
+            let _ = (selections, output_folder, resolution, quality, project_name);
+            #[cfg(feature = "media")]
+            {
+                // Touch the new bus-task state so the unused-vars lint
+                // stays quiet until Task 2 lands the real handler that
+                // actually mutates them.
+                let _ = (&export_progress, &current_export_cancel);
+            }
+            CommandReply {
+                ok: false,
+                error: Some("not yet implemented (phase 10 task 2)".into()),
+            }
+        }
+        Command::CancelExport => {
+            // Phase 10 Task 0: command shape only. Task 2 lands the
+            // real handler that flips `current_export_cancel` to
+            // signal the in-flight export driver.
+            #[cfg(feature = "media")]
+            {
+                let _ = (&export_progress, &current_export_cancel);
+            }
+            CommandReply {
+                ok: false,
+                error: Some("not yet implemented (phase 10 task 2)".into()),
+            }
+        }
     }
 }
 
@@ -2394,6 +2533,7 @@ mod tests {
             name: "stale".into(),
             recording_duration: 0.0,
             source_index: 0,
+            tags: Vec::new(),
         });
         let empty: Vec<video_coach_core::project::Clip> = Vec::new();
         write_clip_list(&slot, &empty);
@@ -2417,6 +2557,177 @@ mod tests {
         let g = slot.lock().unwrap();
         assert_eq!(g.len(), 2);
         assert_eq!(g[1].name, "1-00:00:30");
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn write_clip_list_propagates_tags_to_summaries() {
+        // Phase 10 Task 0 (Task 3 plan's "pick (b)"): the export-sheet
+        // UI's tag-aggregation step runs from `ClipListSlot`, so
+        // `write_clip_list` must copy `Clip::tags` through to
+        // `ClipSummary::tags`. This guards against an accidental
+        // regression where the field gets defaulted to empty.
+        let slot = crate::frame_sink::new_clip_list();
+        let mut clip = make_clip("1-00:00:00", 1.5, 0);
+        clip.tags = vec!["basketball".into(), "drills".into()];
+        write_clip_list(&slot, &[clip]);
+        let g = slot.lock().unwrap();
+        assert_eq!(g.len(), 1);
+        assert_eq!(g[0].tags, vec!["basketball", "drills"]);
+    }
+
+    #[test]
+    fn export_compilations_serde_roundtrips() {
+        // Phase 10 Task 0: ExportCompilations carries Vec<TagSelection>,
+        // a folder path, the persisted Resolution + Quality enums, and
+        // the project name (used for filename composition by the bus's
+        // `sanitize_filename` helper).
+        let cmd = Command::ExportCompilations {
+            selections: vec![
+                TagSelection::AllClips,
+                TagSelection::Tag {
+                    name: "basketball".into(),
+                },
+            ],
+            output_folder: "/Users/x/Exports".into(),
+            resolution: video_coach_core::project::Resolution::R1080,
+            quality: video_coach_core::project::Quality::High,
+            project_name: "Practice 2026-04-30".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "export_compilations");
+        assert_eq!(v["output_folder"], "/Users/x/Exports");
+        assert_eq!(v["project_name"], "Practice 2026-04-30");
+        assert_eq!(v["resolution"], "r1080");
+        assert_eq!(v["quality"], "high");
+        assert_eq!(v["selections"][0]["kind"], "all_clips");
+        assert_eq!(v["selections"][1]["kind"], "tag");
+        assert_eq!(v["selections"][1]["name"], "basketball");
+
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                selections,
+                output_folder,
+                resolution,
+                quality,
+                project_name,
+            } => {
+                assert_eq!(selections.len(), 2);
+                assert_eq!(selections[0], TagSelection::AllClips);
+                assert_eq!(
+                    selections[1],
+                    TagSelection::Tag {
+                        name: "basketball".into()
+                    }
+                );
+                assert_eq!(output_folder, "/Users/x/Exports");
+                assert_eq!(resolution, video_coach_core::project::Resolution::R1080);
+                assert_eq!(quality, video_coach_core::project::Quality::High);
+                assert_eq!(project_name, "Practice 2026-04-30");
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn cancel_export_serializes_to_bare_tag() {
+        let v = serde_json::to_value(&Command::CancelExport).unwrap();
+        assert_eq!(v, serde_json::json!({"cmd": "cancel_export"}));
+        let cmd: Command =
+            serde_json::from_value(serde_json::json!({"cmd": "cancel_export"})).unwrap();
+        assert!(matches!(cmd, Command::CancelExport));
+    }
+
+    #[test]
+    fn app_mode_exporting_serializes_with_snake_case() {
+        // Phase 10 Task 0: the new `Exporting` AppMode variant rides
+        // the same snake_case rename as Phase 8/9's unit variants.
+        assert_eq!(
+            serde_json::to_value(AppMode::Exporting).unwrap(),
+            serde_json::Value::String("exporting".into()),
+        );
+        let m: AppMode = serde_json::from_value(serde_json::Value::String("exporting".into()))
+            .expect("snake_case roundtrip");
+        assert_eq!(m, AppMode::Exporting);
+    }
+
+    #[test]
+    fn tag_selection_all_clips_serializes() {
+        // Phase 10 Task 0 (fix #33): TagSelection uses an internally-
+        // tagged kind discriminant so the synthetic "All Clips" row
+        // can sit alongside real tag names without a magic-string
+        // collision.
+        let v = serde_json::to_value(&TagSelection::AllClips).unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "all_clips"}));
+        let s: TagSelection =
+            serde_json::from_value(serde_json::json!({"kind": "all_clips"})).unwrap();
+        assert_eq!(s, TagSelection::AllClips);
+    }
+
+    #[test]
+    fn tag_selection_tag_with_name_serializes() {
+        let v = serde_json::to_value(&TagSelection::Tag {
+            name: "basketball".into(),
+        })
+        .unwrap();
+        assert_eq!(v, serde_json::json!({"kind": "tag", "name": "basketball"}));
+        let s: TagSelection =
+            serde_json::from_value(serde_json::json!({"kind": "tag", "name": "basketball"}))
+                .unwrap();
+        assert_eq!(
+            s,
+            TagSelection::Tag {
+                name: "basketball".into()
+            }
+        );
+    }
+
+    #[test]
+    fn tag_selection_round_trips_through_command() {
+        // Phase 10 Task 0: a full TagSelection round-trip via the
+        // outer Command serde shape — guards against accidental
+        // re-tagging of the inner enum when nested.
+        let cmd = Command::ExportCompilations {
+            selections: vec![
+                TagSelection::Tag {
+                    name: "drills".into(),
+                },
+                TagSelection::AllClips,
+                TagSelection::Tag {
+                    name: "shooting".into(),
+                },
+            ],
+            output_folder: "/tmp/exports".into(),
+            resolution: video_coach_core::project::Resolution::Source,
+            quality: video_coach_core::project::Quality::Low,
+            project_name: "Test".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let cmd2: Command = serde_json::from_str(&json).unwrap();
+        match (cmd, cmd2) {
+            (
+                Command::ExportCompilations { selections: a, .. },
+                Command::ExportCompilations { selections: b, .. },
+            ) => {
+                assert_eq!(a, b);
+                assert_eq!(a.len(), 3);
+                assert_eq!(
+                    a[0],
+                    TagSelection::Tag {
+                        name: "drills".into()
+                    }
+                );
+                assert_eq!(a[1], TagSelection::AllClips);
+                assert_eq!(
+                    a[2],
+                    TagSelection::Tag {
+                        name: "shooting".into()
+                    }
+                );
+            }
+            _ => panic!("expected ExportCompilations both ways"),
+        }
     }
 
     #[test]

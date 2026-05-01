@@ -35,6 +35,13 @@ const FORWARDED_TARGETS: &[&str] = &[
     // event name only, not target) can't collide with `recording.*` or
     // `clip_recording.*`.
     "clip_preview.lifecycle",
+    // Phase 10 — batch export lifecycle (export.batch.started/completed/
+    // failed/cancelled, export.tag.started/completed/failed/skipped,
+    // export.frame_progress). Per adversarial-review fix #1, every Phase
+    // 10 event names under `export.*` and rides this dedicated target so
+    // the harness's wait_for_event (matching by event name only) can't
+    // collide with `recording.*` / `clip_preview.*` / earlier targets.
+    "export.lifecycle",
 ];
 
 #[cfg(feature = "control-socket")]

@@ -226,7 +226,37 @@ docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
 - [x] Task 7: Closeout — appended to plan file; CI green on all 4 jobs.
 
 
-## Phase 10+ — pending
+## Phase 10 — export sheet UI + batch compilation export
+Plan: docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
+
+- [x] Task 0: Preflight — Command shapes, AppMode::Exporting,
+      ExportProgressSlot, TagSelection, sanitize_filename helper,
+      FORWARDED_TARGETS export.lifecycle (commit 3dab92f)
+      TagSelection enum (per fix #33) + ExportCompilations / CancelExport
+      command shapes + stub handlers (per fix #1) returning "not yet
+      implemented (phase 10 task 2)". AppMode::Exporting variant (Clone,
+      no payload per fix #9; is_busy returns true via the existing
+      !matches!(_, Scanning) predicate). RecordingMode::Exporting mirror
+      in frame_sink.rs + write_recording_state mapping. FORWARDED_TARGETS
+      gains "export.lifecycle" (per fix #1). ExportRunOutcome four-state
+      enum + ExportProgressSlotData + ExportProgressSlot threaded
+      through bus::spawn_on, ui::run, main.rs (per fix #17 + #34).
+      current_export_cancel: Option<Arc<AtomicBool>> field on bus task
+      initialized None (per fix #10) — Tasks 1+2 will wire usage.
+      sanitize_filename Windows-safe helper (per fix #31) with 16 unit
+      tests covering illegal-chars / reserved-names / empty-fallback /
+      unicode passthrough. ClipSummary extended with tags: Vec<String>
+      so the UI's tag-aggregation step can run from the slot (per Task
+      3 plan's pick-(b)). Six new bus serde tests covering Command +
+      TagSelection + AppMode shape.
+- [ ] Task 1: Export pipeline (crates/video-coach-media/src/export.rs)
+- [ ] Task 2: Bus wiring — ExportCompilations / CancelExport handlers
+- [ ] Task 3: UI — Slint export-sheet modal
+- [ ] Task 4: Harness E2E — record + export + verify
+- [ ] Task 5: N-frame parity test (compose_entry_frame determinism)
+- [ ] Task 6: Closeout
+
+
+## Phase 11+ — pending
 Per the design doc:
-  Phase 10 Export sheet UI
   Phase 11 Polish, packaging, cross-platform CI green

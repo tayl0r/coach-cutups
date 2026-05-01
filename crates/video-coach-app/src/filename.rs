@@ -1,0 +1,215 @@
+// Phase 10 Task 0 lands the helper + tests; Task 2 wires the call site
+// in `bus::handle` for `Command::ExportCompilations`. Until then the
+// helper has no production caller, only tests — hence the dead_code
+// allow at the module level.
+#![allow(dead_code)]
+
+//! Phase 10 Task 0 (fix #31). Windows-safe filename sanitization helper
+//! used by the export bus handler when composing output filenames from
+//! tag labels and project names.
+//!
+//! The bus turns `<output_folder>/<sanitize(label)> -
+//! <sanitize(project_name)>.mp4` into a write target. macOS and Linux
+//! tolerate most non-NUL bytes, but Windows rejects nine specific
+//! characters (`/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`) and treats a
+//! short list of names (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`,
+//! `LPT1`–`LPT9`) as devices regardless of extension. Trailing dots and
+//! whitespace also confuse Explorer + DOS-era APIs.
+//!
+//! Project files travel between platforms (we ship a Mac-built `.zip`
+//! that someone double-clicks on Windows), so the bus sanitizes
+//! aggressively — even on macOS-only builds — to keep batch outputs
+//! portable.
+
+/// Sanitize a string for use as a filename component (no extension).
+///
+/// Rules:
+/// - Replace `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|` with `-`.
+/// - Trim leading/trailing whitespace and dots.
+/// - If the result (case-insensitive) matches a Windows reserved name
+///   (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`), prefix
+///   with `_`.
+/// - If the result is empty after trimming, return `"untitled"`.
+pub fn sanitize_filename(s: &str) -> String {
+    // 1. Replace illegal chars.
+    let replaced: String = s
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            _ => c,
+        })
+        .collect();
+
+    // 2. Trim whitespace + dots from both ends.
+    let trimmed = replaced
+        .trim_matches(|c: char| c.is_whitespace() || c == '.')
+        .to_string();
+
+    // 3. Empty → fallback.
+    if trimmed.is_empty() {
+        return "untitled".to_string();
+    }
+
+    // 4. Windows reserved-name guard. Compare case-insensitively against
+    //    the bare name (no extension) — but our caller passes us the
+    //    label/project component WITHOUT an extension, so the entire
+    //    trimmed string is the candidate.
+    if is_windows_reserved(&trimmed) {
+        return format!("_{trimmed}");
+    }
+
+    trimmed
+}
+
+fn is_windows_reserved(s: &str) -> bool {
+    let upper = s.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passes_through_simple_label() {
+        assert_eq!(sanitize_filename("basketball"), "basketball");
+    }
+
+    #[test]
+    fn replaces_illegal_chars_with_dash() {
+        // Each Windows-illegal byte becomes a single `-`. Note `:` is
+        // legal on macOS HFS+ Finder but NOT on the underlying APFS or
+        // when copied to NTFS, so we replace it everywhere.
+        assert_eq!(
+            sanitize_filename("a/b\\c:d*e?f\"g<h>i|j"),
+            "a-b-c-d-e-f-g-h-i-j"
+        );
+    }
+
+    #[test]
+    fn trims_leading_and_trailing_whitespace() {
+        assert_eq!(sanitize_filename("  hello  "), "hello");
+        assert_eq!(sanitize_filename("\thello\n"), "hello");
+    }
+
+    #[test]
+    fn trims_leading_and_trailing_dots() {
+        assert_eq!(sanitize_filename("...hello..."), "hello");
+        assert_eq!(sanitize_filename(".hidden."), "hidden");
+    }
+
+    #[test]
+    fn trims_mixed_whitespace_and_dots() {
+        assert_eq!(sanitize_filename(" . hello . "), "hello");
+    }
+
+    #[test]
+    fn empty_input_falls_back_to_untitled() {
+        assert_eq!(sanitize_filename(""), "untitled");
+    }
+
+    #[test]
+    fn whitespace_only_falls_back_to_untitled() {
+        assert_eq!(sanitize_filename("   "), "untitled");
+    }
+
+    #[test]
+    fn dots_only_falls_back_to_untitled() {
+        assert_eq!(sanitize_filename("..."), "untitled");
+    }
+
+    #[test]
+    fn illegal_chars_only_does_not_collapse_to_untitled() {
+        // `/` becomes `-`; the result is "-----" which is non-empty
+        // and not whitespace/dots. We leave it alone.
+        assert_eq!(sanitize_filename("/////"), "-----");
+    }
+
+    #[test]
+    fn windows_reserved_con_gets_underscore_prefix() {
+        assert_eq!(sanitize_filename("CON"), "_CON");
+    }
+
+    #[test]
+    fn windows_reserved_lowercase_con_gets_underscore_prefix() {
+        // Reserved-name comparison is case-insensitive.
+        assert_eq!(sanitize_filename("con"), "_con");
+    }
+
+    #[test]
+    fn windows_reserved_mixed_case_aux_gets_underscore_prefix() {
+        assert_eq!(sanitize_filename("Aux"), "_Aux");
+    }
+
+    #[test]
+    fn windows_reserved_com1_through_com9_get_underscore_prefix() {
+        for n in 1..=9 {
+            let name = format!("COM{n}");
+            assert_eq!(sanitize_filename(&name), format!("_{name}"));
+        }
+    }
+
+    #[test]
+    fn windows_reserved_lpt1_through_lpt9_get_underscore_prefix() {
+        for n in 1..=9 {
+            let name = format!("LPT{n}");
+            assert_eq!(sanitize_filename(&name), format!("_{name}"));
+        }
+    }
+
+    #[test]
+    fn non_reserved_com_passes_through() {
+        // COM10 / COM0 / COMx are NOT reserved — only COM1..=COM9.
+        assert_eq!(sanitize_filename("COM10"), "COM10");
+        assert_eq!(sanitize_filename("COM0"), "COM0");
+        assert_eq!(sanitize_filename("COMA"), "COMA");
+    }
+
+    #[test]
+    fn reserved_name_with_trailing_dot_still_caught() {
+        // Trim runs BEFORE the reserved-name check, so "CON." → "CON" → "_CON".
+        // This matches Windows' behavior: a trailing dot doesn't escape the
+        // device-name treatment.
+        assert_eq!(sanitize_filename("CON."), "_CON");
+    }
+
+    #[test]
+    fn unicode_passes_through_unchanged() {
+        // Japanese + emoji are valid on every modern filesystem we ship
+        // to (APFS, NTFS, ext4, exFAT). Don't strip them.
+        assert_eq!(sanitize_filename("バスケ"), "バスケ");
+        assert_eq!(sanitize_filename("clip-🏀"), "clip-🏀");
+    }
+
+    #[test]
+    fn realistic_tag_with_illegal_path_separator() {
+        // A user types "drills/3pt" as a tag name; the bus sanitizes
+        // before joining the output_folder. The slash mustn't escape
+        // into the path.
+        assert_eq!(sanitize_filename("drills/3pt"), "drills-3pt");
+    }
+}

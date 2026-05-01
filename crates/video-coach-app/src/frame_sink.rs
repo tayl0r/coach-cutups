@@ -24,6 +24,7 @@
 
 #![allow(dead_code)] // referenced by ui::run when feature = "media"
 
+use std::path::PathBuf;
 #[cfg(any(feature = "media", test))]
 use std::sync::atomic::Ordering;
 use std::sync::atomic::{AtomicBool, AtomicU64};
@@ -90,12 +91,19 @@ pub struct RecordingStateSlotData {
 /// mirror only needs to distinguish "is the REC indicator visible" vs.
 /// "is the preview transport visible"; the bus task is the source of
 /// truth for which clip is in preview, so the mirror carries no UUID.
+///
+/// Phase 10: gains `Exporting`. Per the plan's fix #9, `is_busy`
+/// generalises to cover this mode too; the export sheet UI keys off it
+/// to swap between the form view and the in-progress view. State
+/// details (current tag, completed/total) ride on `ExportProgressSlot`,
+/// not this mirror.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordingMode {
     Scanning,
     RecordingStarting,
     Recording,
     PreviewClip,
+    Exporting,
 }
 
 impl Default for RecordingStateSlotData {
@@ -117,12 +125,18 @@ pub fn new_recording_state() -> RecordingStateSlot {
 /// sidebar list. The bus task hydrates `Vec<ClipSummary>` on
 /// OpenProject / NewProject / StopClipRecording (per fix #13). The UI
 /// reads the slot in its 30 Hz timer and converts to the Slint model.
+///
+/// Phase 10 (per the plan's Task 3 "pick (b)"): `tags` is included so
+/// the UI's tag-aggregation step (export-sheet's tag list) can run
+/// directly off the slot, without re-reading project.json or
+/// round-tripping the bus. Mirrors the order of `Clip::tags`.
 #[derive(Debug, Clone)]
 pub struct ClipSummary {
     pub id: uuid::Uuid,
     pub name: String,
     pub recording_duration: f64,
     pub source_index: usize,
+    pub tags: Vec<String>,
 }
 
 /// Shared list of clip summaries for the sidebar. Same shape as
@@ -131,6 +145,80 @@ pub type ClipListSlot = Arc<Mutex<Vec<ClipSummary>>>;
 
 pub fn new_clip_list() -> ClipListSlot {
     Arc::new(Mutex::new(Vec::new()))
+}
+
+/// Phase 10 Task 0 (fix #17 + #34). Outcome of a batch export run, as
+/// observed by the UI. Four-state: nothing has happened (`None`), an
+/// export is mid-flight (`InProgress`), the run finished one of three
+/// ways (`SucceededAll`, `PartialFailure`, `Cancelled`).
+///
+/// The UI reads this slot in its 30 Hz timer to drive the export-sheet
+/// view: `None` → form, `InProgress` → progress view, terminal states
+/// → summary view (success/failure/cancelled banner). The bus is the
+/// sole writer; transitions are linear and only flow forward through
+/// the run before resetting to `None` on the user's "Done" click in
+/// Task 3 (next state cycle).
+///
+/// The `folder` PathBuf on terminal states lets the UI's "Reveal in
+/// Finder" button know where to point — we capture it here so a later
+/// call to a different export can't overwrite it before the user
+/// dismisses the summary.
+#[derive(Debug, Clone, Default)]
+pub enum ExportRunOutcome {
+    /// No export has run this session, or the user dismissed a
+    /// previous summary. The export-sheet shows the form.
+    #[default]
+    None,
+    /// A batch export is mid-flight. UI shows the progress view; the
+    /// `current_tag` / `completed_tags` / `total_tags` fields on the
+    /// surrounding `ExportProgressSlotData` carry the spinner text.
+    InProgress,
+    /// Every selected tag's compilation rendered successfully. UI shows
+    /// the success summary with `tag_count` rendered files.
+    SucceededAll { folder: PathBuf, tag_count: usize },
+    /// One tag's render failed; remaining tags were skipped. UI shows
+    /// the partial-failure summary, naming the failing tag and showing
+    /// the error string.
+    PartialFailure {
+        folder: PathBuf,
+        completed: usize,
+        failed_tag: String,
+        error: String,
+    },
+    /// User clicked Cancel mid-export. The currently-rendering tag's
+    /// partial output was deleted; tags rendered before that one stay
+    /// on disk. UI shows the cancellation summary.
+    Cancelled { folder: PathBuf, completed: usize },
+}
+
+/// Shared state for the export-sheet UI. Bus writer (mode + outcome
+/// transitions), UI reader (30 Hz timer, drives the export-sheet view).
+///
+/// Mirrors the Phase 9 `RecordingStateSlot` pattern: the bus owns
+/// transitions, the UI observes. Lock duration is short — read +
+/// `clone()` of the small enum + a few `usize`/`Option<String>` fields,
+/// no I/O or window calls under the lock.
+#[derive(Debug, Clone, Default)]
+pub struct ExportProgressSlotData {
+    /// Where the run is in its life cycle. See `ExportRunOutcome`.
+    pub outcome: ExportRunOutcome,
+    /// `Some(tag)` while `outcome == InProgress`; `None` otherwise.
+    /// Carries the current tag's display label (`"all-clips"` for the
+    /// synthetic row, otherwise the tag name).
+    pub current_tag: Option<String>,
+    /// Running count of completed tags. Also valid during `InProgress`
+    /// (set to N when the (N+1)-th tag begins rendering).
+    pub completed_tags: usize,
+    /// Total tags in the batch. Set when the run starts; held through
+    /// terminal states so the summary view can show "5 of 5
+    /// rendered".
+    pub total_tags: usize,
+}
+
+pub type ExportProgressSlot = Arc<Mutex<ExportProgressSlotData>>;
+
+pub fn new_export_progress() -> ExportProgressSlot {
+    Arc::new(Mutex::new(ExportProgressSlotData::default()))
 }
 
 /// Phase 9 (fix #3 + #26). Atomic handles exposed by a mounted FrameSink.
@@ -271,6 +359,7 @@ mod tests {
             name: "1-00:00:00".into(),
             recording_duration: 1.5,
             source_index: 0,
+            tags: vec!["basketball".into(), "drills".into()],
         };
         slot.lock().unwrap().push(summary.clone());
         let cloned: Vec<ClipSummary> = slot.lock().unwrap().clone();
@@ -279,9 +368,22 @@ mod tests {
         assert_eq!(cloned[0].name, "1-00:00:00");
         assert!((cloned[0].recording_duration - 1.5).abs() < f64::EPSILON);
         assert_eq!(cloned[0].source_index, 0);
+        assert_eq!(cloned[0].tags, vec!["basketball", "drills"]);
         // Mutate the slot; the cloned vector is unaffected.
         slot.lock().unwrap().clear();
         assert_eq!(cloned.len(), 1);
+    }
+
+    #[test]
+    fn export_progress_slot_defaults_to_none_outcome() {
+        // Phase 10 Task 0 (fix #17). Fresh slot is the form-view state:
+        // outcome=None, no current tag, zero counts.
+        let slot = new_export_progress();
+        let g = slot.lock().unwrap();
+        assert!(matches!(g.outcome, ExportRunOutcome::None));
+        assert!(g.current_tag.is_none());
+        assert_eq!(g.completed_tags, 0);
+        assert_eq!(g.total_tags, 0);
     }
 
     #[test]
