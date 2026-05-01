@@ -10,7 +10,7 @@ license.workspace = true
 # also pulls in video-coach-compositor (and transitively wgpu). Phase 9
 # Task 2 adds video-coach-core (Clip, playback_segments, source_time_at,
 # visible_strokes) which the preview pipeline needs.
-media = ["dep:video-coach-compositor", "dep:video-coach-core"]
+media = ["dep:video-coach-compositor", "dep:video-coach-core", "dep:uuid"]
 
 [dependencies]
 gstreamer = "0.23"
@@ -27,6 +27,10 @@ video-coach-compositor = { path = "../video-coach-compositor", optional = true }
 # + source_time_at + visible_strokes. Optional + gated by `media` so the
 # no-media build stays free of the compositor/wgpu transitive deps.
 video-coach-core = { path = "../video-coach-core", optional = true }
+# Phase 10 Task 1: the export module's public API exposes `HashMap<Uuid, _>`
+# (`recording_paths`) so we need uuid as a non-dev dep when `media` is on.
+# Optional so non-media builds stay lean.
+uuid = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile = "3"

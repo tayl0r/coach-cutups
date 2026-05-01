@@ -2,6 +2,9 @@
 
 #[cfg(feature = "media")]
 pub mod compose;
+// Phase 10 Task 1. Multi-source compilation export pipeline.
+#[cfg(feature = "media")]
+pub mod export;
 pub mod fixture_source;
 #[cfg(feature = "media")]
 pub mod platform_source;
