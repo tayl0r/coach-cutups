@@ -7,6 +7,9 @@ options:
 packages:
   VideoCoachCore:
     path: VideoCoachCore
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit
+    from: 0.39.0
 targets:
   VideoCoach:
     type: application
@@ -15,6 +18,8 @@ targets:
       - App
     dependencies:
       - package: VideoCoachCore
+      - package: MPVKit
+        product: MPVKit
     info:
       path: App/Info.plist
       properties:
