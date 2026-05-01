@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AppKit  // NSOpenGLContext for attachRenderGL (Task 2.1)
 import Metal
 import QuartzCore
 import Libmpv  // module name confirmed in Phase 1 (NOT "MPVKit"; MPVKit's modulemap names the umbrella module Libmpv)
@@ -352,6 +353,68 @@ public final class MPVSourcePlayer {
             }
             return r
         }
+        guard rc >= 0, renderContext != nil else {
+            throw MPVSourcePlayerError.renderContextFailed(code: Int(rc))
+        }
+    }
+
+    /// GL render-context attach — parallel to `attachRender()` (SW path).
+    /// The SW path remains as the safe fallback (Phase 5); Phase 3 wires this
+    /// new path into the production view. Unreferenced for now.
+    ///
+    /// `glContext` MUST be made current on this thread before calling
+    /// `mpv_render_context_create`: create() invokes `getProcAddress`
+    /// synchronously, and CGL's resolver requires a current context. After
+    /// create() returns, we clear it on this thread so the CVDisplayLink
+    /// render thread can acquire it for subsequent renders. Leaving the
+    /// context current on main is what causes CGL "context already current
+    /// on another thread" fatals on some drivers, so we always clear —
+    /// even on failure.
+    public func attachRenderGL(
+        glContext: NSOpenGLContext,
+        getProcAddress: @escaping @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> UnsafeMutableRawPointer?
+    ) throws {
+        renderLock.lock(); defer { renderLock.unlock() }
+        guard renderContext == nil else { throw MPVSourcePlayerError.alreadyAttached }
+
+        // GL context MUST be current on this thread before mpv_render_context_create —
+        // create() calls get_proc_address synchronously, and CGL's resolver requires a
+        // current context. After create() returns we clear the context on this thread
+        // so the CVDisplayLink render thread can make it current safely.
+        glContext.makeCurrentContext()
+
+        var apiTypeBuf = Array("opengl".utf8CString)
+        var advancedControl: Int32 = 0  // keep simple per render.h "Threading" warning
+
+        let rc: CInt = apiTypeBuf.withUnsafeMutableBufferPointer { apiBuf -> CInt in
+            var glInit = mpv_opengl_init_params(
+                get_proc_address: getProcAddress,
+                get_proc_address_ctx: nil
+            )
+            return withUnsafeMutablePointer(to: &glInit) { glInitPtr -> CInt in
+                var params = [
+                    mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE,
+                                     data: UnsafeMutableRawPointer(apiBuf.baseAddress)),
+                    mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
+                                     data: UnsafeMutableRawPointer(glInitPtr)),
+                    mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL,
+                                     data: withUnsafeMutableBytes(of: &advancedControl) { $0.baseAddress }),
+                    mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
+                ]
+                var ctx: OpaquePointer?
+                let r = params.withUnsafeMutableBufferPointer {
+                    mpv_render_context_create(&ctx, handle, $0.baseAddress)
+                }
+                if r >= 0, let ctx { self.renderContext = ctx }
+                return r
+            }
+        }
+
+        // Always clear, even on failure — the context is "owned" by the render
+        // thread from this point on. Leaving it current on main is what causes
+        // CGL "context already current on another thread" fatals on some drivers.
+        NSOpenGLContext.clearCurrentContext()
+
         guard rc >= 0, renderContext != nil else {
             throw MPVSourcePlayerError.renderContextFailed(code: Int(rc))
         }
