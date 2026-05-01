@@ -413,7 +413,15 @@ own SHIPPED line + CI run id once green.
         (Fix #5), 0.5%-delta single gate (Fix #6); resets progress at
         top of each tag iteration; snaps to (1.0, (i+1)/total) after
         Ok(Ok(_)) before completed_tags += 1 (Fix #4).
-  - [ ] Task 1: Slint progress bar + ui.rs hydration
+  - [x] Task 1: Slint progress bar + ui.rs hydration (commit 44c3bc5)
+        Adds export-current-tag-progress + export-batch-progress float
+        properties to main.slint; replaces InProgress static "(N of M)"
+        Text with "(N of M) — XX%" using
+        (root.export-batch-progress * 100).round() (Fix #9 method form)
+        plus a 200ms eased horizontal Rectangle progress bar bound to
+        batch_progress; extends ui.rs 10-tuple to 12, hydrates per-arm
+        defaults explicitly (Fix #8: None=(0,0), InProgress=slot,
+        SucceededAll=(1,1), PartialFailure=slot, Cancelled=slot).
   - [ ] Task 2: Closeout — Plan #2 SHIPPED
 - [ ] Plan #3: source/commentary audio mix in export + preview
 - [ ] Plan #4: freeze-segment compose caching
