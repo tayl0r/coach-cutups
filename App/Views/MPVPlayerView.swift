@@ -51,6 +51,16 @@ final class MPVRenderingNSView: NSView {
         updateDrawableSize()
     }
 
+    override var acceptsFirstResponder: Bool { true }
+
+    override func mouseDown(with event: NSEvent) {
+        // Steal first-responder status on click so a TextField currently
+        // holding focus releases. KeyCommandView sits on top with
+        // hitTest returning nil, so the click falls through to here.
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
+    }
+
     private func updateDrawableSize() {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
         metalLayer.drawableSize = CGSize(
