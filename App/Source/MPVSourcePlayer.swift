@@ -194,6 +194,78 @@ public final class MPVSourcePlayer {
         }
     }
 
+    // MARK: - Skip primitive (Task 3.6)
+
+    public func seek(
+        playlistPos targetPos: Int,
+        timeSeconds targetTime: Double,
+        exact: Bool,
+        completion: @escaping @MainActor () -> Void
+    ) {
+        // Single-slot pending model: SkipCoordinator guarantees only one
+        // seek in flight at a time, so we never need to track more than
+        // one pending. Any prior pending entry was either fired (and would
+        // have caused SkipCoordinator to issue this new seek) or was
+        // dropped via bumpGeneration — either way it's gone here.
+        pending = nil
+
+        if targetPos == playlistPos {
+            let flags = exact ? "absolute+exact" : "absolute+keyframes"
+            issueAsync(
+                args: ["seek", String(targetTime), flags],
+                completion: completion
+            )
+        } else {
+            guard playlistPaths.indices.contains(targetPos) else {
+                // Defensive: out-of-range playlist pos. Fire completion so
+                // SkipCoordinator advances; the next user input will recover.
+                Task { @MainActor in completion() }
+                return
+            }
+            issueAsync(
+                args: ["loadfile", playlistPaths[targetPos], "replace", "0", "start=\(targetTime)"],
+                completion: completion
+            )
+        }
+    }
+
+    private func issueAsync(
+        args: [String],
+        completion: @escaping @MainActor () -> Void
+    ) {
+        let id = nextReplyID
+        nextReplyID &+= 1
+
+        // strdup each arg; ownership transfers to the PendingSeek struct,
+        // which holds them until MPV_EVENT_COMMAND_REPLY frees them. The
+        // freed-too-soon UAF that motivates this comment was identified in
+        // the v1 plan's adversarial review.
+        var cstrings: [UnsafeMutablePointer<CChar>?] =
+            args.map { strdup($0) } + [UnsafeMutablePointer<CChar>?(nil)]
+        pending = PendingSeek(
+            replyID: id,
+            generation: generation,
+            completion: completion,
+            cstrings: cstrings,
+            commandReplied: false
+        )
+
+        cstrings.withUnsafeMutableBufferPointer { buf in
+            let p = UnsafeMutableRawPointer(buf.baseAddress!).assumingMemoryBound(to: UnsafePointer<CChar>?.self)
+            _ = mpv_command_async(handle, id, p)
+        }
+    }
+
+    /// Called from the event-pump's COMMAND_REPLY branch (Task 3.7) to free
+    /// the strdup'd args.
+    fileprivate func freePendingCstrings() {
+        if var p = pending {
+            for c in p.cstrings { if let c { free(c) } }
+            p.cstrings = []
+            pending = p
+        }
+    }
+
     // MARK: - Render lifecycle (Task 3.5)
     //
     // The render context is created/freed here so the production
