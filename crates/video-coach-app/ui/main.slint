@@ -84,6 +84,85 @@ export component MainWindow inherits Window {
     // dispatches `ClosePreview`.
     callback close-preview-clicked();
 
+    // Phase 10 Task 3. Export-sheet UI state.
+    //
+    // tag-rows: hydrated by ui.rs's 30 Hz timer from ClipListSlot via
+    // tag-aggregation. The first row is always the synthetic "All
+    // Clips" row carrying the literal tag value `__all__`; real tag
+    // rows follow, sorted alphabetically. `clip-count`, `duration`,
+    // and `selected` are read-only display fields.
+    //
+    // Slint's pure-function language doesn't support `for` loops over
+    // lists, so we can't write an `is-selected(tag)` helper that
+    // queries `selected-export-tags`. The Rust side (which holds the
+    // canonical selection state) re-emits the rows whenever the
+    // selection changes, with `selected` set per row.
+    in property <[{tag: string, label: string, clip-count: int, duration: float, selected: bool}]> export-tag-rows: [];
+
+    // Selected tags (the literal tag values from `export-tag-rows`,
+    // i.e. `__all__` for the synthetic row + real tag names). The
+    // form-view checkboxes mutate this through the
+    // `export-tag-toggled` callback. `selected-export-tags` doubles
+    // as the dispatch payload — the Rust handler maps each entry to a
+    // `TagSelection` enum variant.
+    in-out property <[string]> selected-export-tags: [];
+
+    // Form fields. Resolution/quality are string discriminants the
+    // Rust side maps to enum variants; project name is an editable
+    // string the UI seeds from the open project's name.
+    in-out property <string> export-output-folder: "";
+    in-out property <string> export-resolution: "1080";
+    in-out property <string> export-quality: "medium";
+    in-out property <string> export-project-name: "";
+
+    // Mirrored from `ExportProgressSlot` in ui.rs's 30 Hz timer. The
+    // outcome-kind string is the canonical view selector — one of
+    // "none" (form view) | "in_progress" (progress view) |
+    // "succeeded_all" (success summary) | "partial_failure" (error
+    // summary) | "cancelled" (cancellation summary). The remaining
+    // `export-*` properties carry per-state details: `total-tags` /
+    // `completed-tags` / `current-tag` for in_progress;
+    // `summary-folder` + `summary-file-count` for succeeded_all;
+    // `error` + `failed-tag` for partial_failure;
+    // `cancelled-completed` for cancelled.
+    in property <string> export-outcome-kind: "none";
+    in property <bool> export-active: false;
+    in property <int> export-total-tags: 0;
+    in property <int> export-completed-tags: 0;
+    in property <string> export-current-tag: "";
+    in property <string> export-error: "";
+    in property <string> export-summary-folder: "";
+    in property <int> export-summary-file-count: 0;
+    in property <string> export-failed-tag: "";
+    in property <int> export-cancelled-completed: 0;
+
+    // True when a project is open. Gates the File→Export
+    // Compilations menu item's `activated` body so a stray click on
+    // a disabled-but-visible menu item is a no-op rather than a
+    // sheet that shows an empty form.
+    in property <bool> project-open: false;
+
+    // Sheet visibility. Set true by the File menu (subject to
+    // project-open) and by a Slint changed-callback hook in ui.rs
+    // that calls .focus() on `sheet-focus-scope`. Set false by
+    // `export-close-clicked` (Esc, click-outside, Done/Cancel
+    // buttons, all wired through ui.rs::on_export_close_clicked).
+    in-out property <bool> export-sheet-visible: false;
+
+    callback export-folder-pick-clicked();
+    // String payload is the literal tag value from
+    // `export-tag-rows` (the synthetic AllClips row uses
+    // `__all__`).
+    callback export-tag-toggled(string);
+    callback export-select-all-clicked();
+    callback export-select-none-clicked();
+    callback export-resolution-changed(string);
+    callback export-quality-changed(string);
+    callback export-start-clicked();
+    callback export-cancel-clicked();
+    callback export-close-clicked();
+    callback export-reveal-clicked();
+
     // Capture keyboard focus at root so Space / arrow keys hit the
     // transport handlers regardless of which TouchArea last clicked.
     forward-focus: keyscope;
@@ -103,6 +182,21 @@ export component MainWindow inherits Window {
                 title: "Add Source Video…";
                 activated => { root.add-source-video-clicked(); }
             }
+            // Phase 10 Task 3. Disabled (no-op) when no project is
+            // open — Slint MenuItem doesn't expose an `enabled`
+            // property in this version, so we gate the activated
+            // body. `export-project-name` is seeded by ui.rs's
+            // 30 Hz timer from the open project's name; the sheet's
+            // form view shows it (read-only) so the user can verify
+            // the file naming before clicking Export.
+            MenuItem {
+                title: "Export Compilations…";
+                activated => {
+                    if (root.project-open) {
+                        root.export-sheet-visible = true;
+                    }
+                }
+            }
             MenuItem {
                 title: "Quit";
                 activated => { root.quit-clicked(); }
@@ -114,6 +208,16 @@ export component MainWindow inherits Window {
         width: 100%;
         height: 100%;
         key-pressed(event) => {
+            // Phase 10 Task 3 (per fix #32). When the export sheet is
+            // visible, ALL existing key bindings (Space, R, arrow
+            // keys, Esc-for-preview-close) are suppressed at the
+            // top-level keyscope. The sheet's own focus scope handles
+            // Esc; everything else just no-ops while the modal is up
+            // so a stray R doesn't start a recording behind the
+            // sheet, etc.
+            if (root.export-sheet-visible) {
+                return reject;
+            }
             if (event.text == " ") {
                 root.play-pause-clicked();
                 return accept;
@@ -640,6 +744,855 @@ export component MainWindow inherits Window {
             vertical-alignment: center;
             overflow: elide;
         }
+    }
+
+    // Phase 10 Task 3. Export-sheet modal overlay.
+    //
+    // Visibility-gated on `export-sheet-visible`. The dim layer's
+    // TouchArea absorbs clicks behind the card so the underlying
+    // sidebar/transport stay inert while the sheet is open. The
+    // card itself is centred; its sub-views switch on
+    // `export-outcome-kind`:
+    //   "none"            → form view (tag list + pickers + Export)
+    //   "in_progress"     → progress view (current tag + Cancel)
+    //   "succeeded_all"   → success summary (Reveal + Done)
+    //   "partial_failure" → error summary
+    //   "cancelled"       → cancellation summary
+    //
+    // Esc + click-outside dismiss the sheet only when outcome is NOT
+    // in_progress (per fix #32 — can't accidentally drop a running
+    // export by clicking outside).
+    if export-sheet-visible: Rectangle {
+        x: 0;
+        y: 0;
+        width: parent.width;
+        height: parent.height;
+        background: #000000aa;
+
+        sheet-touch := TouchArea {
+            width: parent.width;
+            height: parent.height;
+            clicked => {
+                if (root.export-outcome-kind != "in_progress") {
+                    root.export-close-clicked();
+                }
+            }
+        }
+
+        sheet-focus-scope := FocusScope {
+            width: parent.width;
+            height: parent.height;
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    if (root.export-outcome-kind != "in_progress") {
+                        root.export-close-clicked();
+                    }
+                    return accept;
+                }
+                return reject;
+            }
+
+            // The card. A second TouchArea inside the card absorbs
+            // clicks so they DON'T propagate to the dim-layer's
+            // sheet-touch (which would close the sheet on every
+            // checkbox click otherwise).
+            card := Rectangle {
+                x: (parent.width - self.width) / 2;
+                y: (parent.height - self.height) / 2;
+                width: 560px;
+                height: 540px;
+                border-radius: 8px;
+                background: #1f1f1f;
+                border-width: 1px;
+                border-color: #303030;
+
+                card-touch := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    // No clicked handler — purely an absorber.
+                }
+
+                // Card title (constant across all outcome views).
+                Text {
+                    x: 24px;
+                    y: 20px;
+                    width: parent.width - 48px;
+                    height: 24px;
+                    text: root.export-outcome-kind == "in_progress"
+                        ? "Exporting…"
+                        : (root.export-outcome-kind == "succeeded_all"
+                            ? "Export complete"
+                            : (root.export-outcome-kind == "partial_failure"
+                                ? "Export failed"
+                                : (root.export-outcome-kind == "cancelled"
+                                    ? "Export cancelled"
+                                    : "Export Compilations")));
+                    font-size: 16px;
+                    color: #ffffff;
+                }
+
+                // ────────────────────────────── Form view ───────
+                if root.export-outcome-kind == "none": Rectangle {
+                    x: 0;
+                    y: 56px;
+                    width: parent.width;
+                    height: parent.height - 56px;
+
+                    // Tag list header + Select All / None.
+                    Text {
+                        x: 24px;
+                        y: 0;
+                        width: 200px;
+                        height: 18px;
+                        text: "Tags";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    sa-button := Rectangle {
+                        x: parent.width - 184px;
+                        y: -2px;
+                        width: 76px;
+                        height: 22px;
+                        border-radius: 4px;
+                        background: sa-area.pressed
+                            ? #404040
+                            : (sa-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Select all";
+                            font-size: 11px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        sa-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-select-all-clicked(); }
+                        }
+                    }
+                    sn-button := Rectangle {
+                        x: parent.width - 104px;
+                        y: -2px;
+                        width: 80px;
+                        height: 22px;
+                        border-radius: 4px;
+                        background: sn-area.pressed
+                            ? #404040
+                            : (sn-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Select none";
+                            font-size: 11px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        sn-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-select-none-clicked(); }
+                        }
+                    }
+
+                    // Tag-list scrollable area.
+                    Rectangle {
+                        x: 24px;
+                        y: 28px;
+                        width: parent.width - 48px;
+                        height: 200px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #303030;
+                        background: #161616;
+
+                        Flickable {
+                            x: 0; y: 0;
+                            width: parent.width;
+                            height: parent.height;
+                            viewport-width: parent.width;
+                            viewport-height: max(parent.height, root.export-tag-rows.length * 32px + 4px);
+
+                            VerticalLayout {
+                                x: 0; y: 2px;
+                                width: parent.width;
+                                spacing: 0;
+                                padding: 0;
+                                for row[idx] in root.export-tag-rows: Rectangle {
+                                    height: 32px;
+                                    background: tag-area.pressed
+                                        ? #2c5d8a
+                                        : (tag-area.has-hover ? #232323 : transparent);
+
+                                    // Checkbox indicator.
+                                    Rectangle {
+                                        x: 8px;
+                                        y: (parent.height - self.height) / 2;
+                                        width: 16px;
+                                        height: 16px;
+                                        border-radius: 3px;
+                                        border-width: 1px;
+                                        border-color: #707070;
+                                        background: row.selected ? #4a90e2 : transparent;
+                                        Text {
+                                            x: 0; y: 0;
+                                            width: parent.width;
+                                            height: parent.height;
+                                            text: row.selected ? "✓" : "";
+                                            font-size: 12px;
+                                            color: #ffffff;
+                                            horizontal-alignment: center;
+                                            vertical-alignment: center;
+                                        }
+                                    }
+
+                                    // Label.
+                                    Text {
+                                        x: 32px;
+                                        y: 0;
+                                        width: parent.width - 200px;
+                                        height: parent.height;
+                                        text: row.label;
+                                        font-size: 13px;
+                                        color: #ffffff;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+
+                                    // Right-aligned count + duration.
+                                    Text {
+                                        x: parent.width - 168px;
+                                        y: 0;
+                                        width: 160px;
+                                        height: parent.height;
+                                        text: row.clip-count + " clip" + (row.clip-count == 1 ? "" : "s") + " · " + format-mmss(row.duration);
+                                        font-size: 11px;
+                                        color: #aaaaaa;
+                                        vertical-alignment: center;
+                                        horizontal-alignment: right;
+                                    }
+
+                                    tag-area := TouchArea {
+                                        width: parent.width;
+                                        height: parent.height;
+                                        clicked => { root.export-tag-toggled(row.tag); }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Output folder picker row.
+                    Text {
+                        x: 24px;
+                        y: 240px;
+                        width: 120px;
+                        height: 18px;
+                        text: "Output folder";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    Rectangle {
+                        x: 24px;
+                        y: 262px;
+                        width: parent.width - 48px - 100px;
+                        height: 28px;
+                        border-radius: 4px;
+                        border-width: 1px;
+                        border-color: #303030;
+                        background: #161616;
+                        Text {
+                            x: 8px;
+                            y: 0;
+                            width: parent.width - 16px;
+                            height: parent.height;
+                            text: root.export-output-folder == ""
+                                ? "(none — choose a folder)"
+                                : root.export-output-folder;
+                            font-size: 12px;
+                            color: root.export-output-folder == "" ? #777777 : #dddddd;
+                            font-family: "Menlo";
+                            vertical-alignment: center;
+                            overflow: elide;
+                        }
+                    }
+                    of-button := Rectangle {
+                        x: parent.width - 120px;
+                        y: 262px;
+                        width: 96px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: of-area.pressed
+                            ? #404040
+                            : (of-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Choose…";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        of-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-folder-pick-clicked(); }
+                        }
+                    }
+
+                    // Resolution picker row.
+                    Text {
+                        x: 24px;
+                        y: 304px;
+                        width: 120px;
+                        height: 18px;
+                        text: "Resolution";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    res-source-btn := Rectangle {
+                        x: 24px;
+                        y: 326px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-resolution == "source"
+                            ? #4a90e2
+                            : (rs-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Source";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        rs-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-resolution-changed("source"); }
+                        }
+                    }
+                    res-1080-btn := Rectangle {
+                        x: 116px;
+                        y: 326px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-resolution == "1080"
+                            ? #4a90e2
+                            : (r1080-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "1080p";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        r1080-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-resolution-changed("1080"); }
+                        }
+                    }
+                    res-720-btn := Rectangle {
+                        x: 208px;
+                        y: 326px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-resolution == "720"
+                            ? #4a90e2
+                            : (r720-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "720p";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        r720-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-resolution-changed("720"); }
+                        }
+                    }
+
+                    // Quality picker row.
+                    Text {
+                        x: 24px;
+                        y: 366px;
+                        width: 120px;
+                        height: 18px;
+                        text: "Quality";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    q-low-btn := Rectangle {
+                        x: 24px;
+                        y: 388px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-quality == "low"
+                            ? #4a90e2
+                            : (ql-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Low";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        ql-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-quality-changed("low"); }
+                        }
+                    }
+                    q-med-btn := Rectangle {
+                        x: 116px;
+                        y: 388px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-quality == "medium"
+                            ? #4a90e2
+                            : (qm-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Medium";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        qm-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-quality-changed("medium"); }
+                        }
+                    }
+                    q-high-btn := Rectangle {
+                        x: 208px;
+                        y: 388px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-quality == "high"
+                            ? #4a90e2
+                            : (qh-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "High";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        qh-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-quality-changed("high"); }
+                        }
+                    }
+
+                    // Cancel + Export bottom buttons.
+                    cancel-btn := Rectangle {
+                        x: parent.width - 232px;
+                        y: parent.height - 52px;
+                        width: 96px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: cancel-area.pressed
+                            ? #404040
+                            : (cancel-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Cancel";
+                            font-size: 13px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        cancel-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-close-clicked(); }
+                        }
+                    }
+                    export-btn := Rectangle {
+                        x: parent.width - 124px;
+                        y: parent.height - 52px;
+                        width: 100px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: can-export()
+                            ? (export-area.pressed
+                                ? #2c5d8a
+                                : (export-area.has-hover ? #5ba0f2 : #4a90e2))
+                            : #2a3a4a;
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Export";
+                            font-size: 13px;
+                            color: can-export() ? #ffffff : #888888;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        export-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => {
+                                if (can-export()) {
+                                    root.export-start-clicked();
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ────────────────── In-progress view ─────────────
+                if root.export-outcome-kind == "in_progress": Rectangle {
+                    x: 0;
+                    y: 56px;
+                    width: parent.width;
+                    height: parent.height - 56px;
+
+                    // Headline + spinner-equivalent (static glyph;
+                    // Slint 1.8 doesn't ship an indeterminate
+                    // spinner primitive and animating one via
+                    // animate-rotation isn't worth the mass-of-code
+                    // for a v1 ship).
+                    Text {
+                        x: 24px;
+                        y: 60px;
+                        width: parent.width - 48px;
+                        height: 28px;
+                        text: "Exporting " + root.export-current-tag + "…";
+                        font-size: 15px;
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        x: 24px;
+                        y: 96px;
+                        width: parent.width - 48px;
+                        height: 22px;
+                        text: (root.export-completed-tags + 1) + " of " + root.export-total-tags;
+                        font-size: 12px;
+                        color: #aaaaaa;
+                        horizontal-alignment: center;
+                    }
+
+                    // Cancel button.
+                    cx-btn := Rectangle {
+                        x: (parent.width - self.width) / 2;
+                        y: parent.height - 60px;
+                        width: 100px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: cx-area.pressed
+                            ? #404040
+                            : (cx-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Cancel";
+                            font-size: 13px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        cx-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-cancel-clicked(); }
+                        }
+                    }
+                }
+
+                // ────────────────── Success view ─────────────────
+                if root.export-outcome-kind == "succeeded_all": Rectangle {
+                    x: 0;
+                    y: 56px;
+                    width: parent.width;
+                    height: parent.height - 56px;
+
+                    Text {
+                        x: 24px;
+                        y: 60px;
+                        width: parent.width - 48px;
+                        height: 24px;
+                        text: "Wrote " + root.export-summary-file-count + " file" + (root.export-summary-file-count == 1 ? "" : "s") + ".";
+                        font-size: 14px;
+                        color: #ffffff;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        x: 24px;
+                        y: 92px;
+                        width: parent.width - 48px;
+                        height: 20px;
+                        text: root.export-summary-folder;
+                        font-size: 11px;
+                        color: #aaaaaa;
+                        font-family: "Menlo";
+                        horizontal-alignment: center;
+                        overflow: elide;
+                    }
+
+                    // Reveal in Finder + Done buttons.
+                    s-reveal-btn := Rectangle {
+                        x: parent.width - 232px;
+                        y: parent.height - 60px;
+                        width: 140px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: sr-area.pressed
+                            ? #404040
+                            : (sr-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Reveal in Finder";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        sr-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-reveal-clicked(); }
+                        }
+                    }
+                    s-done-btn := Rectangle {
+                        x: parent.width - 84px;
+                        y: parent.height - 60px;
+                        width: 60px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: sd-area.pressed
+                            ? #2c5d8a
+                            : (sd-area.has-hover ? #5ba0f2 : #4a90e2);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Done";
+                            font-size: 13px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        sd-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-close-clicked(); }
+                        }
+                    }
+                }
+
+                // ────────────── Partial-failure view ─────────────
+                if root.export-outcome-kind == "partial_failure": pf-view := Rectangle {
+                    x: 0;
+                    y: 56px;
+                    width: parent.width;
+                    height: parent.height - 56px;
+
+                    Text {
+                        x: 24px;
+                        y: 60px;
+                        width: parent.width - 48px;
+                        height: 24px;
+                        text: "Export of '" + root.export-failed-tag + "' failed.";
+                        font-size: 14px;
+                        color: #ff6464;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        x: 24px;
+                        y: 92px;
+                        width: parent.width - 48px;
+                        height: 60px;
+                        text: root.export-error;
+                        font-size: 11px;
+                        color: #cccccc;
+                        font-family: "Menlo";
+                        horizontal-alignment: center;
+                        wrap: word-wrap;
+                        overflow: elide;
+                    }
+                    Text {
+                        x: 24px;
+                        y: 158px;
+                        width: parent.width - 48px;
+                        height: 20px;
+                        text: "Wrote " + root.export-completed-tags + " file" + (root.export-completed-tags == 1 ? "" : "s") + " before failure.";
+                        font-size: 12px;
+                        color: #aaaaaa;
+                        horizontal-alignment: center;
+                    }
+
+                    // Reveal in Finder visible only when something
+                    // landed on disk (per fix #36). Otherwise the
+                    // Done button takes its slot.
+                    if root.export-completed-tags > 0: Rectangle {
+                        x: pf-view.width - 232px;
+                        y: pf-view.height - 60px;
+                        width: 140px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: pf-rev-area.pressed
+                            ? #404040
+                            : (pf-rev-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Reveal in Finder";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        pf-rev-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-reveal-clicked(); }
+                        }
+                    }
+
+                    pf-done-btn := Rectangle {
+                        x: parent.width - 84px;
+                        y: parent.height - 60px;
+                        width: 60px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: pf-done-area.pressed
+                            ? #2c5d8a
+                            : (pf-done-area.has-hover ? #5ba0f2 : #4a90e2);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Done";
+                            font-size: 13px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        pf-done-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-close-clicked(); }
+                        }
+                    }
+                }
+
+                // ────────────────── Cancelled view ───────────────
+                if root.export-outcome-kind == "cancelled": cn-view := Rectangle {
+                    x: 0;
+                    y: 56px;
+                    width: parent.width;
+                    height: parent.height - 56px;
+
+                    Text {
+                        x: 24px;
+                        y: 60px;
+                        width: parent.width - 48px;
+                        height: 24px;
+                        text: "Cancelled";
+                        font-size: 14px;
+                        color: #f4c430;
+                        horizontal-alignment: center;
+                    }
+                    Text {
+                        x: 24px;
+                        y: 92px;
+                        width: parent.width - 48px;
+                        height: 20px;
+                        text: "Wrote " + root.export-cancelled-completed + " file" + (root.export-cancelled-completed == 1 ? "" : "s") + " before cancel.";
+                        font-size: 12px;
+                        color: #aaaaaa;
+                        horizontal-alignment: center;
+                    }
+
+                    // Reveal visible only when something landed.
+                    if root.export-cancelled-completed > 0: Rectangle {
+                        x: cn-view.width - 232px;
+                        y: cn-view.height - 60px;
+                        width: 140px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: cn-rev-area.pressed
+                            ? #404040
+                            : (cn-rev-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Reveal in Finder";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        cn-rev-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-reveal-clicked(); }
+                        }
+                    }
+
+                    cn-done-btn := Rectangle {
+                        x: parent.width - 84px;
+                        y: parent.height - 60px;
+                        width: 60px;
+                        height: 32px;
+                        border-radius: 4px;
+                        background: cn-done-area.pressed
+                            ? #2c5d8a
+                            : (cn-done-area.has-hover ? #5ba0f2 : #4a90e2);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "Done";
+                            font-size: 13px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        cn-done-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-close-clicked(); }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Phase 10 Task 3 helper used by the export sheet's Export
+    // button. Slint's pure functions don't support `for` loops over
+    // lists, so the `selected` membership query lives on the row
+    // model itself (Rust-side hydrated, see comment on
+    // export-tag-rows above).
+    pure function can-export() -> bool {
+        return root.selected-export-tags.length > 0
+            && root.export-output-folder != "";
     }
 
     // mm:ss formatter as a pure function. Slint 1.16 supports

@@ -19,12 +19,14 @@
 //! | Control socket `quit`    | bus `Quit` handler in bus.rs           |
 //! | OS signal (`--headless`) | `tokio::select!` in main.rs            |
 
-use crate::bus::{BusHandle, Command};
+use crate::bus::{BusHandle, Command, TagSelection};
 use crate::frame_sink::{
-    ClipListSlot, ExportProgressSlot, FrameSlot, PlayerStateSlot, RecordingStateSlot,
+    ClipListSlot, ExportProgressSlot, ExportRunOutcome, FrameSlot, PlayerStateSlot,
+    RecordingStateSlot,
 };
 use crate::last_project;
-use slint::ComponentHandle;
+use slint::{ComponentHandle, Model};
+use std::path::PathBuf;
 
 slint::include_modules!();
 
@@ -38,6 +40,91 @@ const UI_COMMAND_ID: &str = "ui";
 /// allowed to call window setters directly — no `invoke_from_event_loop`
 /// hop.
 const FRAME_TICK_MS: u64 = 33;
+
+/// Phase 10 Task 3: synthetic tag-value used for the "All Clips" row.
+/// The dispatch handler maps this back to `TagSelection::AllClips`;
+/// real tag names land as `TagSelection::Tag { name }`. Picked so it
+/// never collides with a user-defined tag (real tags are
+/// alphanumeric + `-` per the tag-rename UX in v1; double-underscore
+/// is reserved).
+const ALL_CLIPS_TAG: &str = "__all__";
+
+/// Aggregate the clip list's tags into the export-sheet rows.
+///
+/// Pre-condition: `clips` is `(recording_duration, tags)` per clip,
+/// in arbitrary order. Post-condition: the returned vector is the
+/// row model for the Slint sheet:
+/// - First entry: synthetic `(__all__, "All Clips", count, total_dur, selected)`
+///   with count = clips.len() and dur = sum-of-all clip durations.
+/// - Following entries: one per unique tag, sorted alphabetically by
+///   tag name; selected = the tag is in `selected_set`.
+///
+/// The `selected_set` is the UI's current `selected-export-tags`
+/// property. Empty selections are normal — the form view's Export
+/// button is disabled until at least one row is ticked.
+fn aggregate_tag_rows(
+    clips: &[(f64, Vec<String>)],
+    selected_set: &std::collections::HashSet<String>,
+) -> Vec<(String, String, i32, f32, bool)> {
+    use std::collections::BTreeMap;
+    let total_count = clips.len() as i32;
+    let total_dur: f64 = clips.iter().map(|(d, _)| *d).sum();
+    let mut by_tag: BTreeMap<String, (i32, f64)> = BTreeMap::new();
+    for (dur, tags) in clips {
+        for t in tags {
+            let e = by_tag.entry(t.clone()).or_insert((0, 0.0));
+            e.0 += 1;
+            e.1 += *dur;
+        }
+    }
+    let mut rows: Vec<(String, String, i32, f32, bool)> = Vec::with_capacity(by_tag.len() + 1);
+    rows.push((
+        ALL_CLIPS_TAG.to_string(),
+        "All Clips".to_string(),
+        total_count,
+        total_dur as f32,
+        selected_set.contains(ALL_CLIPS_TAG),
+    ));
+    for (tag, (count, dur)) in by_tag {
+        let selected = selected_set.contains(&tag);
+        rows.push((tag.clone(), tag, count, dur as f32, selected));
+    }
+    rows
+}
+
+/// Phase 10 Task 3 (per fix #35). Reveal a folder in the platform's
+/// native file manager. Best-effort: on spawn error we log a warning
+/// and return — the export sheet still shows the folder path so the
+/// user can copy it manually.
+///
+/// Uses plain `open <folder>` on macOS (NOT `open -R`, which reveals
+/// a single file's parent rather than opening the folder itself);
+/// `explorer <folder>` on Windows; `xdg-open <folder>` on Linux.
+fn reveal_folder(folder: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    let cmd = "open";
+    #[cfg(target_os = "windows")]
+    let cmd = "explorer";
+    #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
+    let cmd = "xdg-open";
+    match std::process::Command::new(cmd).arg(folder).spawn() {
+        Ok(_) => {
+            tracing::info!(
+                target: "ui",
+                event = "export.reveal",
+                folder = %folder.display(),
+            );
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "ui",
+                event = "export.reveal_failed",
+                folder = %folder.display(),
+                error = %e,
+            );
+        }
+    }
+}
 
 // Phase 9: ui::run plumbs ClipListSlot for Task 4's sidebar; signature
 // crosses the clippy too-many-arguments threshold. Splitting into a
@@ -70,10 +157,6 @@ pub fn run(
     export_progress: ExportProgressSlot,
     startup_project: Option<String>,
 ) -> anyhow::Result<()> {
-    // Hold the slot alive for the lifetime of `run`. Task 3 reads it
-    // in the 30 Hz timer; Task 0 just keeps the reference rooted so
-    // the bus-side writer's Arc clone stays valid.
-    let _export_progress = export_progress;
     let window = MainWindow::new()?;
 
     // Phase 7 Task 4: drive `source-frame` from the shared frame slot at
@@ -87,10 +170,23 @@ pub fn run(
     let player_state_for_timer = player_state.clone();
     let recording_state_for_timer = recording_state.clone();
     let clip_list_for_timer = clip_list.clone();
+    let export_progress_for_timer = export_progress.clone();
     // Phase 9 Task 4: cache last-seen clip-list signature so we only
     // rebuild the Slint model when something actually changed.
     // (id, name, duration) tuples — same shape we hand to Slint.
     let mut cached_clips: Vec<(uuid::Uuid, String, f64)> = Vec::new();
+    // Phase 10 Task 3 caches: prevent gratuitous Slint property
+    // writes when nothing has changed.
+    //
+    // export-tag-rows is rebuilt from the live clip list whenever
+    // (a) the clip list itself changes OR (b) the user's selection
+    // changes. We snapshot the aggregated tag list (sorted, with the
+    // synthetic all-clips row) and the selection state, and rewrite
+    // the Slint model only when either signature shifts.
+    let mut cached_tag_rows: Vec<(String, String, i32, f32, bool)> = Vec::new();
+    // Outcome-kind transitions trigger summary-field updates. Track
+    // the last serialized outcome string so we know when to rewrite.
+    let mut cached_outcome_kind: String = "none".into();
     frame_timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(FRAME_TICK_MS),
@@ -138,10 +234,19 @@ pub fn run(
             // Phase 9 Task 4: clip list. Read; if changed, build a
             // Slint VecModel and push. Cheap to compare (clip lists
             // stay small — typical project has fewer than 50 clips).
+            // Phase 10 Task 3 also collects each clip's tags so the
+            // export-sheet's tag aggregation runs without a separate
+            // bus round-trip.
             let clip_snapshot: Vec<(uuid::Uuid, String, f64)> = {
                 let g = clip_list_for_timer.lock().expect("clip_list poisoned");
                 g.iter()
                     .map(|c| (c.id, c.name.clone(), c.recording_duration))
+                    .collect()
+            };
+            let clip_tag_snapshot: Vec<(f64, Vec<String>)> = {
+                let g = clip_list_for_timer.lock().expect("clip_list poisoned");
+                g.iter()
+                    .map(|c| (c.recording_duration, c.tags.clone()))
                     .collect()
             };
             let clips_changed = clip_snapshot != cached_clips;
@@ -175,6 +280,94 @@ pub fn run(
             } else {
                 String::new()
             };
+            // Phase 10 Task 3: snapshot ExportProgressSlot. Map the
+            // outcome enum to the Slint string view selector and
+            // pull the per-state fields. Lock duration is short —
+            // we clone() the small enum + a few scalar fields.
+            let (
+                outcome_kind,
+                export_active,
+                total_tags,
+                completed_tags,
+                current_tag,
+                summary_folder,
+                summary_file_count,
+                error_text,
+                failed_tag,
+                cancelled_completed,
+            ) = {
+                let g = export_progress_for_timer
+                    .lock()
+                    .expect("export_progress poisoned");
+                match &g.outcome {
+                    ExportRunOutcome::None => (
+                        "none",
+                        false,
+                        0_i32,
+                        0_i32,
+                        String::new(),
+                        String::new(),
+                        0_i32,
+                        String::new(),
+                        String::new(),
+                        0_i32,
+                    ),
+                    ExportRunOutcome::InProgress => (
+                        "in_progress",
+                        true,
+                        g.total_tags as i32,
+                        g.completed_tags as i32,
+                        g.current_tag.clone().unwrap_or_default(),
+                        String::new(),
+                        0,
+                        String::new(),
+                        String::new(),
+                        0,
+                    ),
+                    ExportRunOutcome::SucceededAll { folder, tag_count } => (
+                        "succeeded_all",
+                        false,
+                        g.total_tags as i32,
+                        g.completed_tags as i32,
+                        String::new(),
+                        folder.to_string_lossy().into_owned(),
+                        *tag_count as i32,
+                        String::new(),
+                        String::new(),
+                        0,
+                    ),
+                    ExportRunOutcome::PartialFailure {
+                        folder,
+                        completed,
+                        failed_tag,
+                        error,
+                    } => (
+                        "partial_failure",
+                        false,
+                        g.total_tags as i32,
+                        *completed as i32,
+                        String::new(),
+                        folder.to_string_lossy().into_owned(),
+                        0,
+                        error.clone(),
+                        failed_tag.clone(),
+                        0,
+                    ),
+                    ExportRunOutcome::Cancelled { folder, completed } => (
+                        "cancelled",
+                        false,
+                        g.total_tags as i32,
+                        *completed as i32,
+                        String::new(),
+                        folder.to_string_lossy().into_owned(),
+                        0,
+                        String::new(),
+                        String::new(),
+                        *completed as i32,
+                    ),
+                }
+            };
+
             if let Some(w) = weak_for_frames.upgrade() {
                 if let Some(buf) = next_frame {
                     w.set_source_frame(slint::Image::from_rgba8(buf));
@@ -203,6 +396,83 @@ pub fn run(
                 if mode_str != "preview_clip" && !w.get_selected_clip_id().is_empty() {
                     w.set_selected_clip_id("".into());
                 }
+
+                // Phase 10 Task 3: project-open is true whenever we
+                // have a non-empty title (the bus's open-project /
+                // new-project handlers stamp the path; "No project
+                // open" is the sentinel default from main.slint).
+                let title = w.get_project_title();
+                let project_is_open = title.as_str() != "No project open" && !title.is_empty();
+                w.set_project_open(project_is_open);
+                // Seed export-project-name once on first project
+                // open so the form view can show it. We don't
+                // re-seed on every tick because the user might
+                // edit it later (Phase 10 ships a read-only
+                // display, but the property is in-out for future
+                // editing).
+                if project_is_open && w.get_export_project_name().is_empty() {
+                    // Project name == folder basename per the bus's
+                    // NewProject handler; pick the trailing path
+                    // component off the project-title path.
+                    let basename = std::path::Path::new(title.as_str())
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or(title.as_str())
+                        .to_string();
+                    w.set_export_project_name(basename.into());
+                }
+
+                // Phase 10 Task 3: rebuild export-tag-rows when the
+                // clip list OR the user's selection has changed.
+                // The synthetic all-clips row is pinned first.
+                let selected_set: std::collections::HashSet<String> = w
+                    .get_selected_export_tags()
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect();
+                let aggregated = aggregate_tag_rows(&clip_tag_snapshot, &selected_set);
+                if aggregated != cached_tag_rows {
+                    // Slint compiles anonymous-struct list properties
+                    // to tuples with fields in alphabetical order;
+                    // the property type is
+                    //   [{tag, label, clip-count, duration, selected}]
+                    // → (clip-count, duration, label, selected, tag).
+                    let model: Vec<(i32, f32, slint::SharedString, bool, slint::SharedString)> =
+                        aggregated
+                            .iter()
+                            .map(|(tag, label, count, dur, sel)| {
+                                (
+                                    *count,
+                                    *dur,
+                                    slint::SharedString::from(label.as_str()),
+                                    *sel,
+                                    slint::SharedString::from(tag.as_str()),
+                                )
+                            })
+                            .collect();
+                    w.set_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(model)));
+                    cached_tag_rows = aggregated;
+                }
+
+                // Phase 10 Task 3: hydrate outcome-derived
+                // properties. We always write `export-active` /
+                // total/completed counts (cheap scalars) and only
+                // write the summary fields when the outcome string
+                // changes — Slint property writes are idempotent
+                // but each one allocates a SharedString.
+                w.set_export_active(export_active);
+                w.set_export_total_tags(total_tags);
+                w.set_export_completed_tags(completed_tags);
+                w.set_export_current_tag(current_tag.into());
+                if outcome_kind != cached_outcome_kind {
+                    w.set_export_outcome_kind(outcome_kind.into());
+                    cached_outcome_kind = outcome_kind.to_string();
+                }
+                w.set_export_summary_folder(summary_folder.into());
+                w.set_export_summary_file_count(summary_file_count);
+                w.set_export_error(error_text.into());
+                w.set_export_failed_tag(failed_tag.into());
+                w.set_export_cancelled_completed(cancelled_completed);
             }
             if clips_changed {
                 cached_clips = clip_snapshot;
@@ -446,6 +716,209 @@ pub fn run(
         });
     });
 
+    // ─────────────────────────── Phase 10 Task 3 ───────────────────────────
+    // Export-sheet callbacks. The sheet's outcome state lives on
+    // ExportProgressSlot (bus-side writer, UI 30 Hz timer reader,
+    // wired above). The handlers below are pure dispatch; they read
+    // Slint properties that the user has touched, build the bus
+    // command, and forward.
+    //
+    // Note: rfd's pick_folder MUST run on a tokio runtime when used
+    // with the "tokio" feature, which is how the existing
+    // open-project / new-project handlers wire it. We follow that
+    // pattern — spawn an async task and await the dialog there.
+
+    // Tag toggle. The Slint tag string is `__all__` for the synthetic
+    // row, otherwise a real tag name. We mutate the in-out
+    // selected-export-tags property; the 30 Hz timer's tag-row
+    // rebuild picks up the new selection on its next tick.
+    let weak_for_tag = window.as_weak();
+    window.on_export_tag_toggled(move |tag: slint::SharedString| {
+        let Some(w) = weak_for_tag.upgrade() else {
+            return;
+        };
+        let current = w.get_selected_export_tags();
+        let s = tag.to_string();
+        let mut next: Vec<slint::SharedString> = current.iter().collect();
+        if let Some(pos) = next.iter().position(|x| x.as_str() == s) {
+            next.remove(pos);
+        } else {
+            next.push(slint::SharedString::from(s.as_str()));
+        }
+        w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(next)));
+    });
+
+    let weak_for_sa = window.as_weak();
+    window.on_export_select_all_clicked(move || {
+        let Some(w) = weak_for_sa.upgrade() else {
+            return;
+        };
+        let rows = w.get_export_tag_rows();
+        // Slint anon-struct field tuple order is alphabetized;
+        // tag is the 5th (index 4) field.
+        let all: Vec<slint::SharedString> = rows.iter().map(|row| row.4.clone()).collect();
+        w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(all)));
+    });
+
+    let weak_for_sn = window.as_weak();
+    window.on_export_select_none_clicked(move || {
+        let Some(w) = weak_for_sn.upgrade() else {
+            return;
+        };
+        w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(Vec::<
+            slint::SharedString,
+        >::new())));
+    });
+
+    // Resolution / quality pickers — straight property writes.
+    let weak_for_res = window.as_weak();
+    window.on_export_resolution_changed(move |s: slint::SharedString| {
+        if let Some(w) = weak_for_res.upgrade() {
+            w.set_export_resolution(s);
+        }
+    });
+    let weak_for_qual = window.as_weak();
+    window.on_export_quality_changed(move |s: slint::SharedString| {
+        if let Some(w) = weak_for_qual.upgrade() {
+            w.set_export_quality(s);
+        }
+    });
+
+    // Folder picker. Same async-rfd pattern as new/open-project.
+    // Path written back to the in-out export-output-folder property
+    // via invoke_from_event_loop because rfd::AsyncFileDialog
+    // resolves on a worker thread.
+    let rt_for_pick = rt.clone();
+    let weak_for_pick = window.as_weak();
+    window.on_export_folder_pick_clicked(move || {
+        let weak = weak_for_pick.clone();
+        rt_for_pick.spawn(async move {
+            let chosen = rfd::AsyncFileDialog::new()
+                .set_title("Choose an export output folder")
+                .pick_folder()
+                .await;
+            let Some(folder) = chosen else {
+                return;
+            };
+            let path = folder.path().to_string_lossy().into_owned();
+            slint::invoke_from_event_loop(move || {
+                if let Some(w) = weak.upgrade() {
+                    w.set_export_output_folder(path.into());
+                }
+            })
+            .ok();
+        });
+    });
+
+    // Start. Read the form fields, build TagSelection vec +
+    // Resolution / Quality enums, dispatch ExportCompilations.
+    let bus_for_start = bus.clone();
+    let rt_for_start = rt.clone();
+    let weak_for_start = window.as_weak();
+    window.on_export_start_clicked(move || {
+        let bus = bus_for_start.clone();
+        let Some(w) = weak_for_start.upgrade() else {
+            return;
+        };
+        let selections: Vec<TagSelection> = w
+            .get_selected_export_tags()
+            .iter()
+            .map(|s| {
+                if s.as_str() == ALL_CLIPS_TAG {
+                    TagSelection::AllClips
+                } else {
+                    TagSelection::Tag {
+                        name: s.to_string(),
+                    }
+                }
+            })
+            .collect();
+        let output_folder = w.get_export_output_folder().to_string();
+        let resolution = match w.get_export_resolution().as_str() {
+            "source" => video_coach_core::project::Resolution::Source,
+            "720" => video_coach_core::project::Resolution::R720,
+            // Default (incl. "1080" sentinel and any unknown future
+            // value) rounds to 1080p — same as project Preferences
+            // default.
+            _ => video_coach_core::project::Resolution::R1080,
+        };
+        let quality = match w.get_export_quality().as_str() {
+            "low" => video_coach_core::project::Quality::Low,
+            "high" => video_coach_core::project::Quality::High,
+            _ => video_coach_core::project::Quality::Medium,
+        };
+        let project_name = w.get_export_project_name().to_string();
+        rt_for_start.spawn(async move {
+            bus.send(
+                UI_COMMAND_ID.into(),
+                Command::ExportCompilations {
+                    selections,
+                    output_folder,
+                    resolution,
+                    quality,
+                    project_name,
+                },
+            )
+            .await;
+        });
+    });
+
+    // Cancel an in-flight export. We DO NOT close the sheet here;
+    // the bus's CancelExport handler flips the AtomicBool, the
+    // export driver tears down + writes the Cancelled outcome to
+    // the slot, the 30 Hz timer's next tick swaps the sheet to the
+    // cancelled view, and the user clicks Done.
+    let bus_for_cancel = bus.clone();
+    let rt_for_cancel = rt.clone();
+    window.on_export_cancel_clicked(move || {
+        let bus = bus_for_cancel.clone();
+        rt_for_cancel.spawn(async move {
+            bus.send(UI_COMMAND_ID.into(), Command::CancelExport).await;
+        });
+    });
+
+    // Close the sheet. From any non-InProgress outcome state. Reset
+    // the slot's outcome back to None so the next sheet open starts
+    // in the form state.
+    let weak_for_close = window.as_weak();
+    let export_progress_for_close = export_progress.clone();
+    window.on_export_close_clicked(move || {
+        if let Some(w) = weak_for_close.upgrade() {
+            w.set_export_sheet_visible(false);
+        }
+        // Reset the slot if the run is in a terminal state. We
+        // never reset while InProgress — that would race the bus
+        // task (the click-outside / Esc path is gated on
+        // outcome != "in_progress" in the .slint, but the Done
+        // button on a terminal-state view still triggers this
+        // close handler, which is fine).
+        let mut g = export_progress_for_close
+            .lock()
+            .expect("export_progress poisoned");
+        if !matches!(g.outcome, ExportRunOutcome::InProgress) {
+            *g = crate::frame_sink::ExportProgressSlotData::default();
+        }
+    });
+
+    // Reveal in Finder. Cross-platform per fix #35: macOS `open`,
+    // Windows `explorer`, Linux `xdg-open`. The folder path comes
+    // from the export-summary-folder Slint property (set by the
+    // 30 Hz timer's outcome hydration). On spawn failure we just
+    // log a warning — the path label is still visible in the sheet
+    // for the user to copy.
+    let weak_for_reveal = window.as_weak();
+    window.on_export_reveal_clicked(move || {
+        let Some(w) = weak_for_reveal.upgrade() else {
+            return;
+        };
+        let folder = w.get_export_summary_folder().to_string();
+        if folder.is_empty() {
+            return;
+        }
+        let path = PathBuf::from(folder);
+        reveal_folder(&path);
+    });
+
     // File → Quit: dispatch through bus so the same shutdown path runs
     // as for the socket-driven Quit.
     let bus_for_quit = bus.clone();
@@ -682,6 +1155,41 @@ pub fn run(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Phase 10 Task 3. Aggregation contract for the export-sheet's tag
+    /// rows: synthetic `__all__` row first, real tags sorted, counts +
+    /// total durations match, and the `selected` flag mirrors the
+    /// caller's selection set.
+    #[test]
+    fn aggregate_tag_rows_pins_all_clips_first_and_sorts_real_tags() {
+        let clips = vec![
+            (3.0, vec!["zebra".into(), "wing".into()]),
+            (4.5, vec!["alpha".into()]),
+            (1.5, vec!["alpha".into(), "wing".into()]),
+        ];
+        let mut sel = std::collections::HashSet::new();
+        sel.insert("alpha".to_string());
+        sel.insert(super::ALL_CLIPS_TAG.to_string());
+        let rows = super::aggregate_tag_rows(&clips, &sel);
+        // 1 synthetic + 3 unique tags
+        assert_eq!(rows.len(), 4);
+        // synthetic comes first
+        assert_eq!(rows[0].0, super::ALL_CLIPS_TAG);
+        assert_eq!(rows[0].1, "All Clips");
+        assert_eq!(rows[0].2, 3); // 3 clips
+        assert!((rows[0].3 - 9.0).abs() < 1e-3); // total duration
+        assert!(rows[0].4); // selected
+                            // real tags alphabetized
+        assert_eq!(rows[1].0, "alpha");
+        assert_eq!(rows[1].2, 2);
+        assert!((rows[1].3 - 6.0).abs() < 1e-3);
+        assert!(rows[1].4); // selected
+        assert_eq!(rows[2].0, "wing");
+        assert_eq!(rows[2].2, 2);
+        assert!(!rows[2].4); // not selected
+        assert_eq!(rows[3].0, "zebra");
+        assert!(!rows[3].4);
+    }
 
     /// Phase 6 Task 6 — proves the Slint component build pipeline + the
     /// headless testing backend are wired up.
