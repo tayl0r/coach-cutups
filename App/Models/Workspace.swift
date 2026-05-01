@@ -91,14 +91,21 @@ final class Workspace {
         // that the user can't recover from.
         var resolved: [(index: Int, url: URL)] = []
         var missing: Set<Int> = []
+        var anyBookmarkRefreshed = false
         for index in project.sourceVideos.indices {
             do {
-                let url = try resolveAndRefreshBookmark(&project.sourceVideos[index])
+                let (url, refreshed) = try resolveAndMaybeRefresh(at: index)
+                if refreshed { anyBookmarkRefreshed = true }
                 resolved.append((index, url))
             } catch {
                 missing.insert(index)
             }
         }
+        // Persist refreshed bookmarks AFTER the resolve loop. Saving inside the
+        // loop while an inout write to project.sourceVideos[index] is in flight
+        // produces a Swift exclusivity violation (saveProject reads `project`
+        // for ProjectStore.write).
+        if anyBookmarkRefreshed { try? saveProject() }
         self.missingSourceIndices = missing
 
         // No sources at all, or any source missing — clear the playlist. We
@@ -203,14 +210,20 @@ final class Workspace {
         }
     }
 
-    /// Resolves and, if the bookmark went stale (e.g. the file was moved), regenerates and persists it.
-    private func resolveAndRefreshBookmark(_ ref: inout SourceRef) throws -> URL {
+    /// Resolves the bookmark at `project.sourceVideos[index]` and refreshes it
+    /// if stale. Returns the URL plus whether the bookmark was refreshed.
+    /// Caller is responsible for calling `saveProject()` after the resolve
+    /// loop completes — calling it from here would nest an inout write on
+    /// `project.sourceVideos[index]` with a read on `project` and trip Swift's
+    /// exclusivity check.
+    private func resolveAndMaybeRefresh(at index: Int) throws -> (URL, refreshed: Bool) {
+        let ref = project.sourceVideos[index]
         let (url, isStale) = try resolveBookmark(ref.bookmark, displayName: ref.displayName)
-        if isStale {
-            ref.bookmark = (try? url.bookmarkData(options: [])) ?? ref.bookmark
-            try? saveProject()
+        guard isStale, let newBookmark = try? url.bookmarkData(options: []) else {
+            return (url, false)
         }
-        return url
+        project.sourceVideos[index].bookmark = newBookmark
+        return (url, true)
     }
 
     // MARK: - Preview cache (Mode C)
