@@ -80,6 +80,39 @@ final class MPVRenderingNSView: NSView {
         self.sharedPlayer = player
     }
 
+    /// Production-path attach update. Idempotent: if the same player is
+    /// passed twice, no-op. If a different (or nil → non-nil) player
+    /// arrives, tears down the old attachment and attaches the new one.
+    @MainActor
+    func updatePlayer(_ newPlayer: MPVSourcePlayer?) {
+        let currentID = sharedPlayer.map { ObjectIdentifier($0) }
+        let newID = newPlayer.map { ObjectIdentifier($0) }
+        if currentID == newID { return }
+
+        // Detach current (if any). For the production path the view does
+        // NOT own the player — only detach the render context + drop the
+        // shared ref. The owned-player path (bring-up window) is handled
+        // by tearDown() on viewWillMove(toWindow: nil) and is mutually
+        // exclusive with this code path.
+        if sharedPlayer != nil {
+            if let link = displayLink {
+                CVDisplayLinkStop(link)
+                displayLink = nil
+            }
+            sharedPlayer?.detachRender()
+            sharedPlayer = nil
+        }
+
+        if let newPlayer {
+            do {
+                try attachRenderAndStart(player: newPlayer)
+                sharedPlayer = newPlayer
+            } catch {
+                NSLog("[MPV] attach failed in updatePlayer: \(error)")
+            }
+        }
+    }
+
     @MainActor
     private func attachRenderAndStart(player: MPVSourcePlayer) throws {
         try player.attachRender()
@@ -147,14 +180,13 @@ struct MPVPlayerView: NSViewRepresentable {
     let player: MPVSourcePlayer?
     func makeNSView(context: Context) -> MPVRenderingNSView {
         let v = MPVRenderingNSView(frame: .zero)
-        if let player {
-            do { try v.attach(player: player) }
-            catch { NSLog("[MPV] attach failed: \(error)") }
-        }
+        // Don't attach here — Workspace.sourcePlayer is lazy-init and
+        // may be nil at first body evaluation. updateNSView handles
+        // the actual attach (nil → non-nil transition + identity changes).
+        v.updatePlayer(player)
         return v
     }
     func updateNSView(_ nsView: MPVRenderingNSView, context: Context) {
-        // No-op; the view recreates if the player identity changes (the
-        // parent uses .id(player.generation) — see Phase 4).
+        nsView.updatePlayer(player)
     }
 }
