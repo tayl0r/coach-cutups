@@ -1,7 +1,9 @@
 import SwiftUI
 import AVKit
 
-struct PlayerSurface: NSViewRepresentable {
+/// AVPlayerView wrapper used by clip-preview only. Source-mode rendering
+/// goes through MPVPlayerView (App/Views/MPVPlayerView.swift).
+struct PreviewPlayerSurface: NSViewRepresentable {
     let player: AVPlayer?
 
     func makeNSView(context: Context) -> AVPlayerView {

@@ -17,14 +17,17 @@ enum WorkspaceError: Error {
 final class Workspace {
     var folder: URL?
     var project: Project = Project(name: "Untitled")
-    var virtualPlayer: AVPlayer?
-    var virtualComposition: AVMutableComposition?
+    /// Source-playback engine. Persistent (D2). Lazy-created on first
+    /// rebuildSourcePlayer that has resolved sources. Stays alive across
+    /// missing-source / Relink cycles so a successful relink does not pay
+    /// init cost again.
+    var sourcePlayer: MPVSourcePlayer?
     /// Indices into `project.sourceVideos` whose bookmark failed to resolve
-    /// (file moved/renamed/deleted). Recomputed every `rebuildVirtualPlayer`.
-    /// When non-empty, `virtualPlayer` is intentionally `nil` so the UI can
-    /// surface a Relink banner — playback would be confusing if we played
-    /// only the surviving sources, since clip `sourceIndex`es would no
-    /// longer line up with the concat.
+    /// (file moved/renamed/deleted). Recomputed every `rebuildSourcePlayer`.
+    /// When non-empty, `sourcePlayer`'s playlist is intentionally cleared so
+    /// the UI can surface a Relink banner — playback would be confusing if
+    /// we played only the surviving sources, since clip `sourceIndex`es
+    /// would no longer line up with the concat.
     var missingSourceIndices: Set<Int> = []
 
     /// Cached AVPlayer per clip for Mode C preview. Populated by a background
@@ -61,7 +64,7 @@ final class Workspace {
         // or project switches. Shred any leftover trash from a prior session.
         lastDeletedClip = nil
         shredTrashDirectory()
-        try await rebuildVirtualPlayer()
+        try await rebuildSourcePlayer()
     }
 
     func saveProject() throws {
@@ -78,10 +81,10 @@ final class Workspace {
             displayName: url.lastPathComponent,
             durationSeconds: duration.seconds))
         try saveProject()
-        try await rebuildVirtualPlayer()
+        try await rebuildSourcePlayer()
     }
 
-    func rebuildVirtualPlayer() async throws {
+    func rebuildSourcePlayer() async throws {
         // First pass — try to resolve every bookmark. Tolerant of failures so
         // a moved file produces a Relink banner instead of a thrown error
         // that the user can't recover from.
@@ -97,41 +100,20 @@ final class Workspace {
         }
         self.missingSourceIndices = missing
 
-        // No sources at all, or any source missing — clear the player. We
+        // No sources at all, or any source missing — clear the playlist. We
         // refuse to play a partial concat because clip `sourceIndex`es
-        // wouldn't line up with the surviving sources' positions.
+        // wouldn't line up with the surviving sources' positions. We KEEP
+        // the player handle alive (D2) so a Relink doesn't repay init cost.
         guard !project.sourceVideos.isEmpty, missing.isEmpty else {
-            virtualPlayer = nil
-            virtualComposition = nil
+            sourcePlayer?.setPlaylist([])
             return
         }
 
-        let comp = AVMutableComposition()
-        // The virtual-concat composition has no custom compositor reading by track ID,
-        // so kCMPersistentTrackID_Invalid (auto-assigned IDs) is fine here. The strict
-        // explicit-track-ID rule from the design applies only to the export composition.
-        guard let v = comp.addMutableTrack(withMediaType: .video,
-                                           preferredTrackID: kCMPersistentTrackID_Invalid),
-              let a = comp.addMutableTrack(withMediaType: .audio,
-                                           preferredTrackID: kCMPersistentTrackID_Invalid)
-        else { return }
-
-        var cursor = CMTime.zero
-        for (_, url) in resolved {
-            let asset = AVURLAsset(url: url)
-            let duration = try await asset.load(.duration)
-            let tracks = try await asset.load(.tracks)
-            guard let videoTrack = tracks.first(where: { $0.mediaType == .video }) else {
-                throw WorkspaceError.noVideoTrack(url)
-            }
-            let audioTrack = tracks.first(where: { $0.mediaType == .audio })
-            let range = CMTimeRange(start: .zero, duration: duration)
-            try v.insertTimeRange(range, of: videoTrack, at: cursor)
-            if let audioTrack { try? a.insertTimeRange(range, of: audioTrack, at: cursor) }
-            cursor = cursor + duration
+        if sourcePlayer == nil {
+            sourcePlayer = try MPVSourcePlayer()
         }
-        self.virtualComposition = comp
-        self.virtualPlayer = AVPlayer(playerItem: AVPlayerItem(asset: comp))
+        sourcePlayer?.setPlaylist(resolved.map { $0.url.path(percentEncoded: false) })
+        sourcePlayer?.setVolume(project.preferences.scanVolume)
     }
 
     /// Number of clips whose `sourceIndex` points at the given source. The
@@ -159,7 +141,7 @@ final class Workspace {
             project.clips[i].sourceIndex -= 1
         }
         try saveProject()
-        try await rebuildVirtualPlayer()
+        try await rebuildSourcePlayer()
     }
 
     /// Drag-to-reorder support for the sources list. Builds an
@@ -184,7 +166,7 @@ final class Workspace {
             }
         }
         try saveProject()
-        try await rebuildVirtualPlayer()
+        try await rebuildSourcePlayer()
     }
 
     /// Replaces the bookmark + display name + duration for a specific source
@@ -203,7 +185,7 @@ final class Workspace {
             durationSeconds: duration.seconds
         )
         try saveProject()
-        try await rebuildVirtualPlayer()
+        try await rebuildSourcePlayer()
     }
 
     private func resolveBookmark(_ data: Data, displayName: String) throws -> (URL, isStale: Bool) {
@@ -435,11 +417,11 @@ final class Workspace {
 
     // MARK: - Recording (Mode B) helpers
 
-    /// Maps a virtual-concat composition time (the value returned by
-    /// `virtualPlayer.currentTime()`) back to the source video that contains
-    /// it and the local offset within that source. Walks the cumulative
-    /// source durations in order — the same order `rebuildVirtualPlayer`
-    /// uses to build the concat. Returns `(0, 0)` if there are no sources.
+    /// Maps a cumulative source time (sum of prior source durations + the
+    /// current local offset) back to the source video that contains it and
+    /// the local offset within that source. Walks the cumulative source
+    /// durations in order — the same order `rebuildSourcePlayer` uses to
+    /// build the playlist. Returns `(0, 0)` if there are no sources.
     func sourceTime(at globalSeconds: Double) -> (sourceIndex: Int, sourceLocalSeconds: Double) {
         guard !project.sourceVideos.isEmpty else { return (0, 0) }
         var cumulative: Double = 0

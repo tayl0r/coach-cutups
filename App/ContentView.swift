@@ -13,13 +13,14 @@ struct ContentView: View {
     @State private var workspace = Workspace()
     @State private var skipCoordinator = SkipCoordinator(burstWindowSeconds: 0.15)
     @State private var skipDebounceTask: Task<Void, Never>?
-    /// Identity of the AVPlayer that the coordinator's current state belongs
-    /// to. When the active player changes (clip swap, preview close), reset.
-    @State private var skipCoordinatorPlayerID: ObjectIdentifier?
-    /// True while a coarse (keyframe-tolerant) FF/RW seek is in flight.
-    /// StrokeReplayLayer reads this via the overlay representable and freezes
-    /// its periodic redraw so strokes don't flash to wrong positions during
-    /// the keyframe-decode window.
+    /// Bumped on every selectedClipID change so a late preview-mode seek
+    /// completion is dropped (D12 — also fixes the preexisting AVPlayer
+    /// cache-hit A→B→A bug previously documented at the .onChange site).
+    @State private var previewSkipGeneration: UInt64 = 0
+    /// True while a coarse (keyframe-tolerant) FF/RW seek is in flight in
+    /// preview mode. StrokeReplayLayer reads this via the overlay
+    /// representable and freezes its periodic redraw so strokes don't flash
+    /// to wrong positions during the keyframe-decode window.
     @State private var coarseSeekInFlight: Bool = false
     @State private var selectedClipID: Clip.ID?
     @State private var appMode: AppMode = .scanning
@@ -94,9 +95,13 @@ struct ContentView: View {
                 onMicChange: handleMicSelectionChange
             ))
             .onChange(of: selectedClipID) { _, _ in
-                // Even if the user navigates A → B → A, the cache may return the
-                // *same* AVPlayer for A — `handleSkip`'s pid-equality check would
-                // not detect that as a swap. Reset unconditionally on selection.
+                // Bump both generations so any late completions from the
+                // prior selection's seeks are dropped. Even if the user
+                // navigates A → B → A, the cache may return the *same*
+                // AVPlayer for A — generation bumps invalidate stale state
+                // unconditionally.
+                previewSkipGeneration &+= 1
+                workspace.sourcePlayer?.bumpGeneration()
                 resetSkipState()
             }
             .onChange(of: selectedClipID) { _, newID in
@@ -218,7 +223,14 @@ struct ContentView: View {
         } content: {
             VStack(spacing: 0) {
                 ZStack {
-                    PlayerSurface(player: currentPlayer)
+                    switch appMode {
+                    case .scanning, .recordingStarting, .recording:
+                        MPVPlayerView(player: workspace.sourcePlayer)
+                    case .previewLoading:
+                        Color.black
+                    case .previewClip(let id):
+                        PreviewPlayerSurface(player: workspace.previewPlayer(for: id))
+                    }
                     // Mode C overlays — only mounted when previewing so the
                     // periodic time observer in StrokeReplayLayer doesn't run
                     // during scanning/recording.
@@ -243,7 +255,6 @@ struct ContentView: View {
                         )
                     }
                     KeyCommandView(
-                        player: currentPlayer,
                         appMode: appMode,
                         onSkip: handleSkip,
                         onTogglePlay: handleTogglePlay,
@@ -370,25 +381,12 @@ struct ContentView: View {
         .padding(.vertical, 6)
     }
 
-    // MARK: - Player routing
-
-    private var currentPlayer: AVPlayer? {
-        switch appMode {
-        case .scanning, .recordingStarting, .recording:
-            return workspace.virtualPlayer
-        case .previewLoading:
-            return nil
-        case .previewClip(let id):
-            return workspace.previewPlayer(for: id)
-        }
-    }
-
     // MARK: - Mode transitions
 
     private func handleSelectionChange(_ newID: Clip.ID?) {
         // Pause whatever was playing — switching selection should park the
         // prior player so audio doesn't bleed across clips.
-        workspace.virtualPlayer?.pause()
+        workspace.sourcePlayer?.pause()
         if case .previewClip(let priorID) = appMode {
             workspace.previewPlayer(for: priorID)?.pause()
         }
@@ -448,81 +446,137 @@ struct ContentView: View {
     // MARK: - Keyboard handling
 
     private func handleSkip(_ delta: Double) {
-        guard let player = currentPlayer else { return }
         if appMode == .recording { recordingController?.appendSkip(delta: delta) }
-
-        let pid = ObjectIdentifier(player)
-        if skipCoordinatorPlayerID != pid {
-            resetSkipState()
-            // Don't nil this on swap — the late-completion guard inside
-            // applySkipDecision reads it to short-circuit stale callbacks.
-            skipCoordinatorPlayerID = pid
-        }
-
         let now = CACurrentMediaTime()
-        let curr = player.currentTime().seconds
-        let durRaw = player.currentItem?.duration.seconds ?? .infinity
-        let dur = (durRaw.isFinite && durRaw > 0) ? durRaw : .greatestFiniteMagnitude
 
-        let decision = skipCoordinator.requestSkip(
-            deltaSeconds: delta,
-            currentPlayerTimeSeconds: curr.isFinite ? curr : 0,
-            clipDurationSeconds: dur,
-            nowMonotonicSeconds: now
-        )
-        applySkipDecision(decision, on: player)
+        switch appMode {
+        case .scanning, .recordingStarting, .recording:
+            guard let player = workspace.sourcePlayer else { return }
+            // Don't issue seeks while the playlist is empty (Relink banner
+            // state). mpv would refuse the seek anyway and the cumulative
+            // math would feed the coordinator a bogus zero.
+            guard player.hasLoadedFile else { return }
+            let project = workspace.project
+            let cumulativeCurrent = project.cumulativeOffset(forSourceIndex: player.playlistPos) + player.timePos
+            let total = project.totalSourceDuration
+            // SkipCoordinator does NOT walk a playlist; it operates on a
+            // single scalar `current/duration`. We feed it cumulative-time
+            // semantics so its target lands in [0, total].
+            let decision = skipCoordinator.requestSkip(
+                deltaSeconds: delta,
+                currentPlayerTimeSeconds: cumulativeCurrent.isFinite ? cumulativeCurrent : 0,
+                clipDurationSeconds: total > 0 ? total : .greatestFiniteMagnitude,
+                nowMonotonicSeconds: now
+            )
+            let gen = player.generation
+            driveSkipDecision(decision, generation: gen) { params, completion in
+                // Translate cumulative target back to (sourceIndex, sourceLocal),
+                // applying the D9 end-clamp epsilon to ensure mpv never
+                // refuses the seek.
+                let endEpsilon: Double = 0.05
+                let clamped = max(0, min(params.targetSeconds, max(0, total - endEpsilon)))
+                let mapped = workspace.sourceTime(at: clamped)
+                player.seek(
+                    playlistPos: mapped.sourceIndex,
+                    timeSeconds: mapped.sourceLocalSeconds,
+                    exact: params.exact,
+                    completion: completion
+                )
+            }
+
+        case .previewClip(let id):
+            guard let player = workspace.previewPlayer(for: id) else { return }
+            let durRaw = player.currentItem?.duration.seconds ?? .infinity
+            let dur = (durRaw.isFinite && durRaw > 0) ? durRaw : .greatestFiniteMagnitude
+            let curr = player.currentTime().seconds
+            let decision = skipCoordinator.requestSkip(
+                deltaSeconds: delta,
+                currentPlayerTimeSeconds: curr.isFinite ? curr : 0,
+                clipDurationSeconds: dur,
+                nowMonotonicSeconds: now
+            )
+            let gen = previewSkipGeneration
+            driveSkipDecision(decision, generation: gen) { params, completion in
+                let t = CMTime(seconds: params.targetSeconds, preferredTimescale: 600)
+                let tol: CMTime = params.exact ? .zero : .positiveInfinity
+                if !params.exact { coarseSeekInFlight = true }
+                player.seek(to: t, toleranceBefore: tol, toleranceAfter: tol) { _ in
+                    Task { @MainActor in
+                        // Generation-guard the state mutation so it doesn't
+                        // bleed into a fresh preview the user has navigated to.
+                        if gen == previewSkipGeneration {
+                            coarseSeekInFlight = false
+                        }
+                        completion()
+                    }
+                }
+            }
+
+        case .previewLoading:
+            return
+        }
     }
 
     /// Side-effecting executor for SkipCoordinator decisions. Re-enters via
     /// the seek-completion handler or debounce-fire Task; never synchronous
-    /// self-recursion.
-    private func applySkipDecision(_ decision: SkipDecision, on player: AVPlayer) {
-        let pid = ObjectIdentifier(player)
+    /// self-recursion. Closure-based so source (mpv) and preview (AVPlayer)
+    /// paths can share the control flow while issuing different seek calls.
+    @MainActor
+    private func driveSkipDecision(
+        _ decision: SkipDecision,
+        generation: UInt64,
+        issueSeek: @escaping (SeekParams, _ completion: @escaping @MainActor () -> Void) -> Void
+    ) {
         if let s = decision.seek {
-            let t = CMTime(seconds: s.targetSeconds, preferredTimescale: 600)
-            let tol: CMTime = s.exact ? .zero : .positiveInfinity
-            if !s.exact {
-                coarseSeekInFlight = true
-            }
-            player.seek(to: t, toleranceBefore: tol, toleranceAfter: tol) { _ in
-                // AVPlayer fires the completion on a private queue. Bounce
-                // back to the main actor before mutating coordinator state.
-                Task { @MainActor in
-                    // If the active player changed since this seek was issued,
-                    // ignore the late completion — coordinator was reset already.
-                    guard self.skipCoordinatorPlayerID == pid else { return }
-                    // Clear before the recursion: a follow-up exact seek
-                    // shouldn't inherit the coarse-in-flight freeze.
-                    self.coarseSeekInFlight = false
-                    let next = self.skipCoordinator.seekCompleted(
-                        nowMonotonicSeconds: CACurrentMediaTime()
-                    )
-                    self.applySkipDecision(next, on: player)
-                }
+            issueSeek(s) {
+                // Late-completion guard.
+                guard generation == self.currentSkipGeneration() else { return }
+                let next = self.skipCoordinator.seekCompleted(
+                    nowMonotonicSeconds: CACurrentMediaTime()
+                )
+                self.driveSkipDecision(next, generation: generation, issueSeek: issueSeek)
             }
         }
         if let after = decision.armDebounceSeconds {
             skipDebounceTask?.cancel()
             skipDebounceTask = Task { @MainActor in
                 try? await Task.sleep(nanoseconds: UInt64(after * 1_000_000_000))
-                guard !Task.isCancelled else { return }
-                guard self.skipCoordinatorPlayerID == pid else { return }
+                if Task.isCancelled { return }
+                guard generation == self.currentSkipGeneration() else { return }
                 let next = self.skipCoordinator.burstEnded(
                     nowMonotonicSeconds: CACurrentMediaTime()
                 )
-                self.applySkipDecision(next, on: player)
+                self.driveSkipDecision(next, generation: generation, issueSeek: issueSeek)
             }
         }
     }
 
+    private func currentSkipGeneration() -> UInt64 {
+        switch appMode {
+        case .scanning, .recordingStarting, .recording:
+            return workspace.sourcePlayer?.generation ?? 0
+        case .previewClip, .previewLoading:
+            return previewSkipGeneration
+        }
+    }
+
     private func handleTogglePlay() {
-        guard let player = currentPlayer else { return }
-        let wasPlaying = player.rate != 0
-        wasPlaying ? player.pause() : player.play()
-        if appMode == .recording {
-            wasPlaying
-                ? recordingController?.appendPause()
-                : recordingController?.appendPlay()
+        switch appMode {
+        case .scanning, .recordingStarting, .recording:
+            guard let player = workspace.sourcePlayer else { return }
+            let wasPlaying = !player.isPaused
+            wasPlaying ? player.pause() : player.play()
+            if appMode == .recording {
+                wasPlaying
+                    ? recordingController?.appendPause()
+                    : recordingController?.appendPlay()
+            }
+        case .previewClip(let id):
+            guard let player = workspace.previewPlayer(for: id) else { return }
+            let wasPlaying = player.rate != 0
+            wasPlaying ? player.pause() : player.play()
+        case .previewLoading:
+            return
         }
     }
 
@@ -537,22 +591,23 @@ struct ContentView: View {
         }
     }
 
-    /// Cancels any in-flight debounce, resets coordinator state, and clears
-    /// the player-id guard. Idempotent. Call on close and on every sidebar
-    /// selection change — anywhere the active preview player might have
-    /// flipped.
+    /// Cancels any in-flight debounce and resets coordinator state.
+    /// Idempotent. Call on close and on every sidebar selection change —
+    /// anywhere the active player might have flipped. Generation bumps
+    /// (sourcePlayer.bumpGeneration / previewSkipGeneration) handle late
+    /// completions that race past this reset.
     private func resetSkipState() {
         skipDebounceTask?.cancel()
         skipDebounceTask = nil
         skipCoordinator.reset()
-        skipCoordinatorPlayerID = nil
         coarseSeekInFlight = false
     }
 
-    /// Deselect the current clip and route the player back to the source
-    /// virtual concat. Wired to the Source button in `PreviewTransport` and
-    /// to the Esc key when `appMode` is a preview state.
+    /// Deselect the current clip and route the player back to the source.
+    /// Wired to the Source button in `PreviewTransport` and to the Esc key
+    /// when `appMode` is a preview state.
     private func handleClosePreview() {
+        previewSkipGeneration &+= 1
         resetSkipState()
         // Pause the preview player so audio doesn't keep playing if AVPlayer
         // somehow holds a reference past the swap.
@@ -610,7 +665,7 @@ struct ContentView: View {
             recordingError = "Open a project folder before recording."
             return
         }
-        guard let player = workspace.virtualPlayer else {
+        guard let player = workspace.sourcePlayer else {
             recordingError = "Add a source video before recording."
             return
         }
@@ -626,22 +681,29 @@ struct ContentView: View {
         let filename = "clip-\(clipID).mov"
         let url = recordingsDir.appendingPathComponent(filename)
 
-        // Capture (sourceIndex, startSourceSeconds) as the playhead is RIGHT
-        // NOW. The playhead may move while we await the first sample; the
-        // clip's source mapping is anchored to R-press, not to first-frame.
-        let global = player.currentTime().seconds
-        let mapped = workspace.sourceTime(at: global.isFinite ? global : 0)
-        pendingRecording = PendingRecording(
-            clipID: clipID,
-            filename: filename,
-            sourceIndex: mapped.sourceIndex,
-            startSourceSeconds: mapped.sourceLocalSeconds
-        )
-
         let preferredCameraID = deviceCatalog.selectedCameraID
         let preferredMicID = deviceCatalog.selectedMicID
 
         Task {
+            // One event-pump tick to flush pause / playlist-pos / time-pos
+            // events so the cached @Observable fields reflect the post-pause
+            // state. Without this we may capture a pre-pause prefetch state.
+            await Task.yield()
+
+            // Capture (sourceIndex, startSourceSeconds) from the cached
+            // @Observable fields — the playhead at R-press, anchored before
+            // any subsequent user input moves it.
+            let mappedSourceIndex = player.playlistPos
+            let mappedSourceLocal = player.timePos
+            await MainActor.run {
+                pendingRecording = PendingRecording(
+                    clipID: clipID,
+                    filename: filename,
+                    sourceIndex: mappedSourceIndex,
+                    startSourceSeconds: mappedSourceLocal
+                )
+            }
+
             do {
                 // Lazy configure: the capture session is paused (stopRunning)
                 // between recordings so the indicator light is off while the

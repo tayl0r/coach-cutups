@@ -1,8 +1,6 @@
 import SwiftUI
-import AVFoundation
 
 struct KeyCommandView: NSViewRepresentable {
-    let player: AVPlayer?
     let appMode: AppMode
     let onSkip: (Double) -> Void
     let onTogglePlay: () -> Void
@@ -10,7 +8,7 @@ struct KeyCommandView: NSViewRepresentable {
     /// active one, or is ignored is decided here based on `appMode`.
     let onToggleRecord: () -> Void
     /// Invoked for Esc when in a preview mode. Wired to clear the clip
-    /// selection so the player returns to the source virtual concat.
+    /// selection so the player returns to the source.
     let onClosePreview: () -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {

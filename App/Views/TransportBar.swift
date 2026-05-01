@@ -81,7 +81,7 @@ struct ScanningTransport: View {
                     .frame(width: 18)
             }
             .buttonStyle(.borderless)
-            .disabled(workspace.virtualPlayer == nil)
+            .disabled(workspace.sourcePlayer == nil)
             .help(isPlaying ? "Pause" : "Play")
 
             HStack(spacing: 6) {
@@ -93,7 +93,7 @@ struct ScanningTransport: View {
                 )
                 .frame(width: 120)
                 .onChange(of: workspace.project.preferences.scanVolume) { _, new in
-                    workspace.virtualPlayer?.volume = Float(new)
+                    workspace.sourcePlayer?.setVolume(new)
                     // TODO(Phase 10): debounce + persist on slider release rather
                     // than every drag tick. For now we accept the write amplification.
                     try? workspace.saveProject()
@@ -105,13 +105,14 @@ struct ScanningTransport: View {
     }
 
     private var isPlaying: Bool {
-        (workspace.virtualPlayer?.rate ?? 0) != 0
+        guard let p = workspace.sourcePlayer else { return false }
+        return !p.isPaused
     }
 
     private func togglePlay() {
-        guard let player = workspace.virtualPlayer else { return }
-        if player.rate == 0 {
-            player.volume = Float(workspace.project.preferences.scanVolume)
+        guard let player = workspace.sourcePlayer else { return }
+        if player.isPaused {
+            player.setVolume(workspace.project.preferences.scanVolume)
             player.play()
         } else {
             player.pause()
