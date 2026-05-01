@@ -71,13 +71,45 @@ public final class MPVSourcePlayer {
             throw MPVSourcePlayerError.initializeFailed(code: Int(rc))
         }
         self.handle = h
+        mpv_observe_property(h, 1, "pause",          MPV_FORMAT_FLAG)
+        mpv_observe_property(h, 2, "playlist-count", MPV_FORMAT_INT64)
+        mpv_observe_property(h, 3, "playlist-pos",   MPV_FORMAT_INT64)
+        mpv_observe_property(h, 4, "time-pos",       MPV_FORMAT_DOUBLE)
         let pump = Thread { [handle = h] in
             while true {
                 guard let evt = mpv_wait_event(handle, 0.1) else { continue }
                 let id = evt.pointee.event_id
                 if id == MPV_EVENT_NONE { continue }
                 if id == MPV_EVENT_SHUTDOWN { return }
-                // Property + command-reply + playback-restart handlers added in 3.3 / 3.7.
+                if id == MPV_EVENT_PROPERTY_CHANGE {
+                    let prop = UnsafeMutableRawPointer(evt.pointee.data)?
+                        .assumingMemoryBound(to: mpv_event_property.self).pointee
+                    let userdata = evt.pointee.reply_userdata
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        switch userdata {
+                        case 1:
+                            if let data = prop?.data {
+                                self.isPaused = data.assumingMemoryBound(to: Int32.self).pointee != 0
+                            }
+                        case 2:
+                            if let data = prop?.data {
+                                self.playlistCount = Int(data.assumingMemoryBound(to: Int64.self).pointee)
+                            }
+                        case 3:
+                            if let data = prop?.data {
+                                self.playlistPos = Int(max(0, data.assumingMemoryBound(to: Int64.self).pointee))
+                            }
+                        case 4:
+                            if let data = prop?.data {
+                                let v = data.assumingMemoryBound(to: Double.self).pointee
+                                if v.isFinite { self.timePos = v }
+                            }
+                        default: break
+                        }
+                    }
+                    continue
+                }
             }
         }
         pump.name = "mpv-event-pump"
