@@ -300,6 +300,25 @@ pub fn spawn_on(
         #[cfg(feature = "media")]
         let mut current_preview_mount: Option<crate::frame_sink::MountHandles> = None;
 
+        // Phase 9 Task 3 (fix #14 + #15 + #21). Per-task preview state. The
+        // pipeline is held in an `Arc` so the position-poll task can read
+        // `snapshot()` without blocking the bus loop. The poll task's
+        // `AbortHandle` lets `ClosePreview` cancel it before tearing down
+        // the pipeline (otherwise the poll holds an Arc clone and
+        // `Arc::try_unwrap` fails). The shared compositor (fix #21) is
+        // constructed once at task spawn and cloned per OpenClipPreview —
+        // also saves wgpu init cost across repeated previews.
+        #[cfg(feature = "media")]
+        let mut current_preview: Option<
+            std::sync::Arc<video_coach_media::preview_pipeline::PreviewPipeline>,
+        > = None;
+        #[cfg(feature = "media")]
+        let mut current_preview_poll: Option<tokio::task::AbortHandle> = None;
+        #[cfg(feature = "media")]
+        let compositor: std::sync::Arc<video_coach_compositor::Compositor> = std::sync::Arc::new(
+            video_coach_compositor::Compositor::new_headless().expect("compositor init"),
+        );
+
         while let Some(env) = rx.recv().await {
             let reply = handle(
                 env.command,
@@ -313,6 +332,12 @@ pub fn spawn_on(
                 &mut current_player_mount,
                 #[cfg(feature = "media")]
                 &mut current_preview_mount,
+                #[cfg(feature = "media")]
+                &mut current_preview,
+                #[cfg(feature = "media")]
+                &mut current_preview_poll,
+                #[cfg(feature = "media")]
+                &compositor,
                 #[cfg(feature = "media")]
                 &frame_mount_factory,
                 #[cfg(feature = "media")]
@@ -384,6 +409,73 @@ fn spawn_position_poll(
             }
         }
     });
+}
+
+/// Phase 9 Task 3 (fix #15). Position-poll task for the preview pipeline.
+/// Mirrors `spawn_position_poll`'s shape (100 ms tick, 200 ms last_seek_at
+/// suppression, watch-based shutdown) but takes the
+/// `PreviewPipeline`'s `snapshot()` and returns an `AbortHandle` so
+/// `ClosePreview` can cancel it before tearing the pipeline down.
+///
+/// Same shared `PlayerStateSlot` (per fix #16) — the UI reads ONE slot
+/// and doesn't need to know which pipeline produced the data.
+#[cfg(feature = "media")]
+fn spawn_preview_position_poll(
+    rt: &tokio::runtime::Handle,
+    preview: std::sync::Arc<video_coach_media::preview_pipeline::PreviewPipeline>,
+    state: crate::frame_sink::PlayerStateSlot,
+    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::AbortHandle {
+    let join = rt.spawn(async move {
+        let mut tick = tokio::time::interval(std::time::Duration::from_millis(100));
+        // Skip the immediate first fire; first poll happens after 100 ms.
+        tick.tick().await;
+        loop {
+            tokio::select! {
+                _ = tick.tick() => {
+                    let snap = preview.snapshot();
+                    let mut guard = state.lock().expect("player_state poisoned");
+                    let suppress = guard
+                        .last_seek_at
+                        .map(|t| t.elapsed() < std::time::Duration::from_millis(200))
+                        .unwrap_or(false);
+                    if !suppress {
+                        guard.position_seconds = snap.position_seconds;
+                    }
+                    guard.duration_seconds = snap.duration_seconds;
+                    guard.is_playing = snap.is_playing;
+                }
+                _ = shutdown_rx.changed() => {
+                    if *shutdown_rx.borrow() {
+                        break;
+                    }
+                }
+            }
+        }
+    });
+    join.abort_handle()
+}
+
+/// Phase 9 Task 3 (fix #13). Hydrate the shared `ClipListSlot` from the
+/// project's `clips` vector. Called from three sites: `OpenProject`,
+/// `NewProject`, `StopClipRecording`. The slot is what the UI's 30 Hz
+/// timer reads to populate the sidebar.
+#[cfg(feature = "media")]
+fn write_clip_list(
+    slot: &crate::frame_sink::ClipListSlot,
+    clips: &[video_coach_core::project::Clip],
+) {
+    let summaries: Vec<crate::frame_sink::ClipSummary> = clips
+        .iter()
+        .map(|c| crate::frame_sink::ClipSummary {
+            id: c.id,
+            name: c.name.clone(),
+            recording_duration: c.recording_duration,
+            source_index: c.source_index,
+        })
+        .collect();
+    let mut g = slot.lock().expect("clip_list poisoned");
+    *g = summaries;
 }
 
 /// In-progress clip recording metadata. Built when `StartClipRecording`
@@ -477,6 +569,11 @@ async fn handle(
     >,
     #[cfg(feature = "media")] current_player_mount: &mut Option<crate::frame_sink::MountHandles>,
     #[cfg(feature = "media")] current_preview_mount: &mut Option<crate::frame_sink::MountHandles>,
+    #[cfg(feature = "media")] current_preview: &mut Option<
+        std::sync::Arc<video_coach_media::preview_pipeline::PreviewPipeline>,
+    >,
+    #[cfg(feature = "media")] current_preview_poll: &mut Option<tokio::task::AbortHandle>,
+    #[cfg(feature = "media")] compositor: &std::sync::Arc<video_coach_compositor::Compositor>,
     #[cfg(feature = "media")] frame_mount_factory: &FrameMountFactory,
     #[cfg(feature = "media")] rt_for_poll: &tokio::runtime::Handle,
     #[cfg(feature = "media")] shutdown_tx_for_poll: &tokio::sync::watch::Sender<bool>,
@@ -650,12 +747,13 @@ async fn handle(
                             player_state,
                         )
                         .await;
-                        // Phase 9 (fix #13): clip-list hydration sites
-                        // (OpenProject/NewProject/StopClipRecording)
-                        // land in Task 3. Task 0 just keeps the slot
-                        // wired through so the UI's reader has a
-                        // typed contract from the get-go.
-                        let _ = clip_list;
+                        // Phase 9 Task 3 (fix #13). NewProject's
+                        // project.clips is empty; this clears any stale
+                        // contents from a previously-open project so the
+                        // sidebar matches the now-current project.
+                        if let Some((p, _)) = current.as_ref() {
+                            write_clip_list(clip_list, &p.clips);
+                        }
                     }
                     CommandReply {
                         ok: true,
@@ -706,8 +804,11 @@ async fn handle(
                             player_state,
                         )
                         .await;
-                        // Phase 9: clip_list hydration in Task 3.
-                        let _ = clip_list;
+                        // Phase 9 Task 3 (fix #13). Hydrate sidebar from
+                        // freshly-loaded project.clips.
+                        if let Some((p, _)) = current.as_ref() {
+                            write_clip_list(clip_list, &p.clips);
+                        }
                     }
                     CommandReply {
                         ok: true,
@@ -858,14 +959,35 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                let Some(player) = current_player.as_ref() else {
-                    return CommandReply {
-                        ok: false,
-                        error: Some("no source loaded".into()),
+                // Phase 9 Task 3 (fix #16): route to whichever pipeline is
+                // mounted. PreviewClip mode → preview pipeline. Otherwise
+                // → source player.
+                let result: Result<Result<(), String>, tokio::task::JoinError> =
+                    if matches!(*current_mode, AppMode::PreviewClip(_)) {
+                        let Some(preview) = current_preview.as_ref() else {
+                            return CommandReply {
+                                ok: false,
+                                error: Some("no preview loaded".into()),
+                            };
+                        };
+                        let preview = preview.clone();
+                        tokio::task::spawn_blocking(move || {
+                            preview.play().map_err(|e| e.to_string())
+                        })
+                        .await
+                    } else {
+                        let Some(player) = current_player.as_ref() else {
+                            return CommandReply {
+                                ok: false,
+                                error: Some("no source loaded".into()),
+                            };
+                        };
+                        let player = player.clone();
+                        tokio::task::spawn_blocking(move || {
+                            player.play().map_err(|e| e.to_string())
+                        })
+                        .await
                     };
-                };
-                let player = player.clone();
-                let result = tokio::task::spawn_blocking(move || player.play()).await;
                 match result {
                     Ok(Ok(())) => CommandReply {
                         ok: true,
@@ -873,7 +995,7 @@ async fn handle(
                     },
                     Ok(Err(e)) => CommandReply {
                         ok: false,
-                        error: Some(e.to_string()),
+                        error: Some(e),
                     },
                     Err(join) => CommandReply {
                         ok: false,
@@ -892,14 +1014,32 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                let Some(player) = current_player.as_ref() else {
-                    return CommandReply {
-                        ok: false,
-                        error: Some("no source loaded".into()),
+                let result: Result<Result<(), String>, tokio::task::JoinError> =
+                    if matches!(*current_mode, AppMode::PreviewClip(_)) {
+                        let Some(preview) = current_preview.as_ref() else {
+                            return CommandReply {
+                                ok: false,
+                                error: Some("no preview loaded".into()),
+                            };
+                        };
+                        let preview = preview.clone();
+                        tokio::task::spawn_blocking(move || {
+                            preview.pause().map_err(|e| e.to_string())
+                        })
+                        .await
+                    } else {
+                        let Some(player) = current_player.as_ref() else {
+                            return CommandReply {
+                                ok: false,
+                                error: Some("no source loaded".into()),
+                            };
+                        };
+                        let player = player.clone();
+                        tokio::task::spawn_blocking(move || {
+                            player.pause().map_err(|e| e.to_string())
+                        })
+                        .await
                     };
-                };
-                let player = player.clone();
-                let result = tokio::task::spawn_blocking(move || player.pause()).await;
                 match result {
                     Ok(Ok(())) => CommandReply {
                         ok: true,
@@ -907,7 +1047,7 @@ async fn handle(
                     },
                     Ok(Err(e)) => CommandReply {
                         ok: false,
-                        error: Some(e.to_string()),
+                        error: Some(e),
                     },
                     Err(join) => CommandReply {
                         ok: false,
@@ -927,19 +1067,38 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                let Some(player) = current_player.as_ref() else {
-                    return CommandReply {
-                        ok: false,
-                        error: Some("no source loaded".into()),
+                let result: Result<Result<(), String>, tokio::task::JoinError> =
+                    if matches!(*current_mode, AppMode::PreviewClip(_)) {
+                        let Some(preview) = current_preview.as_ref() else {
+                            return CommandReply {
+                                ok: false,
+                                error: Some("no preview loaded".into()),
+                            };
+                        };
+                        let preview = preview.clone();
+                        tokio::task::spawn_blocking(move || {
+                            preview.seek(seconds, accurate).map_err(|e| e.to_string())
+                        })
+                        .await
+                    } else {
+                        let Some(player) = current_player.as_ref() else {
+                            return CommandReply {
+                                ok: false,
+                                error: Some("no source loaded".into()),
+                            };
+                        };
+                        let player = player.clone();
+                        tokio::task::spawn_blocking(move || {
+                            player.seek(seconds, accurate).map_err(|e| e.to_string())
+                        })
+                        .await
                     };
-                };
-                let player = player.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || player.seek(seconds, accurate)).await;
                 // Record the seek so the position-poll task suppresses
                 // its next update — otherwise the bar briefly snaps
                 // back to the pre-seek position while the decoder
-                // flushes. (Adversarial-review fix #8.)
+                // flushes. (Adversarial-review fix #8.) Same write
+                // regardless of which pipeline received the seek (fix
+                // #16: ONE shared PlayerStateSlot).
                 if matches!(result, Ok(Ok(()))) {
                     let mut g = player_state.lock().expect("player_state poisoned");
                     g.last_seek_at = Some(std::time::Instant::now());
@@ -952,7 +1111,7 @@ async fn handle(
                     },
                     Ok(Err(e)) => CommandReply {
                         ok: false,
-                        error: Some(e.to_string()),
+                        error: Some(e),
                     },
                     Err(join) => CommandReply {
                         ok: false,
@@ -1289,6 +1448,10 @@ async fn handle(
                     Ok(Ok(())) => {
                         *current_mode = AppMode::Scanning;
                         write_recording_state(recording_state, current_mode, None);
+                        // Phase 9 Task 3 (fix #13). project.clips already
+                        // has the just-pushed clip; sync the slot so the
+                        // sidebar shows it.
+                        write_clip_list(clip_list, &project.clips);
                         tracing::info!(
                             target: "recording.lifecycle",
                             event = "clip_recording.stopped",
@@ -1431,10 +1594,6 @@ async fn handle(
             }
         }
         Command::OpenClipPreview { clip_id } => {
-            // Phase 9 Task 0: command + variant + serde shape only.
-            // Full handler — pause player, mount preview pipeline,
-            // transition mode, emit `clip_preview.opened` — lands in
-            // Task 3.
             #[cfg(not(feature = "media"))]
             {
                 let _ = clip_id;
@@ -1445,35 +1604,228 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                let _ = (
-                    clip_id,
-                    &recording,
-                    &recording_clip,
-                    &current,
-                    &current_player,
-                    &current_player_mount,
-                    &current_preview_mount,
-                    frame_mount_factory,
-                    rt_for_poll,
-                    shutdown_tx_for_poll,
-                    player_state,
-                    recording_state,
-                    clip_list,
-                    &current_mode,
-                    fixture_recording_source,
-                );
-                CommandReply {
-                    ok: false,
-                    error: Some("not yet implemented (phase 9 task 3)".into()),
+                // Phase 9 Task 3. Strict order per fixes #3, #14, #22, #25:
+                //   1. parse clip_id
+                //   2. refuse if no project
+                //   3. refuse if busy (per fix #22 — emit
+                //      clip_preview.failed with reason="already_in_preview"
+                //      when the busy reason is specifically PreviewClip)
+                //   4. find clip
+                //   5. resolve paths via project_folder.join (NO
+                //      per-call canonicalize — per fix #25)
+                //   6. flip player_mount.active=false BEFORE pause-await
+                //      (fix #3)
+                //   7. pause source player (best-effort)
+                //   8. build fresh preview FrameSink + handles
+                //   9. spawn_blocking PreviewPipeline::open
+                //  10. on success: stash, set mode, seed slot,
+                //      spawn position-poll task (fix #15), log opened.
+                //      on failure: roll back player_mount.active=true,
+                //      clear preview_mount, log failed.
+
+                let clip_uuid = match uuid::Uuid::parse_str(&clip_id) {
+                    Ok(u) => u,
+                    Err(e) => {
+                        return CommandReply {
+                            ok: false,
+                            error: Some(format!("invalid clip_id: {e}")),
+                        };
+                    }
+                };
+
+                let Some((project, project_folder)) = current.as_ref() else {
+                    return CommandReply {
+                        ok: false,
+                        error: Some("no project open".into()),
+                    };
+                };
+
+                if is_busy(recording, recording_clip, current_mode) {
+                    let reason = if matches!(*current_mode, AppMode::PreviewClip(_)) {
+                        "already_in_preview"
+                    } else {
+                        "busy"
+                    };
+                    tracing::warn!(
+                        target: "clip_preview.lifecycle",
+                        event = "clip_preview.failed",
+                        clip_id = %clip_id,
+                        reason = reason,
+                    );
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!("cannot open preview: {reason}")),
+                    };
+                }
+
+                let Some(clip) = project.clips.iter().find(|c| c.id == clip_uuid).cloned() else {
+                    tracing::warn!(
+                        target: "clip_preview.lifecycle",
+                        event = "clip_preview.failed",
+                        clip_id = %clip_id,
+                        reason = "clip_not_found",
+                    );
+                    return CommandReply {
+                        ok: false,
+                        error: Some("clip not found".into()),
+                    };
+                };
+
+                let Some(source_ref) = project.source_videos.get(clip.source_index) else {
+                    tracing::warn!(
+                        target: "clip_preview.lifecycle",
+                        event = "clip_preview.failed",
+                        clip_id = %clip_id,
+                        reason = "source_index_out_of_range",
+                    );
+                    return CommandReply {
+                        ok: false,
+                        error: Some("source index out of range".into()),
+                    };
+                };
+                let source_path = project_folder.join(&source_ref.relative_path);
+                let recording_path =
+                    video_coach_core::project_store::recordings_dir(project_folder)
+                        .join(&clip.recording_filename);
+                if !recording_path.is_file() {
+                    tracing::warn!(
+                        target: "clip_preview.lifecycle",
+                        event = "clip_preview.failed",
+                        clip_id = %clip_id,
+                        reason = "recording_file_missing",
+                    );
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!("recording missing: {}", recording_path.display())),
+                    };
+                }
+                let source_duration_seconds = source_ref.duration_seconds;
+
+                // Fix #3: flip player_mount.active=false BEFORE pause-await
+                // so a queued frame from GStreamer's streaming thread
+                // can't sneak into the slot AFTER the preview's first
+                // frame lands.
+                if let Some(handles) = current_player_mount.as_ref() {
+                    handles
+                        .active
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+
+                // Pause source player. Best-effort: a failure here (e.g.
+                // no source loaded yet) shouldn't block the preview.
+                if let Some(player) = current_player.as_ref() {
+                    let player = player.clone();
+                    let _ = tokio::task::spawn_blocking(move || player.pause()).await;
+                }
+
+                // Fresh preview FrameSink + handles. The factory mints a
+                // new active flag + frames-pushed counter; we stash the
+                // handles AFTER successful open so a failed open doesn't
+                // leave a dangling preview_mount entry.
+                let mounted = frame_mount_factory();
+                let preview_handles = crate::frame_sink::MountHandles {
+                    active: mounted.active.clone(),
+                    frames_pushed: mounted.frames_pushed.clone(),
+                };
+
+                let compositor_for_open = compositor.clone();
+                let clip_for_open = clip.clone();
+                let source_path_for_open = source_path.clone();
+                let recording_path_for_open = recording_path.clone();
+                let sink = mounted.sink;
+                let result = tokio::task::spawn_blocking(move || {
+                    video_coach_media::preview_pipeline::PreviewPipeline::open(
+                        &source_path_for_open,
+                        &recording_path_for_open,
+                        &clip_for_open,
+                        source_duration_seconds,
+                        compositor_for_open,
+                        sink,
+                    )
+                })
+                .await;
+
+                match result {
+                    Ok(Ok(pipeline)) => {
+                        let pipeline = std::sync::Arc::new(pipeline);
+                        *current_preview = Some(pipeline.clone());
+                        *current_preview_mount = Some(preview_handles);
+                        *current_mode = AppMode::PreviewClip(clip_uuid);
+                        write_recording_state(recording_state, current_mode, None);
+
+                        // Seed the player_state slot so the UI's first
+                        // paint shows the right duration / position /
+                        // paused state. The position-poll task overwrites
+                        // this every 100 ms.
+                        {
+                            let mut g = player_state.lock().expect("player_state poisoned");
+                            g.duration_seconds = clip.recording_duration;
+                            g.position_seconds = 0.0;
+                            g.is_playing = false;
+                            g.last_seek_at = None;
+                        }
+
+                        // Fix #15: position-poll task with AbortHandle
+                        // so ClosePreview can cancel before tearing the
+                        // pipeline down.
+                        let poll_handle = spawn_preview_position_poll(
+                            rt_for_poll,
+                            pipeline.clone(),
+                            player_state.clone(),
+                            shutdown_tx_for_poll.subscribe(),
+                        );
+                        *current_preview_poll = Some(poll_handle);
+
+                        tracing::info!(
+                            target: "clip_preview.lifecycle",
+                            event = "clip_preview.opened",
+                            clip_id = %clip_uuid,
+                            source = %source_path.display(),
+                            recording = %recording_path.display(),
+                            recording_duration = clip.recording_duration,
+                        );
+                        CommandReply {
+                            ok: true,
+                            error: None,
+                        }
+                    }
+                    Ok(Err(e)) => {
+                        // Failure rollback: re-enable player_mount, no
+                        // preview_mount stashed. Mode stays Scanning.
+                        if let Some(handles) = current_player_mount.as_ref() {
+                            handles
+                                .active
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        *current_preview_mount = None;
+                        tracing::warn!(
+                            target: "clip_preview.lifecycle",
+                            event = "clip_preview.failed",
+                            clip_id = %clip_id,
+                            reason = "open_failed",
+                            error = %e,
+                        );
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("preview open: {e}")),
+                        }
+                    }
+                    Err(join) => {
+                        if let Some(handles) = current_player_mount.as_ref() {
+                            handles
+                                .active
+                                .store(true, std::sync::atomic::Ordering::Release);
+                        }
+                        *current_preview_mount = None;
+                        CommandReply {
+                            ok: false,
+                            error: Some(format!("join: {join}")),
+                        }
+                    }
                 }
             }
         }
         Command::ClosePreview => {
-            // Phase 9 Task 0: command + variant + serde shape only.
-            // Full handler — abort poll, flip preview_mount.active=false,
-            // tear down PreviewPipeline, restore player_mount.active=true,
-            // emit `clip_preview.closed` with frames_pushed — lands in
-            // Task 3.
             #[cfg(not(feature = "media"))]
             {
                 CommandReply {
@@ -1483,15 +1835,84 @@ async fn handle(
             }
             #[cfg(feature = "media")]
             {
-                let _ = (
-                    &current_player_mount,
-                    &current_preview_mount,
-                    recording_state,
-                    &current_mode,
+                if !matches!(*current_mode, AppMode::PreviewClip(_)) {
+                    return CommandReply {
+                        ok: false,
+                        error: Some(format!("cannot close preview in mode {:?}", *current_mode)),
+                    };
+                }
+
+                // 1. Abort the position-poll task so it stops holding an
+                //    Arc clone of the pipeline (otherwise Arc::try_unwrap
+                //    below fails).
+                if let Some(handle) = current_preview_poll.take() {
+                    handle.abort();
+                }
+
+                // 2. Fix #3: flip preview_mount.active=false BEFORE
+                //    teardown. Straggler frames from the preview's
+                //    GStreamer threads land on the floor.
+                if let Some(handles) = current_preview_mount.as_ref() {
+                    handles
+                        .active
+                        .store(false, std::sync::atomic::Ordering::Release);
+                }
+
+                // 3. Read frames_pushed BEFORE clearing the mount handle
+                //    so the event reflects the actual count. Fix #26.
+                let frames_pushed = current_preview_mount
+                    .as_ref()
+                    .map(|h| h.frames_pushed.load(std::sync::atomic::Ordering::Acquire))
+                    .unwrap_or(0);
+
+                // 4. Tear down via PreviewPipeline::stop in spawn_blocking
+                //    (per fix #14 — explicit, NOT just Drop). The
+                //    pipeline is held in an Arc; Arc::try_unwrap consumes
+                //    it. Should always succeed UNLESS something else
+                //    holds an Arc clone — the poll task is the only
+                //    other holder, and we just aborted it. abort() is
+                //    asynchronous, so yield once to let the runtime
+                //    drop the JoinHandle's Arc clone before we unwrap.
+                if let Some(pipeline_arc) = current_preview.take() {
+                    tokio::task::yield_now().await;
+                    match std::sync::Arc::try_unwrap(pipeline_arc) {
+                        Ok(pipeline) => {
+                            let _ = tokio::task::spawn_blocking(move || pipeline.stop()).await;
+                        }
+                        Err(arc) => {
+                            tracing::warn!(
+                                target: "clip_preview.lifecycle",
+                                event = "clip_preview.teardown_via_drop",
+                                reason = "arc_still_shared",
+                            );
+                            drop(arc); // Drop impl runs the safety-net teardown.
+                        }
+                    }
+                }
+
+                // 5. Mode → Scanning.
+                *current_mode = AppMode::Scanning;
+                write_recording_state(recording_state, current_mode, None);
+
+                // 6. Fix #3 + #9: re-enable player_mount.active=true. The
+                //    source player stays paused (matches v1) — user
+                //    re-presses Space to resume — but the slot needs to
+                //    be writable when they do.
+                if let Some(handles) = current_player_mount.as_ref() {
+                    handles
+                        .active
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
+                *current_preview_mount = None;
+
+                tracing::info!(
+                    target: "clip_preview.lifecycle",
+                    event = "clip_preview.closed",
+                    frames_pushed = frames_pushed as i64,
                 );
                 CommandReply {
-                    ok: false,
-                    error: Some("not yet implemented (phase 9 task 3)".into()),
+                    ok: true,
+                    error: None,
                 }
             }
         }
@@ -1917,6 +2338,85 @@ mod tests {
         let cmd: Command =
             serde_json::from_value(serde_json::json!({"cmd": "close_preview"})).unwrap();
         assert!(matches!(cmd, Command::ClosePreview));
+    }
+
+    #[cfg(feature = "media")]
+    fn make_clip(
+        name: &str,
+        recording_duration: f64,
+        source_index: usize,
+    ) -> video_coach_core::project::Clip {
+        video_coach_core::project::Clip {
+            id: uuid::Uuid::new_v4(),
+            name: name.into(),
+            notes: String::new(),
+            tags: Vec::new(),
+            source_index,
+            start_source_seconds: 0.0,
+            recording_duration,
+            recording_filename: format!("{name}.mov"),
+            events: Vec::new(),
+            sort_index: 0,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn write_clip_list_hydrates_from_open_project() {
+        // Phase 9 fix #13 (OpenProject path). Bus loads a project with
+        // 2 existing clips; the slot must reflect those clips after the
+        // write. Same call shape the OpenProject handler uses.
+        let slot = crate::frame_sink::new_clip_list();
+        let clips = vec![
+            make_clip("1-00:00:00", 1.5, 0),
+            make_clip("1-00:00:05", 2.25, 0),
+        ];
+        write_clip_list(&slot, &clips);
+        let g = slot.lock().unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[0].name, "1-00:00:00");
+        assert!((g[0].recording_duration - 1.5).abs() < f64::EPSILON);
+        assert_eq!(g[1].name, "1-00:00:05");
+        assert_eq!(g[0].source_index, 0);
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn write_clip_list_clears_for_empty_project() {
+        // Phase 9 fix #13 (NewProject path). NewProject's clips are
+        // empty; the slot — which may have entries from a previously
+        // open project — must clear so the sidebar matches.
+        let slot = crate::frame_sink::new_clip_list();
+        // Pre-populate to simulate a previously-loaded project.
+        slot.lock().unwrap().push(crate::frame_sink::ClipSummary {
+            id: uuid::Uuid::new_v4(),
+            name: "stale".into(),
+            recording_duration: 0.0,
+            source_index: 0,
+        });
+        let empty: Vec<video_coach_core::project::Clip> = Vec::new();
+        write_clip_list(&slot, &empty);
+        assert!(slot.lock().unwrap().is_empty());
+    }
+
+    #[cfg(feature = "media")]
+    #[test]
+    fn write_clip_list_appends_after_stop_clip_recording() {
+        // Phase 9 fix #13 (StopClipRecording path). After a successful
+        // stop, project.clips already has the new clip pushed; the slot
+        // call syncs against the post-push vector.
+        let slot = crate::frame_sink::new_clip_list();
+        let mut clips = vec![make_clip("1-00:00:00", 1.0, 0)];
+        write_clip_list(&slot, &clips);
+        assert_eq!(slot.lock().unwrap().len(), 1);
+
+        // Simulate StopClipRecording's project.clips.push:
+        clips.push(make_clip("1-00:00:30", 2.0, 0));
+        write_clip_list(&slot, &clips);
+        let g = slot.lock().unwrap();
+        assert_eq!(g.len(), 2);
+        assert_eq!(g[1].name, "1-00:00:30");
     }
 
     #[test]

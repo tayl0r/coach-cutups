@@ -15,11 +15,15 @@ control-socket = []
 # runtime and the binary builds with no GStreamer dependency.
 # Phase 7 added video-coach-media's `media` feature gating around the
 # source_player + compose modules; propagate it through.
-media = ["dep:video-coach-media", "video-coach-media/media"]
+media = ["dep:video-coach-media", "video-coach-media/media", "dep:video-coach-compositor"]
 
 [dependencies]
 video-coach-core = { path = "../video-coach-core" }
 video-coach-media = { path = "../video-coach-media", optional = true }
+# Phase 9 Task 3. Bus task holds an Arc<Compositor> so OpenClipPreview can
+# clone it into the PreviewPipeline (fix #21 — shared compositor across
+# previews, also saves wgpu init cost on repeated opens).
+video-coach-compositor = { path = "../video-coach-compositor", optional = true }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "io-util", "net", "signal", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

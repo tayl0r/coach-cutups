@@ -5892,6 +5892,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "video-coach-compositor",
  "video-coach-core",
  "video-coach-media",
 ]
