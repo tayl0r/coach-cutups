@@ -328,6 +328,9 @@ public final class MPVSourcePlayer {
     // player. The CVDisplayLink lives on the view; renderInto is called
     // from that link's callback.
 
+    /// LEGACY: superseded by attachRenderGL/renderIntoGL. Retained as a fallback
+    /// during the soak period. Schedule for removal once the GL path has shipped
+    /// for at least one release without regressions. See MPVRenderBackend.production.
     public func attachRender() throws {
         renderLock.lock(); defer { renderLock.unlock() }
         guard renderContext == nil else { throw MPVSourcePlayerError.alreadyAttached }
@@ -429,9 +432,12 @@ public final class MPVSourcePlayer {
         }
     }
 
-    /// Called by MPVRenderingNSView's CVDisplayLink. Try-locks to avoid
-    /// blocking the display-link thread on a teardown in flight; nil
-    /// renderContext means a teardown happened, so we skip this frame.
+    /// LEGACY: SW render path. Superseded by renderIntoGL. Called by
+    /// MPVRenderingNSView's CVDisplayLink when MPVRenderBackend is .sw.
+    /// Try-locks to avoid blocking the display-link thread on a teardown in
+    /// flight; nil renderContext means a teardown happened, so we skip this
+    /// frame. Schedule for removal alongside attachRender once the GL path
+    /// has soaked for one release.
     public nonisolated func renderInto(layer: CAMetalLayer, drawableSize: CGSize, commandQueue: MTLCommandQueue) {
         guard renderLock.try() else {
             return
