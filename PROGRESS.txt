@@ -201,7 +201,7 @@ PENDING. Plan: docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
       Three new unit tests for fix #13 hydration sites (OpenProject,
       NewProject clears, StopClipRecording appends). Compositor dep added
       to video-coach-app under media feature.
-- [x] Task 4: UI — clip sidebar + mode-aware transport + preview-close action (commit __TASK4_SHA__)
+- [x] Task 4: UI — clip sidebar + mode-aware transport + preview-close action (commit f19e731)
       main.slint: 200px clip sidebar with name + format-mmss(duration) +
       hover/selected highlight, source-frame-image shifts right when
       sidebar present. Esc + "← Source" button → close-preview-clicked.
