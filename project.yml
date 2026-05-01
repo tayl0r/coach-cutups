@@ -35,3 +35,22 @@ targets:
         SWIFT_VERSION: 5.9
         MACOSX_DEPLOYMENT_TARGET: "14.0"
         ARCHS: arm64
+  VideoCoachUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: AppUITests
+        excludes:
+          - "*.entitlements"
+    dependencies:
+      - target: VideoCoach
+    settings:
+      base:
+        TEST_TARGET_NAME: VideoCoach
+        SWIFT_VERSION: 5.9
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachUITests
+        CODE_SIGN_ENTITLEMENTS: AppUITests/VideoCoachUITests.entitlements
+        ENABLE_APP_SANDBOX: NO
