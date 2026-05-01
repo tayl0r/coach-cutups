@@ -190,8 +190,27 @@ PENDING. Plan: docs/plans/2026-04-30-rust-rewrite-phase-9-clip-preview.md
       preview_pipeline_pushes_frames_for_a_simple_clip (≥10 frames in 1s
       assertion — actual: 25 frames) and preview_pipeline_opens_clip_with_
       freeze_segment (pre-decode path doesn't panic on a Pause/Play clip).
-- [ ] Task 3: Bus wiring — OpenClipPreview / ClosePreview + ClipListSlot
-- [ ] Task 4: UI — clip sidebar + mode-aware transport + preview-close action
+- [x] Task 3: Bus wiring — OpenClipPreview / ClosePreview + ClipListSlot (commit 93f46f7)
+      OpenClipPreview/ClosePreview handlers — fix #3 active-flag handover,
+      fix #14 explicit PreviewPipeline::stop via spawn_blocking + Arc::try_unwrap,
+      fix #15 spawn_preview_position_poll returning AbortHandle, fix #16
+      shared PlayerStateSlot routing (Play/Pause/Seek dispatch on
+      AppMode::PreviewClip), fix #21 shared Arc<Compositor> per bus task,
+      fix #22 already_in_preview reason on busy refusal, fix #25 no
+      per-call canonicalize, fix #26 frames_pushed on clip_preview.closed.
+      Three new unit tests for fix #13 hydration sites (OpenProject,
+      NewProject clears, StopClipRecording appends). Compositor dep added
+      to video-coach-app under media feature.
+- [x] Task 4: UI — clip sidebar + mode-aware transport + preview-close action (commit __TASK4_SHA__)
+      main.slint: 200px clip sidebar with name + format-mmss(duration) +
+      hover/selected highlight, source-frame-image shifts right when
+      sidebar present. Esc + "← Source" button → close-preview-clicked.
+      Preview-clip-name centred above transport bar in preview mode.
+      ui.rs: 30 Hz timer hydrates Slint clips model from ClipListSlot
+      (rebuilds only on change), wires clip-clicked → OpenClipPreview
+      and close-preview-clicked → ClosePreview. selected-clip-id
+      stamped locally on click for instant highlight, cleared when
+      mode flips out of preview_clip.
 - [ ] Task 5: Harness E2E — record + preview + verify frames
 - [ ] Task 6: Single-frame preview-vs-export parity check
 - [ ] Task 7: Closeout

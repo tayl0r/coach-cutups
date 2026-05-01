@@ -25,8 +25,26 @@ export component MainWindow inherits Window {
     // "scanning", "recording_starting", "recording" (matching
     // bus::AppMode's snake_case serde). The REC indicator + M:SS
     // label below switch on this string.
+    //
+    // Phase 9 Task 4. Mode also gains "preview_clip" — when set the
+    // sidebar selection highlights the active clip and the transport
+    // bar shows a "← Source" button + the clip name.
     in property <string> mode: "scanning";
     in property <float> recording-elapsed-seconds: 0;
+
+    // Phase 9 Task 4. Sidebar of clips for the currently-open project.
+    // Hydrated by ui.rs's 30 Hz timer reading the bus's `ClipListSlot`.
+    // Each row carries a stringified clip-id (the `clip-clicked`
+    // callback re-emits it; the Rust handler parses + dispatches
+    // OpenClipPreview { clip_id }).
+    in property <[{id: string, name: string, duration: float}]> clips: [];
+    // Clip currently in preview, as the same stringified UUID. Used to
+    // highlight the active row in the sidebar. Empty string when
+    // mode != "preview_clip".
+    in property <string> selected-clip-id: "";
+    // Display name of the previewing clip — shown center of the
+    // transport bar when mode == "preview_clip".
+    in property <string> preview-clip-name: "";
 
     callback new-project-clicked();
     callback open-project-clicked();
@@ -56,6 +74,15 @@ export component MainWindow inherits Window {
     // seconds since stroke-start. The Rust handler wraps this in a
     // CommentaryEvent { kind: Stroke } via Command::AppendStroke.
     callback stroke-completed(string);
+
+    // Phase 9 Task 4. A clip in the sidebar was clicked. The Rust
+    // handler dispatches `OpenClipPreview { clip_id }` with the same
+    // stringified UUID.
+    callback clip-clicked(string);
+    // Phase 9 Task 4. The "← Source" button in the transport bar (or
+    // Esc key) was activated while in preview mode. The Rust handler
+    // dispatches `ClosePreview`.
+    callback close-preview-clicked();
 
     // Capture keyboard focus at root so Space / arrow keys hit the
     // transport handlers regardless of which TouchArea last clicked.
@@ -103,14 +130,28 @@ export component MainWindow inherits Window {
                 root.record-toggled();
                 return accept;
             }
+            // Phase 9 Task 4. Esc closes the active preview; pass-through
+            // for every other mode (so future Esc handlers in dialogs
+            // etc. can pick it up unchanged).
+            if (event.text == Key.Escape) {
+                if (root.mode == "preview_clip") {
+                    root.close-preview-clicked();
+                    return accept;
+                }
+                return reject;
+            }
             return reject;
         }
     }
 
-    // Source video surface — fills above the transport bar.
+    // Phase 9 Task 4. Source video surface — fills the area to the
+    // right of the clip sidebar (200px wide when clips.length > 0,
+    // collapsed to 0 when the project has no clips so the surface
+    // fills the full window the same as Phase 7/8).
     source-frame-image := Image {
-        x: 0; y: 0;
-        width: parent.width;
+        x: clips.length > 0 ? 200px : 0;
+        y: 0;
+        width: parent.width - (clips.length > 0 ? 200px : 0px);
         height: parent.height - 56px;
         image-fit: contain;
         source: source-frame;
@@ -215,8 +256,58 @@ export component MainWindow inherits Window {
         }
     }
 
+    // Phase 9 Task 4. Clip sidebar. Fixed 200 px on the left edge,
+    // visible only when the current project has at least one clip.
+    // Each row shows the clip's name + duration formatted as M:SS;
+    // clicking dispatches `clip-clicked(clip-id)` which the Rust
+    // handler maps to OpenClipPreview. The active clip is
+    // highlighted via `selected-clip-id`.
+    if clips.length > 0: Rectangle {
+        x: 0;
+        y: 0;
+        width: 200px;
+        height: parent.height - 56px;
+        background: #181818;
+        VerticalLayout {
+            x: 0; y: 0;
+            width: parent.width;
+            spacing: 0;
+            padding: 0;
+            for clip[idx] in clips: Rectangle {
+                height: 44px;
+                background: clip.id == root.selected-clip-id
+                    ? #2c5d8a
+                    : (clip-area.has-hover ? #242424 : transparent);
+                Text {
+                    x: 8px;
+                    y: 4px;
+                    width: parent.width - 16px;
+                    height: 18px;
+                    text: clip.name;
+                    font-size: 13px;
+                    color: #ffffff;
+                    overflow: elide;
+                }
+                Text {
+                    x: 8px;
+                    y: 22px;
+                    width: parent.width - 16px;
+                    height: 16px;
+                    text: format-mmss(clip.duration);
+                    font-size: 11px;
+                    color: #aaaaaa;
+                }
+                clip-area := TouchArea {
+                    width: parent.width;
+                    height: parent.height;
+                    clicked => { root.clip-clicked(clip.id); }
+                }
+            }
+        }
+    }
+
     Text {
-        x: 16px;
+        x: clips.length > 0 ? 216px : 16px;
         y: 16px;
         text: project-title;
         font-size: 18px;
@@ -269,6 +360,12 @@ export component MainWindow inherits Window {
 
     // Transport bar at the bottom: play/pause + custom scrub track +
     // position label.
+    //
+    // Phase 9 Task 4. In preview_clip mode the bar gains a "← Source"
+    // button at its left edge and a center label with the clip name.
+    // The skip / play / scrub / volume controls remain in place;
+    // play/pause/scrub already route to the active pipeline (preview
+    // when in preview mode) per the bus's Task 3 dispatch.
     Rectangle {
         x: 0;
         y: parent.height - 56px;
@@ -276,9 +373,43 @@ export component MainWindow inherits Window {
         height: 56px;
         background: #1a1a1a;
 
+        // Phase 9 Task 4. Close-preview button. Hidden outside
+        // preview_clip mode; visible at the very left edge in preview
+        // mode where it replaces nothing — the existing skip-back-10
+        // button shifts right when this is visible by means of an `if`
+        // wrapping the close button rather than relative-positioning,
+        // because Slint's `if`-conditional siblings keep the original
+        // x-anchors intact (skip-back-10 sits at x: 12px regardless of
+        // the close button's presence; the two stack at the same x but
+        // are mutually exclusive).
+        if mode == "preview_clip": close-preview-button := Rectangle {
+            x: 12px;
+            y: (parent.height - self.height) / 2;
+            width: 96px;
+            height: 32px;
+            border-radius: 4px;
+            background: close-area.pressed
+                ? #303030
+                : (close-area.has-hover ? #2a2a2a : transparent);
+            Text {
+                text: "← Source";
+                font-size: 13px;
+                color: #ffffff;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                width: parent.width;
+                height: parent.height;
+            }
+            close-area := TouchArea {
+                width: parent.width;
+                height: parent.height;
+                clicked => { root.close-preview-clicked(); }
+            }
+        }
+
         // Skip −10s
         skip-back-10 := Rectangle {
-            x: 12px;
+            x: mode == "preview_clip" ? 116px : 12px;
             y: (parent.height - self.height) / 2;
             width: 32px;
             height: 32px;
@@ -483,6 +614,31 @@ export component MainWindow inherits Window {
                     }
                 }
             }
+        }
+    }
+
+    // Phase 9 Task 4. Preview clip-name label floating just above the
+    // transport bar. Visible only in preview_clip mode so it doesn't
+    // conflict with the recording flow's overlay area. The text is
+    // hydrated by ui.rs's 30 Hz timer from the active clip's name.
+    if mode == "preview_clip" && preview-clip-name != "": Rectangle {
+        x: (parent.width - self.width) / 2;
+        y: parent.height - 56px - 28px;
+        width: min(400px, max(120px, preview-name-text.preferred-width + 24px));
+        height: 24px;
+        border-radius: 4px;
+        background: #00000099;
+        preview-name-text := Text {
+            x: 12px;
+            y: 0;
+            width: parent.width - 24px;
+            height: parent.height;
+            text: preview-clip-name;
+            font-size: 13px;
+            color: #ffffff;
+            horizontal-alignment: center;
+            vertical-alignment: center;
+            overflow: elide;
         }
     }
 

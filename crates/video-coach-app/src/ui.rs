@@ -56,14 +56,12 @@ pub fn run(
     // observes them (Task 3).
     recording_state: RecordingStateSlot,
     // Phase 9: shared clip list for the sidebar. UI reader, bus writer
-    // (Task 3 hydrates per fix #13). Task 0 just plumbs the slot in;
-    // Task 4 will wire the sidebar UI + 30 Hz pull. Held here to keep
-    // the slot alive for the lifetime of the UI process.
+    // (Task 3 hydrates per fix #13). The 30 Hz timer reads it, converts
+    // to a Slint model, and pushes via `set_clips`. Held alive for the
+    // lifetime of the UI process.
     clip_list: ClipListSlot,
     startup_project: Option<String>,
 ) -> anyhow::Result<()> {
-    // Suppress dead-code warnings until Task 4 wires the sidebar.
-    let _ = &clip_list;
     let window = MainWindow::new()?;
 
     // Phase 7 Task 4: drive `source-frame` from the shared frame slot at
@@ -76,6 +74,11 @@ pub fn run(
     let slot_for_timer = frame_slot.clone();
     let player_state_for_timer = player_state.clone();
     let recording_state_for_timer = recording_state.clone();
+    let clip_list_for_timer = clip_list.clone();
+    // Phase 9 Task 4: cache last-seen clip-list signature so we only
+    // rebuild the Slint model when something actually changed.
+    // (id, name, duration) tuples — same shape we hand to Slint.
+    let mut cached_clips: Vec<(uuid::Uuid, String, f64)> = Vec::new();
     frame_timer.start(
         slint::TimerMode::Repeated,
         std::time::Duration::from_millis(FRAME_TICK_MS),
@@ -97,9 +100,9 @@ pub fn run(
                     RecordingMode::Scanning => "scanning",
                     RecordingMode::RecordingStarting => "recording_starting",
                     RecordingMode::Recording => "recording",
-                    // Phase 9 Task 0: surface as a stable string for
-                    // the harness; Task 4 wires the sidebar + mode-
-                    // aware transport that actually consumes this.
+                    // Phase 9 Task 4: surfaced via the same `mode`
+                    // property; sidebar/transport bar conditionals key
+                    // off this string.
                     RecordingMode::PreviewClip => "preview_clip",
                 };
                 let elapsed = g
@@ -116,6 +119,46 @@ pub fn run(
                     .expect("player_state poisoned");
                 (g.position_seconds, g.duration_seconds, g.is_playing)
             };
+            // Phase 9 Task 4: clip list. Read; if changed, build a
+            // Slint VecModel and push. Cheap to compare (clip lists
+            // stay small — typical project has fewer than 50 clips).
+            let clip_snapshot: Vec<(uuid::Uuid, String, f64)> = {
+                let g = clip_list_for_timer.lock().expect("clip_list poisoned");
+                g.iter()
+                    .map(|c| (c.id, c.name.clone(), c.recording_duration))
+                    .collect()
+            };
+            let clips_changed = clip_snapshot != cached_clips;
+            // Phase 9 Task 4. The `selected-clip-id` + `preview-clip-name`
+            // properties want to derive from the active clip when
+            // mode == "preview_clip". The bus owns the source-of-truth
+            // (current_mode) but the UI only sees the mode string and
+            // the clip list — to find the current clip's id we'd need
+            // to plumb the active uuid through. Workaround: when in
+            // preview mode AND the clip list is non-empty, search by
+            // the displayed `selected-clip-id` value the UI is
+            // already setting (it's empty pre-open). For the MVP we
+            // pick a simpler path: the clip-clicked handler stamps
+            // selected-clip-id locally (UI-only) when it dispatches
+            // open; on close-preview we clear it. So the timer just
+            // resolves preview-clip-name from selected-clip-id. This
+            // works because the bus has already validated and opened
+            // the preview by the time the user-visible `mode`
+            // property flips to preview_clip.
+            let preview_name = if mode_str == "preview_clip" {
+                if let Some(w) = weak_for_frames.upgrade() {
+                    let sel = w.get_selected_clip_id().to_string();
+                    clip_snapshot
+                        .iter()
+                        .find(|(id, _, _)| id.to_string() == sel)
+                        .map(|(_, name, _)| name.clone())
+                        .unwrap_or_default()
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
             if let Some(w) = weak_for_frames.upgrade() {
                 if let Some(buf) = next_frame {
                     w.set_source_frame(slint::Image::from_rgba8(buf));
@@ -125,6 +168,28 @@ pub fn run(
                 w.set_is_playing(playing);
                 w.set_mode(mode_str.into());
                 w.set_recording_elapsed_seconds(elapsed);
+                if clips_changed {
+                    let model: Vec<(f32, slint::SharedString, slint::SharedString)> = clip_snapshot
+                        .iter()
+                        .map(|(id, name, dur)| {
+                            (
+                                *dur as f32,
+                                slint::SharedString::from(id.to_string()),
+                                slint::SharedString::from(name.as_str()),
+                            )
+                        })
+                        .collect();
+                    w.set_clips(slint::ModelRc::new(slint::VecModel::from(model)));
+                }
+                w.set_preview_clip_name(preview_name.into());
+                // When mode flips out of preview_clip, clear the local
+                // selection-id stamp.
+                if mode_str != "preview_clip" && !w.get_selected_clip_id().is_empty() {
+                    w.set_selected_clip_id("".into());
+                }
+            }
+            if clips_changed {
+                cached_clips = clip_snapshot;
             }
         },
     );
@@ -322,6 +387,46 @@ pub fn run(
                 Command::AppendStroke { points_json: json },
             )
             .await;
+        });
+    });
+
+    // Phase 9 Task 4. Clip sidebar → OpenClipPreview. The Slint side
+    // emits `clip-clicked(string)` carrying the stringified UUID; we
+    // forward it as-is. The bus parses + validates. We also stamp
+    // `selected-clip-id` locally so the sidebar highlights the active
+    // row immediately rather than waiting for the bus's mode flip to
+    // round-trip; if the open fails the bus's error path leaves mode
+    // = Scanning and the timer above clears the selection on the next
+    // tick.
+    let bus_for_clip = bus.clone();
+    let rt_for_clip = rt.clone();
+    let weak_for_clip = window.as_weak();
+    window.on_clip_clicked(move |clip_id: slint::SharedString| {
+        let bus = bus_for_clip.clone();
+        let id_string = clip_id.to_string();
+        // Stamp selected-clip-id immediately for UI highlight feedback.
+        if let Some(w) = weak_for_clip.upgrade() {
+            w.set_selected_clip_id(clip_id.clone());
+        }
+        rt_for_clip.spawn(async move {
+            bus.send(
+                UI_COMMAND_ID.into(),
+                Command::OpenClipPreview { clip_id: id_string },
+            )
+            .await;
+        });
+    });
+
+    // Phase 9 Task 4. "← Source" button OR Esc key in preview mode →
+    // ClosePreview. The bus tears down the preview pipeline and
+    // returns mode to Scanning; the 30 Hz timer picks up the mode
+    // change on its next tick and clears selected-clip-id.
+    let bus_for_close = bus.clone();
+    let rt_for_close = rt.clone();
+    window.on_close_preview_clicked(move || {
+        let bus = bus_for_close.clone();
+        rt_for_close.spawn(async move {
+            bus.send(UI_COMMAND_ID.into(), Command::ClosePreview).await;
         });
     });
 
