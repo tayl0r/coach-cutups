@@ -1199,6 +1199,16 @@ pub fn run(
                     codec,
                     project_name,
                     filename_template,
+                    // Phase 11 Plan #6 Task 0. Plumb the new field
+                    // through the existing UI Export-click site so the
+                    // crate compiles. Task 2 wires the
+                    // "Overwrite existing" checkbox; until then the
+                    // UI sends the named-default (Resume — the new
+                    // Plan-#6 default) so live runs follow the new
+                    // policy. Mirrors the bus
+                    // `default_overwrite_policy_for_command` named
+                    // default.
+                    overwrite_policy: video_coach_core::project::default_overwrite_policy(),
                 },
             )
             .await;

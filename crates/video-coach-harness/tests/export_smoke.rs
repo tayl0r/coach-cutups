@@ -120,6 +120,14 @@ async fn export_full_lifecycle() -> anyhow::Result<()> {
             "resolution": "r720",
             "quality": "low",
             "project_name": "phase10-export-test",
+            // Phase 11 Plan #6 Task 0 (adv-fix #4). Pin OverwriteAll
+            // explicitly so this test isn't subject to the new
+            // Plan-#6 Resume default — we'd otherwise skip the
+            // re-export and the frames_pushed >= 20 assertion would
+            // never fire. Phase 10 invariant: this test exercises a
+            // first-time-fresh-output path, so OverwriteAll == Resume
+            // here, but pinning makes the intent explicit.
+            "overwrite_policy": "overwriteAll",
         }))
         .await?;
     assert_eq!(
@@ -215,6 +223,10 @@ async fn export_cancel_deletes_partial_output() -> anyhow::Result<()> {
             "resolution": "r720",
             "quality": "low",
             "project_name": "phase10-cancel-test",
+            // Phase 11 Plan #6 Task 0 (adv-fix #4). Pin OverwriteAll
+            // for stable cancel semantics — Resume would skip on
+            // subsequent runs of this test if a stale output exists.
+            "overwrite_policy": "overwriteAll",
         }))
         .await?;
     assert_eq!(

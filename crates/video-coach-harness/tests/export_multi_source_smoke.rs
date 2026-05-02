@@ -126,6 +126,11 @@ async fn export_multi_source_compilation_writes_one_mp4() -> anyhow::Result<()> 
             "codec": "h264",
             "project_name": project_name,
             "filename_template": "{tag} - {project}",
+            // Phase 11 Plan #6 Task 0 (adv-fix #4). Pin OverwriteAll
+            // so the multi-source smoke isn't subject to the new
+            // Plan-#6 Resume default; this test's frames_pushed
+            // assertions assume the tag re-encodes.
+            "overwrite_policy": "overwriteAll",
         }))
         .await?;
     anyhow::ensure!(

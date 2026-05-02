@@ -17,7 +17,9 @@ pub(crate) mod test_fixtures;
 // Functions and module-private types stay at their module paths.
 pub use compilation_plan::{CompilationEntry, CompilationPlan};
 pub use event::{CommentaryEvent, EventKind};
-pub use project::{Clip, Codec, Preferences, Project, Quality, Resolution, SourceRef};
+pub use project::{
+    Clip, Codec, ExportOverwritePolicy, Preferences, Project, Quality, Resolution, SourceRef,
+};
 pub use project_store::ProjectStoreError;
 pub use stroke::{Rgba, Stroke, StrokePoint};
 pub use stroke_replay::VisibleStroke;

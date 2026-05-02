@@ -66,6 +66,13 @@ async fn export_partial_failure_completes_first_tag_fails_second_skips_third() -
             "codec": "h264",
             "project_name": project_name,
             "filename_template": "{tag} - {project}",
+            // Phase 11 Plan #6 Task 0 (adv-fix #4). Pin OverwriteAll
+            // so this partial-failure smoke isn't subject to the new
+            // Plan-#6 Resume default; the test's tag.started /
+            // tag.failed assertions assume every tag attempts to
+            // encode (Resume would skip a pre-existing good-1 output
+            // if the test re-ran on a dirty workdir).
+            "overwrite_policy": "overwriteAll",
         }))
         .await?;
     anyhow::ensure!(

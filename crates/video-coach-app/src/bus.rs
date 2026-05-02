@@ -158,6 +158,18 @@ pub enum Command {
         /// `default_command_filename_template_matches_core`.
         #[serde(default = "default_command_filename_template")]
         filename_template: String,
+        /// Phase 11 Plan #6 Task 0. Defaults to `Resume` so a pre-Plan-#6
+        /// caller (e.g. a v2 harness that hasn't been updated yet) gets
+        /// the new behavior — skip-if-exists. The UI always sends the
+        /// current value of the export-sheet "Overwrite existing"
+        /// checkbox so the bus reflects the user's intent at click
+        /// time. The named-default delegates to
+        /// `video_coach_core::project::default_overwrite_policy()` so
+        /// the default lives in exactly one place across crates — see
+        /// `default_overwrite_policy_for_command_matches_core` for the
+        /// anti-drift guard.
+        #[serde(default = "default_overwrite_policy_for_command")]
+        overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
     },
     /// Phase 10. Request cancellation of the in-flight batch export.
     /// The bus flips its `current_export_cancel` AtomicBool; the export
@@ -180,6 +192,17 @@ pub enum Command {
 /// anti-drift guard.
 fn default_command_filename_template() -> String {
     video_coach_core::project::default_filename_template()
+}
+
+/// Phase 11 Plan #6 Task 0. Default value for
+/// `Command::ExportCompilations::overwrite_policy` when a Phase-10-era
+/// JSON payload (or a test fixture predating Plan #6) lacks the field.
+/// Delegates to `video_coach_core::project::default_overwrite_policy`
+/// so the default lives in exactly one place across crates — see the
+/// `default_overwrite_policy_for_command_matches_core` test below for
+/// the anti-drift guard.
+fn default_overwrite_policy_for_command() -> video_coach_core::project::ExportOverwritePolicy {
+    video_coach_core::project::default_overwrite_policy()
 }
 
 /// Phase 10 Task 0 (fix #33). Tag selection for `ExportCompilations`.
@@ -309,6 +332,16 @@ pub struct ExportPrefsSnapshot {
     /// for fresh projects and Phase-10-era project.json files (the
     /// `Preferences` field carries `#[serde(default = "default_filename_template")]`).
     pub export_filename_template: String,
+    /// Phase 11 Plan #6 Task 0. The last-persisted overwrite policy,
+    /// hydrated into the export sheet's "Overwrite existing" checkbox
+    /// on open. Plan #6 Task 2 wires the read-side; this field is
+    /// already populated by `write_export_prefs_snapshot` so a sheet
+    /// reopen reflects the user's last choice. `#[allow(dead_code)]`
+    /// is temporary — non-test builds have no reader yet (Task 2 adds
+    /// one); the test build exercises the field via the
+    /// `export_prefs_snapshot_default_overwrite_policy_is_resume` test.
+    #[allow(dead_code)]
+    pub overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
 }
 
 impl Default for ExportPrefsSnapshot {
@@ -319,6 +352,7 @@ impl Default for ExportPrefsSnapshot {
             quality: p.last_export_quality,
             codec: p.last_export_codec,
             export_filename_template: p.export_filename_template,
+            overwrite_policy: p.export_overwrite_policy,
         }
     }
 }
@@ -431,6 +465,10 @@ fn write_export_prefs_snapshot(
         // Phase 11 Plan #7 Task 2 (adv fix #1). Plumb the filename
         // template into the snapshot the UI reads on sheet open.
         export_filename_template: prefs.export_filename_template.clone(),
+        // Phase 11 Plan #6 Task 0. Mirror the export-overwrite policy
+        // so a reopen of the export sheet shows the user's last choice
+        // (Task 2 wires the UI read side).
+        overwrite_policy: prefs.export_overwrite_policy,
     };
 }
 
@@ -2249,6 +2287,7 @@ async fn handle(
             codec,
             project_name,
             filename_template,
+            overwrite_policy,
         } => {
             #[cfg(not(feature = "media"))]
             {
@@ -2260,6 +2299,7 @@ async fn handle(
                     codec,
                     project_name,
                     filename_template,
+                    overwrite_policy,
                 );
                 CommandReply {
                     ok: false,
@@ -2276,6 +2316,7 @@ async fn handle(
                     codec,
                     project_name,
                     filename_template,
+                    overwrite_policy,
                     current,
                     current_mode,
                     recording,
@@ -2349,6 +2390,7 @@ async fn handle_export_compilations(
     codec: video_coach_core::project::Codec,
     project_name: String,
     filename_template: String,
+    overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
     current: &mut Option<(video_coach_core::project::Project, std::path::PathBuf)>,
     current_mode: &mut AppMode,
     recording: &Option<video_coach_media::recording::Recording>,
@@ -2366,6 +2408,14 @@ async fn handle_export_compilations(
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
     use uuid::Uuid;
+
+    // Phase 11 Plan #6 Task 0: the policy is plumbed end-to-end but
+    // not yet acted on. Task 1 wires the per-tag skip-on-exists check
+    // (see TODO breadcrumb at the per-tag for-loop top) and persists
+    // the value onto `Project::preferences::export_overwrite_policy`
+    // alongside the other export prefs in the persist_prefs block.
+    // The `let _` keeps the unused-binding lint quiet for Task 0.
+    let _ = overwrite_policy;
 
     // ── 1. Validate inputs (per plan step 1). ────────────────────────────
     let project_name_trimmed = project_name.trim().to_string();
@@ -2709,6 +2759,14 @@ async fn handle_export_compilations(
                 &today_local,
             );
             let output_path = output_folder_path.join(format!("{filename}.mp4"));
+
+            // TODO(phase11-plan-6 task 1): if overwrite_policy ==
+            // ExportOverwritePolicy::Resume && output_exists_and_intact(
+            // &output_path, recording_mov_path) { emit
+            // export.tag.skipped { reason = "already_exists" } and
+            // `continue` BEFORE the silent-delete below. The skip path
+            // also bumps both g.completed_tags AND the local
+            // completed_tags counter (Plan #2 split — see adv-fix #1).
 
             // Silently delete prior output (per fix #13).
             let _ = std::fs::remove_file(&output_path);
@@ -3522,6 +3580,11 @@ mod tests {
             codec: video_coach_core::project::Codec::H264,
             project_name: "Practice 2026-04-30".into(),
             filename_template: default_command_filename_template(),
+            // Phase 11 Plan #6 Task 0. Pin OverwriteAll on the
+            // existing serde-roundtrip assertion so this test continues
+            // to assert the legacy Phase-10 behavior shape rather than
+            // implicitly inheriting the new Resume default.
+            overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["cmd"], "export_compilations");
@@ -3530,6 +3593,7 @@ mod tests {
         assert_eq!(v["resolution"], "r1080");
         assert_eq!(v["quality"], "high");
         assert_eq!(v["codec"], "h264");
+        assert_eq!(v["overwrite_policy"], "overwriteAll");
         assert_eq!(v["selections"][0]["kind"], "all_clips");
         assert_eq!(v["selections"][1]["kind"], "tag");
         assert_eq!(v["selections"][1]["name"], "basketball");
@@ -3544,6 +3608,7 @@ mod tests {
                 codec,
                 project_name,
                 filename_template,
+                overwrite_policy,
             } => {
                 assert_eq!(selections.len(), 2);
                 assert_eq!(selections[0], TagSelection::AllClips);
@@ -3559,6 +3624,10 @@ mod tests {
                 assert_eq!(codec, video_coach_core::project::Codec::H264);
                 assert_eq!(project_name, "Practice 2026-04-30");
                 assert_eq!(filename_template, default_command_filename_template());
+                assert_eq!(
+                    overwrite_policy,
+                    video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+                );
             }
             _ => panic!("expected ExportCompilations"),
         }
@@ -3578,6 +3647,9 @@ mod tests {
             codec: video_coach_core::project::Codec::Hevc,
             project_name: "Practice".into(),
             filename_template: default_command_filename_template(),
+            // Phase 11 Plan #6 Task 0. Pin OverwriteAll for legacy
+            // assertion stability under the new Resume default.
+            overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["cmd"], "export_compilations");
@@ -3619,6 +3691,7 @@ mod tests {
                 codec,
                 project_name,
                 filename_template,
+                overwrite_policy,
             } => {
                 assert_eq!(selections.len(), 1);
                 assert_eq!(selections[0], TagSelection::AllClips);
@@ -3627,6 +3700,12 @@ mod tests {
                 assert_eq!(quality, video_coach_core::project::Quality::Medium);
                 assert_eq!(codec, video_coach_core::project::Codec::H264);
                 assert_eq!(project_name, "Legacy Practice");
+                // Phase 11 Plan #6 Task 0. Pre-Plan-#6 JSON without
+                // `overwrite_policy` defaults to Resume.
+                assert_eq!(
+                    overwrite_policy,
+                    video_coach_core::project::ExportOverwritePolicy::Resume,
+                );
                 // Phase 11 Plan #7 Task 2: a Phase-10-shaped JSON
                 // payload (no `filename_template` key) must default
                 // to the Phase 10 hardcoded format byte-for-byte —
@@ -3659,6 +3738,8 @@ mod tests {
             codec: prefs.last_export_codec,
             // Phase 11 Plan #7 Task 2 (adv fix #1).
             export_filename_template: prefs.export_filename_template.clone(),
+            // Phase 11 Plan #6 Task 0.
+            overwrite_policy: prefs.export_overwrite_policy,
         };
         let (res, qual, codec, _template) = export_prefs_to_slint_strings(snap);
         assert_eq!(res, "720");
@@ -3749,6 +3830,9 @@ mod tests {
             codec: video_coach_core::project::Codec::H264,
             project_name: "Test".into(),
             filename_template: default_command_filename_template(),
+            // Phase 11 Plan #6 Task 0. Pin OverwriteAll for legacy
+            // assertion stability under the new Resume default.
+            overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let cmd2: Command = serde_json::from_str(&json).unwrap();
@@ -3840,6 +3924,7 @@ mod tests {
             video_coach_core::project::Codec::H264,
             "Test".into(),
             default_command_filename_template(),
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
             &mut current,
             &mut current_mode,
             &recording,
@@ -3896,6 +3981,7 @@ mod tests {
             video_coach_core::project::Codec::H264,
             "Test".into(),
             default_command_filename_template(),
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
             &mut current,
             &mut current_mode,
             &recording,
@@ -3938,6 +4024,9 @@ mod tests {
             codec: video_coach_core::project::Codec::H264,
             project_name: "Practice".into(),
             filename_template: "{date}_{tag}_{project}".into(),
+            // Phase 11 Plan #6 Task 0. Pin OverwriteAll for legacy
+            // assertion stability under the new Resume default.
+            overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["filename_template"], "{date}_{tag}_{project}");
@@ -4015,6 +4104,8 @@ mod tests {
             quality: prefs.last_export_quality,
             codec: prefs.last_export_codec,
             export_filename_template: prefs.export_filename_template.clone(),
+            // Phase 11 Plan #6 Task 0.
+            overwrite_policy: prefs.export_overwrite_policy,
         };
         let (_res, _qual, _codec, template) = export_prefs_to_slint_strings(snap);
         assert_eq!(template.as_str(), "{tag}_{project}_{date}");
@@ -4094,6 +4185,7 @@ mod tests {
             // `.` sanitizes to "untitled" via filename::sanitize_filename's
             // dot-trim contract — caught by the invalid gate.
             ".".into(),
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
             &mut current,
             &mut current_mode,
             &recording,
@@ -4158,6 +4250,7 @@ mod tests {
             video_coach_core::project::Codec::H264,
             "Test".into(),
             "static-name".into(),
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
             &mut current,
             &mut current_mode,
             &recording,
@@ -4279,5 +4372,84 @@ mod tests {
         assert_eq!(reply.error.as_deref(), Some("not_exporting"));
         // No flag was minted because we never entered Exporting.
         assert!(current_export_cancel.is_none());
+    }
+
+    // ── Phase 11 Plan #6 Task 0 — overwrite-policy tests ──────────────
+
+    #[test]
+    fn default_overwrite_policy_for_command_matches_core() {
+        // Phase 11 Plan #6 Task 0 (anti-drift guard, mirrors
+        // `default_command_filename_template_matches_core`). The bus's
+        // `default_overwrite_policy_for_command` and core's
+        // `video_coach_core::project::default_overwrite_policy` MUST
+        // agree. If a future plan flips one, this test fails loudly,
+        // forcing the other to follow.
+        assert_eq!(
+            default_overwrite_policy_for_command(),
+            video_coach_core::project::default_overwrite_policy(),
+        );
+        assert_eq!(
+            default_overwrite_policy_for_command(),
+            video_coach_core::project::ExportOverwritePolicy::Resume,
+        );
+    }
+
+    #[test]
+    fn export_prefs_snapshot_default_overwrite_policy_is_resume() {
+        // Phase 11 Plan #6 Task 0. The snapshot's default must mirror
+        // `Preferences::default().export_overwrite_policy` so a fresh
+        // sheet open hydrates the "Overwrite existing" checkbox to
+        // unchecked (Resume) — verified by Task 2's UI binding.
+        let snap = ExportPrefsSnapshot::default();
+        assert_eq!(
+            snap.overwrite_policy,
+            video_coach_core::project::ExportOverwritePolicy::Resume,
+        );
+        // And `write_export_prefs_snapshot` round-trips a non-default
+        // policy unchanged. Builds a `Preferences` with `OverwriteAll`,
+        // writes into a fresh slot, asserts the slot reflects it.
+        let prefs = video_coach_core::project::Preferences {
+            export_overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            ..Default::default()
+        };
+        let slot = new_export_prefs_slot();
+        write_export_prefs_snapshot(&slot, &prefs);
+        let g = slot.lock().unwrap();
+        assert_eq!(
+            g.overwrite_policy,
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+        );
+    }
+
+    #[test]
+    fn export_command_omitted_overwrite_policy_field_deserializes_to_resume() {
+        // Phase 11 Plan #6 Task 0 (legacy compat). A Phase-10-era /
+        // Plan-#5-era control-socket client / harness fixture sends
+        // `Command::ExportCompilations` JSON without an `overwrite_policy`
+        // key. With `#[serde(default = "default_overwrite_policy_for_command")]`
+        // the field fills in to `Resume` — the new Plan-#6 default.
+        // Mirrors `export_command_without_filename_template_field_deserializes_to_default`.
+        let json = r#"{
+            "cmd": "export_compilations",
+            "selections": [{"kind": "all_clips"}],
+            "output_folder": "/tmp/exports",
+            "resolution": "r720",
+            "quality": "low",
+            "codec": "h264",
+            "project_name": "Legacy",
+            "filename_template": "{tag} - {project}"
+        }"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                overwrite_policy, ..
+            } => {
+                assert_eq!(
+                    overwrite_policy,
+                    video_coach_core::project::ExportOverwritePolicy::Resume,
+                );
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
     }
 }

@@ -32,6 +32,41 @@ pub enum Codec {
     Hevc,
 }
 
+/// Phase 11 Plan #6. Selects whether a batch export overwrites
+/// pre-existing per-tag .mp4 files (`OverwriteAll`, the Phase 10
+/// behavior) or skips them when they already exist on disk and look
+/// structurally complete (`Resume`, the new default).
+///
+/// `#[serde(default = "default_overwrite_policy")]` on
+/// `Preferences::export_overwrite_policy` (named-function form below)
+/// makes a pre-Plan-#6 project.json deserialize as `Resume` — i.e.
+/// existing users opt INTO the new behavior on first open. This is a
+/// behavior change from Phase 10's silent-overwrite default; documented
+/// in the Phase 11 Plan #6 closeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ExportOverwritePolicy {
+    /// Skip a per-tag output if it exists on disk and passes the
+    /// structural validation (size > 50 KB AND `ftyp` magic at offset
+    /// 4..8 AND `moov` atom in the last 64 KiB tail). Default for new
+    /// projects and the migration path for pre-Plan-#6 projects.
+    #[default]
+    Resume,
+    /// Always re-encode every selected tag, deleting any prior output
+    /// silently before encode starts. Reproduces the Phase 10 behavior
+    /// for users who explicitly want it (the export-sheet "Overwrite
+    /// existing" checkbox).
+    OverwriteAll,
+}
+
+/// Default value for `Preferences::export_overwrite_policy`. Declared
+/// `pub` (not `pub(crate)`) so cross-crate callers in `video-coach-app`
+/// (the bus's `default_overwrite_policy_for_command`) can reference it
+/// as the single source of truth. Phase 11 Plan #6.
+pub fn default_overwrite_policy() -> ExportOverwritePolicy {
+    ExportOverwritePolicy::Resume
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
@@ -54,6 +89,17 @@ pub struct Preferences {
     /// `""` would sanitize to `"untitled"` — wrong default behavior.
     #[serde(default = "default_filename_template")]
     pub export_filename_template: String,
+    /// Phase 11 Plan #6. Selects skip-if-exists (`Resume`, the new
+    /// default) vs always-re-encode (`OverwriteAll`, the Phase 10
+    /// behavior). See `ExportOverwritePolicy` doc-comment.
+    /// `#[serde(default = "default_overwrite_policy")]` so a pre-Plan-#6
+    /// project.json deserializes as `Resume`. The named-function form
+    /// is used (instead of `#[serde(default)]` falling back to
+    /// `<ExportOverwritePolicy as Default>::default()`) for parallel
+    /// structure with `default_filename_template` and to keep the
+    /// resolved default visible at the field site.
+    #[serde(default = "default_overwrite_policy")]
+    pub export_overwrite_policy: ExportOverwritePolicy,
     pub preferred_camera_id: Option<String>,
     pub preferred_mic_id: Option<String>,
 }
@@ -76,6 +122,7 @@ impl Default for Preferences {
             last_export_quality: Quality::Medium,
             last_export_codec: Codec::H264,
             export_filename_template: default_filename_template(),
+            export_overwrite_policy: default_overwrite_policy(),
             preferred_camera_id: None,
             preferred_mic_id: None,
         }
@@ -251,6 +298,63 @@ mod tests {
         // both the serde default attribute and (in Task 2) the bus's
         // `default_command_filename_template`.
         assert_eq!(default_filename_template(), "{tag} - {project}");
+    }
+
+    #[test]
+    fn export_overwrite_policy_serializes_to_camel_case() {
+        // Phase 11 Plan #6. Wire form is camelCase per the
+        // enum-level `#[serde(rename_all = "camelCase")]`.
+        assert_eq!(
+            serde_json::to_string(&ExportOverwritePolicy::Resume).unwrap(),
+            r#""resume""#,
+        );
+        assert_eq!(
+            serde_json::to_string(&ExportOverwritePolicy::OverwriteAll).unwrap(),
+            r#""overwriteAll""#,
+        );
+        let r: ExportOverwritePolicy = serde_json::from_str(r#""resume""#).unwrap();
+        assert_eq!(r, ExportOverwritePolicy::Resume);
+        let oa: ExportOverwritePolicy = serde_json::from_str(r#""overwriteAll""#).unwrap();
+        assert_eq!(oa, ExportOverwritePolicy::OverwriteAll);
+    }
+
+    #[test]
+    fn export_overwrite_policy_default_is_resume() {
+        // Phase 11 Plan #6. Both the enum-level Default and the
+        // Preferences-level field default land on Resume.
+        assert_eq!(
+            ExportOverwritePolicy::default(),
+            ExportOverwritePolicy::Resume,
+        );
+        assert_eq!(default_overwrite_policy(), ExportOverwritePolicy::Resume);
+        assert_eq!(
+            Preferences::default().export_overwrite_policy,
+            ExportOverwritePolicy::Resume,
+        );
+    }
+
+    #[test]
+    fn preferences_deserializes_without_overwrite_policy_field() {
+        // Phase 11 Plan #6. A pre-Plan-#6 project.json lacks the
+        // `exportOverwritePolicy` key. With
+        // `#[serde(default = "default_overwrite_policy")]` the field
+        // fills in to `Resume`, the new default. This is a behavior
+        // change from Phase 10 (silent overwrite); documented in
+        // closeout.
+        let legacy_json = r#"{
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "lastExportCodec": "h264",
+            "exportFilenameTemplate": "{tag} - {project}",
+            "preferredCameraId": null,
+            "preferredMicId": null
+        }"#;
+        let prefs: Preferences = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(prefs.export_overwrite_policy, ExportOverwritePolicy::Resume,);
+        assert_eq!(prefs, Preferences::default());
     }
 
     #[test]
