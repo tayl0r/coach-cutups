@@ -1015,7 +1015,23 @@ export component MainWindow inherits Window {
                                     // rectangle so the Rust handler can
                                     // compute the relative drop Y on
                                     // release (fix #4).
+                                    //
+                                    // Plan #7 code-review #3. Also fire on
+                                    // `changed height`. On initial sheet
+                                    // open the rectangle's height starts
+                                    // at 0 (no rows in the selected list);
+                                    // Slint's layout pass for a 0-height
+                                    // rectangle may not establish an
+                                    // absolute-position before the first
+                                    // row enters, so `changed
+                                    // absolute-position` doesn't fire.
+                                    // Capturing on height changes too
+                                    // ensures the value updates the
+                                    // moment rows render.
                                     changed absolute-position => {
+                                        root.selected-list-top-y = self.absolute-position.y;
+                                    }
+                                    changed height => {
                                         root.selected-list-top-y = self.absolute-position.y;
                                     }
 
