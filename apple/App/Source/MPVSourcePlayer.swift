@@ -3,6 +3,7 @@ import Observation
 import AppKit
 import QuartzCore
 import Libmpv  // module name confirmed in Phase 1 (NOT "MPVKit"; MPVKit's modulemap names the umbrella module Libmpv)
+import VideoCoachCore
 
 // Render path history:
 //   Phase 1 of mpv migration: vo=libmpv + MPV_RENDER_API_TYPE_SW
@@ -371,6 +372,24 @@ public final class MPVSourcePlayer {
         guard let h = handle else { return }
         var mpvVolume = max(0, min(100, v * 100))
         mpv_set_property(h, "volume", MPV_FORMAT_DOUBLE, &mpvVolume)
+    }
+
+    public func setZoom(_ zoom: Zoom) {
+        guard let h = handle else { return }
+        // mpv's video-zoom is logarithmic (each unit = 2x). Our Zoom.scale is
+        // linear, so log2 the scale.
+        var mpvZoom = log2(zoom.scale)
+        // mpv's video-pan-x/-y are fractions of the UNZOOMED fit-width, NOT of
+        // the source. To get zoom-invariant panning that matches our convention
+        // (pan is a fraction of source width, centered), multiply by scale before
+        // writing. See mpv issue #3038 for the mpv-side rationale; the
+        // adversarial-review history at the top of this plan documents the bug
+        // this conversion fixes.
+        var px = zoom.panX * zoom.scale
+        var py = zoom.panY * zoom.scale
+        mpv_set_property(h, "video-zoom",  MPV_FORMAT_DOUBLE, &mpvZoom)
+        mpv_set_property(h, "video-pan-x", MPV_FORMAT_DOUBLE, &px)
+        mpv_set_property(h, "video-pan-y", MPV_FORMAT_DOUBLE, &py)
     }
 
     private func runCommandSync(_ args: [String]) {
