@@ -608,8 +608,8 @@ own SHIPPED line + CI run id once green.
         Verification battery green: build/test --features media,
         build/test workspace, --no-default-features build, clippy
         media + clippy excluding media, fmt --check.
-- [ ] Plan #8: coverage hardening (multi-source / multi-tag /
-      PartialFailure E2Es)
+- [x] Plan #8: coverage hardening (multi-source / multi-tag /
+      PartialFailure E2Es) — SHIPPED
       Tests-only plan landing fixtures + harness E2Es for three Phase 10
       coverage gaps flagged at closeout: (a) multi-source compilation
       export, (b) multi-tag batch export, (c) PartialFailure UI rendering.
