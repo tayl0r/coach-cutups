@@ -618,6 +618,26 @@ own SHIPPED line + CI run id once green.
         overwrite, re-encodes-on-corrupt-output, SucceededAll.tag_
         count==N including skipped). 115 app tests pass; clippy + fmt
         clean. +597 LOC.
+  - [x] Task 2: UI "Overwrite existing" checkbox + persist policy
+        (commit c459cfd)
+        main.slint adds in/out property export-overwrite-existing:
+        bool (default false = Resume) + export-overwrite-existing-
+        changed(bool) callback + a custom-Rectangle checkbox row in
+        the Form view (mirrors codec radio's custom-Rectangle pattern,
+        NOT Slint's CheckBox widget, for visual consistency). ui.rs
+        adds the change-handler write-through (NO bus dispatch per
+        adv-fix #5+#6 — Command::SetPreferences doesn't exist; toggle
+        without click discarded on quit), extends sheet-open hydration
+        to read snap.overwrite_policy and call set_export_overwrite_
+        existing(b), and replaces Task 0's default-Resume placeholder
+        at the Export-click dispatch site with a click-time get_
+        export_overwrite_existing() read mapped bool→
+        ExportOverwritePolicy. bus.rs persist_prefs block writes the
+        click-time overwrite_policy onto Project::preferences.export_
+        overwrite_policy alongside res/qual/codec/template; drops the
+        #[allow(dead_code)] on ExportPrefsSnapshot.overwrite_policy
+        now that the UI reads it. 116 app tests pass; clippy + fmt
+        clean. +170/-20 LOC.
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
       SHIPPED 2026-05-01. CI run 25241681131 green on all 4 jobs.
       Two small UX wins for the export sheet: (1) drag-to-reorder of
