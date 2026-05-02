@@ -16,3 +16,12 @@ Package.resolved
 # XcodeGen
 *.xcodeproj
 App/Info.plist
+
+# Claude Code workspace
+.claude/
+
+# Rust build artifacts
+target/
+
+# Local test fixtures (large video files; not tracked)
+fixtures/
