@@ -70,8 +70,7 @@ pub struct Compositor {
     // compose_tick docstring per Fix #49). Key includes content-derived
     // prefix bytes per Fix #43 to defend against allocator address
     // reuse. Value is Arc<Frame> per Fix #44 so cache hits don't
-    // memcpy. (Task 0: scaffolded but not yet wired.)
-    #[allow(dead_code)]
+    // memcpy. Wired in Task 3 via compose_with_identity.
     pub(crate) freeze_cache: Mutex<FreezeCache>,
 
     // Plan #4: test-only counters for cache-rebuild assertions
@@ -85,7 +84,6 @@ pub struct Compositor {
     #[allow(dead_code)]
     pub(crate) stroke_vbo_grows: AtomicU64,
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) freeze_cache_hits: AtomicU64,
 }
 
@@ -151,7 +149,6 @@ pub(crate) struct PooledVbo {
     pub capacity_vertices: usize,
 }
 
-#[allow(dead_code)]
 pub(crate) struct FreezeCache {
     /// LRU. Newest at end. 16-entry cap. Linear scan is fine at N=16.
     /// Per Fix #44, value is `Arc<Frame>` so cache hits clone an Arc
@@ -160,7 +157,6 @@ pub(crate) struct FreezeCache {
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-#[allow(dead_code)]
 pub(crate) struct FreezeCacheKey {
     // Per Fix #43, the cache key resists Arc-pointer-address reuse
     // (allocator-slot reuse across drop-then-allocate at clip
@@ -519,6 +515,104 @@ impl Compositor {
         Ok(Frame::new(w, h, pixels))
     }
 
+    /// Plan #4 Task 3: compose path with Arc-pointer identity caching for
+    /// freeze segments. The preview/export driver hands the SAME
+    /// `Arc<Frame>` pair (frozen source + last-known webcam) for every
+    /// tick inside a Freeze segment; strokes only change at event
+    /// boundaries. Per Fix #43 the cache key mixes Arc-pointer identity
+    /// with a content-derived prefix (first 16 bytes + len + dims) to
+    /// defend against allocator address reuse across segment edges.
+    /// Per Fix #44 the value is `Arc<Frame>` so cache hits return a
+    /// cheap refcount bump, not an 8 MB pixel clone.
+    ///
+    /// On a cache hit this returns the SAME `Arc<Frame>` previously
+    /// inserted (so callers can `Arc::ptr_eq` if they need that
+    /// invariant). On a miss it composes via `compose` and inserts
+    /// before returning.
+    pub fn compose_with_identity(
+        &self,
+        source: &Arc<Frame>,
+        webcam: &Arc<Frame>,
+        strokes: &[VisibleStroke],
+    ) -> Result<Arc<Frame>, CompositorError> {
+        let key = FreezeCacheKey {
+            source_ptr: Arc::as_ptr(source) as usize,
+            source_w: source.width,
+            source_h: source.height,
+            source_pixels_len: source.pixels.len(),
+            source_first16: first16_or_zero(&source.pixels),
+            webcam_ptr: Arc::as_ptr(webcam) as usize,
+            webcam_w: webcam.width,
+            webcam_h: webcam.height,
+            webcam_pixels_len: webcam.pixels.len(),
+            webcam_first16: first16_or_zero(&webcam.pixels),
+            stroke_hash: hash_stroke_set(strokes),
+        };
+
+        if let Some(cached) = self.lookup_freeze(&key) {
+            #[cfg(test)]
+            self.freeze_cache_hits
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Ok(cached);
+        }
+
+        let composed = self.compose(source.as_ref(), webcam.as_ref(), strokes)?;
+        let arc_composed = Arc::new(composed);
+        self.insert_freeze(key, arc_composed.clone());
+        Ok(arc_composed)
+    }
+
+    /// Per Fix #51: freeze cache is a user-data path, so poison-recover
+    /// rather than panic. Lock held only for the linear scan; result
+    /// `Arc<Frame>` cloned out before guard drops.
+    fn lookup_freeze(&self, key: &FreezeCacheKey) -> Option<Arc<Frame>> {
+        let g = match self.freeze_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.entries
+            .iter()
+            .find(|(k, _)| k == key)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// 16-entry LRU. Newest at end; eviction pops the oldest from the
+    /// front. Re-inserts of an existing key are deduped (retain != key)
+    /// so the entry rotates to the back as "most-recently-used".
+    fn insert_freeze(&self, key: FreezeCacheKey, frame: Arc<Frame>) {
+        const LRU_CAP: usize = 16;
+        let mut g = match self.freeze_cache.lock() {
+            Ok(g) => g,
+            Err(p) => {
+                tracing::warn!(
+                    target: "compositor.cache",
+                    event = "compositor.cache_poisoned",
+                    which = "freeze",
+                );
+                p.into_inner()
+            }
+        };
+        g.entries.retain(|(k, _)| k != &key);
+        if g.entries.len() >= LRU_CAP {
+            g.entries.remove(0);
+        }
+        g.entries.push((key, frame));
+    }
+
+    /// Drop every cached freeze-compose entry. Called by the production
+    /// drivers at segment-index transitions (preview) and at entry
+    /// boundaries (export) per Fix #43 — content-prefix-defended keys
+    /// already make stale-Arc hits impossible, but proactively clearing
+    /// avoids a pathological 16-entry-per-segment build-up across long
+    /// timelines.
+    pub fn clear_freeze_cache(&self) {
+        let mut g = match self.freeze_cache.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        g.entries.clear();
+    }
+
     /// Encodes the stroke render pass onto `encoder`, writing into `target`
     /// using `LoadOp::Load` so the previous PiP pass's pixels are preserved
     /// and the strokes blend on top via `ALPHA_BLENDING`. Caller MUST ensure
@@ -809,6 +903,37 @@ impl Compositor {
             shader: Arc::new(shader),
         }
     }
+}
+
+/// Per Fix #43: copy the first 16 bytes of `pixels` (zero-padding if
+/// shorter) into a fixed-size array. Used by `FreezeCacheKey` as a
+/// content-derived prefix that defends the cache against allocator
+/// address reuse — when an `Arc<Frame>` drops at a segment boundary and
+/// the next clip's freeze-frame happens to land at the same heap slot,
+/// the prefix mismatch forces a cache miss instead of a stale hit.
+fn first16_or_zero(pixels: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let n = pixels.len().min(16);
+    out[..n].copy_from_slice(&pixels[..n]);
+    out
+}
+
+/// Per Fix #45: hash the visible-stroke set using `f64::to_bits` for
+/// the stroke's `first_point_record_time` (NaN-safe, exact bit
+/// equality), and prefix the slice length so `[]` and
+/// `[VisibleStroke{drawn=0}]` cannot collide. Stroke identity is
+/// `Stroke::id` (Uuid) folded in as `u128` so two strokes with
+/// identical geometry but different UUIDs distinguish.
+fn hash_stroke_set(strokes: &[VisibleStroke]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (strokes.len() as u64).hash(&mut h);
+    for vs in strokes {
+        vs.stroke.id.as_u128().hash(&mut h);
+        (vs.drawn_point_count as u64).hash(&mut h);
+        vs.first_point_record_time.to_bits().hash(&mut h);
+    }
+    h.finish()
 }
 
 /// Builds a flat triangle-list vertex buffer (6 vertices per segment) from
@@ -1137,6 +1262,110 @@ mod tests {
         assert_eq!(
             rebuilds, 1,
             "expected exactly 1 PiP pipeline rebuild for 5 same-dim composes, got {rebuilds}"
+        );
+    }
+
+    #[test]
+    fn freeze_cache_hit_returns_byte_identical_output() {
+        // Plan #4 Task 3: compose_with_identity caches the composed
+        // Arc<Frame> by Arc-pointer identity (defended by content
+        // prefix). A second call with the SAME Arc<Frame> source +
+        // webcam + strokes must return the SAME Arc (ptr_eq) and thus
+        // byte-identical pixels — the cache hit short-circuits the GPU
+        // compose entirely.
+        use std::sync::atomic::Ordering;
+        use std::sync::Arc;
+
+        let comp = Compositor::new_headless().expect("compositor");
+        let source = Arc::new(Frame::solid(64, 64, [200, 100, 50, 255]));
+        let webcam = Arc::new(Frame::solid(32, 32, [0, 0, 0, 255]));
+
+        let first = comp
+            .compose_with_identity(&source, &webcam, &[])
+            .expect("compose 1");
+        let hits_after_first = comp.freeze_cache_hits.load(Ordering::Relaxed);
+        assert_eq!(hits_after_first, 0, "first call must miss");
+
+        let second = comp
+            .compose_with_identity(&source, &webcam, &[])
+            .expect("compose 2");
+        let hits_after_second = comp.freeze_cache_hits.load(Ordering::Relaxed);
+        assert_eq!(hits_after_second, 1, "second call must hit");
+
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "cache hit should return the same Arc"
+        );
+        assert_eq!(first.pixels, second.pixels, "cache hit byte-identical");
+    }
+
+    #[test]
+    fn stroke_hash_distinguishes_drawn_count() {
+        use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
+        let stroke = Stroke {
+            id: uuid::Uuid::nil(),
+            color: Rgba::RED,
+            line_width: 0.01,
+            points: vec![
+                StrokePoint {
+                    x: 0.0,
+                    y: 0.0,
+                    t: 0.0,
+                },
+                StrokePoint {
+                    x: 0.5,
+                    y: 0.5,
+                    t: 0.5,
+                },
+                StrokePoint {
+                    x: 1.0,
+                    y: 1.0,
+                    t: 1.0,
+                },
+            ],
+            auto_clear_after_seconds: None,
+        };
+        let vs1 = VisibleStroke {
+            stroke: stroke.clone(),
+            first_point_record_time: 0.0,
+            drawn_point_count: 2,
+        };
+        let vs2 = VisibleStroke {
+            stroke,
+            first_point_record_time: 0.0,
+            drawn_point_count: 3,
+        };
+        assert_ne!(
+            hash_stroke_set(std::slice::from_ref(&vs1)),
+            hash_stroke_set(std::slice::from_ref(&vs2)),
+            "drawn_point_count delta must change the hash"
+        );
+    }
+
+    #[test]
+    fn stroke_hash_length_prefix_disambiguates() {
+        use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
+        let stroke = Stroke {
+            id: uuid::Uuid::nil(),
+            color: Rgba::RED,
+            line_width: 0.01,
+            points: vec![StrokePoint {
+                x: 0.0,
+                y: 0.0,
+                t: 0.0,
+            }],
+            auto_clear_after_seconds: None,
+        };
+        let single_empty = VisibleStroke {
+            stroke,
+            first_point_record_time: 0.0,
+            drawn_point_count: 0,
+        };
+        let h_empty_slice = hash_stroke_set(&[]);
+        let h_one_zero_drawn = hash_stroke_set(std::slice::from_ref(&single_empty));
+        assert_ne!(
+            h_empty_slice, h_one_zero_drawn,
+            "[] must hash differently from [VisibleStroke{{drawn=0}}]; length prefix"
         );
     }
 

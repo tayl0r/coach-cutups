@@ -62,7 +62,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use thiserror::Error;
 use uuid::Uuid;
-use video_coach_compositor::{compose_tick, Compositor, Frame};
+use video_coach_compositor::{compose_tick_with_identity, Compositor, Frame};
 use video_coach_core::compilation_plan::{CompilationEntry, CompilationPlan};
 use video_coach_core::export_settings::{bitrate, pixel_size};
 use video_coach_core::project::{Clip, Codec, Quality, Resolution};
@@ -353,7 +353,7 @@ pub fn compose_entry_frame(
     record_time: f64,
     source_frame: &Frame,
     webcam_frame: &Frame,
-    frozen_frames: &HashMap<usize, Frame>,
+    frozen_frames: &HashMap<usize, Arc<Frame>>,
 ) -> Result<Frame, ExportError> {
     let seg_idx = segment_index_at(&entry.segments, record_time);
     let seg = entry
@@ -362,16 +362,28 @@ pub fn compose_entry_frame(
         .copied()
         .ok_or_else(|| ExportError::Plan("segment lookup out of bounds".into()))?;
 
-    let resolved_source: Frame = match seg.kind {
+    // Plan #4 Task 3 / Fix #44: hand stable Arc<Frame> to
+    // compose_tick_with_identity so the freeze branch's repeated
+    // ticks-per-segment hit the compose cache. Play branch wraps the
+    // borrowed `&Frame` in a fresh Arc — uniform call site, the
+    // freeze cache only fires for Freeze keys anyway.
+    let resolved_source: Arc<Frame> = match seg.kind {
         SegmentKind::Freeze => frozen_frames
             .get(&seg_idx)
             .cloned()
-            .unwrap_or_else(|| Frame::solid(2, 2, [0, 0, 0, 255])),
-        SegmentKind::Play => source_frame.clone(),
+            .unwrap_or_else(|| Arc::new(Frame::solid(2, 2, [0, 0, 0, 255]))),
+        SegmentKind::Play => Arc::new(source_frame.clone()),
     };
+    let webcam_arc = Arc::new(webcam_frame.clone());
 
     let strokes = visible_strokes(clip, record_time);
-    let composed = compose_tick(compositor, &resolved_source, webcam_frame, &strokes)?;
+    let composed_arc =
+        compose_tick_with_identity(compositor, &resolved_source, &webcam_arc, &strokes)?;
+    // Stable public return type is `Frame`; on a cache hit this is the
+    // unavoidable clone, but it's still vastly cheaper than re-running
+    // the GPU compose. Caller (run_driver_loop / parity test) consumes
+    // by value.
+    let composed: Frame = (*composed_arc).clone();
     Ok(composed)
 }
 
@@ -1372,6 +1384,14 @@ fn run_driver_loop(args: DriverArgs<'_>) -> Result<(), ExportError> {
             return Err(ExportError::Cancelled);
         }
 
+        // Plan #4 Task 3 / Fix #43: clear the freeze compose cache at
+        // every entry boundary. New entry → new clip → new (Arc<Frame>)
+        // freeze frames freshly built from the per-entry HashMap below.
+        // Content-prefix-defended keys already make stale-Arc hits
+        // impossible, but proactively clearing bounds the LRU's
+        // working set to the current entry's freeze segments.
+        compositor.clear_freeze_cache();
+
         let clip = clips_by_id
             .get(&entry.clip_id)
             .ok_or_else(|| ExportError::Plan(format!("clip not in map: {}", entry.clip_id)))?;
@@ -1397,10 +1417,19 @@ fn run_driver_loop(args: DriverArgs<'_>) -> Result<(), ExportError> {
             q.lock().expect("aq lock").bytes.clear();
         }
 
-        let frozen_for_entry = frozen_frames_by_entry
+        // Plan #4 Task 3 / Fix #48: pre_decode_all_freeze_frames keeps
+        // its `HashMap<usize, HashMap<usize, Frame>>` return type
+        // (stable surface); we wrap each value in `Arc::new` here at
+        // the consumer boundary so the per-entry frozen-frame map
+        // hands stable `Arc<Frame>` pointers to compose_entry_frame.
+        let frozen_for_entry_raw = frozen_frames_by_entry
             .get(&entry_idx)
             .cloned()
             .unwrap_or_default();
+        let frozen_for_entry: HashMap<usize, Arc<Frame>> = frozen_for_entry_raw
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect();
 
         // Frame count per fix #39: round, don't truncate.
         let entry_frame_count = (entry.recording_duration * 30.0).round() as u64;

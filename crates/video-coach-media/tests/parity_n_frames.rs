@@ -21,6 +21,7 @@
 #![cfg(feature = "media")]
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use uuid::Uuid;
 
 use video_coach_compositor::{Compositor, Frame};
@@ -119,10 +120,15 @@ fn n_frames_of_compose_entry_frame_match_byte_for_byte() {
     // fix #11 the production driver pre-decodes one frame per Freeze;
     // for the parity test we just hand-roll a solid frame for whichever
     // segments are Freeze. Walk entry.segments to populate.
-    let mut frozen_frames: HashMap<usize, Frame> = HashMap::new();
+    // Phase 11 Plan #4 Task 3 / Fix #48: compose_entry_frame's frozen-
+    // frame param is now `&HashMap<usize, Arc<Frame>>` so the freeze
+    // branch can hand a stable Arc-pointer to the freeze compose
+    // cache. The parity contract is unchanged: same inputs → byte-
+    // identical pixels across two passes.
+    let mut frozen_frames: HashMap<usize, Arc<Frame>> = HashMap::new();
     for (i, seg) in entry.segments.iter().enumerate() {
         if matches!(seg.kind, video_coach_core::timeline::SegmentKind::Freeze) {
-            frozen_frames.insert(i, frozen_frame_for_freeze_seg());
+            frozen_frames.insert(i, Arc::new(frozen_frame_for_freeze_seg()));
         }
     }
 

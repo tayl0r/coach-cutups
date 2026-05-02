@@ -38,6 +38,23 @@ pub fn compose_tick(
     compositor.compose(source, webcam, strokes)
 }
 
+/// Plan #4 Task 3 sibling of `compose_tick`. Wraps
+/// `Compositor::compose_with_identity` so callers that already hold
+/// `Arc<Frame>` for the source + webcam slots (preview/export drivers
+/// after the Fix #48 consumer-boundary wrap) can hit the freeze-segment
+/// compose cache. On a cache hit the returned `Arc<Frame>` is the SAME
+/// one inserted on the prior miss; on a miss the GPU compose runs and
+/// the result is wrapped in a fresh `Arc` before being inserted +
+/// returned.
+pub fn compose_tick_with_identity(
+    compositor: &Compositor,
+    source: &std::sync::Arc<Frame>,
+    webcam: &std::sync::Arc<Frame>,
+    strokes: &[VisibleStroke],
+) -> Result<std::sync::Arc<Frame>, CompositorError> {
+    compositor.compose_with_identity(source, webcam, strokes)
+}
+
 #[cfg(test)]
 mod tests {
     #[test]

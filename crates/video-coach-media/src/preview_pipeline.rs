@@ -119,9 +119,11 @@ pub struct PreviewPipeline {
 
     // Cached frozen frames keyed by segment index (Freeze segments only).
     // Held on the struct so the Arc outlives the driver thread (the driver
-    // thread also holds a clone — these are belt-and-suspenders).
+    // thread also holds a clone — these are belt-and-suspenders). Per
+    // Fix #48, values are `Arc<Frame>` so the driver hands the SAME Arc
+    // for every Freeze tick → freeze-cache pointer-identity hits.
     #[allow(dead_code)]
-    frozen_frames: Arc<HashMap<usize, Frame>>,
+    frozen_frames: Arc<HashMap<usize, Arc<Frame>>>,
 
     // Static metadata.
     segments: Arc<Vec<PlaybackSegment>>,
@@ -170,8 +172,16 @@ impl PreviewPipeline {
         crate::init().map_err(|e| PreviewPipelineError::Construction(e.to_string()))?;
 
         // 1. Build the playback segment list and pre-decode freeze frames.
+        // Per Fix #48: pre_decode_freeze_frames keeps its `HashMap<usize,
+        // Frame>` return type (stable surface); we wrap each value in
+        // `Arc::new` here at the consumer boundary so the driver hands a
+        // stable Arc-pointer per Freeze segment for compose-cache hits.
         let segments = playback_segments(clip, source_duration_seconds);
-        let frozen_frames = pre_decode_freeze_frames(source_path, clip, &segments)?;
+        let frozen_frames_raw = pre_decode_freeze_frames(source_path, clip, &segments)?;
+        let frozen_frames: HashMap<usize, Arc<Frame>> = frozen_frames_raw
+            .into_iter()
+            .map(|(k, v)| (k, Arc::new(v)))
+            .collect();
 
         // 2. Build the live composition pipeline. Source + webcam decoders
         //    in one pipeline; both feed RGBA appsinks; webcam adds an
@@ -1020,7 +1030,7 @@ struct DriverContext {
     compositor: Arc<Compositor>,
     pipeline: gstreamer::Pipeline,
     segments: Arc<Vec<PlaybackSegment>>,
-    frozen_frames: Arc<HashMap<usize, Frame>>,
+    frozen_frames: Arc<HashMap<usize, Arc<Frame>>>,
     clip: Arc<Clip>,
     latest_source_frame: Arc<Mutex<Option<Frame>>>,
     latest_webcam_frame: Arc<Mutex<Option<Frame>>>,
@@ -1094,6 +1104,18 @@ fn run_driver_loop(ctx: DriverContext) {
         let seg_idx = segment_index_at(&segments, record_time);
         let seg = segments[seg_idx];
 
+        // Plan #4 Task 3 / Fix #43: clear the freeze compose cache on
+        // any segment-index change. The content-prefix-defended key
+        // already prevents stale-Arc hits across boundaries, but this
+        // proactive clear bounds the LRU's working set to the current
+        // segment so a long timeline doesn't grow unrelated entries.
+        // Placed BEFORE the Freeze→Play seek so the cache is dropped
+        // for every transition direction (Play→Freeze, Freeze→Freeze
+        // included).
+        if last_segment_idx != Some(seg_idx) {
+            compositor.clear_freeze_cache();
+        }
+
         // Freeze→Play boundary: one-shot source seek (per fix #23 case (b)).
         if let Some(prev) = last_segment_idx {
             let prev_kind = segments[prev].kind;
@@ -1103,34 +1125,47 @@ fn run_driver_loop(ctx: DriverContext) {
         }
         last_segment_idx = Some(seg_idx);
 
-        // Resolve source frame.
-        let source_frame = match seg.kind {
+        // Resolve source frame as Arc<Frame>. For Freeze the cached
+        // `Arc<Frame>` is cloned (cheap refcount bump) and yields a
+        // STABLE pointer across ticks → compose cache hits. For Play
+        // we wrap the live appsink slot's Frame in a fresh Arc each
+        // tick (the slot mutates from GStreamer's streaming thread; a
+        // fresh Arc per tick is correct + the freeze cache only kicks
+        // in for Freeze segments anyway).
+        let source_frame: Arc<Frame> = match seg.kind {
             SegmentKind::Freeze => frozen_frames.get(&seg_idx).cloned().unwrap_or_else(|| {
                 // Defensive fallback: shouldn't happen because pre-decode
                 // covers every Freeze, but if something went wrong (file
                 // disappeared mid-preview?) use a 2x2 black so the driver
                 // doesn't crash.
-                Frame::solid(2, 2, [0, 0, 0, 255])
+                Arc::new(Frame::solid(2, 2, [0, 0, 0, 255]))
             }),
-            SegmentKind::Play => latest_source_frame
-                .lock()
-                .expect("source slot lock")
-                .clone()
-                .unwrap_or_else(|| Frame::solid(2, 2, [0, 0, 0, 255])),
+            SegmentKind::Play => Arc::new(
+                latest_source_frame
+                    .lock()
+                    .expect("source slot lock")
+                    .clone()
+                    .unwrap_or_else(|| Frame::solid(2, 2, [0, 0, 0, 255])),
+            ),
         };
 
         // Webcam frame — last-frame-held past EOS per fix #20.
-        let webcam_frame = latest_webcam_frame
-            .lock()
-            .expect("webcam slot lock")
-            .clone()
-            .unwrap_or_else(|| Frame::solid(2, 2, [0, 0, 0, 255]));
+        let webcam_frame = Arc::new(
+            latest_webcam_frame
+                .lock()
+                .expect("webcam slot lock")
+                .clone()
+                .unwrap_or_else(|| Frame::solid(2, 2, [0, 0, 0, 255])),
+        );
 
         // Strokes for this record_time.
         let strokes = video_coach_core::stroke_replay::visible_strokes(&clip, record_time);
 
-        // Compose + push.
-        match video_coach_compositor::compose_tick(
+        // Compose + push via the identity-cached entry point (Plan #4
+        // Task 3). The Freeze branch's stable Arc-pointer + identical
+        // strokes hit the freeze cache for every tick after the first
+        // inside the same segment.
+        match video_coach_compositor::compose_tick_with_identity(
             &compositor,
             &source_frame,
             &webcam_frame,
