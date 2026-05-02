@@ -143,9 +143,18 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         let size = CGSize(width: w, height: h)
 
         // 3. Base full-frame (only if we have one — otherwise the black fill
-        //    remains).
+        //    remains). Apply zoom delta on top of the existing stretch-to-fill
+        //    at non-identity zoom; identity is bit-identical to today's output.
         if let base, let img = makeCGImage(base) {
-            cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+            let zoom = inst?.events.zoomAt(recordTime: recordTime) ?? .identity
+            if zoom == .identity {
+                cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+            } else {
+                cg.saveGState()
+                cg.concatenate(zoom.deltaTransform(viewportSize: CGSize(width: w, height: h)))
+                cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+                cg.restoreGState()
+            }
         }
 
         // 4. Webcam PiP, bottom-right at 22% width with 2.2% margin. With a
