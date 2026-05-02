@@ -553,6 +553,45 @@ own SHIPPED line + CI run id once green.
         4 pure-Rust drag_reorder tests pass (swap, same-index no-op,
         drop-below clamps to len, drop-above clamps to zero); full
         crate suite 83/83 green; clippy + fmt clean.
+  - [x] Task 2: Bus wiring + per-tag apply_template + sheet-open
+        hydration (commit 6f4a911)
+        Drops Copy from ExportPrefsSnapshot and clones-on-read per adv
+        fix #1; extends the snapshot with export_filename_template:
+        String alongside resolution/quality/codec, and grows
+        export_prefs_to_slint_strings to a 4-tuple. Extends
+        Command::ExportCompilations with filename_template: String
+        gated by #[serde(default = "default_command_filename_template")]
+        — the helper calls pub video_coach_core::project::
+        default_filename_template() per adv fix #2 (with a
+        default_command_filename_template_matches_core drift test).
+        handle_export_compilations now computes today_local =
+        chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()
+        ONCE at the top per adv fix #7 (batch consistency), then runs
+        the sensitivity-test gate per adv fix #8 — probes ALPHA/BRAVO/
+        2000-01-01 vs ZETA/YANKEE/2099-12-31 and emits two distinct
+        export.batch.failed reasons: filename_template_invalid (probe
+        sanitizes to empty) and filename_template_no_placeholders
+        (single-tag with same template proceeds; N>1 with identical
+        rendered names would overwrite). Persists project.preferences.
+        export_filename_template alongside last_export_resolution/
+        quality/codec. Per-tag for-loop replaces the hard-coded
+        sanitize_filename(&label)/sanitize_filename(&project_name_
+        trimmed) pair with a single apply_template(&template, label,
+        &project_name_trimmed, &today_local) call. ui.rs sheet-open
+        hydration helper extended to push template prefs into the
+        LineEdit, with empty/whitespace fallback to default per adv
+        fix #10. 9 new tests: bus serde round-trip with non-default
+        template, legacy-JSON without filenameTemplate field defaults,
+        default_command_filename_template_matches_core drift, sheet-
+        open hydrates filename_template from prefs,
+        hydrate_empty_template_falls_back_to_default (incl. whitespace-
+        only), invalid template emits filename_template_invalid, no-
+        placeholders+multi-tag emits filename_template_no_placeholders
+        (single-tag with same template proceeds), default template
+        writes Phase-10 byte-for-byte format, date template writes
+        today's local date. 92 tests pass; grep gates clean
+        (no sanitize_filename(&label)/sanitize_filename(&project_name_
+        trimmed) hits in bus.rs; ExportPrefsSnapshot has no Copy derive).
 
 
 ## Phase 11 — pending
