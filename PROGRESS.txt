@@ -594,6 +594,30 @@ own SHIPPED line + CI run id once green.
         snapshot-default + write_export_prefs_snapshot round-trip,
         command-omitted round-trip. 51 core + 102 app tests pass;
         clippy + fmt clean.
+  - [x] Task 1: bus per-tag skip-on-exists + output_exists_and_intact
+        helper (commit 85366f1)
+        In handle_export_compilations's per-tag for-loop, before the
+        silent-delete + encoder spawn, check whether the target output
+        .mp4 exists and looks structurally intact. New private enum
+        OutputIntactness { Intact, Missing, Corrupt, RecordingNewer }
+        + helper output_exists_and_intact(path, recording_mov_path)
+        — size >= 50 KB + ftyp magic at offset 4..8 + moov atom found
+        in last 64 KiB tail-scan + optional recording.mov mtime
+        comparison. Adv-fix #2 (RecordingNewer stale-output detection)
+        and #3 (moov tail-scan in addition to ftyp) baked in. Resume
+        + Intact → emit export.tag.skipped { reason="already_exists" },
+        bump BOTH g.completed_tags AND local completed_tags counter
+        (adv-fix #1: SucceededAll.tag_count includes skipped rows),
+        continue. Resume + RecordingNewer → emit export.tag.stale_
+        output { reason="recording_newer" } + fall through to silent-
+        delete + encode. Resume + Missing/Corrupt → fall through.
+        OverwriteAll bypasses the entire branch. Single-clip detection
+        via plan.entries.iter().map(|e| e.clip_id).all-equal — multi-
+        clip plans pass recording_mov_path = None. 9 helper unit tests
+        + 4 bus integration tests (skips-on-resume, re-encodes-on-
+        overwrite, re-encodes-on-corrupt-output, SucceededAll.tag_
+        count==N including skipped). 115 app tests pass; clippy + fmt
+        clean. +597 LOC.
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
       SHIPPED 2026-05-01. CI run 25241681131 green on all 4 jobs.
       Two small UX wins for the export sheet: (1) drag-to-reorder of
