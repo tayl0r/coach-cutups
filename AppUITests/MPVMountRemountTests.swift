@@ -85,6 +85,13 @@ final class MPVMountRemountTests: XCTestCase {
         bringUpItem.click()
         XCTAssertTrue(bringUp.waitForExistence(timeout: 5),
                       "Bring-up window did not reappear (second mount)")
+
+        // Force VideoCoach to the front + raise the bring-up window so the
+        // screenshot grabs OUR pixels and not whatever app is occluding us.
+        // Without this, bringUp.screenshot() returns the screen region the
+        // window occupies — which can be obscured by another app post-reopen.
+        app.activate()
+        bringUp.click()
         Thread.sleep(forTimeInterval: 2.0)
 
         let secondShot = bringUp.screenshot()
