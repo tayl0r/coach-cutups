@@ -5932,6 +5932,8 @@ dependencies = [
  "serde_json",
  "tempfile",
  "tokio",
+ "uuid",
+ "video-coach-core",
 ]
 
 [[package]]
