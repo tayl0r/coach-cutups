@@ -54,12 +54,8 @@ pub struct Compositor {
     // the key changes. wgpu handles inside (RenderPipeline / BGL /
     // Sampler / ShaderModule) are Clone (refcounted Arc). Per Fix #41,
     // the lock is held only for cache-lookup-and-clone-out; encode
-    // happens unlocked. (Task 0: scaffolded but not yet wired into
-    // compose / encode_stroke_pass — `dead_code` allow stays until
-    // Tasks 1–3 land.)
-    #[allow(dead_code)]
+    // happens unlocked.
     pub(crate) pip_cache: Mutex<Option<PipPassCache>>,
-    #[allow(dead_code)]
     pub(crate) stroke_cache: Mutex<Option<StrokePassCache>>,
 
     // Plan #4 Task 2: pooled stroke vertex buffer. Capacity grows on
@@ -82,10 +78,8 @@ pub struct Compositor {
     // (Fix #47). Crate-local; not visible to other crates' tests.
     // Tasks 1–3 wire the increments; Task 0 just scaffolds the fields.
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) pip_cache_rebuilds: AtomicU64,
     #[cfg(test)]
-    #[allow(dead_code)]
     pub(crate) stroke_cache_rebuilds: AtomicU64,
     #[cfg(test)]
     #[allow(dead_code)]
@@ -110,14 +104,20 @@ pub(crate) struct PipPassKey {
     pub source_h: u32,
 }
 
+// wgpu 22's handles (RenderPipeline / BindGroupLayout / Sampler /
+// ShaderModule / PipelineLayout) are NOT `Clone` directly — they own the
+// drop-side teardown. We wrap them in `Arc` so cache hits clone an Arc
+// handle (cheap atomic refcount bump) instead of recreating the GPU
+// resource. The Arc lives as long as any caller holds a clone, so the
+// underlying `Drop` runs exactly once when the last clone goes away.
 #[allow(dead_code)]
 pub(crate) struct PipPassCache {
     pub key: PipPassKey,
-    pub bind_group_layout: wgpu::BindGroupLayout,
-    pub pipeline_layout: wgpu::PipelineLayout,
-    pub pipeline: wgpu::RenderPipeline,
-    pub sampler: wgpu::Sampler,
-    pub shader: wgpu::ShaderModule,
+    pub bind_group_layout: Arc<wgpu::BindGroupLayout>,
+    pub pipeline_layout: Arc<wgpu::PipelineLayout>,
+    pub pipeline: Arc<wgpu::RenderPipeline>,
+    pub sampler: Arc<wgpu::Sampler>,
+    pub shader: Arc<wgpu::ShaderModule>,
 }
 
 #[derive(Copy, Clone, PartialEq, Eq)]
@@ -131,9 +131,9 @@ pub(crate) struct StrokePassKey {
 #[allow(dead_code)]
 pub(crate) struct StrokePassCache {
     pub key: StrokePassKey,
-    pub pipeline_layout: wgpu::PipelineLayout,
-    pub pipeline: wgpu::RenderPipeline,
-    pub shader: wgpu::ShaderModule,
+    pub pipeline_layout: Arc<wgpu::PipelineLayout>,
+    pub pipeline: Arc<wgpu::RenderPipeline>,
+    pub shader: Arc<wgpu::ShaderModule>,
 }
 
 #[allow(dead_code)]
@@ -363,101 +363,35 @@ impl Compositor {
                 usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             });
 
-        // 3. Pipeline.
-        let shader = self
-            .device
-            .create_shader_module(wgpu::include_wgsl!("shaders/pip.wgsl"));
-        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Linear,
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            ..Default::default()
-        });
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("pip-bgl"),
-                entries: &[
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 0,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 1,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Texture {
-                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                            view_dimension: wgpu::TextureViewDimension::D2,
-                            multisampled: false,
-                        },
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 2,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                        count: None,
-                    },
-                    wgpu::BindGroupLayoutEntry {
-                        binding: 3,
-                        visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Buffer {
-                            ty: wgpu::BufferBindingType::Uniform,
-                            has_dynamic_offset: false,
-                            min_binding_size: None,
-                        },
-                        count: None,
-                    },
-                ],
-            });
-        let pl_layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("pip-layout"),
-                bind_group_layouts: &[&bgl],
-                push_constant_ranges: &[],
-            });
-        let pipeline = self
-            .device
-            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: Some("pip-pipeline"),
-                layout: Some(&pl_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: "vs_fullscreen",
-                    compilation_options: Default::default(),
-                    buffers: &[],
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: "fs_pip",
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: wgpu::TextureFormat::Rgba8Unorm,
-                        blend: None,
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
-                }),
-                primitive: wgpu::PrimitiveState::default(),
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview: None,
-                // wgpu 22 added this field; absence is a compile error.
-                cache: None,
-            });
+        // 3. Pipeline — cached. Per Fix #41 the Mutex guard is bounded to
+        // the cache-lookup-and-clone block; encode below runs unlocked.
+        // Per Fix #51 this is a pure-compute path, so panic on poison.
+        let pip_key = PipPassKey {
+            source_w: w,
+            source_h: h,
+        };
+        let (pip_pipeline, pip_bgl, pip_sampler) = {
+            let mut g = self.pip_cache.lock().expect("pip_cache poisoned");
+            let needs_rebuild = g.as_ref().map(|c| c.key != pip_key).unwrap_or(true);
+            if needs_rebuild {
+                #[cfg(test)]
+                self.pip_cache_rebuilds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *g = Some(self.build_pip_cache(pip_key));
+            }
+            let c = g.as_ref().expect("populated above");
+            (
+                c.pipeline.clone(),
+                c.bind_group_layout.clone(),
+                c.sampler.clone(),
+            )
+        }; // guard dropped here — encode happens unlocked
 
         let src_view = src_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let webcam_view = webcam_tex.create_view(&wgpu::TextureViewDescriptor::default());
         let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("pip-bg"),
-            layout: &bgl,
+            layout: &pip_bgl,
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
@@ -469,7 +403,7 @@ impl Compositor {
                 },
                 wgpu::BindGroupEntry {
                     binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&sampler),
+                    resource: wgpu::BindingResource::Sampler(&pip_sampler),
                 },
                 wgpu::BindGroupEntry {
                     binding: 3,
@@ -500,7 +434,7 @@ impl Compositor {
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-            rpass.set_pipeline(&pipeline);
+            rpass.set_pipeline(&pip_pipeline);
             rpass.set_bind_group(0, &bind_group, &[]);
             rpass.draw(0..3, 0..1);
         }
@@ -593,10 +527,157 @@ impl Compositor {
                 contents: bytemuck::cast_slice(vertices),
                 usage: wgpu::BufferUsages::VERTEX,
             });
+
+        // Cached pipeline. Per Fix #41 the guard is dropped before encode;
+        // per Fix #51 this is a pure-compute path so panic on poison.
+        let stroke_key = StrokePassKey { _placeholder: 0 };
+        let stroke_pipeline = {
+            let mut g = self.stroke_cache.lock().expect("stroke_cache poisoned");
+            let needs_rebuild = g.as_ref().map(|c| c.key != stroke_key).unwrap_or(true);
+            if needs_rebuild {
+                #[cfg(test)]
+                self.stroke_cache_rebuilds
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                *g = Some(self.build_stroke_cache(stroke_key));
+            }
+            g.as_ref().expect("populated above").pipeline.clone()
+        }; // guard dropped here
+
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("stroke-pass"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &target_view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        rpass.set_pipeline(&stroke_pipeline);
+        rpass.set_vertex_buffer(0, vbo.slice(..));
+        let vertex_count = vertices.len() as u32;
+        rpass.draw(0..vertex_count, 0..1);
+    }
+
+    /// Build a fresh PiP pass cache entry. Called from `compose` only when
+    /// the cache key changes (or on first use). All wgpu handles inside
+    /// `PipPassCache` are refcounted — clone-out is cheap.
+    ///
+    /// Per the `PipPassKey` cache-key intent comment above, the construction
+    /// is dimension-agnostic; `key.source_w` / `key.source_h` are stored on
+    /// the returned cache for future-proofing only and are NOT used here.
+    fn build_pip_cache(&self, key: PipPassKey) -> PipPassCache {
+        let shader = self
+            .device
+            .create_shader_module(wgpu::include_wgsl!("shaders/pip.wgsl"));
+        let sampler = self.device.create_sampler(&wgpu::SamplerDescriptor {
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            ..Default::default()
+        });
+        let bind_group_layout =
+            self.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("pip-bgl"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Texture {
+                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                view_dimension: wgpu::TextureViewDimension::D2,
+                                multisampled: false,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 3,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let pipeline_layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("pip-layout"),
+                bind_group_layouts: &[&bind_group_layout],
+                push_constant_ranges: &[],
+            });
+        let pipeline = self
+            .device
+            .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                label: Some("pip-pipeline"),
+                layout: Some(&pipeline_layout),
+                vertex: wgpu::VertexState {
+                    module: &shader,
+                    entry_point: "vs_fullscreen",
+                    compilation_options: Default::default(),
+                    buffers: &[],
+                },
+                fragment: Some(wgpu::FragmentState {
+                    module: &shader,
+                    entry_point: "fs_pip",
+                    compilation_options: Default::default(),
+                    targets: &[Some(wgpu::ColorTargetState {
+                        format: wgpu::TextureFormat::Rgba8Unorm,
+                        blend: None,
+                        write_mask: wgpu::ColorWrites::ALL,
+                    })],
+                }),
+                primitive: wgpu::PrimitiveState::default(),
+                depth_stencil: None,
+                multisample: wgpu::MultisampleState::default(),
+                multiview: None,
+                // wgpu 22 added this field; absence is a compile error.
+                cache: None,
+            });
+        PipPassCache {
+            key,
+            bind_group_layout: Arc::new(bind_group_layout),
+            pipeline_layout: Arc::new(pipeline_layout),
+            pipeline: Arc::new(pipeline),
+            sampler: Arc::new(sampler),
+            shader: Arc::new(shader),
+        }
+    }
+
+    /// Build a fresh stroke pass cache entry. Called from
+    /// `encode_stroke_pass` only on first use (the key is currently a
+    /// `_placeholder: u8` singleton — see `StrokePassKey`).
+    fn build_stroke_cache(&self, key: StrokePassKey) -> StrokePassCache {
         let shader = self
             .device
             .create_shader_module(wgpu::include_wgsl!("shaders/strokes.wgsl"));
-        let pl_layout = self
+        let pipeline_layout = self
             .device
             .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("stroke-layout"),
@@ -607,7 +688,7 @@ impl Compositor {
             .device
             .create_render_pipeline(&wgpu::RenderPipelineDescriptor {
                 label: Some("stroke-pipeline"),
-                layout: Some(&pl_layout),
+                layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
                     entry_point: "vs_stroke",
@@ -668,26 +749,12 @@ impl Compositor {
                 multiview: None,
                 cache: None,
             });
-
-        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("stroke-pass"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &target_view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Load,
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-        rpass.set_pipeline(&pipeline);
-        rpass.set_vertex_buffer(0, vbo.slice(..));
-        let vertex_count = vertices.len() as u32;
-        rpass.draw(0..vertex_count, 0..1);
+        StrokePassCache {
+            key,
+            pipeline_layout: Arc::new(pipeline_layout),
+            pipeline: Arc::new(pipeline),
+            shader: Arc::new(shader),
+        }
     }
 }
 
@@ -936,6 +1003,23 @@ mod tests {
         assert_eq!(via_method.width, via_free.width);
         assert_eq!(via_method.height, via_free.height);
         assert_eq!(via_method.pixels, via_free.pixels);
+    }
+
+    #[test]
+    fn pip_cache_rebuild_count_is_one_for_n_calls() {
+        let comp = Compositor::new_headless().expect("compositor");
+        let source = Frame::solid(64, 64, [200, 100, 50, 255]);
+        let webcam = Frame::solid(32, 32, [0, 0, 0, 255]);
+        for _ in 0..5 {
+            let _ = comp.compose(&source, &webcam, &[]).expect("compose");
+        }
+        let rebuilds = comp
+            .pip_cache_rebuilds
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            rebuilds, 1,
+            "expected exactly 1 PiP pipeline rebuild for 5 same-dim composes, got {rebuilds}"
+        );
     }
 
     #[cfg(target_os = "macos")]
