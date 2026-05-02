@@ -608,7 +608,33 @@ own SHIPPED line + CI run id once green.
         Verification battery green: build/test --features media,
         build/test workspace, --no-default-features build, clippy
         media + clippy excluding media, fmt --check.
-
+- [ ] Plan #8: coverage hardening (multi-source / multi-tag /
+      PartialFailure E2Es)
+      Tests-only plan landing fixtures + harness E2Es for three Phase 10
+      coverage gaps flagged at closeout: (a) multi-source compilation
+      export, (b) multi-tag batch export, (c) PartialFailure UI rendering.
+      Defensive backstop for upcoming audio-mix + resume-failed plans
+      which both depend on multi-source/multi-tag working correctly.
+      No production-code change. Plan: docs/plans/2026-05-01-rust-rewrite-
+      phase-11-coverage-hardening.md
+  - [x] Task 0: Shared test helpers + multi-clip recording
+        (commit db78b9b)
+        Adds crates/video-coach-harness/tests/common/mod.rs (~280 LOC)
+        with LaunchedProject struct (App + project_path + RAII tempdir
+        parent) and 6 helpers: fixture_1080p / fixture_4k / webcam_fixture
+        path getters, launch_new_project_with_source (launch + new_project
+        + add first source + wait source.added/player.opened),
+        record_clip (start_clip_recording → sleep → stop_clip_recording,
+        returns clip_id), add_second_source (add_source_video + waits
+        source.added ONLY per adv-fix #1/#6), quit_and_mutate_project
+        (App::quit by-value, project_store::read+mutate+write sync),
+        relaunch_and_open (relaunch app + OpenProject + wait
+        project.opened). File-header docstring documents wait_for_event's
+        drop-on-mismatch contract (adv-fix #3), the recording flow's
+        hardcoded source_index = 0 (adv-fix #1), hand-mutation rationale
+        (no Command::SetClipTags), and guaranteed-quit shape convention.
+        Cargo.toml adds dev-dependencies: uuid (workspace) +
+        video-coach-core (path = "../video-coach-core").
 
 ## Phase 11 — pending
 Per the design doc:
