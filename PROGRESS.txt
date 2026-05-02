@@ -655,6 +655,25 @@ own SHIPPED line + CI run id once green.
         source on ingest) is cross-plan scope and deferred. The test
         body is fully wired so a future enabling commit just removes
         the #[ignore] attribute once the compositor limit is lifted.
+  - [x] Task 2: Multi-tag batch export E2E
+        (commit da30ca8)
+        Adds crates/video-coach-harness/tests/export_multi_tag_smoke.rs
+        (~177 LOC) with export_multi_tag_batch_writes_three_mp4s:
+        launches a project with the 1080p fixture, records 3 clips
+        (~0.8s each) at the playhead, quits + mutates clip tags
+        (clips[0]=['a'], clips[1]=['a','b'], clips[2]=['b']) via
+        project_store hand-mutation (no Command::SetClipTags),
+        relaunches + OpenProject + ExportCompilations with three
+        selections [Tag 'a', Tag 'b', AllClips] and explicit
+        filename_template '{tag} - {project}'. Wait sequence matches
+        bus emission EXACTLY (adv-fix #3): batch.started (assert
+        tag_count == 3 per adv-fix #4) → for each of ['a','b',
+        'all-clips' literal hyphen]: tag.started (selection match) →
+        tag.completed (selection match + frames_pushed >= 15) →
+        batch.completed (tag_count == 3). Asserts three .mp4 files
+        exist on disk and the AllClips file is >= each per-tag file
+        + 20 KB. Guaranteed-quit shape (adv-fix #7). NO #[ignore] —
+        runs end-to-end against the 1080p fixture in ~33s wall.
 
 ## Phase 11 — pending
 Per the design doc:
