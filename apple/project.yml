@@ -63,6 +63,9 @@ targets:
     platform: macOS
     sources:
       - path: Tests/AppTests
+      - path: App/Recording/RecordingController.swift
+    dependencies:
+      - package: VideoCoachCore
     settings:
       base:
         SWIFT_VERSION: 5.9
