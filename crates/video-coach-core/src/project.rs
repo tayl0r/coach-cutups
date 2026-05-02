@@ -44,8 +44,26 @@ pub struct Preferences {
     /// field deserializes to `Codec::H264` (preserves Phase 10 behavior).
     #[serde(default)]
     pub last_export_codec: Codec,
+    /// Phase 11 Plan #7. Free-form template with `{tag}`, `{project}`,
+    /// `{date}` placeholders. Default = `"{tag} - {project}"` which
+    /// reproduces Phase 10's hard-coded format byte-for-byte.
+    /// `#[serde(default = "default_filename_template")]` so a
+    /// pre-Plan-#7 project.json deserializes cleanly with the legacy
+    /// behavior preserved. The named-function form is used (instead of
+    /// `#[serde(default)]` falling back to `String::default()`) because
+    /// `""` would sanitize to `"untitled"` — wrong default behavior.
+    #[serde(default = "default_filename_template")]
+    pub export_filename_template: String,
     pub preferred_camera_id: Option<String>,
     pub preferred_mic_id: Option<String>,
+}
+
+/// Default value for `Preferences::export_filename_template`. Declared
+/// `pub` (not `pub(crate)`) so cross-crate callers in `video-coach-app`
+/// (the bus's `default_command_filename_template`) can reference it as
+/// the single source of truth. Phase 11 Plan #7.
+pub fn default_filename_template() -> String {
+    "{tag} - {project}".to_string()
 }
 
 impl Default for Preferences {
@@ -57,6 +75,7 @@ impl Default for Preferences {
             last_export_resolution: Resolution::R1080,
             last_export_quality: Quality::Medium,
             last_export_codec: Codec::H264,
+            export_filename_template: default_filename_template(),
             preferred_camera_id: None,
             preferred_mic_id: None,
         }
@@ -193,6 +212,45 @@ mod tests {
         let prefs: Preferences = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(prefs.last_export_codec, Codec::H264);
         assert_eq!(prefs, Preferences::default());
+    }
+
+    #[test]
+    fn preferences_default_template_is_phase_10_format() {
+        // Default template reproduces Phase 10's hard-coded
+        // `<tag> - <project>` format byte-for-byte.
+        assert_eq!(
+            Preferences::default().export_filename_template,
+            "{tag} - {project}"
+        );
+    }
+
+    #[test]
+    fn preferences_deserializes_without_template_field() {
+        // A pre-Plan #7 project.json lacks `exportFilenameTemplate`.
+        // Confirm `#[serde(default = "default_filename_template")]` fills
+        // in the Phase 10 format default rather than `String::default()`
+        // (which would yield `""` and mis-sanitize to `"untitled"`).
+        let legacy_json = r#"{
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "lastExportCodec": "h264",
+            "preferredCameraId": null,
+            "preferredMicId": null
+        }"#;
+        let prefs: Preferences = serde_json::from_str(legacy_json).unwrap();
+        assert_eq!(prefs.export_filename_template, "{tag} - {project}");
+        assert_eq!(prefs, Preferences::default());
+    }
+
+    #[test]
+    fn default_filename_template_returns_phase_10_format() {
+        // The free function is the single source of truth referenced by
+        // both the serde default attribute and (in Task 2) the bus's
+        // `default_command_filename_template`.
+        assert_eq!(default_filename_template(), "{tag} - {project}");
     }
 
     #[test]

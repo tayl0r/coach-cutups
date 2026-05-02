@@ -61,6 +61,47 @@ pub fn sanitize_filename(s: &str) -> String {
     trimmed
 }
 
+/// Strip `{` and `}` from substituent values BEFORE substitution so that
+/// a tag/project/date containing literal braces cannot smuggle a
+/// placeholder back into the partially-substituted template (Phase 11
+/// Plan #7 fix #6). Without this, a project named `"My {tag} project"`
+/// combined with template `"{tag} - {project}"` and tag `"X"` would
+/// yield `"X - My {tag} project"` — a literal `{tag}` survives in the
+/// filename. Stripping the braces from substituent values gives
+/// `"X - My tag project"` instead.
+fn strip_braces(s: &str) -> String {
+    s.chars().filter(|c| *c != '{' && *c != '}').collect()
+}
+
+/// Substitute `{tag}`, `{project}`, `{date}` placeholders in `template`
+/// then sanitize the result for use as a filename component.
+///
+/// Substitution is single-pass and non-recursive: a tag named literally
+/// `"{tag}"` is first stripped of its braces (per Phase 11 Plan #7 fix
+/// #6) so it does NOT re-substitute. Unsupported placeholders pass
+/// through as literal text (e.g. `"{frame}"` survives unchanged in the
+/// output — future-compatible).
+///
+/// Date format is hardcoded to `YYYY-MM-DD` in project LOCAL time
+/// (NOT UTC) — this is a user-facing filename and a UTC date can
+/// disagree with the calendar the user is looking at. The caller
+/// supplies the formatted date string; this helper is timezone-agnostic.
+///
+/// The result is passed through `sanitize_filename` so any
+/// substituted-in illegal Windows chars (`/`, `\`, `:` etc.) are
+/// scrubbed. An empty post-substitution-and-sanitize result falls
+/// back to `"untitled"` (inherited from `sanitize_filename`'s contract).
+pub fn apply_template(template: &str, tag: &str, project: &str, date: &str) -> String {
+    let tag_clean = strip_braces(tag);
+    let project_clean = strip_braces(project);
+    let date_clean = strip_braces(date);
+    let substituted = template
+        .replace("{tag}", &tag_clean)
+        .replace("{project}", &project_clean)
+        .replace("{date}", &date_clean);
+    sanitize_filename(&substituted)
+}
+
 fn is_windows_reserved(s: &str) -> bool {
     let upper = s.to_ascii_uppercase();
     matches!(
@@ -211,5 +252,111 @@ mod tests {
         // before joining the output_folder. The slash mustn't escape
         // into the path.
         assert_eq!(sanitize_filename("drills/3pt"), "drills-3pt");
+    }
+
+    // -----------------------------------------------------------------
+    // Phase 11 Plan #7 — apply_template tests.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn default_template_matches_phase_10_format() {
+        // The default template reproduces Phase 10's hard-coded
+        // `<tag> - <project>` format byte-for-byte. The supplied date
+        // is irrelevant when the default template lacks `{date}`.
+        assert_eq!(
+            apply_template("{tag} - {project}", "drills", "MyProj", "2026-05-01"),
+            "drills - MyProj"
+        );
+    }
+
+    #[test]
+    fn template_with_date_substitutes_supplied_date() {
+        // `{date}` is substituted with the caller-supplied date string
+        // verbatim (the helper is timezone-agnostic; the bus formats
+        // the date and hands it in).
+        assert_eq!(
+            apply_template("{date}_{tag}_{project}", "a", "P", "2026-05-01"),
+            "2026-05-01_a_P"
+        );
+    }
+
+    #[test]
+    fn template_with_no_placeholders_passes_through() {
+        // A template with no placeholders sanitizes-through unchanged.
+        assert_eq!(
+            apply_template("static-name", "anything", "anything", "anything"),
+            "static-name"
+        );
+    }
+
+    #[test]
+    fn template_with_unknown_placeholder_passes_through_literal() {
+        // `{frame}` is not a recognized placeholder; it survives in the
+        // output verbatim. `{` and `}` are NOT in `sanitize_filename`'s
+        // illegal-char list, so they pass through.
+        assert_eq!(apply_template("{frame}_{tag}", "a", "X", "d"), "{frame}_a");
+    }
+
+    #[test]
+    fn template_substitutes_into_illegal_chars_safely() {
+        // A tag containing `/` substitutes into the template; the
+        // post-substitution sanitize replaces the `/` with `-`.
+        assert_eq!(apply_template("{tag}", "a/b", "P", "d"), "a-b");
+    }
+
+    #[test]
+    fn template_substitutes_project_with_colon() {
+        // A project name containing `:` substitutes; sanitize replaces
+        // it with `-`.
+        assert_eq!(
+            apply_template("{project}", "tag", "5:30 drill", "d"),
+            "5-30 drill"
+        );
+    }
+
+    #[test]
+    fn empty_template_falls_back_to_untitled() {
+        // An empty template sanitizes to `"untitled"` per the existing
+        // contract. The bus's pre-Export validation catches this case
+        // upstream; the helper still produces a safe filename.
+        assert_eq!(apply_template("", "x", "y", "d"), "untitled");
+    }
+
+    #[test]
+    fn template_with_only_placeholders_resolving_to_empty_falls_back() {
+        // `{tag}` only, with empty tag, substitutes to `""` and
+        // sanitizes to `"untitled"`.
+        assert_eq!(apply_template("{tag}", "", "P", "d"), "untitled");
+    }
+
+    #[test]
+    fn windows_reserved_template_result_gets_underscore() {
+        // A tag of `"CON"` substituted into `"{tag}"` post-sanitizes to
+        // `"_CON"` per the Windows reserved-name guard.
+        assert_eq!(apply_template("{tag}", "CON", "P", "d"), "_CON");
+    }
+
+    #[test]
+    fn template_substituent_with_braces_is_stripped() {
+        // A project name containing literal `{tag}` gets its braces
+        // stripped before substitution (Plan #7 fix #6) — otherwise the
+        // surviving `{tag}` would re-substitute into a tag value mid-
+        // template and produce confusing filenames.
+        assert_eq!(
+            apply_template("{tag} - {project}", "X", "My {tag} project", "d"),
+            "X - My tag project"
+        );
+    }
+
+    #[test]
+    fn template_with_literal_tag_in_input_is_not_recursively_substituted() {
+        // A tag literally named `"{tag}"` has its braces stripped first
+        // (fix #6), so it substitutes as `"tag"` — NOT recursively
+        // re-substituted as another `{tag}` round. Documents the non-
+        // recursive contract.
+        assert_eq!(
+            apply_template("{tag}_{project}", "{tag}", "P", "d"),
+            "tag_P"
+        );
     }
 }
