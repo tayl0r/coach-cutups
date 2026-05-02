@@ -157,11 +157,184 @@ keeps that work.
 
 The main session ran one adversarial-review pass on this plan; the
 fixes are **non-negotiable**. Sub-agent: every one must be present in
-shipped code. Numbered here in order of pass and fix; the orchestrator
-fills in this section after the adv-plan-review sub-agent reports.
+shipped code.
 
-(Section to be populated during the `ADV_REVIEWED` → `READY_FOR_TASK_0`
-state transition.)
+**1. Bump local `completed_tags` on every skip.** `bus.rs` already
+maintains TWO separate notions of "completed": the local
+`let mut completed_tags: usize = 0;` (line 2622) that feeds
+`ExportRunOutcome::SucceededAll { tag_count: completed_tags }` /
+`Cancelled { completed }` / `PartialFailure { completed }`, AND the
+slot's `g.completed_tags` that drives the UI bar. Phase 11 Plan #2
+deliberately split these (line 2740 comment: "must NOT read
+`completed_tags` from the slot — only write into it"). The skip path
+in Task 1 MUST `completed_tags += 1` after the slot update, in the
+SAME branch, with a comment pointing back to Plan #2's split. Without
+this, a 6-tag run that skipped all 6 yields
+`SucceededAll { tag_count: 0 }` even though `g.completed_tags == 6` —
+silent contract violation.
+
+Task 1's `export_skipped_tag_count_includes_in_succeeded_all` test
+must assert on the OUTCOME's `tag_count` field explicitly, not just
+on `g.completed_tags`. Add a separate assertion for both.
+
+**2. Stale-output detection: compare output mtime vs recording.mov
+mtime for single-clip plans.** A user re-records a clip while a
+previous export's .mp4 still sits on disk; default `Resume` would
+silently reuse the stale .mp4 (Scope #5 "no fingerprint-based
+staleness" punts to the Overwrite checkbox). Tighten the contract for
+the cheap case: `output_exists_and_intact` takes an optional
+`recording_mov_path: Option<&Path>` — when the plan has exactly one
+distinct clip (`plan.entries.len() >= 1` AND every entry references
+the same `clip_id`), pass the clip's `recording_filename`. The helper
+returns false if `recording.mov.mtime > output.mtime`, forcing
+re-encode. Multi-clip plans (AllClips compilation, multi-clip tag
+selections) skip this check — walking every clip's recording mtime
+adds I/O per skip-check and the user's escape hatch (Overwrite
+checkbox) covers it. Document the limitation.
+
+When the mtime check trips, log
+`event = "export.tag.stale_output", reason = "recording_newer", selection = …`
+under `target = "export.lifecycle"` (NEW event name; not a `skipped`
+since the encode runs). Task 1's helper unit tests cover the new path.
+
+**3. Tail-scan last 64 KB for `moov` atom in addition to `ftyp`
+header.** Plan #6's "PartialFailure on tag K, then resume" failure
+mode IS exactly the case where qtmux (default `streamable=false`)
+wrote `ftyp` + `mdat` then crashed before flushing `moov`. The plan's
+`ftyp + 50 KB` check is a near-certain false positive there: `ftyp`
+sits at offset 4 (qtmux writes it eagerly), `mdat` is large after
+even a few seconds of encode, but `moov` is missing. The file is
+unplayable; Plan #6 happily skips it. Tighten `output_exists_and_intact`:
+
+```rust
+// After the ftyp + size check, tail-scan the last min(64 KiB,
+// file_size) bytes for the bytes b"moov". qtmux writes a `moov`
+// box (size-prefixed: 4 bytes BE size, then b"moov", then payload)
+// at the END of the file on EOS in non-streamable mode. A file
+// missing `moov` is unplayable regardless of the ftyp prefix.
+let tail_len = std::cmp::min(metadata.len(), 64 * 1024) as usize;
+let mut tail = vec![0u8; tail_len];
+file.seek(std::io::SeekFrom::End(-(tail_len as i64))).ok()?;
+file.read_exact(&mut tail).ok()?;
+// Scan for b"moov" anywhere in the tail (size prefix is variable).
+tail.windows(4).any(|w| w == b"moov")
+```
+
+(Use `?` only inside a closure that returns `Option<bool>`; convert
+None to false at the call site.) Add a unit test: synthetic file
+with ftyp at offset 4 + 60 KB random body + NO moov, assert
+`not_intact`. Plan #6's "Architecture" line 35-42 contract becomes
+`size > 50 KB AND ftyp@4 AND moov found in last 64 KB`.
+
+**4. Audit existing harness tests; pass `OverwriteAll` explicitly.**
+Default flipped to `Resume` is a silent regression for any harness
+test that exports the same selection twice (e.g.
+`export_partial_failure_smoke.rs` runs an export then a re-export).
+The second run would skip and the test's `frames_pushed >= 20`
+assertion would fail. Task 0's scope expands to:
+
+> Audit every existing harness test that calls
+> `Command::ExportCompilations`. Update each to pass
+> `overwrite_policy: ExportOverwritePolicy::OverwriteAll` explicitly.
+> Only Plan #6's new `export_resume_skips_existing_tags` test
+> exercises the Resume default. Tests touched should include (but
+> verify by grep): `export_smoke.rs`, `export_partial_failure_smoke.rs`,
+> `export_codec_*`, `export_template_*`. ~5 LOC × ~6 files.
+
+Task 0's commit message mentions this audit explicitly so reviewers
+can spot-check.
+
+**5. Single source of truth: `Command::ExportCompilations.overwrite_policy`
+is the run truth; snapshot is hydration-only.** The plan's
+"Architecture" mentions both "rides the existing `ExportPrefsSnapshot`"
+and "the UI sends the current state of the form's checkbox" via the
+Command field — these are inconsistent if the user toggles the
+checkbox between sheet open and Export click. Resolve: the Command's
+field is what drives the run; the snapshot is REBUILT from
+`Preferences` on next sheet open (Plan #3 pattern). The bus's
+existing `persist_prefs` path on Export click (`bus.rs:2540`) writes
+the new `Preferences::export_overwrite_policy` field to project.json.
+The snapshot reads from the saved prefs on next sheet open.
+
+Task 0's scope clarification: extend `ExportPrefsSnapshot` (so the
+checkbox hydrates correctly on re-open with the LAST-PERSISTED value),
+extend `Command::ExportCompilations.overwrite_policy` (the run-time
+truth), but do NOT introduce a new `Command::SetPreferences`. The
+snapshot's value at run time has NO effect on the run.
+
+**6. Drop `Command::SetPreferences`; persist only on Export click.**
+Verified by grep: there is NO `Command::SetPreferences` in the
+codebase. Plan #7 (the existing pattern) persists prefs ON EXPORT
+CLICK in `bus.rs:2540`, not on UI toggle. Plan #6's Task 2 mentions
+"`Command::SetPreferences { export_overwrite_policy: ... }`"; this
+command does not exist. Mirror Plan #7's actual pattern:
+
+- The export-sheet checkbox binds to a Slint in/out property
+  `export-overwrite-existing: bool`.
+- On click of Export, `ui.rs` reads the current property value and
+  threads it into the `Command::ExportCompilations` payload as
+  `overwrite_policy`.
+- The bus's `persist_prefs` path persists it.
+- A user who toggles the checkbox without clicking Export sees the
+  change reverted on next launch (matches every other export pref).
+
+This drops Task 2's `SetPreferences` extension entirely; Task 0 does
+NOT add `SetPreferences`; on-toggle persistence is explicitly out of
+scope ("What Plan #6 deliberately does NOT include" gains a row).
+Task 2's LOC budget shrinks from ~120 to ~80.
+
+**7. Harness E2E uses SHA-256 of first 1 KiB as the canonical "file
+unchanged" witness; mtime is informational only.** mtime resolution
+varies across filesystems (APFS: nanoseconds; some Linux setups:
+seconds; Windows NTFS: 100 ns). A test that asserts mtime-equality
+across runs is one filesystem flake away from reds. The plan's
+Task 3 step 5e already hedges; tighten to:
+
+> Re-read the file's first 1024 bytes; SHA-256 them. Assert SHA
+> matches the value captured in step 4d. The mp4 header (`ftyp`
+> + first sample tables) sits in this prefix, so a re-encode would
+> always change it. The mtime is captured for the test's debug
+> output but is NOT a load-bearing assertion — qtmux's frame timing
+> can produce byte-identical headers across two encodes of the same
+> input only if cancel/recovery happened mid-frame, which is the
+> exact condition Plan #6 prevents anyway.
+
+Drop mtime-equality assertions; SHA-only.
+
+**8. Tracing breadcrumb when `export_overwrite_policy` falls back to
+serde default on project.json load.** Existing users opening their
+project.json post-Plan-#6 see a SILENT default flip from Phase 10's
+"always overwrite" to Plan #6's "skip-if-exists". The plan documents
+this in the closeout but offers no in-app trace. Add to Task 0:
+
+> When `Preferences` loads from project.json AND the
+> `exportOverwritePolicy` field was absent (i.e., the serde default
+> kicked in), emit a one-line `tracing::info!(target: "project",
+> event = "preferences.export_overwrite_policy.defaulted",
+> chosen = "resume", reason = "field_absent_in_project_json")` so
+> power users grepping logs find the breadcrumb. Detected by
+> deserializing into a `MaybeFieldHelper` first OR by checking the
+> raw JSON for the key before deserializing — pick whichever fits
+> the existing project.json loader pattern best (Phase 9 added a
+> few similar paths for the recording prefs).
+
+If detecting "field was absent" adds plumbing, drop this fix (it's
+diagnostic, not load-bearing) — but try first. Phase 9's existing
+pattern probably already handles this.
+
+---
+
+### Rejected findings (logged for completeness)
+
+- **F7 — `is_file()` Windows flake under concurrent writer.** No
+  concrete trigger in the codebase; the export pipeline doesn't
+  open the output for read concurrent with write. Speculative.
+- **F9 — Cancel-flag race with skip-check.** Cancel arriving between
+  the per-iteration cancel-check and the skip-check would let the
+  skip fire on a cancelled batch — but skipping is fast (3 syscalls)
+  and the next iteration's cancel check catches it. Benign.
+- **F10 — Per-tag validation syscall cost on 100-tag batch.** ~300
+  syscalls total in microseconds. No realistic perf concern.
 
 ---
 
@@ -199,6 +372,12 @@ state transition.)
   "this run skipped K of M tags". Aggregating across tags is the
   job of any future analytics consumer; the per-event log is the
   contract.
+- **On-toggle persistence of the "Overwrite existing" checkbox.**
+  Adv-fix #6. Persistence happens on Export click only — same as
+  every other export pref (resolution, quality, codec, filename
+  template). A user who toggles the checkbox without clicking
+  Export sees the change discarded on quit. No
+  `Command::SetPreferences` is added.
 
 ---
 
@@ -317,13 +496,32 @@ to ride `overwrite_policy: ExportOverwritePolicy`. The snapshot is set
 when an export run begins so the UI's progress + summary views see the
 exact policy that drove the run.
 
-**Update `Command::SetPreferences`** (or whatever command exposes
-preferences to the UI) to accept `export_overwrite_policy:
-Option<ExportOverwritePolicy>`. The bus handler writes the field to
-`current.0.preferences.export_overwrite_policy` and writes project.json.
-If `SetPreferences` doesn't exist yet, this task adds the minimum needed
-for the UI to round-trip the checkbox. Keep the additive serde shape so
-older callers' command JSON keeps working.
+**Do NOT add `Command::SetPreferences`** (per baked-in fix #6). The
+codebase does not have one; Plan #7's pattern persists export prefs
+on Export click in `bus.rs::handle_export_compilations` (the existing
+`persist_prefs` block at `bus.rs:2540`). Mirror that pattern: extend
+the persist block in Task 1 to also persist
+`export_overwrite_policy`. The UI threads the checkbox state into
+`Command::ExportCompilations.overwrite_policy` at click time; the bus
+persists it. Toggle without click = change discarded (matches all
+other export prefs).
+
+**Audit existing harness tests** (per baked-in fix #4). After landing
+the new `overwrite_policy` field on `Command::ExportCompilations`, run
+`grep -rn "ExportCompilations" crates/video-coach-harness/tests/` and
+update each call site to pass `overwrite_policy:
+ExportOverwritePolicy::OverwriteAll` explicitly. The default-Resume
+flip would otherwise silently break tests that re-export the same
+selection. Estimated ~5 LOC × ~6 tests. Mention the audit explicitly
+in the Task 0 commit message.
+
+**Tracing breadcrumb on default fallback** (per baked-in fix #8).
+Best-effort: detect when `export_overwrite_policy` was absent from
+project.json on load and emit a one-line
+`tracing::info!(target: "project", event =
+"preferences.export_overwrite_policy.defaulted", ...)`. If the
+existing project.json loader doesn't already track field-absent vs
+field-default, drop this fix (diagnostic only).
 
 **Stub the bus's per-tag skip:** add a TODO comment in
 `handle_export_compilations` at the location where Task 1 will insert
@@ -394,6 +592,14 @@ if matches!(overwrite_policy, ExportOverwritePolicy::Resume)
         g.current_tag_progress = 0.0;
     }
 
+    // ── Adv-fix #1: bump the LOCAL counter too. ──
+    // Phase 11 Plan #2 split the slot's `g.completed_tags` (UI bar)
+    // from this scope's `let mut completed_tags` (which feeds the
+    // outcome's `tag_count`). The skip path must touch BOTH or
+    // `SucceededAll { tag_count: 0 }` ships with `g.completed_tags
+    // == N`. See bus.rs:2740 comment for the split rationale.
+    completed_tags += 1;
+
     continue;
 }
 
@@ -424,11 +630,26 @@ let _ = std::fs::remove_file(&output_path);
 /// is much slower than re-encoding for a 1-s clip. Future hardening
 /// could add a Discoverer probe behind a flag.
 ///
+/// Adv-fix #3: ALSO tail-scan the last 64 KiB for the `moov` atom
+/// magic. qtmux's default `streamable=false` mode writes `ftyp` +
+/// `mdat` eagerly but defers `moov` to EOS. A process killed mid-encode
+/// has `ftyp` AND > 50 KB of `mdat` but NO `moov` — unplayable but
+/// passes the cheap checks alone.
+///
+/// Adv-fix #2: if `recording_mov_path` is `Some(p)` AND `p.mtime >
+/// path.mtime`, the underlying clip was re-recorded after the .mp4
+/// was written; force re-encode (returns false). Caller passes Some
+/// only for single-clip plans (`plan.entries.len() >= 1` AND every
+/// entry references the same `clip_id`); multi-clip plans pass None.
+///
 /// I/O errors (permission denied, etc.) are treated as "not intact" —
 /// the export will then attempt to delete + re-encode, which surfaces
 /// the real error via the export pipeline's own error path.
-fn output_exists_and_intact(path: &std::path::Path) -> bool {
-    use std::io::Read;
+fn output_exists_and_intact(
+    path: &std::path::Path,
+    recording_mov_path: Option<&std::path::Path>,
+) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
     let metadata = match std::fs::metadata(path) {
         Ok(m) => m,
         Err(_) => return false,
@@ -436,6 +657,21 @@ fn output_exists_and_intact(path: &std::path::Path) -> bool {
     if !metadata.is_file() || metadata.len() < 50_000 {
         return false;
     }
+
+    // Adv-fix #2: stale-output detection.
+    if let Some(mov) = recording_mov_path {
+        if let (Ok(mov_meta), Ok(out_modified)) = (
+            std::fs::metadata(mov),
+            metadata.modified(),
+        ) {
+            if let Ok(mov_modified) = mov_meta.modified() {
+                if mov_modified > out_modified {
+                    return false;
+                }
+            }
+        }
+    }
+
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
         Err(_) => return false,
@@ -444,20 +680,46 @@ fn output_exists_and_intact(path: &std::path::Path) -> bool {
     if file.read_exact(&mut header).is_err() {
         return false;
     }
-    &header[4..8] == b"ftyp"
+    if &header[4..8] != b"ftyp" {
+        return false;
+    }
+
+    // Adv-fix #3: tail-scan for `moov`.
+    let tail_len = std::cmp::min(metadata.len(), 64 * 1024) as usize;
+    let mut tail = vec![0u8; tail_len];
+    if file
+        .seek(SeekFrom::End(-(tail_len as i64)))
+        .and_then(|_| file.read_exact(&mut tail))
+        .is_err()
+    {
+        return false;
+    }
+    tail.windows(4).any(|w| w == b"moov")
 }
 ```
 
 **Unit tests for the helper** (in bus.rs's `#[cfg(test)]` block):
-- `intact_when_size_and_ftyp_magic_present` — write a synthetic file
-  with `[0u8; 4]` followed by `b"ftyp"` followed by a 60_000-byte
-  payload, assert true.
+- `intact_when_size_ftyp_and_moov_all_present` — write a synthetic
+  file with `[0u8; 4]` followed by `b"ftyp"` followed by a 60_000-byte
+  payload that contains `b"moov"` somewhere in the last 64 KiB,
+  assert true.
 - `not_intact_when_missing` — pass a non-existent path, assert false.
 - `not_intact_when_too_small` — write a 10_000-byte file with valid
-  magic, assert false.
-- `not_intact_when_magic_wrong` — write a 60_000-byte file starting
-  with `b"00000000"`, assert false.
+  ftyp + moov magic, assert false.
+- `not_intact_when_ftyp_wrong` — write a 60_000-byte file starting
+  with `b"00000000"` but containing moov, assert false.
+- `not_intact_when_moov_missing` — write a 60_000-byte file with
+  ftyp at offset 4 but NO `moov` anywhere in the tail (e.g.,
+  zeros + non-moov fill). Assert false. (Adv-fix #3 regression
+  test.)
 - `not_intact_when_directory` — pass a directory path, assert false.
+- `not_intact_when_recording_newer` — write a valid mp4-shaped file
+  AND a recording.mov; touch recording.mov to be 1s newer; assert
+  false when `recording_mov_path = Some(...)`. (Adv-fix #2.)
+- `intact_when_recording_older` — opposite: recording.mov is older;
+  assert true.
+- `intact_when_recording_path_is_none` — multi-clip plan path; pass
+  None; assert true even if a separate recording.mov is newer.
 - `not_intact_on_io_error` — pass a path on a permission-denied
   parent (Linux/macOS: chmod 000 + open; skip on Windows). If the
   test isn't reliably cross-platform, document with a `#[cfg(unix)]`
@@ -492,11 +754,16 @@ that already exercises `handle_export_compilations` with mock fixtures):
 **Files:**
 - Modify: `crates/video-coach-app/ui/main.slint` (export-sheet Form
   view; new checkbox component).
-- Modify: `crates/video-coach-app/src/ui.rs` (binding setup; toggle
-  handler dispatches `Command::SetPreferences`).
-- Modify: `crates/video-coach-app/src/bus.rs` if `SetPreferences`
-  needs to be extended to accept `export_overwrite_policy` (this may
-  have happened in Task 0 already — double-check before duplicating).
+- Modify: `crates/video-coach-app/src/ui.rs` (binding setup; read
+  the property AT EXPORT CLICK TIME and thread into
+  `Command::ExportCompilations.overwrite_policy`).
+
+**Adv-fix #5 + #6 alignment.** Task 2 does NOT add a
+`Command::SetPreferences`; that command does not exist and Plan #6
+does not introduce one. Persistence happens on Export click via the
+existing `bus.rs::handle_export_compilations` `persist_prefs` block
+(extended in Task 0). The checkbox toggle without click is a
+disposable UI state — same UX as every other export pref today.
 
 **Slint changes** in the export-sheet Form view:
 - Add a `CheckBox` (or use Slint's `CheckBoxStyle` if one exists)
@@ -506,26 +773,23 @@ that already exercises `handle_export_compilations` with mock fixtures):
   (snake_case in Slint per existing convention isn't enforced; use
   the project's existing kebab-case-to-Rust-field convention,
   matching e.g. `export-sheet-visible`).
-- The checkbox's `toggled` callback dispatches a Slint callback
-  `export-overwrite-existing-changed(bool)` which `ui.rs` subscribes
-  to and forwards as `Command::SetPreferences { export_overwrite_
-  policy: Some(if checked { OverwriteAll } else { Resume }), .. }`.
+- No `toggled` callback dispatches a bus command. The Slint
+  property holds the state until Export click; on click, `ui.rs`
+  reads the property and threads its value into the
+  `Command::ExportCompilations.overwrite_policy` field. Mirrors
+  Plan #7's filename-template flow.
 
 **`ui.rs` changes:**
-- On window setup, hydrate `export-overwrite-existing` from
-  `current.preferences.export_overwrite_policy` (= true if
-  `OverwriteAll`, false if `Resume`). Pull from
-  `state_for_window.lock().preferences.export_overwrite_policy` —
-  the same shape Plan #7's filename-template hydration uses.
-- On `export-overwrite-existing-changed(bool)` callback, fire
-  `Command::SetPreferences` with the converted policy. Reuse the
-  existing send-to-bus pattern (probably `command_tx.send(...)` or
-  whatever the project's existing pattern is).
-- On Export click, the `Command::ExportCompilations` payload picks up
-  the current value from preferences (either via the `ExportPrefsSnapshot`
-  pattern from Task 0 or by reading prefs at click time). Either is
-  fine; the snapshot pattern is preferred for consistency with Plan #3
-  and #7.
+- On window setup (or sheet-open hydration — match Plan #7's
+  pattern), hydrate `export-overwrite-existing` from
+  `bus.export_prefs_snapshot().overwrite_policy` (= true if
+  `OverwriteAll`, false if `Resume`).
+- NO toggle callback. (Adv-fix #5 + #6.)
+- On Export click, the `Command::ExportCompilations` payload sets
+  `overwrite_policy: if export_overwrite_existing { OverwriteAll }
+  else { Resume }` — read directly from the Slint property at click
+  time. The bus's `persist_prefs` block writes the value to
+  project.json + refreshes the snapshot.
 
 **Slint focus discipline (per Phase 10 fix #32):**
 - The new checkbox lives inside the existing `FocusScope` for the
@@ -534,9 +798,7 @@ that already exercises `handle_export_compilations` with mock fixtures):
   default Slint behavior matches the existing form-field UX (clicking
   a checkbox shouldn't grab keyboard focus from an open text input).
 
-**No new bus handler changes** if Task 0 already extended
-`SetPreferences`. If it didn't, this task adds the minimum extension
-+ a serde test.
+**No new bus commands.** Adv-fix #6.
 
 **Slint preview-mode test (best-effort):**
 - The Slint compiler's `slint::ComponentHandle` test pattern can
@@ -567,9 +829,10 @@ that already exercises `handle_export_compilations` with mock fixtures):
    b. Wait for `export.batch.completed` (timeout 60s — same lavapipe
       headroom as `export_smoke.rs`).
    c. Verify `<tmp>/all-clips - test.mp4` exists, size > 50 KB.
-   d. Capture `metadata.modified()` (mtime) and a SHA-256 of the
-      first 1024 bytes. Both serve as "did the file change?"
-      witnesses.
+   d. Capture a SHA-256 of the first 1024 bytes (canonical "did
+      the file change?" witness per adv-fix #7); also capture
+      `metadata.modified()` for debug output but do NOT assert on
+      it.
 5. **Second export run (the actual resume test):**
    a. Send the same `Command::ExportCompilations` with the same
       selections + `overwrite_policy: Resume`.
@@ -580,18 +843,17 @@ that already exercises `handle_export_compilations` with mock fixtures):
    d. Wait for `export.batch.completed`. Assert the outcome
       reflected in `ExportProgressSlot` is `SucceededAll { tag_count:
       1 }`.
-   e. Re-read the .mp4's metadata + first-1024-bytes SHA-256. Assert
-      mtime is unchanged (or, if the test framework's mtime resolution
-      isn't reliable across filesystems, assert the SHA-256 matches
-      step 4d).
+   e. Re-read the .mp4's first-1024-bytes SHA-256. Assert it
+      matches step 4d. (Adv-fix #7: SHA-only canonical witness;
+      mtime is informational only.)
 6. **Third run with overwrite forced:**
    a. Send `Command::ExportCompilations { ..., overwrite_policy:
       OverwriteAll }`.
    b. Wait for `export.tag.started` (NOT skipped). Wait for
       `export.batch.completed`.
-   c. Verify the file's mtime updated (or, equivalently, the first-
-      1024-bytes SHA-256 changed — encoder timestamps in qtmux can
-      drift between runs even on identical input).
+   c. Verify the first-1024-bytes SHA-256 changed (encoder
+      timestamps in qtmux drift between runs even on identical
+      input). Adv-fix #7: SHA-only.
 7. Quit cleanly.
 
 **Cancel-then-resume test** (separate `#[test]`):
