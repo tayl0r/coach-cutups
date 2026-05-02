@@ -10,6 +10,9 @@ struct KeyCommandView: NSViewRepresentable {
     /// Invoked for Esc when in a preview mode. Wired to clear the clip
     /// selection so the player returns to the source.
     let onClosePreview: () -> Void
+    /// Invoked for ⌘0. Wired to reset the workspace zoom transform back to
+    /// identity so the player frame fills the viewport without translation.
+    let onResetZoom: () -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
@@ -26,6 +29,7 @@ struct KeyCommandView: NSViewRepresentable {
         v.onTogglePlay = onTogglePlay
         v.onToggleRecord = onToggleRecord
         v.onClosePreview = onClosePreview
+        v.onResetZoom = onResetZoom
     }
 }
 
@@ -41,6 +45,7 @@ private enum KeyCode {
     static let rightArrow: UInt16 = 0x7C // kVK_RightArrow
     static let space: UInt16 = 0x31      // kVK_Space
     static let escape: UInt16 = 0x35     // kVK_Escape
+    static let zero: UInt16 = 0x1D       // kVK_ANSI_0
 }
 
 final class KeyCatchingView: NSView {
@@ -49,6 +54,7 @@ final class KeyCatchingView: NSView {
     var onTogglePlay: () -> Void = {}
     var onToggleRecord: () -> Void = {}
     var onClosePreview: () -> Void = {}
+    var onResetZoom: () -> Void = {}
 
     private var monitor: Any?
 
@@ -109,6 +115,15 @@ final class KeyCatchingView: NSView {
                 self.onSkip(delta)
                 return nil
             case KeyCode.space:                 self.onTogglePlay(); return nil
+            case KeyCode.zero:
+                // ⌘0 resets the video zoom transform. Without ⌘ the keystroke
+                // falls through so typing "0" elsewhere (e.g. number-only
+                // fields once we add them) still works normally.
+                if event.modifierFlags.contains(.command) {
+                    self.onResetZoom()
+                    return nil
+                }
+                return event
             default: return event
             }
         }

@@ -280,7 +280,8 @@ struct ContentView: View {
                         onSkip: handleSkip,
                         onTogglePlay: handleTogglePlay,
                         onToggleRecord: handleToggleRecord,
-                        onClosePreview: handleClosePreview
+                        onClosePreview: handleClosePreview,
+                        onResetZoom: { workspace.currentZoom = .identity }
                     )
                     if case .previewLoading = appMode {
                         // Cover the player surface while we wait for the preview
