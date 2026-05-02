@@ -12,6 +12,25 @@
 
 **Companion document:** `apple/docs/plans/2026-05-01-video-zoom-design.md` — read this first for the *why* behind every decision (D1–D9). This plan covers the *what* and *how*.
 
+---
+
+## Adversarial review history (plan v1 → v2)
+
+The first draft was reviewed by `feature-dev:code-reviewer`. Findings folded into v2 (this document) before any execution:
+
+| Finding | Where it lives now |
+|---------|-------------------|
+| **mpv `video-pan-x`/`video-pan-y` are fractions of the *unzoomed* fit-width, not of the source.** At scale=2, passing raw `panX=0.25` lands the visual center at source ~0.625, not the intended 0.75 (mpv issue #3038). The pure-Swift math tests pass; the mpv translation is wrong. | Task 2.1 — `setZoom` now multiplies by scale before writing: `var px = zoom.panX * zoom.scale`. The unit conversion is documented in the function comment with a reference to mpv issue #3038. |
+| **`PreviewCompositor` is a pure CIImage pipeline; the plan's "CGContext path" note primes the implementer for the wrong code.** Additionally, `Zoom.transform` uses letterbox-fit (`min`); the existing PreviewCompositor stretches to fill (`outW/baseCI.extent.width × outH/...`). Applying the transform at identity silently changes preview from stretch to letterbox. | Task 5.1 — rewritten to specify the CIImage path exclusively. `Zoom.transform` keeps letterbox-fit semantics; PreviewCompositor's existing stretch is preserved by composing zoom AS A DELTA (`zoom.deltaTransform(...)`) on top of the existing layout transform, so identity zoom is bit-identical to current output. |
+| **`Workspace.currentZoom` didSet reentrancy is fragile and intersects an open `@Observable` macro bug** (Apple Developer Forums 731113). | Task 2.2 — replaced with an explicit `setCurrentZoom(_:)` method on `Workspace`. Backing storage is `@ObservationIgnored _currentZoom`; the public `var currentZoom: Zoom` has a custom getter/setter that delegates. No reentrant didSet. |
+| **`appendZoom(_:atRecordTime:)` test seam is a public API surface that production code can accidentally call with arbitrary timestamps, breaking monotonicity assumptions in `zoomAt(recordTime:)`.** | Task 4.1 — clock injection instead. `RecordingController.init(t0Seconds: Double, clock: @escaping () -> Double = { CACurrentMediaTime() })`. Tests inject a fake clock; production uses the default. The two-argument overload disappears. |
+| **`CommentaryEvent.Kind.zoom` Codable: old builds will crash with `DecodingError.dataCorrupted` when reading new project files containing zoom events** — Swift's synthesized Codable for enums throws on unknown discriminators. | Task 1.3 — adds a manual `init(from:)` on `CommentaryEvent.Kind` with an explicit `case unknown` fallback for unrecognized variants. The `Clip` event-array decoder skips `.unknown` events at replay time. `Project.formatVersion` bumps to 2. |
+| **`CompilationCompositor` at identity zoom changes export from stretch-to-fill to letterbox-fit for non-matching aspect ratios** — same silent behavior change as PreviewCompositor. | Task 5.2 — same `deltaTransform` pattern as Task 5.1. Existing stretch policy is preserved at identity; non-identity zoom applies the delta on top. The design doc D4's "bit-identical" claim is now actually true. |
+| **Scroll-direction inversion not documented**; future readers can't tell if the deltaY-based zoom direction is intentional. | Task 3.1 — explanatory comment in `scrollWheel(with:)` body referencing the macOS natural-scrolling convention. |
+| **`MPVRenderingNSView.setCurrentZoom` is dead code unless ContentView calls back after Workspace clamping.** | Task 3.4 — `updateNSView` in the production representable explicitly calls `nsView.setCurrentZoom(workspace.currentZoom)` so the view's local mirror stays canonical after clamping. |
+
+---
+
 **Test commands:**
 - `cd apple && swift test --package-path VideoCoachCore` — unit tests for Zoom math, lookup, capture rules, compositor pixel assertions.
 - `cd apple && xcodebuild test -scheme VideoCoach -destination 'platform=macOS,arch=arm64' -only-testing:VideoCoachUITests/MPVZoomPlaybackTests` — XCUITest for live-playback wiring.
@@ -203,13 +222,14 @@ git add apple/VideoCoachCore/Sources/VideoCoachCore/Zoom.swift \
 git commit -m "feat(zoom): cursor-pivot zoom math with chained-zoom invariant test"
 ```
 
-### Task 1.3: Add `.zoom(Zoom)` to `CommentaryEvent.Kind`
+### Task 1.3: Add `.zoom(Zoom)` to `CommentaryEvent.Kind` with backward-compat decoder
 
 **Files:**
 - Modify: `apple/VideoCoachCore/Sources/VideoCoachCore/CommentaryEvent.swift`
+- Modify: `apple/VideoCoachCore/Sources/VideoCoachCore/Project.swift` (formatVersion bump)
 - Create: `apple/VideoCoachCore/Tests/VideoCoachCoreTests/CommentaryEventZoomTests.swift`
 
-**Step 1: Write the failing test (Codable round-trip).**
+**Step 1: Write the failing tests.**
 
 ```swift
 import XCTest
@@ -225,33 +245,136 @@ final class CommentaryEventZoomTests: XCTestCase {
         let decoded = try JSONDecoder().decode(CommentaryEvent.self, from: data)
         XCTAssertEqual(decoded, original)
     }
+
+    func test_unknown_kind_decodes_as_unknown_case_not_error() throws {
+        // Simulates a future build's project file with a kind discriminator
+        // we don't recognize. Old builds must not crash on this.
+        let json = #"""
+        {"recordTime":1.0,"kind":{"futureKind":{"someField":42}}}
+        """#.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(CommentaryEvent.self, from: json)
+        if case .unknown = decoded.kind {
+            // Pass.
+        } else {
+            XCTFail("Expected .unknown for future discriminator, got \(decoded.kind)")
+        }
+    }
+
+    func test_unknown_kind_does_not_appear_in_zoom_lookup() {
+        let unknown = CommentaryEvent(recordTime: 1.0, kind: .unknown)
+        let zoom = CommentaryEvent(recordTime: 2.0, kind: .zoom(Zoom(scale: 2, panX: 0, panY: 0)))
+        let c = Clip(name: "x", sourceIndex: 0, startSourceSeconds: 0,
+                     recordingDuration: 5, recordingFilename: "x.mov",
+                     events: [unknown, zoom], sortIndex: 0)
+        XCTAssertEqual(c.zoomAt(recordTime: 3.0).scale, 2.0, accuracy: 1e-9)
+    }
 }
 ```
 
-**Step 2: Run, expect fail (`.zoom` case missing).**
+**Step 2: Run, expect fail.**
 
-**Step 3: Add the case.**
+**Step 3: Add the case + manual decoder.**
 
 ```swift
-// CommentaryEvent.swift
-public enum Kind: Codable, Hashable, Sendable {
-    case play
-    case pause
-    case skip(delta: Double)
-    case stroke(Stroke)
-    case clearAll
-    case zoom(Zoom)        // NEW
+// apple/VideoCoachCore/Sources/VideoCoachCore/CommentaryEvent.swift
+import Foundation
+
+public struct CommentaryEvent: Codable, Hashable, Sendable {
+    public var recordTime: Double
+    public var kind: Kind
+    public init(recordTime: Double, kind: Kind) {
+        self.recordTime = recordTime
+        self.kind = kind
+    }
+
+    public enum Kind: Hashable, Sendable {
+        case play
+        case pause
+        case skip(delta: Double)
+        case stroke(Stroke)
+        case clearAll
+        case zoom(Zoom)        // NEW
+        case unknown           // Forward-compat: future kinds we don't recognize
+    }
+}
+
+// Manual Codable for Kind so unknown discriminators decode as .unknown
+// instead of throwing DecodingError.dataCorrupted. Old builds opening
+// new project files don't crash on .zoom or any future variant.
+extension CommentaryEvent.Kind: Codable {
+    private enum CodingKeys: String, CodingKey {
+        case play, pause, skip, stroke, clearAll, zoom
+    }
+    private struct SkipPayload: Codable { let delta: Double }
+
+    public init(from decoder: Decoder) throws {
+        // Match Swift's auto-synth: enums with associated values are emitted
+        // as a single-key dictionary {"caseName": <payload>} (or {"caseName": {}}
+        // for no-payload cases).
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        if container.contains(.play)     { self = .play; return }
+        if container.contains(.pause)    { self = .pause; return }
+        if container.contains(.clearAll) { self = .clearAll; return }
+        if let s = try? container.decode(SkipPayload.self, forKey: .skip) {
+            self = .skip(delta: s.delta); return
+        }
+        if let stroke = try? container.decode(Stroke.self, forKey: .stroke) {
+            self = .stroke(stroke); return
+        }
+        if let z = try? container.decode(Zoom.self, forKey: .zoom) {
+            self = .zoom(z); return
+        }
+        // Unknown discriminator → graceful skip instead of crash.
+        self = .unknown
+    }
+
+    public func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        switch self {
+        case .play:       try container.encode([String:String](), forKey: .play)
+        case .pause:      try container.encode([String:String](), forKey: .pause)
+        case .clearAll:   try container.encode([String:String](), forKey: .clearAll)
+        case .skip(let d): try container.encode(SkipPayload(delta: d), forKey: .skip)
+        case .stroke(let s): try container.encode(s, forKey: .stroke)
+        case .zoom(let z):   try container.encode(z, forKey: .zoom)
+        case .unknown:
+            // Don't write .unknown back — it represents a kind we couldn't
+            // decode, so we can't faithfully re-encode it. Drop on save.
+            // (Old builds opening new files don't save them right back; if
+            // they DO, the unknown event silently drops, which is acceptable.)
+            break
+        }
+    }
 }
 ```
 
-**Step 4: Run, expect pass.**
+> **Note on the auto-synth compat:** Swift's automatic enum Codable emits `{"play": {}}` (empty object, not `null`) for no-payload cases. The dummy `[String:String]()` above matches that on encode and the `container.contains(.play)` matches it on decode regardless of whether the payload is `{}` or `null`. Verify against an existing encoded project file before final commit.
 
-**Step 5: Commit.**
+**Step 4: Bump format version.**
+
+```swift
+// Project.swift
+public struct Project: Codable, Hashable, Sendable {
+    public var formatVersion: Int = 2  // was 1; bumped for .zoom event variant
+    // ...
+}
+```
+
+**Step 5: Modify `Clip.zoomAt(recordTime:)` from Task 1.4 to skip `.unknown` events** (the implementer adjusts the `case let .zoom(z) = e.kind` switch to add a default that ignores `.unknown`; existing tests still pass).
+
+**Step 6: Run all tests in the package, expect pass.**
+
+```bash
+cd apple && swift test --package-path VideoCoachCore
+```
+
+**Step 7: Commit.**
 
 ```bash
 git add apple/VideoCoachCore/Sources/VideoCoachCore/CommentaryEvent.swift \
+        apple/VideoCoachCore/Sources/VideoCoachCore/Project.swift \
         apple/VideoCoachCore/Tests/VideoCoachCoreTests/CommentaryEventZoomTests.swift
-git commit -m "feat(zoom): add .zoom(Zoom) variant to CommentaryEvent.Kind"
+git commit -m "feat(zoom): .zoom(Zoom) + .unknown variant for forward-compat decoding"
 ```
 
 ### Task 1.4: `Clip.zoomAt(recordTime:)` lerp
@@ -488,10 +611,17 @@ git commit -m "feat(zoom): Zoom.transform(sourceSize:destSize:) affine helper"
 // Add as a peer of play/pause/setVolume in MPVSourcePlayer.
 public func setZoom(_ zoom: Zoom) {
     guard let h = handle else { return }
-    // Convert linear scale → log2 (mpv's video-zoom scale).
+    // mpv's video-zoom is logarithmic (each unit = 2x). Our Zoom.scale is
+    // linear, so log2 the scale.
     var mpvZoom = log2(zoom.scale)
-    var px = zoom.panX
-    var py = zoom.panY
+    // mpv's video-pan-x/-y are fractions of the UNZOOMED fit-width, NOT of
+    // the source. To get zoom-invariant panning that matches our convention
+    // (pan is a fraction of source width, centered), multiply by scale before
+    // writing. See mpv issue #3038 for the mpv-side rationale; the
+    // adversarial-review history at the top of this plan documents the bug
+    // this conversion fixes.
+    var px = zoom.panX * zoom.scale
+    var py = zoom.panY * zoom.scale
     mpv_set_property(h, "video-zoom",  MPV_FORMAT_DOUBLE, &mpvZoom)
     mpv_set_property(h, "video-pan-x", MPV_FORMAT_DOUBLE, &px)
     mpv_set_property(h, "video-pan-y", MPV_FORMAT_DOUBLE, &py)
@@ -514,12 +644,12 @@ git add apple/App/Source/MPVSourcePlayer.swift
 git commit -m "feat(zoom): MPVSourcePlayer.setZoom writes mpv runtime properties"
 ```
 
-### Task 2.2: Add `currentZoom` to Workspace
+### Task 2.2: Add `currentZoom` to Workspace via explicit setter
 
 **Files:**
 - Modify: `apple/App/Models/Workspace.swift`
 
-**Step 1: Add the observable property.**
+**Step 1: Add the observable property + setter** (avoiding the reentrant-didSet pattern that intersects an open `@Observable` macro bug — see the v2 review history).
 
 Find the existing observable properties (`folder`, `project`, `sourcePlayer`, `missingSourceIndices`) near the top of the class. Add:
 
@@ -527,22 +657,41 @@ Find the existing observable properties (`folder`, `project`, `sourcePlayer`, `m
 /// Live zoom/pan state for the source-playback view. Ephemeral —
 /// not persisted to the project. Reset to identity on workspace switch
 /// (which happens by Workspace re-init in openProject).
-var currentZoom: Zoom = .identity {
-    didSet {
-        let clamped = currentZoom.clamped()
-        if clamped != currentZoom {
-            // didSet runs after the assignment; reassign with the clamped
-            // value to keep the public-facing value in canonical form. The
-            // reentrant didSet is a no-op because clamped == clamped.clamped().
-            currentZoom = clamped
-            return
-        }
-        sourcePlayer?.setZoom(clamped)
-    }
+///
+/// Backed by a private stored property; mutate via `setCurrentZoom(_:)`
+/// (or assign via the computed setter, which delegates). The setter
+/// clamps the input to the valid range, propagates to mpv, and emits a
+/// keyframe to the in-progress recording (if any).
+@ObservationIgnored
+private var _currentZoom: Zoom = .identity
+
+var currentZoom: Zoom {
+    get { _currentZoom }
+    set { setCurrentZoom(newValue) }
+}
+
+func setCurrentZoom(_ zoom: Zoom) {
+    let clamped = zoom.clamped()
+    guard clamped != _currentZoom else { return }
+    // @Observable observes via the computed property's getter; touch it.
+    self._currentZoom = clamped  // ← @Observable's macro wraps this; binding readers
+                                 //    re-fire because the computed getter returns
+                                 //    the new value.
+    sourcePlayer?.setZoom(clamped)
+    recordingController?.appendZoom(clamped)
 }
 ```
 
-> **Why the reentrant assignment:** SwiftUI/@Observable views that bind `currentZoom` see the canonical clamped value, not whatever the input handler accidentally pushed. The early `return` skips the second mpv write — the second didSet pass propagates correctly.
+> **Why the explicit setter:** the v1 plan used a reentrant didSet that re-assigned a clamped value. The reviewer flagged that this pattern (a) intersects an open `@Observable` macro bug where `didSet` doesn't always fire as expected, and (b) is fragile — any future caller who reads `currentZoom` from inside the didSet would see a transient unclamped value. The explicit setter pattern eliminates both issues. Test bindings still work: SwiftUI views that read `currentZoom` re-render when `_currentZoom` changes (via the `@Observable` macro's tracking on the computed-property getter).
+
+**Step 2: Add the `recordingController` reference** (assuming it doesn't exist yet on Workspace; if it does, skip):
+
+```swift
+@ObservationIgnored
+weak var recordingController: RecordingController?
+```
+
+This is set by ContentView when recording starts; cleared when recording stops. Weak so the controller isn't kept alive past its natural end.
 
 **Step 2: Add `import VideoCoachCore`** if not already imported.
 
@@ -612,9 +761,11 @@ override func scrollWheel(with event: NSEvent) {
     let cursor = cursorInBounds(event)
     if event.hasPreciseScrollingDeltas {
         // Trackpad two-finger swipe → pan.
+        // Direction: positive scrollingDeltaY = swipe up = expose more of top
+        // (so the visible center moves toward smaller y in source). The flip
+        // already incorporates the user's natural-scrolling preference; mpv
+        // and Apple's docs both treat scrollingDeltaY as content-direction.
         guard currentZoom.scale > 1.0 else { return }
-        // Pan deltas in source-fraction units. Negative dx because dragging
-        // right reveals more of the right-hand source.
         let viewW = max(1, bounds.width)
         let viewH = max(1, bounds.height)
         let dx = -event.scrollingDeltaX / (viewW * currentZoom.scale)
@@ -627,6 +778,12 @@ override func scrollWheel(with event: NSEvent) {
         commit(next)
     } else {
         // Coarse mouse wheel → zoom toward cursor.
+        // Direction: scrollingDeltaY > 0 = wheel scrolled up (away from user)
+        // = zoom IN. This matches Maps, Safari, Final Cut, every macOS app
+        // that supports wheel-to-zoom. macOS's natural-scrolling preference
+        // is already baked into scrollingDeltaY; we don't read
+        // isDirectionInvertedFromDevice separately. (Verified against reviewer
+        // finding 7 in v2 review history.)
         let step = 0.1
         let factor = 1.0 + step * (event.scrollingDeltaY > 0 ? 1.0 : -1.0)
         let nextScale = currentZoom.scale * factor
@@ -788,16 +945,23 @@ Modify `MPVPlayerView` to take a closure parameter:
 ```swift
 struct MPVPlayerView: NSViewRepresentable {
     let player: MPVSourcePlayer?
+    let currentZoom: Zoom               // workspace-canonical (clamped) value
     let onZoomChange: (Zoom) -> Void
     func makeNSView(context: Context) -> MPVRenderingNSView {
         let v = MPVRenderingNSView(frame: .zero)
         v.updatePlayer(player)
         v.onZoomChange = onZoomChange
+        v.setCurrentZoom(currentZoom)
         return v
     }
     func updateNSView(_ nsView: MPVRenderingNSView, context: Context) {
         nsView.updatePlayer(player)
         nsView.onZoomChange = onZoomChange
+        // Sync the view's local Zoom mirror with the workspace canonical
+        // (clamped) value after every body re-eval. Without this, the view's
+        // internal mirror diverges from Workspace state at clamp boundaries
+        // and the next gesture computes from stale state. (Reviewer finding 8.)
+        nsView.setCurrentZoom(currentZoom)
     }
 }
 ```
@@ -805,9 +969,11 @@ struct MPVPlayerView: NSViewRepresentable {
 In `ContentView` where `MPVPlayerView(player:)` is constructed, change the call site to pass the workspace closure:
 
 ```swift
-MPVPlayerView(player: workspace.sourcePlayer) { newZoom in
-    workspace.currentZoom = newZoom
-}
+MPVPlayerView(
+    player: workspace.sourcePlayer,
+    currentZoom: workspace.currentZoom,
+    onZoomChange: { newZoom in workspace.currentZoom = newZoom }
+)
 ```
 
 > Find the existing `MPVPlayerView(player:` call site with `grep -n 'MPVPlayerView(player' apple/App/ContentView.swift`.
@@ -923,34 +1089,64 @@ cd apple && xcodebuild test -scheme VideoCoach -destination 'platform=macOS,arch
   -only-testing:VideoCoachTests/RecordingZoomCaptureTests
 ```
 
-**Step 3: Implement.**
+**Step 3: Implement with clock injection (no public time-override seam).**
+
+Modify `RecordingController.init` to accept an injectable clock:
 
 ```swift
-// Append to RecordingController.swift
-private var lastCapturedZoom: Zoom = .identity
-private var lastCaptureTime: Double = -.infinity
+@MainActor
+final class RecordingController {
+    let t0Seconds: Double
+    private let clock: () -> Double          // NEW: injectable for tests
+    private(set) var events: [CommentaryEvent] = []
+    private var lastCapturedZoom: Zoom = .identity
+    private var lastCaptureTime: Double = -.infinity
 
-/// Called at start-of-recording with the inherited zoom from
-/// Workspace.currentZoom. Always emits a .zoom event at recordTime=0.
-func appendInitialZoom(_ z: Zoom) {
-    events.append(.init(recordTime: 0, kind: .zoom(z)))
-    lastCapturedZoom = z
-    lastCaptureTime = 0
-}
-
-/// Test seam — production path uses `appendZoom(_:)` which reads `now`.
-func appendZoom(_ z: Zoom, atRecordTime t: Double) {
-    if t - lastCaptureTime > 0.1 {
-        events.append(.init(recordTime: t - 0.001, kind: .zoom(lastCapturedZoom)))
+    init(t0Seconds: Double, clock: @escaping () -> Double = { CACurrentMediaTime() }) {
+        self.t0Seconds = t0Seconds
+        self.clock = clock
     }
-    events.append(.init(recordTime: t, kind: .zoom(z)))
-    lastCapturedZoom = z
-    lastCaptureTime = t
-}
 
-func appendZoom(_ z: Zoom) {
-    appendZoom(z, atRecordTime: now)
+    private var now: Double { clock() - t0Seconds }
+
+    // Existing append methods keep using `now` (which now goes through clock).
+    // ...
+
+    /// Called at start-of-recording with the inherited zoom from
+    /// Workspace.currentZoom. Always emits a .zoom event at recordTime=0.
+    func appendInitialZoom(_ z: Zoom) {
+        events.append(.init(recordTime: 0, kind: .zoom(z)))
+        lastCapturedZoom = z
+        lastCaptureTime = 0
+    }
+
+    /// Append a zoom keyframe at the current recordTime (via injected clock).
+    /// If the gap since the last capture is > 100ms, emit an anchor keyframe
+    /// at (now - 1ms) holding the previous value, so lerp lookup produces a
+    /// snap rather than drifting backward through a quiet period.
+    func appendZoom(_ z: Zoom) {
+        let t = now
+        if t - lastCaptureTime > 0.1 {
+            events.append(.init(recordTime: t - 0.001, kind: .zoom(lastCapturedZoom)))
+        }
+        events.append(.init(recordTime: t, kind: .zoom(z)))
+        lastCapturedZoom = z
+        lastCaptureTime = t
+    }
 }
+```
+
+> **Why the clock injection** (rather than the v1 plan's `appendZoom(_:atRecordTime:)` overload): production code can't accidentally call into the time-override path because it doesn't exist. Tests inject a closure (e.g. `var t = 0.0; let rc = RecordingController(t0Seconds: 0, clock: { t })` and step `t` between calls). Reviewer finding 4 fixed.
+
+The earlier `RecordingZoomCaptureTests` need a small update to use the clock-injection seam. Replace `rc.appendZoom(zoom, atRecordTime: t)` with:
+
+```swift
+var clockTime = 0.0
+let rc = RecordingController(t0Seconds: 0, clock: { clockTime })
+rc.appendInitialZoom(.identity)
+clockTime = 5.0
+rc.appendZoom(Zoom(scale: 2.0, panX: 0, panY: 0))
+// assertions...
 ```
 
 **Step 4: Run tests, expect pass.**
@@ -1013,39 +1209,96 @@ git commit -m "feat(zoom): inherit at recording start; capture ongoing changes"
 
 ## Phase 5 — Preview + export integration
 
-### Task 5.1: PreviewCompositor applies zoom transform per frame
+### Task 5.1: PreviewCompositor applies zoom delta-transform per frame (CIImage path)
 
 **Files:**
-- Modify: `apple/VideoCoachCore/Sources/VideoCoachCore/PreviewCompositor.swift`
+- Modify: `apple/VideoCoachCore/Sources/VideoCoachCore/Zoom.swift` — add `deltaTransform`.
+- Modify: `apple/VideoCoachCore/Sources/VideoCoachCore/PreviewCompositor.swift`.
 
-**Step 1: Find the per-frame source-draw site.** Search inside `PreviewCompositor.startRequest(_:)` for where the source frame is composited (likely a `ctx.draw(...)` or a CIImage transform chain).
+> **Important** (reviewer finding 2): `PreviewCompositor` is a **pure CIImage pipeline**. It does NOT use a `CGContext`. Read `apple/VideoCoachCore/Sources/VideoCoachCore/PreviewCompositor.swift` first; the integration point is wherever the source CIImage is transformed before being composited with overlays.
+>
+> Additionally, the existing PreviewCompositor stretches source-to-output (non-uniform). `Zoom.transform(sourceSize:destSize:)` is a letterbox-fit transform — applying it at identity would silently change preview from stretch-to-fill to letterbox-fit. To preserve identity-equivalence, apply zoom as a DELTA on top of the existing layout transform, rather than replacing it.
 
-**Step 2: Apply the zoom transform.**
+**Step 1: Add a `deltaTransform` helper to `Zoom`** that captures only the zoom-and-pan portion (no base scale):
 
-Compute zoom + transform once per frame:
+```swift
+// Append to Zoom.swift
+public extension Zoom {
+    /// Zoom-and-pan delta in normalized [0,1] viewport coordinates,
+    /// to be applied AFTER any existing layout transform. At identity,
+    /// returns the identity transform (no behavior change for existing
+    /// compositors). At scale=2, panX=0.1: scale up by 2 around the
+    /// viewport center, then translate by 0.1 of viewport width.
+    func deltaTransform(viewportSize: CGSize) -> CGAffineTransform {
+        guard scale != 1.0 || panX != 0 || panY != 0 else { return .identity }
+        let cx = viewportSize.width / 2
+        let cy = viewportSize.height / 2
+        let tx = -panX * viewportSize.width
+        let ty = -panY * viewportSize.height
+        return CGAffineTransform.identity
+            .translatedBy(x: cx + tx, y: cy + ty)
+            .scaledBy(x: scale, y: scale)
+            .translatedBy(x: -cx, y: -cy)
+    }
+}
+```
+
+Add a unit test:
+
+```swift
+// Append to ZoomTests.swift
+func test_deltaTransform_at_identity_is_identity() {
+    let t = Zoom.identity.deltaTransform(viewportSize: CGSize(width: 1920, height: 1080))
+    XCTAssertEqual(t, .identity)
+}
+
+func test_deltaTransform_at_scale_2_centers_zoomed_viewport() {
+    let vp = CGSize(width: 1000, height: 500)
+    let t = Zoom(scale: 2, panX: 0, panY: 0).deltaTransform(viewportSize: vp)
+    // Center of viewport (500, 250) should map to itself.
+    let center = CGPoint(x: 500, y: 250).applying(t)
+    XCTAssertEqual(center.x, 500, accuracy: 1e-9)
+    XCTAssertEqual(center.y, 250, accuracy: 1e-9)
+    // Top-left of viewport (0,0) should map to (-500, -250) — pulled outside.
+    let origin = CGPoint.zero.applying(t)
+    XCTAssertEqual(origin.x, -500, accuracy: 1e-9)
+    XCTAssertEqual(origin.y, -250, accuracy: 1e-9)
+}
+```
+
+**Step 2: Apply the delta in `PreviewCompositor.startRequest(_:)`.**
+
+Locate the line where the source CIImage gets its layout transform applied (search for `.transformed(by:` near the source-frame handling). Apply zoom AFTER that transform:
 
 ```swift
 let recordTime = (request.compositionTime - inst.clipCompositionStart).seconds
 let zoom = clip.zoomAt(recordTime: recordTime)
-let zoomXform = zoom.transform(sourceSize: sourceSize, destSize: outputSize)
-// Apply zoomXform to source pixels before drawing strokes/text on top.
+let zoomDelta = zoom.deltaTransform(viewportSize: outputSize)
+
+// Apply existing layout transform first (stretch-to-fill — unchanged), then
+// the zoom delta on top:
+let baseImage = sourceCIImage.transformed(by: existingLayoutTransform)
+let zoomed = zoom.scale == 1.0
+    ? baseImage
+    : baseImage.transformed(by: zoomDelta).cropped(to: CGRect(origin: .zero, size: outputSize))
 ```
 
-The exact integration depends on whether PreviewCompositor uses CGContext or CIImage:
-- **CGContext path:** wrap the existing `ctx.draw(image, in: rect)` in `ctx.saveGState() / ctx.concatenate(zoomXform) / ctx.draw(...) / ctx.restoreGState()`.
-- **CIImage path:** `let zoomed = sourceCIImage.transformed(by: zoomXform); ctx.draw(zoomed, ...)`.
+> **Why `cropped`:** scaling a CIImage by 2× expands its `extent` past the viewport. Without crop, the compositor would composite the larger image into the destination, scaling everything down and defeating the zoom. The `cropped(to:)` constrains the output to viewport bounds — the visible portion is exactly the zoomed region.
 
-**Step 3: Build + run any existing PreviewCompositor tests (smoke).**
+**Step 3: Run existing PreviewCompositor tests (smoke).**
 
 ```bash
 cd apple && swift test --package-path VideoCoachCore --filter PreviewCompositor
 ```
+Expected: all existing tests still pass (identity-zoom is bit-identical to current behavior).
 
 **Step 4: Commit.**
 
 ```bash
-git add apple/VideoCoachCore/Sources/VideoCoachCore/PreviewCompositor.swift
-git commit -m "feat(zoom): PreviewCompositor applies per-frame zoom transform"
+git add apple/VideoCoachCore/Sources/VideoCoachCore/Zoom.swift \
+        apple/VideoCoachCore/Sources/VideoCoachCore/PreviewCompositor.swift \
+        apple/VideoCoachCore/Tests/VideoCoachCoreTests/ZoomTests.swift
+git commit -m "feat(zoom): PreviewCompositor applies CIImage zoom delta-transform"
 ```
 
 ### Task 5.2: CompilationCompositor pixel test (TDD-first)
@@ -1061,25 +1314,50 @@ import XCTest
 @testable import VideoCoachCore
 
 final class CompilationCompositorZoomTests: XCTestCase {
+    func test_identity_zoom_produces_same_output_as_no_zoom() async throws {
+        // Regression test: at scale=1, panX=0, panY=0, the compositor output
+        // must be byte-identical to a clip with no zoom events at all.
+        // Reviewer finding 6 — guards against the silent stretch-vs-letterbox
+        // regression.
+        // ... generate two outputs (one with .identity zoom event, one with
+        //     no events), assert center+corner pixels match.
+    }
+
     func test_zoom_2x_centered_shows_only_center_quadrant_of_source() async throws {
         // Build a synthetic source that's red top-left quadrant + blue
         // everywhere else. At zoom=2 panX=0 panY=0, the visible viewport
-        // is the center quadrant of the source — neither pure red nor
-        // pure blue. We sample the center of the output and assert it's
-        // blue (the corner is cut off).
-        // ... uses SyntheticAsset.swift to generate the input
-        // ... runs through CompilationCompositor with one clip + one zoom keyframe
-        // ... PixelSampling.swift to read the output center pixel
-        XCTFail("Implement once Compositor zoom integration lands")
+        // is the center quadrant of the source — sampling the output's
+        // top-left corner should now show pixels FROM the source's
+        // (25%, 25%) point, not (0, 0). We sample three known points and
+        // assert they reflect the zoomed region.
     }
 }
 ```
 
-**Step 2: Run, expect XCTFail.**
+**Step 2: Run, expect compile error / XCTFail.**
 
-**Step 3: Wire zoom into `CompilationCompositor.startRequest(_:)`** following the same pattern as Task 5.1 (PreviewCompositor). Reference the design doc D4 for the affine transform site.
+**Step 3: Wire zoom into `CompilationCompositor.startRequest(_:)`** using the SAME delta-transform pattern as Task 5.1.
 
-**Step 4: Implement the test body.** Build a synthetic source via `SyntheticAsset.swift`'s helpers, configure a `Clip` with a single `.zoom(Zoom(scale: 2, ...))` event, run the compositor, assert pixels.
+`CompilationCompositor`'s rendering path uses a `CGContext` (the `makeCGImage(_:)` helper in the existing source converts CVPixelBuffer→CIImage→CGImage; the resulting CGImage is drawn into the destination via `cg.draw(img, in: fullRect)`).
+
+The current draw call (`cg.draw(img, in: CGRect(x:0, y:0, width:w, height:h))`) is a stretch-to-fill that ignores aspect ratio. Apply the zoom delta as a `concatenate` BEFORE the draw so identity zoom is bit-identical to today's behavior:
+
+```swift
+let recordTime = ...   // existing computation
+let zoom = clip.zoomAt(recordTime: recordTime)
+let zoomDelta = zoom.deltaTransform(viewportSize: CGSize(width: w, height: h))
+
+cg.saveGState()
+if zoom.scale != 1.0 || zoom.panX != 0 || zoom.panY != 0 {
+    cg.concatenate(zoomDelta)
+}
+cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
+cg.restoreGState()
+```
+
+> **Why this preserves the existing stretch-to-fill at identity:** at zoom=1 the deltaTransform is `.identity` and we skip the `concatenate` entirely. The `cg.draw(img, in: fullRect)` call is unchanged from current behavior — the compositor's output is identical for all clips with no zoom events. Reviewer finding 6 fixed.
+
+**Step 4: Implement the test bodies.** Build a synthetic source via `SyntheticAsset.swift`'s helpers, configure a `Clip` with one `.zoom(Zoom(scale: 2, ...))` event, run the compositor, assert pixels via `PixelSampling.swift`.
 
 **Step 5: Run, expect pass.**
 
@@ -1088,7 +1366,7 @@ final class CompilationCompositorZoomTests: XCTestCase {
 ```bash
 git add apple/VideoCoachCore/Sources/VideoCoachCore/CompilationCompositor.swift \
         apple/VideoCoachCore/Tests/VideoCoachCoreTests/CompilationCompositorZoomTests.swift
-git commit -m "feat(zoom): CompilationCompositor applies per-frame zoom transform"
+git commit -m "feat(zoom): CompilationCompositor applies per-frame zoom delta-transform"
 ```
 
 ---
