@@ -155,10 +155,300 @@ at plan-write time by reading the current `Compositor::compose` impl in
 
 ## Adversarial-review fixes baked in
 
-(Filled in by orchestrator at the `ADV_REVIEWED` stage with the
-adversarial reviewer's net-new findings + their disposition. Orchestrator
-notes: reviewer must read Phase 10's "Adversarial-review fixes baked in"
-first to find NET-NEW issues only.)
+Inline adversarial pass (orchestrator, 2026-05-01). 11 findings raised;
+all 11 folded (some trimmed). Phase 10's 40 baked-in fixes were treated
+as off-limits. Findings are net-new to Plan #4. Triage discipline: REAL =
+reproducible + cites concrete code/CI failure → fold; OVERSTATED = real
+but smaller → fold trimmed; SPECULATIVE = no concrete trigger → reject.
+
+Reference: full reviewer notes saved at
+`/tmp/phase11-plans/plan-4/adv-review.md`.
+
+### Fix #41 [HIGH, F1] — Drop cache-Mutex guard BEFORE GPU encode/submit
+
+The plan's Task-1 lookup snippet (lines 412–445 of the original draft)
+held the `pip_cache` MutexGuard for "the rest of compose" — i.e. across
+`begin_render_pass`, `set_pipeline`, `draw`, `queue.submit`, and
+`device.poll(Wait)`. On lavapipe `device.poll(Wait)` blocks tens of ms
+waiting for the GPU; holding a Mutex that long defeats the
+"theoretically-not-contended" claim AND turns any future parallel
+`compose` (e.g. parallel-tag export) into a sequential bottleneck. Worse,
+a panic anywhere inside the encode (e.g. `bytemuck::cast_slice`
+mis-alignment) poisons the lock indefinitely.
+
+**Baked-in requirement** (was Known-unknown #1; now mandatory): every
+cache lookup MUST be `lookup → clone-handles → drop guard → encode`.
+wgpu 22's `RenderPipeline`, `PipelineLayout`, `BindGroupLayout`,
+`Sampler`, `ShaderModule`, and `Buffer` are all `Clone` (refcounted-Arc
+internally). Pseudocode:
+
+```rust
+let (pipeline, bgl, sampler) = {
+    let mut g = self.pip_cache.lock().expect("pip_cache poisoned");
+    if g.as_ref().map(|c| c.key != pip_key).unwrap_or(true) {
+        *g = Some(self.build_pip_cache(pip_key));
+    }
+    let c = g.as_ref().expect("populated above");
+    (c.pipeline.clone(), c.bind_group_layout.clone(), c.sampler.clone())
+}; // guard dropped here
+// …encode using cloned handles…
+```
+
+Same shape for `stroke_cache` (Task 1), `stroke_vbo_pool` (Task 2 —
+clone the `wgpu::Buffer` handle out, then `queue.write_buffer` +
+`set_vertex_buffer` outside the lock), and `freeze_cache` (Task 3 —
+clone the `Arc<Frame>` out, drop guard, return).
+
+### Fix #42 [HIGH, F2] — `PipPassKey` cache-key intent comment
+
+`PipPassKey { source_w, source_h }` over-keys (the pipeline + BGL are
+dimension-agnostic — fullscreen-triangle vertex shader, UV-sampled
+fragment) but does NOT under-key, because nothing in the cached state
+depends on webcam dims (`pip_rect()`'s output goes into the per-call
+uniform, not the pipeline). Adding webcam dims to the key would cause
+spurious rebuilds when consecutive clips have different webcam-frame
+dimensions.
+
+**Baked-in code-comment requirement** above the `PipPassKey` struct:
+
+```rust
+// Cache key intent: the cached pipeline + BGL are dimension-agnostic
+// (vs_fullscreen has no per-instance state, fs_pip samples by UV, the
+// PiP rect goes through a per-call uniform buffer — see compose's
+// `uniform_buf` at the call site). Including webcam_w/h or output
+// dimensions would cause spurious rebuilds across clips with different
+// webcam shapes WITHOUT improving correctness. If a future change adds
+// dimension-baked constants to the shader (e.g. HDR / 10-bit work), the
+// key MUST grow accordingly. Audit by inspecting shaders/pip.wgsl.
+```
+
+### Fix #43 [HIGH, F3] — Freeze cache key MUST resist Arc-pointer-address reuse
+
+`Arc::as_ptr(&arc) as usize` is unstable across drop-then-allocate: the
+allocator can reuse a freed slot, producing identical `usize` keys for
+distinct `Arc<Frame>` allocations. In production this matters at clip
+boundaries: when entry N+1's `frozen_frames` map is built after entry
+N's is dropped, an address reuse collides the cache → returns the
+PREVIOUS entry's composed frame. Pixel divergence; parity test catches
+it post-hoc but only after a wrong export ships.
+
+**Baked-in defense-in-depth (cheap):**
+
+(1) Strengthen `FreezeCacheKey` with a content-derived prefix:
+
+```rust
+#[derive(Clone, PartialEq, Eq, Hash)]
+pub(crate) struct FreezeCacheKey {
+    pub source_ptr: usize,           // Arc::as_ptr cast
+    pub source_w: u32,
+    pub source_h: u32,
+    pub source_pixels_len: usize,
+    pub source_first16: [u8; 16],    // pixels[0..16]
+    pub webcam_ptr: usize,
+    pub webcam_w: u32,
+    pub webcam_h: u32,
+    pub webcam_pixels_len: usize,
+    pub webcam_first16: [u8; 16],
+    pub stroke_hash: u64,
+}
+```
+
+`first16 + len + dims` cost: 64 bytes/key, two-pixel-row-prefix copy +
+`(w, h, len)` reads. Negligible vs the 8 MB compose work being cached.
+
+(2) Add `Compositor::clear_freeze_cache()` (`pub`, `&self`, locks +
+clears the Vec) and call it from the export driver's `for entry in
+entries` top-of-loop AND from the preview driver's segment-transition
+edge. This is the principled GC: caches are bounded to one entry's
+lifetime in production. Tasks 3 must wire both call sites.
+
+### Fix #44 [HIGH, F4] — Cache stores `Arc<Frame>`; `compose_with_identity` returns `Arc<Frame>`
+
+Storing `Frame` and returning `Frame` from the cached path means TWO 8
+MB clones per cache miss + ONE per hit. At 16-entry × 8 MB peak + 16 MB
+of clone-traffic per call, this can push CI lavapipe runners over their
+working-set ceiling.
+
+**Baked-in API shape (new method ships correct from day one):**
+
+```rust
+// Storage:
+pub(crate) struct FreezeCache {
+    pub entries: Vec<(FreezeCacheKey, Arc<Frame>)>,
+}
+
+// Public API:
+pub fn compose_with_identity(
+    &self,
+    source: &Arc<Frame>,
+    webcam: &Arc<Frame>,
+    strokes: &[VisibleStroke],
+) -> Result<Arc<Frame>, CompositorError> { … }
+```
+
+The two production callers (export's `compose_entry_frame` + preview's
+driver loop) accept `Arc<Frame>` return + adapt their downstream
+consumers (one signature change each — driver's `frame_sink.push(frame)`
+takes `Frame`, so an `Arc::try_unwrap().unwrap_or_else(|a|
+(*a).clone())` adapter is needed if the Arc is shared at that point;
+typically not — the cache holds the only other Arc, so try_unwrap
+succeeds and avoids a clone). The existing `compose` / `compose_tick`
+free functions keep returning `Frame` — backward compat for the parity
+tests + uncached callers.
+
+`compose_tick_with_identity` mirrors with `Arc<Frame>` in/out.
+
+### Fix #45 [MEDIUM, F5] — Stroke-set hash spec: explicit f64 bit-cast + length prefix
+
+`f64: !Hash` (compile error); naive hashing of
+`first_point_record_time` won't compile and sub-agent might pick a
+wrong workaround.
+
+**Baked-in spec:**
+
+```rust
+fn hash_stroke_set(strokes: &[VisibleStroke]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    (strokes.len() as u64).hash(&mut h);  // length prefix
+    for vs in strokes {
+        vs.stroke.id.as_u128().hash(&mut h);
+        (vs.drawn_point_count as u64).hash(&mut h);
+        vs.first_point_record_time.to_bits().hash(&mut h);
+    }
+    h.finish()
+}
+```
+
+Plus a unit test `stroke_hash_distinguishes_drawn_count` (two
+VisibleStrokes differing only in `drawn_point_count` produce different
+hashes) AND `stroke_hash_length_prefix_disambiguates` (single empty
+stroke vs no strokes hash differently).
+
+### Fix #46 [MEDIUM, F6] — `compose_tick_perf_smoke` ceiling 60s + assert per-call max, not total
+
+30 s ceiling on N=30 calls = 1 s/call max; lavapipe under host
+contention + first-call shader compile can overrun. Total-ms is also
+the wrong signal — a single GC/swap stall skews it; per-call max is
+robust.
+
+**Baked-in spec:**
+
+```rust
+let max_ms = per_call_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+assert!(
+    total.as_secs_f64() < 60.0,
+    "compose_tick × {N} took {:.1}s (ceiling 60s) — perf regression?",
+    total.as_secs_f64()
+);
+assert!(
+    max_ms < 5_000.0,
+    "compose_tick max per-call {:.1}ms (ceiling 5000ms)",
+    max_ms
+);
+```
+
+### Fix #47 [MEDIUM, F7] — Cache-rebuild counters: `AtomicU64` + `pub(crate)` accessor crate-local
+
+Plan called for `#[cfg(test)] pub fn pip_cache_rebuild_count`; ambiguous
+on shape and visibility. Spec:
+
+```rust
+// On Compositor:
+#[cfg(test)]
+pub(crate) pip_cache_rebuilds: std::sync::atomic::AtomicU64,
+#[cfg(test)]
+pub(crate) stroke_vbo_grows: std::sync::atomic::AtomicU64,
+#[cfg(test)]
+pub(crate) freeze_cache_hits: std::sync::atomic::AtomicU64,
+
+// Accessor (crate-local; only used by compositor.rs::tests):
+#[cfg(test)]
+pub(crate) fn pip_cache_rebuilds(&self) -> u64 {
+    self.pip_cache_rebuilds.load(std::sync::atomic::Ordering::Relaxed)
+}
+```
+
+Increment with `Relaxed` ordering at each rebuild/grow/hit point. No
+cross-crate exposure; the new tests live inside `compositor.rs::tests`
+where `pub(crate)` is reachable. `parity_n_frames.rs` (cross-crate)
+remains a behavioral parity test, not a counter-introspection test.
+
+### Fix #48 [MEDIUM, F8] — `frozen_frames` `Arc<Frame>` wrapping happens at call-site, not in helper signatures
+
+Plan's Task-3 file list omitted `pre_decode_freeze_frames` (preview) and
+`pre_decode_all_freeze_frames` (export). Don't change those helper
+signatures; wrap at the consumer boundary instead — lower blast radius,
+preserves Phase 10 fix #11's stable surface.
+
+**Baked-in pattern (preview_pipeline.rs around line 174–219):**
+
+```rust
+let frozen_frames_raw = pre_decode_freeze_frames(source_path, clip, &segments)?;
+let frozen_frames: HashMap<usize, Arc<Frame>> = frozen_frames_raw
+    .into_iter()
+    .map(|(k, v)| (k, Arc::new(v)))
+    .collect();
+let frozen_frames_arc = Arc::new(frozen_frames);
+```
+
+Same pattern in export.rs at the `pre_decode_all_freeze_frames` consumer
+boundary. Helper signatures unchanged.
+
+### Fix #49 [MEDIUM, F9] — Memory-usage docstring + closeout note
+
+128 MB peak for the freeze cache is acceptable but must be discoverable.
+
+**Baked-in additions:**
+
+(1) Extend `compose_tick`'s docstring with: "Internal caches total
+~128 MB peak at 1080p RGBA (16-entry freeze cache of `Arc<Frame>`
+composed outputs + small pipeline / VBO state). Per-process. Single
+shared `Arc<Compositor>` per Phase 10 fix #15."
+
+(2) Add a Closeout bullet (filled at READY_FOR_CLOSEOUT stage):
+"Peak compositor memory: ~128 MB (16-entry freeze cache × 8 MB
+1080p RGBA). Documented in compose_tick docstring."
+
+### Fix #50 [LOW, F10] — `debug_assert!(!vertices.is_empty())` in `encode_stroke_pass`
+
+Today's call site at line 372–373 of compositor.rs guards against empty
+vertex slices reaching `encode_stroke_pass` (Vulkan validation rejects
+zero-sized vertex-buffer slices on some backends). Pooled-VBO Task 2
+preserves the guard; lock it in with a 1-line `debug_assert` at the top
+of `encode_stroke_pass`:
+
+```rust
+fn encode_stroke_pass(...) {
+    debug_assert!(
+        !vertices.is_empty(),
+        "encode_stroke_pass called with empty vertices; caller must guard"
+    );
+    ...
+}
+```
+
+### Fix #51 [LOW, F11] — Poison-recovery scoped to user-data path only
+
+The plan's `tracing::warn!` + `into_inner()` recovery applied at every
+cache lookup is over-engineered for the pure-compute paths
+(`pip_cache`, `stroke_cache`, `stroke_vbo_pool`) — a panic in
+pipeline-build is a real bug; let the next compose panic too. KEEP the
+recovery for `freeze_cache` (user-data path; corruption-free recovery
+is reasonable).
+
+**Baked-in pattern:**
+
+- `pip_cache`, `stroke_cache`, `stroke_vbo_pool`:
+  `lock().expect("compose lock poisoned")` — let panic propagate.
+- `freeze_cache`: keep the `match { Ok(g) => …, Err(p) => warn! +
+  p.into_inner() }` recovery.
+
+### Rejected findings
+
+(None — all 11 reviewer findings folded above. F2 was doc-only,
+F10/F11 were OVERSTATED but the trimmed forms still ship as 1-line
+fixes.)
 
 ---
 
@@ -172,23 +462,35 @@ pub struct Compositor {
     pub(crate) queue: wgpu::Queue,
 
     // Plan #4 Task 1: cached PiP + stroke pipelines, rebuilt only when
-    // the key changes. The bind group layout + sampler are key-
-    // independent (no source-dim or stroke dependency); the pipeline +
-    // pipeline-layout depend on the format (hardcoded Rgba8Unorm) +
-    // shader (constant). So in practice the cache is a single Option
-    // per pass, not a multi-entry map. Mutex-wrapped for &self compose.
+    // the key changes. wgpu handles inside (RenderPipeline / BGL /
+    // Sampler / ShaderModule) are Clone (refcounted Arc). Per Fix #41,
+    // the lock is held only for cache-lookup-and-clone-out; encode
+    // happens unlocked.
     pip_cache: std::sync::Mutex<Option<PipPassCache>>,
     stroke_cache: std::sync::Mutex<Option<StrokePassCache>>,
 
     // Plan #4 Task 2: pooled stroke vertex buffer. Capacity grows on
-    // demand; never shrinks. Mutex'd for &self.
+    // demand; never shrinks. wgpu::Buffer is Clone — same lock
+    // discipline as Task 1 (clone-out, drop, encode).
     stroke_vbo_pool: std::sync::Mutex<Option<PooledVbo>>,
 
     // Plan #4 Task 3: freeze-segment compose memoization. LRU bounded
-    // at 16 entries (~128 MB at 1080p RGBA — see "Memory" review note).
-    // Key: (Arc<Frame> pointer of source, Arc<Frame> pointer of webcam,
-    //       u64 stroke-set hash). Value: Frame.
+    // at 16 entries (~128 MB peak at 1080p RGBA — disclosed in
+    // compose_tick docstring per Fix #49). Key includes content-derived
+    // prefix bytes per Fix #43 to defend against allocator address
+    // reuse. Value is Arc<Frame> (Fix #44) so cache hits don't memcpy.
     freeze_cache: std::sync::Mutex<FreezeCache>,
+
+    // Plan #4: test-only counters for cache-rebuild assertions
+    // (Fix #47). Crate-local; not visible to other crates' tests.
+    #[cfg(test)]
+    pub(crate) pip_cache_rebuilds: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) stroke_cache_rebuilds: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) stroke_vbo_grows: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    pub(crate) freeze_cache_hits: std::sync::atomic::AtomicU64,
 }
 ```
 
@@ -322,15 +624,20 @@ compose for each (source-dim) — typically one entry per export.)
 /// Canonical "one tick of preview/export work" entry point. Per phase-9
 /// adversarial fix #24: ...
 ///
-/// **Phase 11 Plan #4 cache contract:** `Compositor` holds three
+/// **Phase 11 Plan #4 cache contract:** `Compositor` holds four
 /// internal caches (PiP pipeline, stroke pipeline, pooled stroke VBO,
-/// freeze-segment compose). All three are populated lazily inside
-/// `compose` under interior-mutex'd state. Cache hits MUST produce
-/// byte-identical output to cache misses; a parity divergence is a
-/// ship-blocker. Tests in `parity_smoke.rs` and `parity_n_frames.rs`
-/// guard the invariant. Compositor is no longer "stateless from the
-/// inside" but its EXTERNAL contract (same input → same output) is
-/// unchanged.
+/// and a freeze-segment compose LRU). All are populated lazily inside
+/// `compose` / `compose_with_identity` under interior-mutex'd state;
+/// cache hits MUST produce byte-identical output to cache misses (a
+/// parity divergence is a ship-blocker). Tests in `parity_smoke.rs`
+/// and `parity_n_frames.rs` guard the invariant. Compositor is no
+/// longer "stateless from the inside" but its EXTERNAL contract (same
+/// input → same output) is unchanged.
+///
+/// Per Fix #49: internal caches total ~128 MB peak at 1080p RGBA
+/// (16-entry freeze cache of `Arc<Frame>` composed outputs + small
+/// pipeline / VBO state). Per-process. Single shared
+/// `Arc<Compositor>` per Phase 10 fix #15.
 ```
 
 **perf_smoke.rs content:**
@@ -359,18 +666,27 @@ fn compose_tick_perf_smoke() {
         per_call_ms.push(t0.elapsed().as_secs_f64() * 1e3);
     }
     let total = start.elapsed();
+    let max_ms = per_call_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
     eprintln!(
         "compose_tick_perf_smoke: N={N} total={:.1}ms avg={:.2}ms \
          min={:.2}ms max={:.2}ms",
         total.as_secs_f64() * 1e3,
         per_call_ms.iter().sum::<f64>() / N as f64,
         per_call_ms.iter().cloned().fold(f64::INFINITY, f64::min),
-        per_call_ms.iter().cloned().fold(f64::NEG_INFINITY, f64::max),
+        max_ms,
     );
+    // Fix #46: 60s ceiling (lavapipe + CI host contention headroom).
     assert!(
-        total.as_secs_f64() < 30.0,
-        "compose_tick × {N} took {:.1}s — perf regression?",
+        total.as_secs_f64() < 60.0,
+        "compose_tick × {N} took {:.1}s (ceiling 60s) — perf regression?",
         total.as_secs_f64()
+    );
+    // Fix #46: per-call max is the robust signal (total can be skewed
+    // by GC/swap/host pre-emption).
+    assert!(
+        max_ms < 5_000.0,
+        "compose_tick max per-call {:.1}ms (ceiling 5000ms)",
+        max_ms
     );
 }
 ```
@@ -407,42 +723,32 @@ smoke + cache scaffolding`.
 
 **Behavior:**
 
-In `compose`, after computing `(w, h)`:
+In `compose`, after computing `(w, h)` — **per Fix #41 + Fix #51, the
+guard MUST be dropped before encoding; clone-handles-out:**
 
 ```rust
 let pip_key = PipPassKey { source_w: w, source_h: h };
-let pip_cache_guard = self.pip_cache.lock();  // poison-tolerant; see below
-let cache = match pip_cache_guard {
-    Ok(mut g) => {
-        let needs_rebuild = g.as_ref().map(|c| c.key != pip_key).unwrap_or(true);
-        if needs_rebuild {
-            *g = Some(self.build_pip_cache(pip_key));
-        }
-        // SAFETY: `g` lives until end of compose; we hold the mutex
-        // for the whole render. Cache fields are wgpu handles which
-        // are themselves Arc-shared internally, so re-using them
-        // across submits is safe per wgpu 22 docs.
-        g  // hold the guard for the rest of compose
-    }
-    Err(poisoned) => {
-        tracing::warn!(target: "compositor.cache",
-            event = "compositor.cache_poisoned", which = "pip");
-        // Fall through: rebuild ad-hoc, drop poisoned lock
-        let mut g = poisoned.into_inner();
+let (pipeline, bgl, sampler) = {
+    let mut g = self.pip_cache.lock().expect("pip_cache poisoned");
+    let needs_rebuild = g.as_ref().map(|c| c.key != pip_key).unwrap_or(true);
+    if needs_rebuild {
+        #[cfg(test)]
+        self.pip_cache_rebuilds
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         *g = Some(self.build_pip_cache(pip_key));
-        g
     }
+    let c = g.as_ref().expect("populated above");
+    // wgpu 22: RenderPipeline / BindGroupLayout / Sampler are Clone
+    // (refcounted Arc internally); cheap to clone, safe to use after
+    // the guard drops.
+    (c.pipeline.clone(), c.bind_group_layout.clone(), c.sampler.clone())
 };
+// guard dropped — encode happens unlocked
 ```
 
-(In practice, the simpler shape is to wrap the lookup in a
-`with_pip_cache(key, |cache| { ... })` helper closure, holding the lock
-for the duration of the render-pass encode. Sub-agent picks the cleaner
-shape — both are byte-equivalent.)
-
-Then in the render-pass encode block (lines 343–362), use
-`&cache.pipeline` and `&cache.bind_group_layout` instead of the freshly-
-built ones.
+Then in the render-pass encode block (lines 343–362), use the cloned
+`pipeline` and `bgl` (for the per-call `create_bind_group` call) instead
+of the freshly-built ones.
 
 The bind group itself (lines 314–335) STAYS per-call — bind groups
 reference the per-call source/webcam textures + uniform buffer, so they
@@ -499,43 +805,45 @@ on Compositor`.
 **Behavior:**
 
 Replace the per-call `create_buffer_init` with a pooled buffer that's
-written via `Queue::write_buffer`:
+written via `Queue::write_buffer`. Per Fix #41 + Fix #51 the lock is
+held only for cache-lookup + clone-out (and the rare grow-allocate);
+the `write_buffer` + `set_vertex_buffer` happen on the cloned handle
+outside the lock:
 
 ```rust
+debug_assert!(!vertices.is_empty(), "encode_stroke_pass empty"); // Fix #50
 let bytes = bytemuck::cast_slice(vertices);
 let needed = bytes.len();
 
-let mut pool_guard = self.stroke_vbo_pool.lock().unwrap_or_else(|p| {
-    tracing::warn!(target: "compositor.cache",
-        event = "compositor.cache_poisoned", which = "stroke_vbo");
-    p.into_inner()
-});
+let buffer = {
+    let mut g = self.stroke_vbo_pool
+        .lock()
+        .expect("stroke_vbo_pool poisoned"); // Fix #51 (pure-compute path)
+    let need_grow = match g.as_ref() {
+        None => true,
+        Some(p) => p.capacity_vertices * std::mem::size_of::<StrokeVertex>() < needed,
+    };
+    if need_grow {
+        #[cfg(test)]
+        self.stroke_vbo_grows
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Round up to next power-of-2 vertices to amortize regrow cost.
+        // Floor of 64 vertices (~one short stroke segment).
+        let new_cap = vertices.len().next_power_of_two().max(64);
+        let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("stroke-vbo-pool"),
+            size: (new_cap * std::mem::size_of::<StrokeVertex>()) as u64,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        *g = Some(PooledVbo { buffer: new_buffer, capacity_vertices: new_cap });
+    }
+    g.as_ref().expect("populated above").buffer.clone() // wgpu::Buffer is Clone
+}; // guard dropped
 
-let need_grow = match pool_guard.as_ref() {
-    None => true,
-    Some(p) => p.capacity_vertices * std::mem::size_of::<StrokeVertex>() < needed,
-};
-if need_grow {
-    // Round up to next power-of-2 vertices to amortize regrow cost.
-    // Floor of 64 vertices (~one short stroke segment). Cap on regrow
-    // is unbounded — strokes can be arbitrarily long, but in practice
-    // a multi-thousand-vertex stroke is rare enough that doubling
-    // works.
-    let new_cap = vertices.len().next_power_of_two().max(64);
-    let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("stroke-vbo-pool"),
-        size: (new_cap * std::mem::size_of::<StrokeVertex>()) as u64,
-        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
-        mapped_at_creation: false,
-    });
-    *pool_guard = Some(PooledVbo { buffer, capacity_vertices: new_cap });
-}
-
-let pool = pool_guard.as_ref().expect("populated above");
-self.queue.write_buffer(&pool.buffer, 0, bytes);
-
+self.queue.write_buffer(&buffer, 0, bytes);
 // In the render pass:
-rpass.set_vertex_buffer(0, pool.buffer.slice(..bytes.len() as u64));
+rpass.set_vertex_buffer(0, buffer.slice(..bytes.len() as u64));
 ```
 
 **Critical detail (`write_buffer` ordering vs render-pass encode):**
@@ -602,63 +910,75 @@ via write_buffer`.
   Update the `for (i, seg) in entry.segments.iter().enumerate()` loop
   to insert `Arc::new(...)`.
 
-**Cache lookup flow:**
+**Cache lookup flow** — per Fix #43 + Fix #44, the new method takes
+`&Arc<Frame>` (not `&Frame`) and returns `Arc<Frame>`. The cache key
+includes content-derived prefix bytes to defend against allocator
+address reuse. Existing `compose` / `compose_tick` keep their `&Frame`
++ `Frame` shape (uncached path; backward compat for tests + simple
+callers):
 
 ```rust
-// In compose's entry point:
-pub fn compose(
-    &self,
-    source: &Frame,
-    webcam: &Frame,
-    strokes: &[VisibleStroke],
-) -> Result<Frame, CompositorError> {
-    // Plan #4 Task 3: Freeze cache. Only check if BOTH source + webcam
-    // are stable across calls — pointer-eq via Arc means the caller is
-    // passing the same Arc. Since `compose` accepts &Frame (not
-    // &Arc<Frame>), callers that ARE working with Arc<Frame> must
-    // funnel through a separate compose_arc(...) entry point. To keep
-    // the public API single-shaped, we instead ask the caller to pass
-    // an OPTIONAL identity hint via a new pub fn.
-
-    // NO CACHE HIT for the &Frame entry point — preserves backward
-    // compat for direct callers like the existing tests.
-    self.compose_uncached(source, webcam, strokes)
-}
-
+// New method (Plan #4):
 pub fn compose_with_identity(
     &self,
-    source: &Frame, source_id: Option<usize>,
-    webcam: &Frame, webcam_id: Option<usize>,
+    source: &Arc<Frame>,
+    webcam: &Arc<Frame>,
     strokes: &[VisibleStroke],
-) -> Result<Frame, CompositorError> {
-    if let (Some(sid), Some(wid)) = (source_id, webcam_id) {
-        let stroke_hash = hash_stroke_set(strokes);
-        let key = FreezeCacheKey {
-            source_ptr: sid, webcam_ptr: wid, stroke_hash,
-        };
-        // Fast path: cache hit
-        if let Some(cached) = self.lookup_freeze(&key) {
-            return Ok(cached);
-        }
-        let composed = self.compose_uncached(source, webcam, strokes)?;
-        self.insert_freeze(key, composed.clone());
-        return Ok(composed);
+) -> Result<Arc<Frame>, CompositorError> {
+    let key = FreezeCacheKey {
+        source_ptr: Arc::as_ptr(source) as usize,
+        source_w: source.width,
+        source_h: source.height,
+        source_pixels_len: source.pixels.len(),
+        source_first16: first16_or_zero(&source.pixels),
+        webcam_ptr: Arc::as_ptr(webcam) as usize,
+        webcam_w: webcam.width,
+        webcam_h: webcam.height,
+        webcam_pixels_len: webcam.pixels.len(),
+        webcam_first16: first16_or_zero(&webcam.pixels),
+        stroke_hash: hash_stroke_set(strokes),
+    };
+
+    // Fast path: cache hit (clone-Arc-out under lock; encode unblocked)
+    if let Some(cached) = self.lookup_freeze(&key) {
+        #[cfg(test)]
+        self.freeze_cache_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return Ok(cached);
     }
-    self.compose_uncached(source, webcam, strokes)
+
+    // Slow path: compose, then insert.
+    let composed = self.compose(source, webcam, strokes)?;
+    let arc_composed = Arc::new(composed);
+    self.insert_freeze(key, arc_composed.clone());
+    Ok(arc_composed)
+}
+
+pub fn clear_freeze_cache(&self) {
+    let mut g = match self.freeze_cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.entries.clear();
+}
+
+fn first16_or_zero(pixels: &[u8]) -> [u8; 16] {
+    let mut out = [0u8; 16];
+    let n = pixels.len().min(16);
+    out[..n].copy_from_slice(&pixels[..n]);
+    out
 }
 ```
 
-**Wait — this changes the public API.** Reconsider: keep `compose`'s
-`&Frame` shape; have the caller (export driver / preview driver) pass
-identity via a thread-local or via `Arc::as_ptr(&arc) as usize` in a
-new param. Decision: **add an optional `identity` param via a new
-helper method** rather than reshaping `compose`. Tests + simple callers
-keep using `compose`; the production drivers (preview + export) call
-the new identity-aware entry point.
-
-`compose_tick` in `lib.rs` gets a sibling: `compose_tick_with_identity`.
-Both wrap the same underlying logic. Production paths call the new one;
-tests stick with the existing `compose_tick`.
+`compose_tick` in `lib.rs` gets a sibling
+`compose_tick_with_identity(compositor, &Arc<Frame>, &Arc<Frame>,
+&[VisibleStroke]) -> Result<Arc<Frame>, …>`. Both wrap the same
+underlying logic. Production paths (export's `compose_entry_frame` +
+preview's driver loop) call the new one; tests stick with the existing
+`compose_tick`. Both production sites call
+`compositor.clear_freeze_cache()` at entry-segment transitions per Fix
+#43 (export driver: top of `for entry in entries`; preview driver:
+on segment-transition edge).
 
 **Stroke hashing**: `hash_stroke_set(strokes: &[VisibleStroke]) -> u64`
 hashes the visible-portion of each stroke (id + drawn_point_count +
@@ -667,10 +987,11 @@ are immutable once captured; (id, drawn_count) uniquely identifies the
 visible state. Use `std::hash::DefaultHasher` (cheap, non-crypto). The
 hash is for cache keying, not security.
 
-**LRU eviction (`insert_freeze`):**
+**LRU eviction (`insert_freeze`)** — per Fix #44 stores `Arc<Frame>`,
+per Fix #51 keeps poison-recovery on this user-data path:
 
 ```rust
-fn insert_freeze(&self, key: FreezeCacheKey, frame: Frame) {
+fn insert_freeze(&self, key: FreezeCacheKey, frame: Arc<Frame>) {
     const LRU_CAP: usize = 16;
     let mut g = match self.freeze_cache.lock() {
         Ok(g) => g,
@@ -688,19 +1009,23 @@ fn insert_freeze(&self, key: FreezeCacheKey, frame: Frame) {
     }
     g.entries.push((key, frame));
 }
+
+fn lookup_freeze(&self, key: &FreezeCacheKey) -> Option<Arc<Frame>> {
+    let g = match self.freeze_cache.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    g.entries.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
 ```
 
-**`Frame::clone` cost:** `Frame { width, height, pixels: Vec<u8> }` —
-clone copies 8 MB at 1080p. To avoid pixel-Vec re-clone on every cache
-hit, store `Arc<Frame>` in the cache: `entries: Vec<(FreezeCacheKey,
-Arc<Frame>)>`. `lookup_freeze` returns `Arc<Frame>`; the caller (the
-production path) must accept either `Frame` or `Arc<Frame>` from
-compose. **Decision**: change `compose_with_identity`'s return to
-`Result<Frame, ...>` but on cache hit do `(*arc).clone()` — the clone is
-unavoidable at the API boundary. The cache win is amortizing the
-**GPU compose** (~5-15 ms on Apple Silicon, ~50-100 ms on lavapipe);
-the 8 MB memcpy on cache hit is ~1-2 ms. Net win is still significant.
-Future plan can change return type to `Arc<Frame>` if memcpy dominates.
+**`Frame::clone` cost** — eliminated by storing `Arc<Frame>` per Fix
+#44. Cache hit clones an Arc handle (cheap atomic refcount bump), not
+8 MB of pixels. Cache miss allocates one `Arc<Frame>`. Net memcpy on
+cache hit: zero. Net allocation on cache miss: one (the `Arc::new`
+boxing of the composed frame). The cache win is amortizing the **GPU
+compose** (~5–15 ms Apple Silicon, ~50–100 ms lavapipe); the
+Arc-handle-clone is sub-microsecond.
 
 **Test changes:**
 - `parity_n_frames.rs` — the test calls `compose_entry_frame`, which
@@ -734,8 +1059,10 @@ Future plan can change return type to `Arc<Frame>` if memcpy dominates.
 - `cargo clippy --workspace --all-targets --features media -- -D warnings`.
 - `cargo fmt --check`.
 
-**LOC budget: ~150.** Cache lookup helpers + `Arc<Frame>` type-
-threading in preview + export + parity test.
+**LOC budget: ~180.** Cache lookup helpers + content-prefix key (Fix
+#43) + `clear_freeze_cache` + segment-edge call sites + `Arc<Frame>`
+type-threading in preview + export + parity test. Original ~150 + ~30
+for Fix #43's content-prefix key + clear_freeze_cache wiring.
 
 **Commit message:** `phase11(compositor-perf, task 3): freeze-segment
 compose cache via Arc<Frame> identity`.
@@ -752,7 +1079,7 @@ compose cache via Arc<Frame> identity`.
 | `crates/video-coach-media/src/preview_pipeline.rs` | 3 | +10 |
 | `crates/video-coach-media/src/export.rs` | 3 | +10 |
 | `crates/video-coach-media/tests/parity_n_frames.rs` | 3 | +5 |
-| **Total** | | **~355 LOC** |
+| **Total** | | **~385 LOC** (+30 for adv-review fixes #43/#48) |
 
 Each task individually fits under 700 LOC; aggregate fits the plan's
 ~300-500 LOC scope estimate.
