@@ -609,7 +609,7 @@ own SHIPPED line + CI run id once green.
         build/test workspace, --no-default-features build, clippy
         media + clippy excluding media, fmt --check.
 - [x] Plan #8: coverage hardening (multi-source / multi-tag /
-      PartialFailure E2Es) — SHIPPED
+      PartialFailure E2Es) SHIPPED 2026-05-01. CI run 25243458328 green on all 4 jobs.
       Tests-only plan landing fixtures + harness E2Es for three Phase 10
       coverage gaps flagged at closeout: (a) multi-source compilation
       export, (b) multi-tag batch export, (c) PartialFailure UI rendering.

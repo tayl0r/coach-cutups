@@ -1075,7 +1075,7 @@ tests + shared helpers landed; one of the three is `#[ignore]`'d on a
 known-but-out-of-scope production bug (compositor wgpu limit, see
 Deferred items).
 
-**CI run**: _(filled in at CI_PENDING → CI_DONE)_
+**CI run**: 25243458328 — green on all 4 jobs.
 
 ### Commits (in shipping order)
 
