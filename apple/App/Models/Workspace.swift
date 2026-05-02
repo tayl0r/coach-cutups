@@ -30,6 +30,37 @@ final class Workspace {
     /// would no longer line up with the concat.
     var missingSourceIndices: Set<Int> = []
 
+    /// Live zoom/pan state for the source-playback view. Ephemeral —
+    /// not persisted to the project. Reset to identity on workspace switch
+    /// (which happens by Workspace re-init in openProject).
+    ///
+    /// Backed by a private stored property; mutate via `setCurrentZoom(_:)`
+    /// (or assign via the computed setter, which delegates). The setter
+    /// clamps the input to the valid range, propagates to mpv, and emits a
+    /// keyframe to the in-progress recording (if any).
+    @ObservationIgnored
+    private var _currentZoom: Zoom = .identity
+
+    var currentZoom: Zoom {
+        get { _currentZoom }
+        set { setCurrentZoom(newValue) }
+    }
+
+    func setCurrentZoom(_ zoom: Zoom) {
+        let clamped = zoom.clamped()
+        guard clamped != _currentZoom else { return }
+        self._currentZoom = clamped
+        sourcePlayer?.setZoom(clamped)
+        // TODO(Phase 4.2): recordingController?.appendZoom(clamped)
+    }
+
+    /// Set by ContentView when recording starts; cleared when recording
+    /// stops. Weak so the controller isn't kept alive past its natural end.
+    /// Used by `setCurrentZoom(_:)` to emit zoom keyframes into the
+    /// in-progress recording (wired in Phase 4.2).
+    @ObservationIgnored
+    weak var recordingController: RecordingController?
+
     /// Cached AVPlayer per clip for Mode C preview. Populated by a background
     /// preparation Task that hands off finished `AVPlayerItem`s built by
     /// `ClipPreviewBuilder`. Lookup-only via `previewPlayer(for:)`; that
