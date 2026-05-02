@@ -24,3 +24,29 @@ public struct Zoom: Codable, Hashable, Sendable {
         return Zoom(scale: s, panX: px, panY: py)
     }
 }
+
+public extension Zoom {
+    /// Source point currently visible at view-relative position
+    /// `viewPos` (each component 0...1). Inverse of the rendering transform.
+    func sourcePoint(atViewPosition viewPos: CGPoint) -> CGPoint {
+        // Visible window in source coordinates: width = 1/scale, centered at
+        // 0.5 + pan. So source = (0.5 + pan) + (viewPos - 0.5) / scale.
+        CGPoint(
+            x: (0.5 + panX) + (Double(viewPos.x) - 0.5) / scale,
+            y: (0.5 + panY) + (Double(viewPos.y) - 0.5) / scale
+        )
+    }
+
+    /// Apply a new scale while keeping the source point under `cursor`
+    /// fixed under the cursor. Pan is clamped via `.clamped()`.
+    func zoomedToCursor(newScale: Double, cursor: CGPoint) -> Zoom {
+        let s2 = max(1.0, min(10.0, newScale))
+        guard s2 > 1.0 else { return .identity }
+        // Source point under cursor before the zoom (uses self.scale and pan).
+        let src = sourcePoint(atViewPosition: cursor)
+        // Solve for pan' such that source = src remains under cursor at s2.
+        let panX2 = (src.x - (Double(cursor.x) - 0.5) / s2) - 0.5
+        let panY2 = (src.y - (Double(cursor.y) - 0.5) / s2) - 0.5
+        return Zoom(scale: s2, panX: panX2, panY: panY2).clamped()
+    }
+}
