@@ -155,16 +155,268 @@ the codec hydration shipped in Plan #1 / Plan #3).
 
 NET-NEW for Plan #7 (drag-reorder + filename-template specific
 pitfalls). Phase 10's 40 fixes are NOT re-raised. Plan #1's 8 fixes
-are NOT re-raised. (Filled in by main session after the adversarial-
-review pass; placeholder list below documents the structure.)
+are NOT re-raised. Findings file:
+`/tmp/phase11-plans/plan-7/adv-review.md` (12 findings, ~770 words).
+Triage applied: 9 REAL/OVERSTATED folded in below; 1 SPECULATIVE
+rejected (logged in "Rejected findings" subsection).
 
-> _**To main session writing this plan**: run an adversarial-review
-> pass before committing the plan, paste the fixes below, then commit.
-> If you skip this and the section stays empty, the sub-agent should
-> stop and ask the user._
+### Fix #1 — Drop `Copy` from `ExportPrefsSnapshot`; clone on read
 
-(Fixes will be appended here under the orchestrator's
-`PLAN_WRITTEN → ADV_REVIEWED → READY_FOR_TASK_0` transition.)
+`ExportPrefsSnapshot` is currently `#[derive(Debug, Clone, Copy)]`
+(`bus.rs:266`); `BusHandle::export_prefs_snapshot` returns it via
+`*self.export_prefs.lock()` (the deref-copy pattern). Adding the new
+`export_filename_template: String` field makes the struct no longer
+`Copy`, so the deref-copy fails to compile (`cannot move out of
+dereference of MutexGuard`). Task 2 MUST drop the `Copy` derive (keep
+`Clone, Debug`) and change `export_prefs_snapshot` to
+`self.export_prefs.lock().expect("export-prefs lock poisoned").clone()`.
+The helper `export_prefs_to_slint_strings` (if it returns
+`&'static str`) must also adapt — the template field now produces a
+runtime-owned `SharedString` cloned from the snapshot. Source: adv
+finding #1 (HIGH/REAL — compile error).
+
+### Fix #2 — `default_filename_template` is `pub`, not `pub(crate)`
+
+The bus's `default_command_filename_template` calls
+`video_coach_core::project::default_filename_template()` from a
+different crate. The plan declared the helper `pub(crate)`, which
+would fail to compile across crates. Make
+`default_filename_template` `pub` (it's a stable contract anyway).
+Update Task 0's snippet:
+
+```rust
+pub fn default_filename_template() -> String {
+    "{tag} - {project}".to_string()
+}
+```
+
+Add a unit test in `bus.rs` that asserts
+`default_command_filename_template() == video_coach_core::project::default_filename_template()`
+to catch drift if a future plan changes one without the other.
+Source: adv finding #2 (HIGH/REAL — compile error).
+
+### Fix #3 — Drag handle uses a SECOND TouchArea, not an extended one
+
+Phase 10's row TouchArea handles `clicked` for tag-toggle. Slint's
+TouchArea fires `clicked` on press-then-release without movement — so
+a user who presses the drag handle and releases without moving would
+toggle the row's selection (unintended side effect). Slint 1.8 has no
+"ignore clicks within sub-rect" API on a single TouchArea. Task 1
+MUST place the drag handle as a separate TouchArea (24×24 px) sibling
+of the row toggle TouchArea, z-ordered ABOVE the row toggle. The
+drag TouchArea handles press/move/release and consumes events; the
+row toggle TouchArea continues to fire `clicked` only when the press
+lands outside the drag-handle rect. Document the z-order in
+`main.slint` comments. Source: adv finding #3 (HIGH/REAL — concrete
+UX bug).
+
+### Fix #4 — Use absolute window coordinates for drag math; verify list non-scrollable; clamp test
+
+Two related drop-Y issues:
+
+1. The current spec `(drop_y / row_height).round() as usize` ignores
+   any vertical scroll offset. Phase 10's tag list is not currently
+   scrollable (the modal caps tag count by viewport), but Task 1
+   MUST verify this in `main.slint` at task start. If the list is
+   scrollable, the math must use absolute Y minus the list's
+   absolute Y, divided by row height. If not, document
+   "list is non-scrollable; if a future plan adds a ScrollView,
+   drop-Y math needs scroll-offset adjustment" in a `// PLAN-7-NOTE`
+   comment in `ui.rs`.
+2. Capture the pointer in absolute window coordinates on
+   `pointer-event(Down)` (via the row's `absolute-position.y +
+   mouse-y` or the equivalent Slint 1.8 idiom) and compare to the
+   list's absolute Y on `Up`. This is robust to Slint's Repeater row
+   recycling — if the model mutates mid-drag (e.g. another async
+   event toggles `selected-export-tags`), the absolute coordinate
+   survives where row-local coordinates would be invalidated.
+3. Add `drag_reorder_to_index_clamps_to_len` test (already in plan)
+   PLUS `drag_reorder_drop_below_list_clamps` — a drop-y past the
+   end of the list resolves to `selected.len()` (append) rather
+   than panicking. Sources: adv findings #4 (HIGH/OVERSTATED) and
+   #12 (MEDIUM/OVERSTATED).
+
+### Fix #5 — Disable Export button while dragging
+
+A user can start a drag, click Export with the other hand (or via
+keyboard), then release the drag. Slint dispatches the Export click
+on a separate handler; `Command::ExportCompilations` would be
+dispatched with the pre-drag order, then the drag-release callback
+mutates `selected-export-tags` after the fact — the user's last
+visual intent is lost. Task 1 + Task 2 MUST gate the Export button:
+in `main.slint`, the Export button's `enabled:` binding becomes
+`enabled: root.dragging-tag-index == -1 && root.export-tag-rows.length > 0`
+(or equivalent). The button visually greys out while a drag is in
+flight. Document in `main.slint` comments. Source: adv finding #5
+(MEDIUM/REAL — confusing race).
+
+### Fix #6 — Sanitize `{` and `}` from substituent values before substitution
+
+Plan's `apply_template` does sequential `.replace()` calls. Tag/
+project values containing literal `{tag}`/`{project}`/`{date}`
+braces can produce unexpected results: a project named `"My {tag} project"`
+combined with template `"{tag} - {project}"` and tag `"X"` yields
+`"X - My {tag} project"` — a literal `{tag}` survives in the
+filename. Task 0's `apply_template` MUST scrub `{` and `}` from
+the `tag`, `project`, and `date` parameters BEFORE substitution:
+
+```rust
+fn strip_braces(s: &str) -> String {
+    s.chars().filter(|c| *c != '{' && *c != '}').collect()
+}
+
+pub fn apply_template(template: &str, tag: &str, project: &str, date: &str) -> String {
+    let tag_clean = strip_braces(tag);
+    let project_clean = strip_braces(project);
+    let date_clean = strip_braces(date);
+    let substituted = template
+        .replace("{tag}", &tag_clean)
+        .replace("{project}", &project_clean)
+        .replace("{date}", &date_clean);
+    sanitize_filename(&substituted)
+}
+```
+
+Add a test `template_substituent_with_braces_is_stripped` covering a
+project name containing `{tag}`. Source: adv finding #6
+(MEDIUM/OVERSTATED).
+
+### Fix #7 — Use `chrono::Local::now().date_naive()` for stable date formatting
+
+`chrono::Local::now().format("%Y-%m-%d")` works on macOS/Linux but
+has historical edge cases at DST transitions on Windows. Task 2
+MUST format the date via the explicit naive-date path:
+
+```rust
+let today_local = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string();
+```
+
+`date_naive()` extracts the calendar date in the local timezone
+without going through timezone-arithmetic, which avoids the
+midnight-offset-by-one-second class of bugs. Source: adv finding #7
+(MEDIUM/OVERSTATED).
+
+### Fix #8 — Validate template by sensitivity test, with single-tag exception
+
+The original spec validates by running `apply_template` with a probe
+input and rejecting if the result equals `"untitled"`. This rejects
+a user template literally `"untitled"` (a perfectly legal filename
+when N==1 selection — no overwrite risk). Task 2 MUST replace the
+naive-equality check with a sensitivity-based check:
+
+```rust
+let probe_a = apply_template(&filename_template, "ALPHA", "BRAVO", "2000-01-01");
+let probe_b = apply_template(&filename_template, "ZETA", "YANKEE", "2099-12-31");
+let template_has_placeholders = probe_a != probe_b;
+
+// Reject only when N > 1 selection AND the template lacks placeholders
+// (would cause N output files to overwrite each other).
+if selections.len() > 1 && !template_has_placeholders {
+    emit_export_batch_failed("filename_template_no_placeholders");
+    return;
+}
+
+// Also reject if the probe sanitizes to "untitled" — degenerate template.
+if probe_a == "untitled" {
+    emit_export_batch_failed("filename_template_invalid");
+    return;
+}
+```
+
+Two failure reasons (`filename_template_no_placeholders` for the
+overwrite-risk case, `filename_template_invalid` for the sanitize-
+empty case) so the UI can surface a helpful message. Add tests for
+each gate. Source: adv finding #8 (MEDIUM/REAL).
+
+### Fix #9 — Selected-tag rows render via separate Repeater above the unselected list (ship-blocker fix)
+
+The drag-reorder gesture mutates `selected-export-tags` (the
+`[string]` membership list), but the visible rows are rendered
+from `export-tag-rows` (the alphabetic-sorted aggregate model).
+Reordering `selected-export-tags` would have ZERO visible effect —
+the dragged row "snaps back" to its alphabetic spot. Ship-blocker.
+
+Task 1 MUST split the visible tag list into TWO Repeaters in
+`main.slint`:
+
+1. **Top Repeater** iterates a new in-out property
+   `selected-export-tag-rows: [{tag, label, clip-count, duration}]`
+   in user-chosen order. Each row has the `☰` drag handle (visible)
+   and the toggle TouchArea pre-checked. This is the section the
+   drag-reorder gesture mutates.
+2. **Bottom Repeater** iterates a new in-out property
+   `unselected-export-tag-rows: [{tag, label, clip-count, duration}]`
+   in alphabetical order (the leftover from `export-tag-rows` minus
+   the selected set). Each row has NO drag handle, toggle TouchArea
+   un-checked.
+
+Sheet-open hydration in `ui.rs` builds both lists from the same
+`tag_aggregation::aggregate(project)` output: split into selected
+(in user-chosen order, defaulting to alphabetic on first open) and
+unselected (alphabetic). Toggle-on a row in the bottom Repeater
+moves it to the BOTTOM of the top Repeater (user can then drag it
+up). Toggle-off a row in the top Repeater moves it back to its
+alphabetic spot in the bottom Repeater. Drag-release fires the
+existing `export-tag-drag-released` callback against the top-list
+indices only.
+
+`export-tag-rows` is retained as a hidden internal property used
+during hydration to compute the split. Existing Phase 10 tests
+that read `export-tag-rows` still work; bus events
+(`export.tag.started`, etc.) iterate `selected-export-tags` (the
+membership list, now matching top-Repeater order) — no bus change.
+
+Update Task 1's gesture handler to mutate the top Repeater's
+backing model + `selected-export-tags` together so they stay
+consistent. Source: adv finding #9 (HIGH/REAL — ship blocker).
+
+### Fix #10 — Empty-string template hydration falls back to default
+
+A malformed `project.json` with explicit `"exportFilenameTemplate": ""`
+deserializes to `""` (serde does NOT call the `default = ...`
+function on a present-but-empty string field). The user opens the
+sheet, sees an empty LineEdit, clicks Export, and trips the
+sensitivity gate from Fix #8 — confusing.
+
+Task 2's sheet-open hydration MUST defensively fall back to default
+on an empty/whitespace template:
+
+```rust
+let template = if prefs.export_filename_template.trim().is_empty() {
+    video_coach_core::project::default_filename_template()
+} else {
+    prefs.export_filename_template.clone()
+};
+w.set_export_filename_template(template.into());
+```
+
+Do NOT immediately persist the corrected default back to project.json
+on hydration — the fix-up happens on the next Export click via the
+existing fix #11 persistence path (Phase 10). The LineEdit's
+`edited("")` callback also does NOT immediately persist empty; the
+user must click Export, where the gate runs. Add a test
+`hydrate_empty_template_falls_back_to_default`. Source: adv
+finding #11 (MEDIUM/REAL).
+
+### Rejected findings
+
+**Adv finding #10 — `"all-clips"` synthetic-row vs real tag name
+collision (LOW/SPECULATIVE).** The reviewer noted that a real
+project with a tag literally named `"all-clips"` would produce two
+output files with the same name (synthetic AllClips row plus the
+real tag). Rejected:
+
+1. The plan deliberately documents at line 88 that `"all-clips"`
+   overwrites are not addressed — consistent with Phase 10's
+   `tag_aggregation::aggregate` which already pins the synthetic
+   row first under that exact label.
+2. No concrete trigger — extremely unlikely a real coaching project
+   has a tag literally named `"all-clips"`.
+3. Even if it occurs, the user immediately notices the duplicate
+   filename in the export folder and renames the tag.
+
+The reviewer themselves marked this as SPECULATIVE / "skip." Logged
+here for traceability; no plan change.
 
 ---
 
