@@ -397,7 +397,7 @@ machine processor; one plan per deferred item. Each plan ships a slug
 under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
 own SHIPPED line + CI run id once green.
 
-- [x] Plan #1: HEVC encoder SHIPPED 2026-05-01. CI run <pending — fill after gate> green on all 4 jobs.
+- [x] Plan #1: HEVC encoder SHIPPED 2026-05-01. CI run 25239782909 green on all 4 jobs (attempt 2 after run 25239616422 failed in media-tests; HEVC encoder-input caps NV12 vs I420 mismatch on x265enc fixed in 08c64e9).
       Adds HEVC (H.265) as a selectable export codec alongside Phase 10's
       H.264 default. Per-platform HW encoder picker (vtenc_h265_hw / vtenc_h265
       / mfh265enc / vaapih265enc / nvh265enc / x265enc). Codec radio row in

@@ -825,7 +825,11 @@ same time.)
 
 ## Closeout — Phase 11 Plan #3 SHIPPED 2026-05-01
 
-**CI run**: `<filled-in-after-gate>` (final SHA `<filled-in-after-gate>`),
+**CI run**: `25239782909` (final SHA `08c64e9`, attempt 2 after a media-tests
+failure on the initial run `25239616422` exposed an HEVC encoder-input
+caps mismatch — `x265enc` requires I420 but the capsfilter pinned NV12,
+fixed in `08c64e9` by codec-aware encoder-input caps in
+`build_video_output_chain` — H.264 keeps NV12, HEVC switches to I420),
 green on all 4 jobs:
 - `test (ubuntu-latest)` ✓
 - `test (windows-latest)` ✓
@@ -842,7 +846,9 @@ green on all 4 jobs:
 | Task 1 | `80e1521` + `1f6627c` | `pick_h265_encoder` mirroring H.264 picker with `[vtenc_h265_hw, vtenc_h265, mfh265enc, vaapih265enc, nvh265enc, x265enc]`; `try_set_encoder_bitrate` switched to `name.starts_with("vtenc_")` so `vtenc_h265_hw` gets bps scaling; `build_video_output_chain` codec-dispatched encoder/parser pair + HEVC capsfilter (`video/x-h265,stream-format=hvc1,alignment=au`) between h265parse and qtmux; `export_compilation` public signature gains `codec: Codec`; bus.rs Task 1 temporary `Codec::H264` glue with comment naming Task 2 as resolver. New `export_compilation_with_hevc_writes_non_empty_mp4` smoke + `pick_h265_encoder_returns_some_factory` unit. vtenc_h265_hw picked on Apple Silicon, ~8 s test runtime |
 | Task 2 | `199a04e` + `1b0f549` | Slint `export-codec` property + `export-codec-changed` callback + Codec radio row (H.264 / HEVC) in main.slint Form view; `Command::ExportCompilations` gains `codec: Codec`; `handle_export_compilations` threads codec through; LOAD-BEARING REPLACEMENT of bus.rs Task 1 temporary glue with the user's codec choice (UI → encoder dispatch cut-over); persists `last_export_codec` alongside resolution + quality. `ui.rs::on_export_codec_changed` binding + warn-and-fall-back-to-prefs codec parser emitting `tracing::warn!` at `export.codec_string_unknown` for unknown strings (never bare wildcard). Atomic sheet-open hydration via new `export-sheet-open-clicked` callback hydrating all three properties from `Preferences` before flipping `export-sheet-visible`. New `ExportPrefsSlot` infra (`Mutex<ExportPrefsSnapshot>`) + `export_command_with_hevc_codec_round_trips` + `opening_export_sheet_hydrates_codec_from_preferences` tests. 67 tests pass; LOC ~340 vs ~110 budget due to ExportPrefsSlot scaffolding (contained to video-coach-app) |
 | Code-review fix | `dc11822` | Folded code-review F1: `#[serde(default)]` on `Command::ExportCompilations.codec` + `export_command_without_codec_field_deserializes_to_h264_default` test (Phase 10-shaped JSON payload missing `codec` key round-trips to `Codec::H264`). Closes legacy harness/control-socket compat gap missed by the existing fully-populated round-trip test. 68 tests pass |
-| Closeout | this commit | PROGRESS.txt SHIPPED flip + plan closeout |
+| Closeout | `ca67f6c` | PROGRESS.txt SHIPPED flip + plan closeout (commits table, adv-fix coverage checklist, code-review findings, LOC budget, coverage gaps) |
+| CI fix-up | `08c64e9` | First CI run `25239616422` failed in `media-tests`: HEVC export link failure `capsfilter6 → x265enc0` because `x265enc` requires I420 but `build_video_output_chain` pinned NV12 (Apple Silicon's `vtenc_h265_hw` accepts NV12 so local smoke passed; lavapipe Linux's `x265enc` doesn't). Fix: codec-aware encoder-input caps — H.264 keeps NV12, HEVC switches to I420 (universally accepted by `vtenc_h265_hw`/`vtenc_h265`/`mfh265enc`/`vaapih265enc`/`nvh265enc`/`x265enc`). 1 file, +13/-3 LOC. CI retry `25239782909` green on all 4 jobs |
+| CI fill-in | this commit | Final CI run id `25239782909` filled into plan + PROGRESS.txt |
 
 ### Adversarial-fix coverage
 
