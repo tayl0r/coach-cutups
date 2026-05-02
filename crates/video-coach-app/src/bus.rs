@@ -205,6 +205,121 @@ fn default_overwrite_policy_for_command() -> video_coach_core::project::ExportOv
     video_coach_core::project::default_overwrite_policy()
 }
 
+/// Phase 11 Plan #6 Task 1. Result of the per-tag skip-on-exists
+/// structural check. `Intact` means the existing output looks complete
+/// enough to skip re-encoding; `RecordingNewer` means the underlying
+/// clip was re-recorded after the .mp4 was written so we must
+/// re-encode AND emit the `export.tag.stale_output` telemetry event;
+/// any other variant (`Missing`, `Corrupt`, `IoError`) routes through
+/// the silent-delete + re-encode path without an extra event.
+///
+/// Splitting out the variants (rather than returning a bare bool) keeps
+/// adv-fix #2's stale-output telemetry one branch above the encode
+/// path without re-running `std::fs::metadata` on the .mp4 + the
+/// recording.mov a second time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OutputIntactness {
+    /// File exists, size + ftyp + moov tail-scan all pass, and (if a
+    /// recording.mov path was supplied) its mtime is `<=` the output
+    /// mtime. Skip-on-exists hit.
+    Intact,
+    /// File does not exist, is a directory, or `metadata` failed.
+    Missing,
+    /// File exists but failed one of size / ftyp / moov tail-scan.
+    /// Caller silent-deletes + re-encodes.
+    Corrupt,
+    /// File exists and is structurally intact, BUT the supplied
+    /// recording.mov has a newer mtime — the underlying clip was
+    /// re-recorded, so the existing .mp4 is stale. Caller emits
+    /// `export.tag.stale_output { reason = "recording_newer" }`,
+    /// silent-deletes, and re-encodes.
+    RecordingNewer,
+}
+
+/// Phase 11 Plan #6 Task 1. Cheap structural check for "this output
+/// looks complete enough to skip re-encoding". The contract is:
+///
+/// - File exists, is a regular file, and `metadata.len() >= 50_000`
+///   (rules out empty / truncated outputs; the smallest valid 30 fps
+///   × 1 s × VBR-low h.264 mp4 in our fixtures is ~80 KB so 50 KB is
+///   a comfortable floor).
+/// - First 8 bytes are readable; bytes 4..8 are exactly `b"ftyp"` (the
+///   ISO Base Media File Format file-type-box magic at offset 4).
+/// - Adv-fix #3: `b"moov"` is found anywhere in the last
+///   min(64 KiB, file_size) bytes. qtmux's default `streamable=false`
+///   mode writes ftyp + mdat eagerly but defers moov to EOS; a
+///   process killed mid-encode has ftyp + > 50 KB of mdat but NO
+///   moov — unplayable but passes the cheap checks alone.
+/// - Adv-fix #2: if `recording_mov_path` is `Some(p)` AND
+///   `p.mtime > path.mtime`, the underlying clip was re-recorded
+///   after the .mp4 was written; return `RecordingNewer` so the
+///   caller emits stale-output telemetry. Caller passes `Some` only
+///   for single-clip plans (every entry references the same
+///   `clip_id`); multi-clip plans pass `None`.
+///
+/// I/O errors (permission denied, etc.) are treated as `Missing` —
+/// the export pipeline's silent-delete + re-encode path then
+/// surfaces the real error.
+fn output_exists_and_intact(
+    path: &std::path::Path,
+    recording_mov_path: Option<&std::path::Path>,
+) -> OutputIntactness {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let metadata = match std::fs::metadata(path) {
+        Ok(m) => m,
+        Err(_) => return OutputIntactness::Missing,
+    };
+    if !metadata.is_file() {
+        return OutputIntactness::Missing;
+    }
+    if metadata.len() < 50_000 {
+        return OutputIntactness::Corrupt;
+    }
+
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return OutputIntactness::Missing,
+    };
+    let mut header = [0u8; 8];
+    if file.read_exact(&mut header).is_err() {
+        return OutputIntactness::Corrupt;
+    }
+    if &header[4..8] != b"ftyp" {
+        return OutputIntactness::Corrupt;
+    }
+
+    // Adv-fix #3: tail-scan for the `moov` atom magic.
+    let tail_len = std::cmp::min(metadata.len(), 64 * 1024) as usize;
+    let mut tail = vec![0u8; tail_len];
+    if file
+        .seek(SeekFrom::End(-(tail_len as i64)))
+        .and_then(|_| file.read_exact(&mut tail))
+        .is_err()
+    {
+        return OutputIntactness::Corrupt;
+    }
+    if !tail.windows(4).any(|w| w == b"moov") {
+        return OutputIntactness::Corrupt;
+    }
+
+    // Adv-fix #2: stale-output via recording.mov mtime. Runs LAST
+    // because it's the most expensive path (extra metadata syscall)
+    // and is gated on a non-None recording_mov_path which only the
+    // single-clip detection branch supplies.
+    if let Some(mov) = recording_mov_path {
+        if let (Ok(mov_meta), Ok(out_modified)) = (std::fs::metadata(mov), metadata.modified()) {
+            if let Ok(mov_modified) = mov_meta.modified() {
+                if mov_modified > out_modified {
+                    return OutputIntactness::RecordingNewer;
+                }
+            }
+        }
+    }
+
+    OutputIntactness::Intact
+}
+
 /// Phase 10 Task 0 (fix #33). Tag selection for `ExportCompilations`.
 /// The UI sends `Vec<TagSelection>` so the synthetic "All Clips" row
 /// can sit alongside real tag names without a magic string overlap
@@ -2760,13 +2875,102 @@ async fn handle_export_compilations(
             );
             let output_path = output_folder_path.join(format!("{filename}.mp4"));
 
-            // TODO(phase11-plan-6 task 1): if overwrite_policy ==
-            // ExportOverwritePolicy::Resume && output_exists_and_intact(
-            // &output_path, recording_mov_path) { emit
-            // export.tag.skipped { reason = "already_exists" } and
-            // `continue` BEFORE the silent-delete below. The skip path
-            // also bumps both g.completed_tags AND the local
-            // completed_tags counter (Plan #2 split — see adv-fix #1).
+            // Phase 11 Plan #6 Task 1: tag-level resume.
+            //
+            // If the user requested Resume mode AND the target output
+            // already exists on disk AND it passes the structural
+            // check (size + ftyp@4 + moov tail-scan + recording.mov
+            // mtime for single-clip plans), skip the encode and emit
+            // `export.tag.skipped { reason = "already_exists" }`. This
+            // lets a retry of a failed batch only re-render the
+            // failed/remaining tags. The check happens BEFORE the
+            // silent-delete (Phase 10 fix #13) because skipping must
+            // NOT delete the prior output. Adv-fix #2: if the
+            // recording.mov is newer than the output, fall through to
+            // the encode path AND emit `export.tag.stale_output {
+            // reason = "recording_newer" }` for telemetry.
+            //
+            // Single-clip detection: every entry in the plan references
+            // the same `clip_id`. Multi-clip plans pass `None` so the
+            // helper skips the (per-skip-check expensive) extra
+            // metadata syscall on every clip's recording.mov; the user's
+            // escape hatch (Overwrite checkbox) covers stale multi-clip
+            // outputs.
+            let recording_mov_path: Option<std::path::PathBuf> = {
+                let mut clip_id_iter = plan.entries.iter().map(|e| e.clip_id);
+                if let Some(first) = clip_id_iter.next() {
+                    if clip_id_iter.all(|cid| cid == first) {
+                        recording_paths.get(&first).cloned()
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if matches!(
+                overwrite_policy,
+                video_coach_core::project::ExportOverwritePolicy::Resume,
+            ) {
+                let intactness =
+                    output_exists_and_intact(&output_path, recording_mov_path.as_deref());
+                match intactness {
+                    OutputIntactness::Intact => {
+                        tracing::info!(
+                            target: "export.lifecycle",
+                            event = "export.tag.skipped",
+                            selection = %label,
+                            reason = "already_exists",
+                            output_path = %output_path.display(),
+                        );
+
+                        // Bump the slot so the success summary shows
+                        // N of N rendered (skipped tags count toward
+                        // `completed_tags`; Plan #6 contract).
+                        {
+                            let mut g = export_progress_for_task
+                                .lock()
+                                .expect("export_progress poisoned");
+                            g.completed_tags = i + 1;
+                            g.batch_progress = ((i + 1) as f32 / total_tags as f32).min(1.0);
+                            // Snap per-tag progress to 1.0 — visually
+                            // equivalent to a finished encode.
+                            g.current_tag_progress = 1.0;
+                        }
+
+                        // ── Adv-fix #1: bump the LOCAL counter too. ──
+                        // Phase 11 Plan #2 split the slot's
+                        // `g.completed_tags` (UI bar) from this scope's
+                        // `let mut completed_tags` (which feeds the
+                        // outcome's `tag_count`). The skip path MUST
+                        // touch BOTH or `SucceededAll { tag_count: 0 }`
+                        // would ship with `g.completed_tags == N`.
+                        // See bus.rs comment on `completed_tags = i;`
+                        // at the iteration top for the split rationale.
+                        completed_tags += 1;
+                        continue;
+                    }
+                    OutputIntactness::RecordingNewer => {
+                        // Adv-fix #2 stale-output telemetry: the
+                        // existing .mp4 is structurally fine but the
+                        // underlying clip was re-recorded after it
+                        // was written. Emit a one-line breadcrumb
+                        // and fall through to the silent-delete +
+                        // re-encode path below.
+                        tracing::info!(
+                            target: "export.lifecycle",
+                            event = "export.tag.stale_output",
+                            selection = %label,
+                            reason = "recording_newer",
+                            output_path = %output_path.display(),
+                        );
+                    }
+                    OutputIntactness::Missing | OutputIntactness::Corrupt => {
+                        // Fall through: silent-delete + re-encode.
+                    }
+                }
+            }
 
             // Silently delete prior output (per fix #13).
             let _ = std::fs::remove_file(&output_path);
@@ -4451,5 +4655,391 @@ mod tests {
             }
             _ => panic!("expected ExportCompilations"),
         }
+    }
+
+    // ── Phase 11 Plan #6 Task 1 — output_exists_and_intact unit tests ──
+    //
+    // Helpers below write synthetic mp4-shaped fixtures to disk; the
+    // helper consults only `std::fs` + `std::io` so these tests run
+    // without the `media` feature.
+
+    /// Build a synthetic fixture that LOOKS like a valid mp4: 4 zero
+    /// bytes + `b"ftyp"` + filler, with `b"moov"` planted at a known
+    /// offset within the last 64 KiB. `body_len` bytes follow the 8-
+    /// byte header; `moov_at` is the offset (relative to start of
+    /// body) where the moov bytes are written. Total file size is
+    /// `8 + body_len`.
+    fn write_fake_mp4(path: &std::path::Path, body_len: usize, moov_at: Option<usize>) {
+        let mut bytes = Vec::with_capacity(8 + body_len);
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(b"ftyp");
+        bytes.resize(8 + body_len, 0u8);
+        if let Some(at) = moov_at {
+            let abs = 8 + at;
+            bytes[abs..abs + 4].copy_from_slice(b"moov");
+        }
+        std::fs::write(path, &bytes).expect("write fixture");
+    }
+
+    #[test]
+    fn intact_returns_true_for_complete_mp4() {
+        // 60_000 bytes total: 8 header + 59_992 body. Plant `moov`
+        // 1024 bytes from EOF — comfortably inside the 64 KiB tail.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("good.mp4");
+        let body_len = 60_000 - 8;
+        write_fake_mp4(&p, body_len, Some(body_len - 1024));
+        assert_eq!(output_exists_and_intact(&p, None), OutputIntactness::Intact,);
+    }
+
+    #[test]
+    fn intact_returns_false_for_missing_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("does-not-exist.mp4");
+        assert_eq!(
+            output_exists_and_intact(&p, None),
+            OutputIntactness::Missing,
+        );
+    }
+
+    #[test]
+    fn intact_returns_false_for_too_small_file() {
+        // 49 KiB: valid ftyp + moov at offset 1024 from end, but
+        // metadata.len() < 50_000 → Corrupt.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("tiny.mp4");
+        let body_len = 49_000 - 8;
+        write_fake_mp4(&p, body_len, Some(body_len - 1024));
+        assert_eq!(
+            output_exists_and_intact(&p, None),
+            OutputIntactness::Corrupt,
+        );
+    }
+
+    #[test]
+    fn intact_returns_false_for_no_ftyp_magic() {
+        // 60 KB file with `00000000` header (no `ftyp` at offset 4)
+        // but `moov` planted in the tail — should still fail.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("no-ftyp.mp4");
+        let mut bytes = vec![0u8; 60_000];
+        bytes[0..8].copy_from_slice(b"00000000");
+        bytes[58_000..58_004].copy_from_slice(b"moov");
+        std::fs::write(&p, &bytes).unwrap();
+        assert_eq!(
+            output_exists_and_intact(&p, None),
+            OutputIntactness::Corrupt,
+        );
+    }
+
+    #[test]
+    fn intact_returns_false_for_no_moov_in_tail() {
+        // Adv-fix #3 regression test. Valid ftyp + 60_000 bytes total
+        // but NO `moov` anywhere in the tail. Mimics qtmux killed
+        // mid-encode (ftyp + mdat written, moov never flushed).
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("no-moov.mp4");
+        let body_len = 60_000 - 8;
+        write_fake_mp4(&p, body_len, None);
+        assert_eq!(
+            output_exists_and_intact(&p, None),
+            OutputIntactness::Corrupt,
+        );
+    }
+
+    #[test]
+    fn intact_returns_recording_newer_when_recording_mtime_after_output() {
+        // Adv-fix #2. Write a structurally-intact mp4, then write a
+        // recording.mov that's newer. Helper returns RecordingNewer.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mp4 = dir.path().join("out.mp4");
+        let mov = dir.path().join("recording.mov");
+        let body_len = 60_000 - 8;
+        write_fake_mp4(&mp4, body_len, Some(body_len - 1024));
+        std::fs::write(&mov, b"fake-mov-bytes").unwrap();
+
+        // Force the recording.mov to be 5 seconds newer than the .mp4
+        // regardless of filesystem mtime resolution. Use
+        // `File::set_modified` (stable since 1.75; project MSRV 1.78).
+        let mp4_mtime = std::fs::metadata(&mp4).unwrap().modified().unwrap();
+        let mov_mtime = mp4_mtime + std::time::Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&mov).unwrap();
+        f.set_modified(mov_mtime).unwrap();
+        drop(f);
+
+        assert_eq!(
+            output_exists_and_intact(&mp4, Some(&mov)),
+            OutputIntactness::RecordingNewer,
+        );
+    }
+
+    #[test]
+    fn intact_returns_true_when_recording_older_than_output() {
+        // Opposite of the test above: recording.mov mtime is older.
+        let dir = tempfile::TempDir::new().unwrap();
+        let mp4 = dir.path().join("out.mp4");
+        let mov = dir.path().join("recording.mov");
+        let body_len = 60_000 - 8;
+        write_fake_mp4(&mp4, body_len, Some(body_len - 1024));
+        std::fs::write(&mov, b"fake-mov-bytes").unwrap();
+
+        let mp4_mtime = std::fs::metadata(&mp4).unwrap().modified().unwrap();
+        let mov_mtime = mp4_mtime - std::time::Duration::from_secs(5);
+        let f = std::fs::File::options().write(true).open(&mov).unwrap();
+        f.set_modified(mov_mtime).unwrap();
+        drop(f);
+
+        assert_eq!(
+            output_exists_and_intact(&mp4, Some(&mov)),
+            OutputIntactness::Intact,
+        );
+    }
+
+    #[test]
+    fn intact_returns_intact_when_recording_path_is_none() {
+        // Multi-clip plan path: caller passes None; helper does not
+        // consult any recording.mov even if one were nearby.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("multi.mp4");
+        let body_len = 60_000 - 8;
+        write_fake_mp4(&p, body_len, Some(body_len - 1024));
+        assert_eq!(output_exists_and_intact(&p, None), OutputIntactness::Intact,);
+    }
+
+    #[test]
+    fn intact_returns_missing_for_directory_path() {
+        // Adv-fix: pass a directory path → not is_file() → Missing.
+        let dir = tempfile::TempDir::new().unwrap();
+        assert_eq!(
+            output_exists_and_intact(dir.path(), None),
+            OutputIntactness::Missing,
+        );
+    }
+
+    // ── Phase 11 Plan #6 Task 1 — bus integration tests ───────────────
+    //
+    // These dispatch `handle_export_compilations` end-to-end, drive the
+    // skip path on Resume + a pre-populated valid output, and assert on
+    // the slot's outcome (which captures `tag_count` per adv-fix #1).
+    // Skip-path tests do NOT spin up the encoder — the per-tag spawn
+    // `continue`s before `export_compilation` is called.
+
+    #[cfg(feature = "media")]
+    fn write_synthetic_intact_mp4(path: &std::path::Path) {
+        // Mirror the unit-test helper: 60 KB, ftyp@4, moov in tail.
+        // Inlined here so the integration tests don't reach into the
+        // unit-test scope.
+        let body_len = 60_000 - 8;
+        let mut bytes = Vec::with_capacity(8 + body_len);
+        bytes.extend_from_slice(&[0u8; 4]);
+        bytes.extend_from_slice(b"ftyp");
+        bytes.resize(8 + body_len, 0u8);
+        let moov_off = 8 + body_len - 1024;
+        bytes[moov_off..moov_off + 4].copy_from_slice(b"moov");
+        std::fs::write(path, &bytes).expect("write synthetic mp4");
+    }
+
+    #[cfg(feature = "media")]
+    fn project_with_tagged_clips(tags: &[&str]) -> video_coach_core::project::Project {
+        let mut p = video_coach_core::project::Project::new("ResumeTest");
+        for (i, tag) in tags.iter().enumerate() {
+            let mut clip = make_clip(&format!("clip-{i}"), 1.0, 0);
+            clip.tags = vec![tag.to_string()];
+            p.clips.push(clip);
+        }
+        p
+    }
+
+    /// Run `handle_export_compilations` end-to-end with the given
+    /// selections + policy + a project pre-loaded into a tempdir, wait
+    /// for the per-tag task to signal cleanup, and return the
+    /// `ExportRunOutcome` + final `completed_tags` from the slot.
+    /// Used by the four Plan-#6 integration tests below to keep each
+    /// test focused on its assertion rather than the bus plumbing.
+    #[cfg(feature = "media")]
+    async fn run_export_and_wait_cleanup(
+        dir: &std::path::Path,
+        project: video_coach_core::project::Project,
+        selections: Vec<TagSelection>,
+        policy: video_coach_core::project::ExportOverwritePolicy,
+        timeout: std::time::Duration,
+    ) -> (crate::frame_sink::ExportRunOutcome, usize) {
+        let mut current = Some((project, dir.to_path_buf()));
+        let mut current_mode = AppMode::Scanning;
+        let recording: Option<video_coach_media::recording::Recording> = None;
+        let recording_clip: Option<RecordingClipInProgress> = None;
+        let recording_state = crate::frame_sink::new_recording_state();
+        let export_progress = crate::frame_sink::new_export_progress();
+        let export_prefs_slot = new_export_prefs_slot();
+        let mut current_export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+        let compositor = std::sync::Arc::new(
+            video_coach_compositor::Compositor::new_headless().expect("compositor"),
+        );
+        let (export_cleanup_tx, mut export_cleanup_rx) =
+            tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let reply = handle_export_compilations(
+            selections,
+            dir.to_string_lossy().into_owned(),
+            video_coach_core::project::Resolution::R720,
+            video_coach_core::project::Quality::Low,
+            video_coach_core::project::Codec::H264,
+            "ResumeTest".into(),
+            default_command_filename_template(),
+            policy,
+            &mut current,
+            &mut current_mode,
+            &recording,
+            &recording_clip,
+            &recording_state,
+            &export_progress,
+            &export_prefs_slot,
+            &mut current_export_cancel,
+            &compositor,
+            &export_cleanup_tx,
+        )
+        .await;
+        assert!(reply.ok, "handle_export_compilations refused: {reply:?}");
+
+        let _ = tokio::time::timeout(timeout, export_cleanup_rx.recv())
+            .await
+            .expect("cleanup signal within timeout");
+
+        let g = export_progress.lock().unwrap();
+        (g.outcome.clone(), g.completed_tags)
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn resume_skips_existing_intact_output_emits_tag_skipped() {
+        // Pre-populate a structurally-valid .mp4 + Resume → skip path
+        // fires. File is NOT deleted; outcome SucceededAll{tag_count=1}.
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = project_with_tagged_clips(&["clipA"]);
+        video_coach_core::project_store::write(&project, dir.path()).unwrap();
+        let output_path = dir.path().join("clipA - ResumeTest.mp4");
+        write_synthetic_intact_mp4(&output_path);
+        let pre_size = std::fs::metadata(&output_path).unwrap().len();
+
+        let (outcome, completed) = run_export_and_wait_cleanup(
+            dir.path(),
+            project,
+            vec![TagSelection::Tag {
+                name: "clipA".into(),
+            }],
+            video_coach_core::project::ExportOverwritePolicy::Resume,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        let post_size = std::fs::metadata(&output_path).unwrap().len();
+        assert_eq!(post_size, pre_size, "skip must not rewrite the file");
+        match outcome {
+            crate::frame_sink::ExportRunOutcome::SucceededAll { tag_count, .. } => {
+                assert_eq!(tag_count, 1, "outcome.tag_count must include the skip");
+            }
+            other => panic!("expected SucceededAll, got: {other:?}"),
+        }
+        assert_eq!(completed, 1);
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn resume_re_encodes_corrupt_existing_output() {
+        // Pre-populate a 1 KB file (below the 50 KB floor → Corrupt) +
+        // Resume → silent-delete runs; the encoder is invoked. The
+        // load-bearing assertion is "1 KB original is gone" — proves
+        // we did NOT skip. Encoder may fail (no real source video);
+        // that's fine for this test's scope.
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = project_with_tagged_clips(&["clipA"]);
+        video_coach_core::project_store::write(&project, dir.path()).unwrap();
+        let output_path = dir.path().join("clipA - ResumeTest.mp4");
+        std::fs::write(&output_path, vec![0u8; 1024]).unwrap();
+        let original_bytes = std::fs::read(&output_path).unwrap();
+
+        let _ = run_export_and_wait_cleanup(
+            dir.path(),
+            project,
+            vec![TagSelection::Tag {
+                name: "clipA".into(),
+            }],
+            video_coach_core::project::ExportOverwritePolicy::Resume,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        let post_bytes = std::fs::read(&output_path).ok();
+        assert!(
+            post_bytes.as_ref() != Some(&original_bytes),
+            "skip path must have run silent-delete on Corrupt output",
+        );
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn overwrite_all_always_re_encodes_existing_output() {
+        // Pre-populate a fully-intact .mp4 + OverwriteAll. The skip
+        // branch is gated on Resume, so OverwriteAll bypasses it
+        // entirely → silent-delete runs; bytes != original.
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = project_with_tagged_clips(&["clipA"]);
+        video_coach_core::project_store::write(&project, dir.path()).unwrap();
+        let output_path = dir.path().join("clipA - ResumeTest.mp4");
+        write_synthetic_intact_mp4(&output_path);
+        let original_bytes = std::fs::read(&output_path).unwrap();
+
+        let _ = run_export_and_wait_cleanup(
+            dir.path(),
+            project,
+            vec![TagSelection::Tag {
+                name: "clipA".into(),
+            }],
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            std::time::Duration::from_secs(60),
+        )
+        .await;
+
+        let post_bytes = std::fs::read(&output_path).ok();
+        assert!(
+            post_bytes.as_ref() != Some(&original_bytes),
+            "OverwriteAll must silent-delete regardless of intactness",
+        );
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn outcome_tag_count_includes_skipped_tags() {
+        // Adv-fix #1. Three tags, all with valid pre-existing outputs.
+        // Outcome is SucceededAll { tag_count: 3 }. Asserts BOTH
+        // `outcome.tag_count` (load-bearing) AND `completed_tags` —
+        // the split adv-fix #1 prevents.
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = project_with_tagged_clips(&["t1", "t2", "t3"]);
+        video_coach_core::project_store::write(&project, dir.path()).unwrap();
+        for tag in ["t1", "t2", "t3"] {
+            write_synthetic_intact_mp4(&dir.path().join(format!("{tag} - ResumeTest.mp4")));
+        }
+
+        let (outcome, completed) = run_export_and_wait_cleanup(
+            dir.path(),
+            project,
+            vec![
+                TagSelection::Tag { name: "t1".into() },
+                TagSelection::Tag { name: "t2".into() },
+                TagSelection::Tag { name: "t3".into() },
+            ],
+            video_coach_core::project::ExportOverwritePolicy::Resume,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
+
+        match outcome {
+            crate::frame_sink::ExportRunOutcome::SucceededAll { tag_count, .. } => {
+                assert_eq!(tag_count, 3, "outcome.tag_count must include all skips");
+            }
+            other => panic!("expected SucceededAll, got: {other:?}"),
+        }
+        assert_eq!(completed, 3);
     }
 }
