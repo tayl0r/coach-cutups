@@ -131,6 +131,14 @@ pub enum Command {
         /// alongside `last_export_resolution` / `last_export_quality`;
         /// hydrated into the export-sheet's Codec radio on sheet open
         /// from `Preferences::last_export_codec`.
+        ///
+        /// Phase 11 Plan #3 code-review fix #1: `#[serde(default)]` so
+        /// legacy harness/control-socket clients sending Phase 10-shaped
+        /// payloads without a `codec` key deserialize cleanly to
+        /// `Codec::H264` (matches the Preferences default). Without this
+        /// the bus task would reject pre-Phase-11 commands with
+        /// `missing field 'codec'`.
+        #[serde(default)]
         codec: video_coach_core::project::Codec,
         project_name: String,
     },
@@ -3421,6 +3429,46 @@ mod tests {
         match cmd {
             Command::ExportCompilations { codec, .. } => {
                 assert_eq!(codec, video_coach_core::project::Codec::Hevc);
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn export_command_without_codec_field_deserializes_to_h264_default() {
+        // Phase 11 Plan #3 code-review fix #1. Legacy Phase 10-era
+        // harness / control-socket clients JSON-encode
+        // `Command::ExportCompilations` without a `codec` key. With
+        // `#[serde(default)]` on the codec field they deserialize
+        // cleanly to `Codec::H264` (matches `Preferences::default`).
+        // Without the attribute, deserialization would fail with
+        // `missing field 'codec'` and the bus task would reject the
+        // command — silently breaking pre-Phase-11 clients.
+        let json = r#"{
+            "cmd": "export_compilations",
+            "selections": [{"kind": "all_clips"}],
+            "output_folder": "/Users/x/Exports",
+            "resolution": "r1080",
+            "quality": "medium",
+            "project_name": "Legacy Practice"
+        }"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                selections,
+                output_folder,
+                resolution,
+                quality,
+                codec,
+                project_name,
+            } => {
+                assert_eq!(selections.len(), 1);
+                assert_eq!(selections[0], TagSelection::AllClips);
+                assert_eq!(output_folder, "/Users/x/Exports");
+                assert_eq!(resolution, video_coach_core::project::Resolution::R1080);
+                assert_eq!(quality, video_coach_core::project::Quality::Medium);
+                assert_eq!(codec, video_coach_core::project::Codec::H264);
+                assert_eq!(project_name, "Legacy Practice");
             }
             _ => panic!("expected ExportCompilations"),
         }
