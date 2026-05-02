@@ -14,6 +14,21 @@ pub use video_coach_core::stroke_replay::VisibleStroke;
 /// enforced. Today it's a thin wrapper around `Compositor::compose`; future
 /// per-tick orchestration (frame timing, stats counters, color-space
 /// conversions) lands here without forking call sites.
+///
+/// **Phase 11 Plan #4 cache contract:** `Compositor` holds four
+/// internal caches (PiP pipeline, stroke pipeline, pooled stroke VBO,
+/// and a freeze-segment compose LRU). All are populated lazily inside
+/// `compose` / `compose_with_identity` under interior-mutex'd state;
+/// cache hits MUST produce byte-identical output to cache misses (a
+/// parity divergence is a ship-blocker). Tests in `parity_smoke.rs`
+/// and `parity_n_frames.rs` guard the invariant. Compositor is no
+/// longer "stateless from the inside" but its EXTERNAL contract (same
+/// input → same output) is unchanged.
+///
+/// Per Fix #49: internal caches total ~128 MB peak at 1080p RGBA
+/// (16-entry freeze cache of `Arc<Frame>` composed outputs + small
+/// pipeline / VBO state). Per-process. Single shared
+/// `Arc<Compositor>` per Phase 10 fix #15.
 pub fn compose_tick(
     compositor: &Compositor,
     source: &Frame,

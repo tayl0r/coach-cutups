@@ -1,7 +1,11 @@
 use crate::frame::Frame;
+use std::sync::{Arc, Mutex};
 use thiserror::Error;
 use video_coach_core::stroke_replay::VisibleStroke;
 use wgpu::util::DeviceExt;
+
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 
 #[derive(Debug, Error)]
 pub enum CompositorError {
@@ -45,6 +49,126 @@ const STROKE_QUAD_AA_PAD: f32 = 0.0025;
 pub struct Compositor {
     pub(crate) device: wgpu::Device,
     pub(crate) queue: wgpu::Queue,
+
+    // Plan #4 Task 1: cached PiP + stroke pipelines, rebuilt only when
+    // the key changes. wgpu handles inside (RenderPipeline / BGL /
+    // Sampler / ShaderModule) are Clone (refcounted Arc). Per Fix #41,
+    // the lock is held only for cache-lookup-and-clone-out; encode
+    // happens unlocked. (Task 0: scaffolded but not yet wired into
+    // compose / encode_stroke_pass — `dead_code` allow stays until
+    // Tasks 1–3 land.)
+    #[allow(dead_code)]
+    pub(crate) pip_cache: Mutex<Option<PipPassCache>>,
+    #[allow(dead_code)]
+    pub(crate) stroke_cache: Mutex<Option<StrokePassCache>>,
+
+    // Plan #4 Task 2: pooled stroke vertex buffer. Capacity grows on
+    // demand; never shrinks. wgpu::Buffer is Clone — same lock
+    // discipline as Task 1 (clone-out, drop, encode). (Task 0:
+    // scaffolded but not yet wired.)
+    #[allow(dead_code)]
+    pub(crate) stroke_vbo_pool: Mutex<Option<PooledVbo>>,
+
+    // Plan #4 Task 3: freeze-segment compose memoization. LRU bounded
+    // at 16 entries (~128 MB peak at 1080p RGBA — disclosed in
+    // compose_tick docstring per Fix #49). Key includes content-derived
+    // prefix bytes per Fix #43 to defend against allocator address
+    // reuse. Value is Arc<Frame> per Fix #44 so cache hits don't
+    // memcpy. (Task 0: scaffolded but not yet wired.)
+    #[allow(dead_code)]
+    pub(crate) freeze_cache: Mutex<FreezeCache>,
+
+    // Plan #4: test-only counters for cache-rebuild assertions
+    // (Fix #47). Crate-local; not visible to other crates' tests.
+    // Tasks 1–3 wire the increments; Task 0 just scaffolds the fields.
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) pip_cache_rebuilds: AtomicU64,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) stroke_cache_rebuilds: AtomicU64,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) stroke_vbo_grows: AtomicU64,
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) freeze_cache_hits: AtomicU64,
+}
+
+// Cache key intent: the cached pipeline + BGL are dimension-agnostic
+// (vs_fullscreen has no per-instance state, fs_pip samples by UV, the
+// PiP rect goes through a per-call uniform buffer — see compose's
+// `uniform_buf` at the call site). Including webcam_w/h or output
+// dimensions would cause spurious rebuilds across clips with different
+// webcam shapes WITHOUT improving correctness. If a future change adds
+// dimension-baked constants to the shader (e.g. HDR / 10-bit work), the
+// key MUST grow accordingly. Audit by inspecting shaders/pip.wgsl.
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct PipPassKey {
+    pub source_w: u32,
+    pub source_h: u32,
+}
+
+#[allow(dead_code)]
+pub(crate) struct PipPassCache {
+    pub key: PipPassKey,
+    pub bind_group_layout: wgpu::BindGroupLayout,
+    pub pipeline_layout: wgpu::PipelineLayout,
+    pub pipeline: wgpu::RenderPipeline,
+    pub sampler: wgpu::Sampler,
+    pub shader: wgpu::ShaderModule,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) struct StrokePassKey {
+    // Phase 11: format hardcoded Rgba8Unorm so the key is empty in
+    // practice. Future HDR work extends with format/color-space.
+    pub _placeholder: u8,
+}
+
+#[allow(dead_code)]
+pub(crate) struct StrokePassCache {
+    pub key: StrokePassKey,
+    pub pipeline_layout: wgpu::PipelineLayout,
+    pub pipeline: wgpu::RenderPipeline,
+    pub shader: wgpu::ShaderModule,
+}
+
+#[allow(dead_code)]
+pub(crate) struct PooledVbo {
+    pub buffer: wgpu::Buffer,
+    pub capacity_vertices: usize,
+}
+
+#[allow(dead_code)]
+pub(crate) struct FreezeCache {
+    /// LRU. Newest at end. 16-entry cap. Linear scan is fine at N=16.
+    /// Per Fix #44, value is `Arc<Frame>` so cache hits clone an Arc
+    /// handle (cheap atomic refcount bump), not 8 MB of pixels.
+    pub entries: Vec<(FreezeCacheKey, Arc<Frame>)>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+#[allow(dead_code)]
+pub(crate) struct FreezeCacheKey {
+    // Per Fix #43, the cache key resists Arc-pointer-address reuse
+    // (allocator-slot reuse across drop-then-allocate at clip
+    // boundaries) by mixing content-derived prefix bytes alongside the
+    // pointer. `first16 + len + dims` cost ~64 bytes/key + a two-prefix
+    // copy; negligible vs the 8 MB compose work being cached.
+    pub source_ptr: usize, // Arc::as_ptr cast to usize
+    pub source_w: u32,
+    pub source_h: u32,
+    pub source_pixels_len: usize,
+    pub source_first16: [u8; 16],
+    pub webcam_ptr: usize,
+    pub webcam_w: u32,
+    pub webcam_h: u32,
+    pub webcam_pixels_len: usize,
+    pub webcam_first16: [u8; 16],
+    pub stroke_hash: u64,
 }
 
 /// PiP geometry matches v1's `pipTransform`: webcam at 22% of output width,
@@ -131,7 +255,27 @@ impl Compositor {
                 None,
             )
             .await?;
-        Ok(Self { device, queue })
+        Ok(Self {
+            device,
+            queue,
+            // Plan #4 Task 0: cache scaffolding initialized empty. Tasks
+            // 1–3 wire the lookup/insert paths into compose +
+            // encode_stroke_pass + compose_with_identity.
+            pip_cache: Mutex::new(None),
+            stroke_cache: Mutex::new(None),
+            stroke_vbo_pool: Mutex::new(None),
+            freeze_cache: Mutex::new(FreezeCache {
+                entries: Vec::new(),
+            }),
+            #[cfg(test)]
+            pip_cache_rebuilds: AtomicU64::new(0),
+            #[cfg(test)]
+            stroke_cache_rebuilds: AtomicU64::new(0),
+            #[cfg(test)]
+            stroke_vbo_grows: AtomicU64::new(0),
+            #[cfg(test)]
+            freeze_cache_hits: AtomicU64::new(0),
+        })
     }
 
     pub fn compose(
