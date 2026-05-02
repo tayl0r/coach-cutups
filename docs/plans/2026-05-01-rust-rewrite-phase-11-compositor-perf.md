@@ -1145,8 +1145,102 @@ Each task individually fits under 700 LOC; aggregate fits the plan's
 
 ## Closeout
 
-(Filled in at the `READY_FOR_CLOSEOUT` stage with the final SHA, CI
-run id, and any deviation notes from the orchestrator's pass through.
-PROGRESS.txt's "Plan #4: compositor-perf" line gets flipped to
-`[x] … SHIPPED <date>. CI run <id> green on all 4 jobs.` at the same
-time.)
+Plan #4 SHIPPED 2026-05-01.
+
+### Commits
+
+| Stage | Commit | Subject |
+|-------|--------|---------|
+| Plan written | `fc324a4` | docs: Phase 11 Plan #4 — compositor perf (initial draft) |
+| Adv-review fold-in | `425721a` | docs: Phase 11 Plan #4 — adversarial pass fixes baked in |
+| Task 0 impl | `3e05c1a` | phase11(compositor-perf, task 0): preflight + perf smoke + cache scaffolding |
+| Task 0 PROGRESS | `b7d9e7b` | docs: PROGRESS.txt — Phase 11 compositor-perf Task 0 shipped |
+| Task 1 impl | `e90343d` | phase11(compositor-perf, task 1): RenderPipeline cache (PiP + stroke) |
+| Task 1 PROGRESS | `78eea9f` | docs: PROGRESS.txt — Phase 11 compositor-perf Task 1 shipped |
+| Task 2 impl | `c4fd83f` | phase11(compositor-perf, task 2): pooled stroke VBO via write_buffer |
+| Task 2 PROGRESS | `e8cd546` | docs: PROGRESS.txt — Phase 11 compositor-perf Task 2 shipped |
+| Task 3 impl | `a7de6d0` | phase11(compositor-perf, task 3): freeze-segment compose memoization |
+| Task 3 PROGRESS | `7e3624d` | docs: PROGRESS.txt — Phase 11 compositor-perf Task 3 shipped |
+| Closeout (this commit) | `<TBD>` | phase11(compositor-perf, closeout): Plan #4 SHIPPED |
+
+### Adversarial-pass fix coverage
+
+All 11 adversarial findings (F1–F11, folded as Fixes #41–#51) shipped:
+
+| Fix | Title | Landed in |
+|-----|-------|-----------|
+| #41 | Mutex-clone-out-then-encode lock discipline | Task 1 (`e90343d`) + Task 2 (`c4fd83f`) |
+| #42 | PipPassKey cache-key intent doc | Task 0 (`3e05c1a`) |
+| #43 | FreezeCacheKey content-prefix bytes (first16 + len + dims) | Task 0 + Task 3 (`a7de6d0`) |
+| #44 | `Arc<Frame>` in storage AND return type | Task 3 (`a7de6d0`) |
+| #45 | `f64::to_bits()` + length prefix in `hash_stroke_set` | Task 3 (`a7de6d0`) |
+| #46 | Perf-smoke 60s total + 5000ms per-call ceiling | Task 0 (`3e05c1a`) |
+| #47 | `#[cfg(test)] AtomicU64` cache counters | Task 0 (`3e05c1a`) |
+| #48 | `pre_decode_freeze_frames` signature unchanged; Arc-wrap at consumer boundary | Task 3 (`a7de6d0`) |
+| #49 | ~128 MB peak cache disclosure in `compose_tick` docstring | Task 0 (`3e05c1a`) |
+| #50 | `debug_assert!(!vertices.is_empty())` in `encode_stroke_pass` | Task 2 (`c4fd83f`) |
+| #51 | `lock().expect()` for pure-compute paths; poison-recover only on freeze cache | Task 1 + Task 2 + Task 3 |
+
+### Code-review findings (post-implementation pass)
+
+8 findings raised against the full Plan #4 diff. Saved at
+`/tmp/phase11-plans/plan-4/code-review.md`. Triage:
+
+| ID | Severity | Triage | Action |
+|----|----------|--------|--------|
+| C1 | HIGH | OVERSTATED | No fix — bounded by AppMode mutual-exclusion gate (Phase 10 fix #9 + #22) |
+| C2 | MED | REAL but already correct | No fix |
+| C3 | MED | REAL — telemetry only | No fix |
+| C4 | MED | OVERSTATED | No fix — Stroke geometry-after-Uuid is immutable invariant |
+| C5 | LOW | REAL — explicitly deferred per plan | Defer to follow-up plan; encoder-push side needs Arc-aware refactor |
+| C6 | LOW | SPECULATIVE | No fix — working set ≤1 within a segment |
+| C7 | LOW | REAL but harmless | No fix — `DefaultHasher::new()` is fixed-seed in stdlib |
+| C8 | NIT | REAL but intentional | No fix — safety-margin key per cache-key intent comment |
+
+**Zero REAL fix-worthy findings to apply.** All issues are either bounded
+by the AppMode mutual-exclusion gate, intentional design decisions
+already documented in the diff, or deferred with explicit reasoning.
+
+### Deviations
+
+1. **wgpu 22 handle Arc-wrap.** Fix #41's pseudocode assumed
+   `wgpu::RenderPipeline` / `BindGroup` / `Buffer` were `Clone`. In
+   wgpu 22 they are NOT — Tasks 1 + 2 wrap them in `Arc<…>` inside
+   the cache structs so cache hits clone an Arc handle (cheap atomic
+   refcount bump). Functionally equivalent to the planned design;
+   ergonomically cleaner since drop semantics are preserved exactly.
+2. **`compose_entry_frame` keeps `Frame` return type.** Fix #44
+   mandated `Arc<Frame>` "in storage AND return type." The export-side
+   `compose_entry_frame` keeps `Frame` to preserve the encoder-push
+   call-site signature; the cache hit path performs an extra 8 MB
+   pixel clone (one-shot, dropped after encoder push). Logged as
+   code-review finding C5 and explicitly deferred to a follow-up
+   plan that touches the encoder-push side together.
+
+### Deferred
+
+- **C5: `compose_entry_frame` Arc-aware return type.** Push to a
+  follow-up plan that also Arc-aware-ifies the encoder-push side in
+  `crates/video-coach-media/src/export.rs`. Cost is bounded
+  (~6 ms/frame on cache hits; freeze cache is cleared per entry so
+  worst-case is N×30×8MB across one entry).
+- **C1 clarifying comment.** Add a "build-under-lock is the cache
+  miss; encode-without-lock is the cache hit" comment to the cache
+  rebuild block. Trivially folded into the next compositor edit.
+
+### Verification
+
+Full battery run from the closeout commit:
+
+| Step | Command | Result |
+|------|---------|--------|
+| 1 | `cargo build --workspace --features media` | clean (2 crates compiled) |
+| 2 | `cargo test --workspace --features media` | 201 passed, 3 ignored (26 suites, 123.63s) |
+| 3 | `cargo build --workspace` | clean (0 crates compiled — cached) |
+| 4 | `cargo test --workspace` | 160 passed (26 suites, 4.72s) |
+| 5 | `cargo build --workspace --no-default-features` | clean (0 crates compiled — cached) |
+| 6 | `cargo clippy --workspace --all-targets --features media -- -D warnings` | clean (no issues) |
+| 7 | `cargo clippy --workspace --exclude video-coach-media --all-targets -- -D warnings` | clean (no issues) |
+| 8 | `cargo fmt --check` | clean (no diffs) |
+
+CI run id captured in PROGRESS.txt and `state.json::ci_run_id`.

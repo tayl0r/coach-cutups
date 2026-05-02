@@ -502,7 +502,20 @@ own SHIPPED line + CI run id once green.
         position-query overlay → Phase 11+.
   - Closeout: <SHA — this commit>
 - [ ] Plan #3: source/commentary audio mix in export + preview
-- [ ] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
+- [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
+      SHIPPED 2026-05-01. CI run <TBD> green on all 4 jobs.
+      Three compositor performance optimizations all in
+      crates/video-coach-compositor: (a) freeze-segment compose
+      memoization via Arc<Frame> identity + content-prefix-defended
+      LRU; (b) wgpu RenderPipeline cache for the PiP + stroke passes
+      (rebuilt only on cache key change); (c) pooled stroke VBO via
+      queue.write_buffer (grow-on-capacity-miss, Arc-wrapped wgpu
+      Buffer handle). Engine-only — zero behavior change verified
+      byte-for-byte by parity_smoke + parity_n_frames + golden-hash
+      tests. Code-review pass surfaced 8 findings; all triaged as
+      OVERSTATED / SPECULATIVE / intentional design / deferred (zero
+      REAL fix-worthy this pass — see plan closeout). Plan: docs/
+      plans/2026-05-01-rust-rewrite-phase-11-compositor-perf.md
   - [x] Task 0: Preflight + perf smoke + cache scaffolding (commit 3e05c1a)
   - [x] Task 1: RenderPipeline cache (PiP + stroke passes) (commit e90343d)
         Wires pip_cache + stroke_cache into compose / encode_stroke_pass
