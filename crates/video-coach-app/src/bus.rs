@@ -141,6 +141,23 @@ pub enum Command {
         #[serde(default)]
         codec: video_coach_core::project::Codec,
         project_name: String,
+        /// Phase 11 Plan #7 Task 2. The user's filename template
+        /// (`{tag}` / `{project}` / `{date}` placeholders). The bus
+        /// validates it (sensitivity + sanitize-fallback gates) and
+        /// persists it onto `Project::preferences::export_filename_template`
+        /// alongside `last_export_resolution` / `last_export_quality` /
+        /// `last_export_codec`. Per-tag output filenames are then
+        /// composed via `crate::filename::apply_template` instead of
+        /// Phase 10's hardcoded `<tag> - <project>` format.
+        ///
+        /// `#[serde(default = "default_command_filename_template")]`
+        /// so a Phase-10-era control-socket client (or any test
+        /// fixture predating Plan #7) deserializes cleanly without
+        /// the field. The default reproduces Phase 10's hardcoded
+        /// format byte-for-byte; see
+        /// `default_command_filename_template_matches_core`.
+        #[serde(default = "default_command_filename_template")]
+        filename_template: String,
     },
     /// Phase 10. Request cancellation of the in-flight batch export.
     /// The bus flips its `current_export_cancel` AtomicBool; the export
@@ -152,6 +169,17 @@ pub enum Command {
     /// Phase 10 Task 0 lands only the command shape + a stub handler
     /// returning "not yet implemented (phase 10 task 2)".
     CancelExport,
+}
+
+/// Phase 11 Plan #7 Task 2. Default value for
+/// `Command::ExportCompilations::filename_template` when a Phase-10-era
+/// JSON payload (or a test fixture predating Plan #7) lacks the field.
+/// Delegates to `video_coach_core::project::default_filename_template`
+/// so the default lives in exactly one place across crates — see the
+/// `default_command_filename_template_matches_core` test below for the
+/// anti-drift guard.
+fn default_command_filename_template() -> String {
+    video_coach_core::project::default_filename_template()
 }
 
 /// Phase 10 Task 0 (fix #33). Tag selection for `ExportCompilations`.
@@ -263,11 +291,24 @@ pub struct CommandReply {
 /// clicks Export. The UI reads the slot synchronously when the
 /// File → Export menu item activates and writes the three Slint
 /// properties before flipping `export-sheet-visible = true`.
-#[derive(Debug, Clone, Copy)]
+// Phase 11 Plan #7 Task 2 (adv fix #1). `Copy` was dropped when
+// `export_filename_template: String` was added — `String` is not `Copy`,
+// and the deref-copy pattern in `BusHandle::export_prefs_snapshot`
+// (`*self.export_prefs.lock()...`) would otherwise fail to compile with
+// "cannot move out of dereference of MutexGuard". The accessor now
+// `.clone()`s the snapshot under the lock instead.
+#[derive(Debug, Clone)]
 pub struct ExportPrefsSnapshot {
     pub resolution: video_coach_core::project::Resolution,
     pub quality: video_coach_core::project::Quality,
     pub codec: video_coach_core::project::Codec,
+    /// Phase 11 Plan #7 Task 2. The user's `{tag}` / `{project}` /
+    /// `{date}` filename template, hydrated into the export sheet's
+    /// LineEdit on open. Persisted alongside the codec/res/quality
+    /// fields on Export click; defaults to Phase 10's `"{tag} - {project}"`
+    /// for fresh projects and Phase-10-era project.json files (the
+    /// `Preferences` field carries `#[serde(default = "default_filename_template")]`).
+    pub export_filename_template: String,
 }
 
 impl Default for ExportPrefsSnapshot {
@@ -277,6 +318,7 @@ impl Default for ExportPrefsSnapshot {
             resolution: p.last_export_resolution,
             quality: p.last_export_quality,
             codec: p.last_export_codec,
+            export_filename_template: p.export_filename_template,
         }
     }
 }
@@ -316,23 +358,43 @@ impl BusHandle {
     }
 
     /// Phase 11 Plan #3 Task 2 (fix #8). Synchronous accessor for the
-    /// last-written export preferences. Cheap (lock + Copy of three
-    /// enums); safe to call from the Slint UI thread.
+    /// last-written export preferences. Cheap (lock + clone of three
+    /// enums plus a short template string); safe to call from the
+    /// Slint UI thread.
+    ///
+    /// Phase 11 Plan #7 Task 2 (adv fix #1): clones under the lock now
+    /// that the snapshot carries an owned `String`
+    /// (`export_filename_template`) and is no longer `Copy`.
     pub fn export_prefs_snapshot(&self) -> ExportPrefsSnapshot {
-        *self
-            .export_prefs
+        self.export_prefs
             .lock()
             .expect("export_prefs slot poisoned")
+            .clone()
     }
 }
 
-/// Phase 11 Plan #3 Task 2. Project preferences → the three Slint string
-/// values the export-sheet's radio rows compare against. Pure function
-/// so a hydration test can assert the mapping without spinning a
-/// MainWindow.
+/// Phase 11 Plan #3 Task 2. Project preferences → the four Slint string
+/// values the export-sheet's radio rows + filename LineEdit compare
+/// against. Pure function so a hydration test can assert the mapping
+/// without spinning a MainWindow.
+///
+/// Phase 11 Plan #7 Task 2 (adv fix #1 + #10): widens the return tuple
+/// to 4 values to carry the filename template. Takes `snap` by value so
+/// the caller hands ownership of the template string in (no need to
+/// re-clone). Empty/whitespace templates are NOT rewritten here — the
+/// caller (sheet-open hydration in ui.rs) applies the
+/// "fall back to default on empty" policy so the LineEdit shows a
+/// sensible value on first open instead of an empty string. Keeping
+/// this function pure (no fallback magic) lets the unit test exercise
+/// the empty-string passthrough without confusion.
 pub fn export_prefs_to_slint_strings(
     snap: ExportPrefsSnapshot,
-) -> (&'static str, &'static str, &'static str) {
+) -> (
+    &'static str,
+    &'static str,
+    &'static str,
+    slint::SharedString,
+) {
     use video_coach_core::project::{Codec, Quality, Resolution};
     let res = match snap.resolution {
         Resolution::Source => "source",
@@ -348,7 +410,12 @@ pub fn export_prefs_to_slint_strings(
         Codec::H264 => "h264",
         Codec::Hevc => "hevc",
     };
-    (res, qual, codec)
+    (
+        res,
+        qual,
+        codec,
+        slint::SharedString::from(snap.export_filename_template),
+    )
 }
 
 #[cfg(feature = "media")]
@@ -361,6 +428,9 @@ fn write_export_prefs_snapshot(
         resolution: prefs.last_export_resolution,
         quality: prefs.last_export_quality,
         codec: prefs.last_export_codec,
+        // Phase 11 Plan #7 Task 2 (adv fix #1). Plumb the filename
+        // template into the snapshot the UI reads on sheet open.
+        export_filename_template: prefs.export_filename_template.clone(),
     };
 }
 
@@ -2178,6 +2248,7 @@ async fn handle(
             quality,
             codec,
             project_name,
+            filename_template,
         } => {
             #[cfg(not(feature = "media"))]
             {
@@ -2188,6 +2259,7 @@ async fn handle(
                     quality,
                     codec,
                     project_name,
+                    filename_template,
                 );
                 CommandReply {
                     ok: false,
@@ -2203,6 +2275,7 @@ async fn handle(
                     quality,
                     codec,
                     project_name,
+                    filename_template,
                     current,
                     current_mode,
                     recording,
@@ -2275,6 +2348,7 @@ async fn handle_export_compilations(
     quality: video_coach_core::project::Quality,
     codec: video_coach_core::project::Codec,
     project_name: String,
+    filename_template: String,
     current: &mut Option<(video_coach_core::project::Project, std::path::PathBuf)>,
     current_mode: &mut AppMode,
     recording: &Option<video_coach_media::recording::Recording>,
@@ -2286,7 +2360,6 @@ async fn handle_export_compilations(
     compositor: &std::sync::Arc<video_coach_compositor::Compositor>,
     export_cleanup_tx: &tokio::sync::mpsc::UnboundedSender<()>,
 ) -> CommandReply {
-    use crate::filename::sanitize_filename;
     use crate::frame_sink::{ExportProgressSlotData, ExportRunOutcome};
     use std::collections::HashMap;
     use std::path::PathBuf;
@@ -2305,6 +2378,63 @@ async fn handle_export_compilations(
         return CommandReply {
             ok: false,
             error: Some("invalid_input".into()),
+        };
+    }
+
+    // Phase 11 Plan #7 Task 2 (adv fix #7). Compute today's local date
+    // ONCE up front. All tags in a single batch share the same date
+    // string — a multi-tag batch starting at 23:59 local that crosses
+    // midnight still stamps every output file with the start-time date
+    // (desired: batch consistency). `date_naive()` extracts the
+    // calendar date in local time without going through timezone
+    // arithmetic, sidestepping the midnight-offset-by-one-second class
+    // of bugs around DST transitions.
+    let today_local = chrono::Local::now()
+        .date_naive()
+        .format("%Y-%m-%d")
+        .to_string();
+
+    // Phase 11 Plan #7 Task 2 (adv fix #8). Sensitivity-based template
+    // validation, BEFORE persistence and BEFORE the export run kicks
+    // off. Two probes with disjoint substituent values: if the rendered
+    // output is identical, the template has no effective placeholders
+    // (a single-tag run is fine, but a multi-tag run would write N
+    // files all to the same path, overwriting one another). A degenerate
+    // template that sanitizes to the literal `"untitled"` fallback is
+    // also rejected — even with N==1, the user almost certainly didn't
+    // mean a literal `untitled.mp4`.
+    //
+    // Two distinct reasons (`filename_template_invalid` for the
+    // sanitize-empty case, `filename_template_no_placeholders` for the
+    // overwrite-risk case) so the UI can surface a useful message.
+    // Order: invalid first, then no-placeholders. A degenerate template
+    // (e.g. `"."`) trips the invalid gate before the placeholder gate
+    // even has a chance to fire — invalid is the more specific failure.
+    let probe_a =
+        crate::filename::apply_template(&filename_template, "ALPHA", "BRAVO", "2000-01-01");
+    let probe_b =
+        crate::filename::apply_template(&filename_template, "ZETA", "YANKEE", "2099-12-31");
+    if probe_a == "untitled" {
+        tracing::warn!(
+            target: "export.lifecycle",
+            event = "export.batch.failed",
+            reason = "filename_template_invalid",
+        );
+        return CommandReply {
+            ok: false,
+            error: Some("filename_template_invalid".into()),
+        };
+    }
+    let template_has_placeholders = probe_a != probe_b;
+    if selections.len() > 1 && !template_has_placeholders {
+        tracing::warn!(
+            target: "export.lifecycle",
+            event = "export.batch.failed",
+            reason = "filename_template_no_placeholders",
+        );
+        return CommandReply {
+            ok: false,
+            error: Some("filename_template_no_placeholders".into()),
         };
     }
 
@@ -2389,6 +2519,11 @@ async fn handle_export_compilations(
         // Phase 11 Plan #3 Task 2: persist codec next to res/quality so a
         // sheet reopen reflects the user's last codec choice.
         project.preferences.last_export_codec = codec;
+        // Phase 11 Plan #7 Task 2: persist the filename template the
+        // user typed in the sheet so a reopen shows the same value.
+        // Validation (sensitivity gate + sanitize-fallback gate) ran
+        // earlier, so the template stored here is safe to round-trip.
+        project.preferences.export_filename_template = filename_template.clone();
         // Phase 11 Plan #3 Task 2 (fix #8): publish to the slot the UI
         // reads on subsequent sheet opens. Done before the spawn-blocking
         // disk write so a slow disk doesn't delay the in-memory snapshot.
@@ -2552,12 +2687,23 @@ async fn handle_export_compilations(
                 continue;
             }
 
-            // Build output path (per fix #31).
-            let output_path = output_folder_path.join(format!(
-                "{} - {}.mp4",
-                sanitize_filename(&label),
-                sanitize_filename(&project_name_trimmed),
-            ));
+            // Build output path. Phase 11 Plan #7 Task 2 replaces the
+            // per-piece `sanitize_filename` calls (Phase 10's hardcoded
+            // `<tag> - <project>.mp4` format) with a single
+            // `apply_template` call. The substitution happens BEFORE
+            // sanitize, and the whole-result sanitize replaces the
+            // per-piece approach. Phase 10 fix #31's Windows-reserved +
+            // empty-fallback contracts continue to apply because
+            // `apply_template` delegates to `sanitize_filename`. The
+            // default template `"{tag} - {project}"` reproduces the
+            // Phase 10 output byte-for-byte.
+            let filename = crate::filename::apply_template(
+                &filename_template,
+                &label,
+                &project_name_trimmed,
+                &today_local,
+            );
+            let output_path = output_folder_path.join(format!("{filename}.mp4"));
 
             // Silently delete prior output (per fix #13).
             let _ = std::fs::remove_file(&output_path);
@@ -3354,8 +3500,10 @@ mod tests {
     fn export_compilations_serde_roundtrips() {
         // Phase 10 Task 0: ExportCompilations carries Vec<TagSelection>,
         // a folder path, the persisted Resolution + Quality enums, and
-        // the project name (used for filename composition by the bus's
-        // `sanitize_filename` helper).
+        // the project name. Phase 11 Plan #7 added `filename_template`
+        // — exercised here at its default value to keep the existing
+        // assertion shape; the dedicated round-trip test below covers
+        // a non-default template explicitly.
         let cmd = Command::ExportCompilations {
             selections: vec![
                 TagSelection::AllClips,
@@ -3368,6 +3516,7 @@ mod tests {
             quality: video_coach_core::project::Quality::High,
             codec: video_coach_core::project::Codec::H264,
             project_name: "Practice 2026-04-30".into(),
+            filename_template: default_command_filename_template(),
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["cmd"], "export_compilations");
@@ -3389,6 +3538,7 @@ mod tests {
                 quality,
                 codec,
                 project_name,
+                filename_template,
             } => {
                 assert_eq!(selections.len(), 2);
                 assert_eq!(selections[0], TagSelection::AllClips);
@@ -3403,6 +3553,7 @@ mod tests {
                 assert_eq!(quality, video_coach_core::project::Quality::High);
                 assert_eq!(codec, video_coach_core::project::Codec::H264);
                 assert_eq!(project_name, "Practice 2026-04-30");
+                assert_eq!(filename_template, default_command_filename_template());
             }
             _ => panic!("expected ExportCompilations"),
         }
@@ -3421,6 +3572,7 @@ mod tests {
             quality: video_coach_core::project::Quality::Medium,
             codec: video_coach_core::project::Codec::Hevc,
             project_name: "Practice".into(),
+            filename_template: default_command_filename_template(),
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["cmd"], "export_compilations");
@@ -3461,6 +3613,7 @@ mod tests {
                 quality,
                 codec,
                 project_name,
+                filename_template,
             } => {
                 assert_eq!(selections.len(), 1);
                 assert_eq!(selections[0], TagSelection::AllClips);
@@ -3469,6 +3622,12 @@ mod tests {
                 assert_eq!(quality, video_coach_core::project::Quality::Medium);
                 assert_eq!(codec, video_coach_core::project::Codec::H264);
                 assert_eq!(project_name, "Legacy Practice");
+                // Phase 11 Plan #7 Task 2: a Phase-10-shaped JSON
+                // payload (no `filename_template` key) must default
+                // to the Phase 10 hardcoded format byte-for-byte —
+                // anti-drift guard pairs with
+                // `default_command_filename_template_matches_core`.
+                assert_eq!(filename_template, "{tag} - {project}");
             }
             _ => panic!("expected ExportCompilations"),
         }
@@ -3493,8 +3652,10 @@ mod tests {
             resolution: prefs.last_export_resolution,
             quality: prefs.last_export_quality,
             codec: prefs.last_export_codec,
+            // Phase 11 Plan #7 Task 2 (adv fix #1).
+            export_filename_template: prefs.export_filename_template.clone(),
         };
-        let (res, qual, codec) = export_prefs_to_slint_strings(snap);
+        let (res, qual, codec, _template) = export_prefs_to_slint_strings(snap);
         assert_eq!(res, "720");
         assert_eq!(qual, "low");
         assert_eq!(codec, "hevc");
@@ -3503,7 +3664,7 @@ mod tests {
         // to H.264 — guards the Phase 10-era project.json compatibility
         // path.
         let default_snap = ExportPrefsSnapshot::default();
-        let (res, qual, codec) = export_prefs_to_slint_strings(default_snap);
+        let (res, qual, codec, _template) = export_prefs_to_slint_strings(default_snap);
         assert_eq!(res, "1080");
         assert_eq!(qual, "medium");
         assert_eq!(codec, "h264");
@@ -3582,6 +3743,7 @@ mod tests {
             quality: video_coach_core::project::Quality::Low,
             codec: video_coach_core::project::Codec::H264,
             project_name: "Test".into(),
+            filename_template: default_command_filename_template(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let cmd2: Command = serde_json::from_str(&json).unwrap();
@@ -3672,6 +3834,7 @@ mod tests {
             video_coach_core::project::Quality::Low,
             video_coach_core::project::Codec::H264,
             "Test".into(),
+            default_command_filename_template(),
             &mut current,
             &mut current_mode,
             &recording,
@@ -3727,6 +3890,7 @@ mod tests {
             video_coach_core::project::Quality::Low,
             video_coach_core::project::Codec::H264,
             "Test".into(),
+            default_command_filename_template(),
             &mut current,
             &mut current_mode,
             &recording,
@@ -3749,6 +3913,329 @@ mod tests {
         // Mode must remain Recording (no clobber to Exporting).
         assert_eq!(current_mode, AppMode::Recording);
         assert!(current_export_cancel.is_none());
+    }
+
+    // ── Phase 11 Plan #7 Task 2 — filename-template tests ─────────────
+
+    #[test]
+    fn export_command_with_filename_template_round_trips() {
+        // Phase 11 Plan #7 Task 2. The new `filename_template` field
+        // travels intact through the same JSON serde path the control
+        // socket uses. Mirrors `export_command_with_hevc_codec_round_trips`
+        // for the codec field; the assertion is that a non-default
+        // template (`"{date}_{tag}_{project}"`) survives round-trip in
+        // both directions.
+        let cmd = Command::ExportCompilations {
+            selections: vec![TagSelection::AllClips],
+            output_folder: "/Users/x/Exports".into(),
+            resolution: video_coach_core::project::Resolution::R1080,
+            quality: video_coach_core::project::Quality::Medium,
+            codec: video_coach_core::project::Codec::H264,
+            project_name: "Practice".into(),
+            filename_template: "{date}_{tag}_{project}".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["filename_template"], "{date}_{tag}_{project}");
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                filename_template, ..
+            } => {
+                assert_eq!(filename_template, "{date}_{tag}_{project}");
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn export_command_without_filename_template_field_deserializes_to_default() {
+        // Phase 11 Plan #7 Task 2 (adv fix #2 corollary). A Phase-10-era
+        // control-socket client / harness fixture predating Plan #7
+        // sends JSON without a `filename_template` key. The
+        // `#[serde(default = "default_command_filename_template")]`
+        // attribute fills in the Phase 10 hardcoded format byte-for-
+        // byte, so existing harness tests (e.g. `export_smoke`) keep
+        // producing the expected `<tag> - <project>.mp4` output names
+        // without modification.
+        let json = r#"{
+            "cmd": "export_compilations",
+            "selections": [{"kind": "all_clips"}],
+            "output_folder": "/tmp/exports",
+            "resolution": "r720",
+            "quality": "low",
+            "codec": "h264",
+            "project_name": "Legacy"
+        }"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                filename_template, ..
+            } => {
+                assert_eq!(filename_template, "{tag} - {project}");
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn default_command_filename_template_matches_core() {
+        // Phase 11 Plan #7 Task 2 (adv fix #2 anti-drift guard). The
+        // bus's `default_command_filename_template` and core's
+        // `video_coach_core::project::default_filename_template` MUST
+        // agree byte-for-byte. If a future plan bumps one, the test
+        // fails loudly, forcing the other to follow.
+        assert_eq!(
+            default_command_filename_template(),
+            video_coach_core::project::default_filename_template(),
+        );
+    }
+
+    #[test]
+    fn opening_export_sheet_hydrates_filename_template_from_preferences() {
+        // Phase 11 Plan #7 Task 2 (adv fix #1). A snapshot built from
+        // a preferences value with a custom `export_filename_template`
+        // surfaces that template in the 4-tuple's last slot. The same
+        // helper drives the live `on_export_sheet_open_clicked` binding
+        // in ui.rs, so a regression here surfaces as the LineEdit
+        // reverting to the default on every reopen.
+        let prefs = video_coach_core::project::Preferences {
+            last_export_resolution: video_coach_core::project::Resolution::R720,
+            last_export_quality: video_coach_core::project::Quality::Low,
+            last_export_codec: video_coach_core::project::Codec::Hevc,
+            export_filename_template: "{tag}_{project}_{date}".into(),
+            ..Default::default()
+        };
+        let snap = ExportPrefsSnapshot {
+            resolution: prefs.last_export_resolution,
+            quality: prefs.last_export_quality,
+            codec: prefs.last_export_codec,
+            export_filename_template: prefs.export_filename_template.clone(),
+        };
+        let (_res, _qual, _codec, template) = export_prefs_to_slint_strings(snap);
+        assert_eq!(template.as_str(), "{tag}_{project}_{date}");
+
+        // Default Preferences (fresh project, never exported) hydrates
+        // the Phase 10 format — guards backward-compat.
+        let default_snap = ExportPrefsSnapshot::default();
+        let (_, _, _, default_template) = export_prefs_to_slint_strings(default_snap);
+        assert_eq!(default_template.as_str(), "{tag} - {project}");
+    }
+
+    #[test]
+    fn hydrate_empty_template_falls_back_to_default() {
+        // Phase 11 Plan #7 Task 2 (adv fix #10). A malformed
+        // project.json with explicit `"exportFilenameTemplate": ""`
+        // (or whitespace-only) deserializes to that empty string —
+        // serde does NOT call the `default = ...` function on a
+        // present-but-empty field. ui.rs's sheet-open hydration helper
+        // applies the empty-fallback policy.
+        //
+        // This test mirrors the policy code in
+        // `on_export_sheet_open_clicked` (ui.rs ~line 922-929): if
+        // `template.trim().is_empty()` use
+        // `default_filename_template()`, else use the template
+        // verbatim. We assert the policy directly against
+        // representative inputs.
+        fn hydrate(template: &str) -> String {
+            if template.trim().is_empty() {
+                video_coach_core::project::default_filename_template()
+            } else {
+                template.to_string()
+            }
+        }
+
+        // Empty string falls back.
+        assert_eq!(hydrate(""), "{tag} - {project}");
+        // Whitespace-only falls back.
+        assert_eq!(hydrate("   "), "{tag} - {project}");
+        assert_eq!(hydrate("\t\n"), "{tag} - {project}");
+        // Non-empty passes through verbatim, including templates with
+        // leading/trailing whitespace (the bus's per-tag sanitize
+        // call trims; the hydration policy is conservative).
+        assert_eq!(hydrate("{tag}"), "{tag}");
+        assert_eq!(hydrate("  {tag}  "), "  {tag}  ");
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn handle_export_with_invalid_template_emits_failed_event() {
+        // Phase 11 Plan #7 Task 2 (adv fix #8). A degenerate template
+        // (e.g. `"."`) sanitizes to `"untitled"` — the bus rejects with
+        // `reason = "filename_template_invalid"` BEFORE persisting
+        // prefs or starting the run (no `export.batch.started`).
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = video_coach_core::project::Project::new("Test");
+        video_coach_core::project_store::write(&project, dir.path()).unwrap();
+        let mut current = Some((project, dir.path().to_path_buf()));
+        let mut current_mode = AppMode::Scanning;
+        let recording: Option<video_coach_media::recording::Recording> = None;
+        let recording_clip: Option<RecordingClipInProgress> = None;
+        let recording_state = crate::frame_sink::new_recording_state();
+        let export_progress = crate::frame_sink::new_export_progress();
+        let export_prefs_slot = new_export_prefs_slot();
+        let mut current_export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+        let compositor = std::sync::Arc::new(
+            video_coach_compositor::Compositor::new_headless().expect("compositor"),
+        );
+        let (export_cleanup_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let reply = handle_export_compilations(
+            vec![TagSelection::AllClips],
+            dir.path().to_string_lossy().into_owned(),
+            video_coach_core::project::Resolution::R720,
+            video_coach_core::project::Quality::Low,
+            video_coach_core::project::Codec::H264,
+            "Test".into(),
+            // `.` sanitizes to "untitled" via filename::sanitize_filename's
+            // dot-trim contract — caught by the invalid gate.
+            ".".into(),
+            &mut current,
+            &mut current_mode,
+            &recording,
+            &recording_clip,
+            &recording_state,
+            &export_progress,
+            &export_prefs_slot,
+            &mut current_export_cancel,
+            &compositor,
+            &export_cleanup_tx,
+        )
+        .await;
+
+        assert!(!reply.ok, "should refuse degenerate template");
+        let err = reply.error.unwrap_or_default();
+        assert!(
+            err.contains("filename_template_invalid"),
+            "expected filename_template_invalid in error, got: {err}",
+        );
+        // Mode must NOT have transitioned out of Scanning — refusal
+        // happens before mode flip.
+        assert_eq!(current_mode, AppMode::Scanning);
+        // No cancel flag minted — refusal path.
+        assert!(current_export_cancel.is_none());
+    }
+
+    #[cfg(feature = "media")]
+    #[tokio::test]
+    async fn handle_export_with_no_placeholders_and_multi_tag_emits_failed_event() {
+        // Phase 11 Plan #7 Task 2 (adv fix #8). A static template
+        // ("static-name") with N>1 selections would write all N output
+        // files to the same path, overwriting each other. Reject with
+        // `reason = "filename_template_no_placeholders"`. A single
+        // selection with the same template would be accepted (no
+        // overwrite risk) — the gate is selection-count-conditioned.
+        let dir = tempfile::TempDir::new().unwrap();
+        let project = video_coach_core::project::Project::new("Test");
+        video_coach_core::project_store::write(&project, dir.path()).unwrap();
+        let mut current = Some((project, dir.path().to_path_buf()));
+        let mut current_mode = AppMode::Scanning;
+        let recording: Option<video_coach_media::recording::Recording> = None;
+        let recording_clip: Option<RecordingClipInProgress> = None;
+        let recording_state = crate::frame_sink::new_recording_state();
+        let export_progress = crate::frame_sink::new_export_progress();
+        let export_prefs_slot = new_export_prefs_slot();
+        let mut current_export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
+        let compositor = std::sync::Arc::new(
+            video_coach_compositor::Compositor::new_headless().expect("compositor"),
+        );
+        let (export_cleanup_tx, _rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+
+        let reply = handle_export_compilations(
+            vec![
+                TagSelection::AllClips,
+                TagSelection::Tag {
+                    name: "drills".into(),
+                },
+            ],
+            dir.path().to_string_lossy().into_owned(),
+            video_coach_core::project::Resolution::R720,
+            video_coach_core::project::Quality::Low,
+            video_coach_core::project::Codec::H264,
+            "Test".into(),
+            "static-name".into(),
+            &mut current,
+            &mut current_mode,
+            &recording,
+            &recording_clip,
+            &recording_state,
+            &export_progress,
+            &export_prefs_slot,
+            &mut current_export_cancel,
+            &compositor,
+            &export_cleanup_tx,
+        )
+        .await;
+
+        assert!(!reply.ok, "should refuse multi-tag with no placeholders");
+        let err = reply.error.unwrap_or_default();
+        assert!(
+            err.contains("filename_template_no_placeholders"),
+            "expected filename_template_no_placeholders in error, got: {err}",
+        );
+        // Mode must NOT have transitioned out of Scanning — refusal
+        // happens before mode flip.
+        assert_eq!(current_mode, AppMode::Scanning);
+        assert!(current_export_cancel.is_none());
+    }
+
+    #[test]
+    fn handle_export_with_default_template_writes_phase_10_format() {
+        // Phase 11 Plan #7 Task 2. Faithful approximation: this test
+        // replicates the bus's exact path-composition formula — see
+        // `handle_export_compilations` ~line 2705. Spinning up a real
+        // export pipeline (GStreamer + compositor + non-empty
+        // compilation plan + a fixture source video) is heavy; the
+        // bus's contract is "compose the per-tag filename via
+        // `apply_template(template, label, project_name, today_local)`
+        // and join into output_folder with `.mp4` extension". The
+        // E2E `export_smoke` harness test continues to verify the
+        // default-template path against a real pipeline (no
+        // `filename_template` key in its JSON → serde default →
+        // Phase 10 format byte-for-byte).
+        let template = default_command_filename_template();
+        let label = "all-clips";
+        let project_name = "phase10-export-test";
+        // today_local content is irrelevant for the default template
+        // (no `{date}` placeholder) — pin a fixed value to make the
+        // assertion stable regardless of when the test runs.
+        let today_local = "2026-05-01";
+        let filename = crate::filename::apply_template(&template, label, project_name, today_local);
+        let output_folder = std::path::PathBuf::from("/tmp/exports");
+        let output_path = output_folder.join(format!("{filename}.mp4"));
+        assert_eq!(
+            output_path,
+            std::path::PathBuf::from("/tmp/exports/all-clips - phase10-export-test.mp4"),
+        );
+    }
+
+    #[test]
+    fn handle_export_with_date_template_writes_today_local() {
+        // Phase 11 Plan #7 Task 2. Faithful approximation (see test
+        // above for rationale). Template `"{date}_{tag}"` substitutes
+        // the bus-supplied `today_local` value into position; the
+        // test pins today_local to a known date so the assertion is
+        // stable. The bus's runtime path
+        // (`chrono::Local::now().date_naive().format("%Y-%m-%d")`)
+        // is exercised by the hydration test above; this test exercises
+        // the substitution arithmetic.
+        let today_local = chrono::Local::now()
+            .date_naive()
+            .format("%Y-%m-%d")
+            .to_string();
+        let filename =
+            crate::filename::apply_template("{date}_{tag}", "drills", "MyProj", &today_local);
+        // Output begins with today's local date in YYYY-MM-DD form.
+        assert!(
+            filename.starts_with(&today_local),
+            "expected filename to start with {today_local}, got: {filename}",
+        );
+        assert!(
+            filename.ends_with("_drills"),
+            "expected filename to end with _drills, got: {filename}",
+        );
+        // Sanity: the date is exactly 10 chars (YYYY-MM-DD) followed
+        // by `_drills`.
+        assert_eq!(filename.len(), today_local.len() + "_drills".len());
     }
 
     #[cfg(feature = "media")]

@@ -912,16 +912,25 @@ pub fn run(
             return;
         };
         let snap = bus_for_sheet_open.export_prefs_snapshot();
-        let (res, qual, codec) = crate::bus::export_prefs_to_slint_strings(snap);
+        // Phase 11 Plan #7 Task 2 (adv fix #1 + #10). The snapshot now
+        // carries `export_filename_template`; the helper returns it as
+        // a SharedString in the 4th tuple slot. Apply the
+        // empty/whitespace-template fallback HERE (not inside the pure
+        // helper, which is a unit-tested 1:1 mapping) so a malformed
+        // project.json with an explicit empty template still presents a
+        // sensible LineEdit on sheet open. We do NOT immediately
+        // persist the default back to disk — the next Export click's
+        // existing prefs persistence handles fix-up.
+        let (res, qual, codec, template) = crate::bus::export_prefs_to_slint_strings(snap);
         w.set_export_resolution(slint::SharedString::from(res));
         w.set_export_quality(slint::SharedString::from(qual));
         w.set_export_codec(slint::SharedString::from(codec));
-        // Phase 11 Plan #7 Task 1 PLACEHOLDER hydration. Task 2 replaces
-        // this with a read of `prefs.export_filename_template` from the
-        // ExportPrefsSnapshot once the snapshot carries that field. For
-        // Task 1 we hydrate the default template so the LineEdit shows
-        // a sensible value on first open instead of an empty string.
-        w.set_export_filename_template(slint::SharedString::from(default_filename_template()));
+        let template_for_ui: slint::SharedString = if template.trim().is_empty() {
+            slint::SharedString::from(default_filename_template())
+        } else {
+            template
+        };
+        w.set_export_filename_template(template_for_ui);
         // Phase 11 Plan #7 Task 1 PLACEHOLDER split: write empty model
         // to selected-export-tag-rows and the full export-tag-rows model
         // to unselected-export-tag-rows. Task 2 partitions properly by
@@ -1032,6 +1041,13 @@ pub fn run(
             }
         };
         let project_name = w.get_export_project_name().to_string();
+        // Phase 11 Plan #7 Task 2. Pass the LineEdit-bound template
+        // string through. The bus runs sensitivity validation +
+        // sanitize-fallback gates BEFORE persisting or starting the
+        // run; an invalid template fails fast with one of two
+        // tracing reasons (`filename_template_invalid` or
+        // `filename_template_no_placeholders`).
+        let filename_template = w.get_export_filename_template().to_string();
         rt_for_start.spawn(async move {
             bus.send(
                 UI_COMMAND_ID.into(),
@@ -1042,6 +1058,7 @@ pub fn run(
                     quality,
                     codec,
                     project_name,
+                    filename_template,
                 },
             )
             .await;
