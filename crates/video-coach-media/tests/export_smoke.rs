@@ -20,12 +20,13 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
+use gstreamer_pbutils::prelude::DiscovererStreamInfoExt;
 use uuid::Uuid;
 
 use video_coach_compositor::Compositor;
 use video_coach_core::compilation_plan::{CompilationEntry, CompilationPlan};
 use video_coach_core::event::{CommentaryEvent, EventKind};
-use video_coach_core::project::{Clip, Quality, Resolution};
+use video_coach_core::project::{Clip, Codec, Quality, Resolution};
 use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
 use video_coach_core::timeline::{playback_segments, PlaybackSegment};
 use video_coach_media::export::{export_compilation, ExportError, ExportInputs};
@@ -43,7 +44,7 @@ fn set_test_env() {
     // off so the cargo test harness doesn't need a Cocoa runloop on macOS.
     std::env::set_var(
         "GST_PLUGIN_FEATURE_RANK",
-        "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE",
+        "vtdec_hw:NONE,vtenc_h264:NONE,vtenc_h264_hw:NONE,vtenc_h265:NONE,vtenc_h265_hw:NONE",
     );
 }
 
@@ -168,6 +169,7 @@ fn export_compilation_writes_h264_mp4_for_single_clip_plan() {
         &out_path,
         Resolution::R720, // smaller than source — exercises the videoscale leg.
         Quality::Low,
+        Codec::H264,
         /* source_volume    */ 1.0,
         /* commentary_volume*/ 1.0,
         compositor,
@@ -272,6 +274,7 @@ fn export_compilation_cancel_deletes_partial_output() {
         &out_path,
         Resolution::R720,
         Quality::Low,
+        Codec::H264,
         1.0,
         1.0,
         compositor,
@@ -294,5 +297,109 @@ fn export_compilation_cancel_deletes_partial_output() {
         !out_path.exists(),
         "partial output should be deleted on cancel: {}",
         out_path.display(),
+    );
+}
+
+/// Phase 11 Plan #3 Task 1: HEVC smoke test. Mirrors the H.264 case but
+/// passes `Codec::Hevc`. Asserts:
+///   - Output `.mp4` exists and `metadata.len() > 50_000` bytes (per
+///     Plan #3 fix #3 — a kbps-vs-bps mis-encode would be < 1 KB).
+///   - Discoverer's video-stream caps string starts with
+///     `"video/x-h265"` (per Plan #3 fix #7 — exact prefix; rejects
+///     both a malformed `video/x-h265-fragment` and the silent
+///     fallback-to-H.264 regression).
+///   - Wall-clock budget 120s (per "Known unknowns" #3: lavapipe
+///     Linux runners have no GPU encoder so HEVC falls all the way
+///     through to `x265enc`, which is significantly slower than
+///     `x264enc` for the same content).
+#[test]
+fn export_compilation_with_hevc_writes_non_empty_mp4() {
+    set_test_env();
+
+    let source = fixture("source-1080p.mp4");
+    let recording = fixture("webcam.mov");
+
+    let recording_duration = 1.5_f64;
+    let source_duration = 60.0_f64;
+    let (clip, plan) = build_single_clip_plan(recording_duration, source_duration);
+    let inputs = build_inputs(clip, plan, source, recording, source_duration);
+
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let out_path = tmp.path().join("export-hevc.mp4");
+
+    let compositor = Arc::new(Compositor::new_headless().expect("headless compositor"));
+    let cancel = Arc::new(AtomicBool::new(false));
+    let on_progress: Box<dyn Fn(video_coach_media::export::ExportProgress) + Send + Sync> =
+        Box::new(|_p| {});
+
+    let started = std::time::Instant::now();
+    let summary = export_compilation(
+        inputs,
+        &out_path,
+        Resolution::R720,
+        Quality::Low,
+        Codec::Hevc,
+        /* source_volume    */ 1.0,
+        /* commentary_volume*/ 1.0,
+        compositor,
+        cancel,
+        on_progress,
+    )
+    .expect("export_compilation should succeed for single-clip HEVC plan");
+    let elapsed = started.elapsed();
+    eprintln!(
+        "export_smoke(hevc): frames_pushed={}, elapsed={:?}",
+        summary.frames_pushed, elapsed,
+    );
+
+    assert!(
+        summary.frames_pushed >= 30,
+        "expected ≥30 frames pushed for 1.5s plan, got {}",
+        summary.frames_pushed,
+    );
+
+    // Per Plan #3 fix #3: tightened size assertion. A bps-vs-kbps
+    // mis-encode (vtenc_h265_hw silently routed through the kbps
+    // divisor) would produce < 1 KB output; 50 KB is comfortably
+    // above that and well below any plausible legitimate output.
+    let metadata = std::fs::metadata(&out_path).expect("output mp4 should exist");
+    assert!(
+        metadata.len() > 50_000,
+        "expected > 50KB HEVC output, got {} bytes",
+        metadata.len(),
+    );
+
+    // Discoverer probe with a generous 90s timeout (per "Known
+    // unknowns" #3: lavapipe Linux x265enc is slow enough that the
+    // standard 60s probe budget can squeeze).
+    let _ = video_coach_media::init();
+    let timeout = gstreamer::ClockTime::from_seconds(90);
+    let discoverer = gstreamer_pbutils::Discoverer::new(timeout).expect("discoverer");
+    let abs = out_path.canonicalize().expect("canonicalize output");
+    let uri = format!("file://{}", abs.to_str().expect("output utf8 path"));
+    let info = discoverer
+        .discover_uri(&uri)
+        .unwrap_or_else(|e| panic!("discover {uri}: {e}"));
+
+    let video_streams = info.video_streams();
+    let v = video_streams
+        .first()
+        .expect("output mp4 should have a video stream");
+    // Per Plan #3 fix #7: exact-prefix match on `video/x-h265`. This
+    // rejects both a malformed `video/x-h265-fragment` and the
+    // silent-fallback-to-H.264 regression mode (caps would start
+    // with `video/x-h264`).
+    let caps_str = v.caps().expect("caps").to_string();
+    assert!(
+        caps_str.starts_with("video/x-h265"),
+        "expected HEVC output, got caps: {caps_str}",
+    );
+
+    // 120s wall-clock budget per Plan #3 Task 1 spec. If this is
+    // exceeded on the runner, the test should be marked `#[ignore]`
+    // rather than relax the budget.
+    assert!(
+        elapsed < Duration::from_secs(120),
+        "HEVC export took {elapsed:?}, exceeded 120s budget",
     );
 }

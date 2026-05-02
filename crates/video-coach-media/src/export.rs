@@ -142,6 +142,7 @@ pub fn export_compilation(
     output_path: &Path,
     resolution: Resolution,
     quality: Quality,
+    codec: Codec,
     _source_volume: f64,     // fix #8: unused in Phase 10 (recording-only audio)
     _commentary_volume: f64, // fix #8: unused in Phase 10
     compositor: Arc<Compositor>,
@@ -243,7 +244,8 @@ pub fn export_compilation(
         source_h,
         target_size.0,
         target_size.1,
-        bitrate(resolution, quality, Codec::H264),
+        bitrate(resolution, quality, codec),
+        codec,
     )?;
 
     // ── Step 5: build the shared audio-appsrc → encoder → qtmux chain. ──
@@ -408,16 +410,54 @@ fn pick_h264_encoder(target_bitrate: u32) -> Result<gstreamer::Element, ExportEr
     Err(ExportError::MissingElement("h264 encoder (any)".into()))
 }
 
+/// Pick the best-available HEVC (H.265) encoder element.
+///
+/// Order: HW per platform first, SW (`x265enc`) last. `make_or` failures
+/// for unavailable factories are non-fatal and intentional; on
+/// lavapipe/CI Linux runners we expect `vaapih265enc` + `nvh265enc` to
+/// fail-load and emit `gst-plugin-loader` warnings before the loop falls
+/// through to `x265enc` (this mirrors `pick_h264_encoder`'s tolerated
+/// behavior — Phase 11 Plan #3 fix #1).
+///
+/// macOS note (Phase 11 Plan #3 fix #2): stock GStreamer 1.22+ registers
+/// VideoToolbox HEVC under `vtenc_h265_hw` (HW) and `vtenc_h265` (SW
+/// fallback). We list `_hw` first; if `_hw` isn't registered on the
+/// runner, the SW `vtenc_h265` is still better than `x265enc`.
+fn pick_h265_encoder(target_bitrate: u32) -> Result<gstreamer::Element, ExportError> {
+    let candidates: &[&str] = &[
+        "vtenc_h265_hw", // Apple Silicon HW path (preferred)
+        "vtenc_h265",    // VideoToolbox SW fallback
+        "mfh265enc",     // Windows Media Foundation
+        "vaapih265enc",  // Linux VA-API
+        "nvh265enc",     // NVIDIA NVENC
+        "x265enc",       // CPU fallback (always present via gst-plugins-bad)
+    ];
+    for name in candidates {
+        if let Ok(elem) = make_or(name) {
+            try_set_encoder_bitrate(&elem, name, target_bitrate);
+            tracing::info!(target: "export.lifecycle", event = "export.encoder_picked", encoder = name);
+            return Ok(elem);
+        }
+    }
+    Err(ExportError::MissingElement("h265 encoder (any)".into()))
+}
+
 fn try_set_encoder_bitrate(elem: &gstreamer::Element, encoder_name: &str, target_bps: u32) {
     use gstreamer::glib::object::ObjectExt;
     let Some(spec) = elem.find_property("bitrate") else {
         return;
     };
     let value_type = spec.value_type();
-    // x264enc, vaapih264enc, nvh264enc, mfh264enc: kbps. vtenc_h264: bps.
-    let primary = match encoder_name {
-        "vtenc_h264" => target_bps,
-        _ => target_bps / 1000,
+    // VideoToolbox encoders (vtenc_h264, vtenc_h264_hw, vtenc_h265,
+    // vtenc_h265_hw): bps. Everything else (x264/x265enc, vaapi*, nv*,
+    // mf*): kbps. The `starts_with("vtenc_")` prefix dispatch (per
+    // Phase 11 Plan #3 fix #3) catches all VT variants — a literal
+    // match would silently miss `vtenc_h265_hw` and divide-by-1000,
+    // producing a corrupt sub-1 KB output.
+    let primary = if encoder_name.starts_with("vtenc_") {
+        target_bps
+    } else {
+        target_bps / 1000
     };
     if value_type == gstreamer::glib::Type::U32 {
         elem.set_property("bitrate", primary);
@@ -828,6 +868,7 @@ fn build_webcam_chain(
 
 // ─── output (encode + mux + filesink) chains ────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 fn build_video_output_chain(
     pipeline: &gstreamer::Pipeline,
     output_path: &Path,
@@ -836,6 +877,7 @@ fn build_video_output_chain(
     target_w: u32,
     target_h: u32,
     target_bitrate: u32,
+    codec: Codec,
 ) -> Result<AppSrc, ExportError> {
     // appsrc caps pinned to SOURCE size (per fix #28); videoscale + capsfilter
     // handle the target.
@@ -862,8 +904,30 @@ fn build_video_output_chain(
         )
         .build()
         .map_err(|_| ExportError::MissingElement("capsfilter".into()))?;
-    let video_enc = pick_h264_encoder(target_bitrate)?;
-    let h264parse = make_or("h264parse")?;
+    // Phase 11 Plan #3: codec-dispatched encoder + parser pair.
+    let (video_enc, parser) = match codec {
+        Codec::H264 => (pick_h264_encoder(target_bitrate)?, make_or("h264parse")?),
+        Codec::Hevc => (pick_h265_encoder(target_bitrate)?, make_or("h265parse")?),
+    };
+    // Phase 11 Plan #3 fix #4: qtmux requires AVCC/HVCC stream-format
+    // for MP4 (not byte-stream). h264parse auto-converts because qtmux
+    // advertises `stream-format=avc` on its H.264 sink-pad caps. h265parse
+    // is the same shape, but on some GStreamer 1.20 builds the default
+    // emit is `stream-format=byte-stream, alignment=nal` which qtmux
+    // rejects with `could not link h265parse to qtmux`. Insert an
+    // explicit capsfilter on the HEVC path only.
+    let parser_caps_filter: Option<gstreamer::Element> = match codec {
+        Codec::H264 => None,
+        Codec::Hevc => {
+            let caps = gstreamer::Caps::from_str("video/x-h265,stream-format=hvc1,alignment=au")
+                .map_err(|_| ExportError::Construction("parse h265 parser caps".into()))?;
+            let cf = gstreamer::ElementFactory::make("capsfilter")
+                .property("caps", &caps)
+                .build()
+                .map_err(|_| ExportError::MissingElement("capsfilter (h265)".into()))?;
+            Some(cf)
+        }
+    };
     let qtmux = gstreamer::ElementFactory::make("qtmux")
         .name("qtmux")
         .build()
@@ -877,28 +941,56 @@ fn build_video_output_chain(
         .build()
         .map_err(|_| ExportError::MissingElement("filesink".into()))?;
 
-    pipeline
-        .add_many([
+    // add_many: include the HEVC parser-capsfilter only when present.
+    if let Some(parser_caps_filter) = parser_caps_filter.as_ref() {
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gstreamer::Element>(),
+                &videoconvert,
+                &videoscale,
+                &capsfilter_target,
+                &video_enc,
+                &parser,
+                parser_caps_filter,
+                &qtmux,
+                &filesink,
+            ])
+            .map_err(|e| ExportError::Construction(format!("add output chain: {e}")))?;
+        gstreamer::Element::link_many([
             appsrc.upcast_ref::<gstreamer::Element>(),
             &videoconvert,
             &videoscale,
             &capsfilter_target,
             &video_enc,
-            &h264parse,
+            &parser,
+            parser_caps_filter,
             &qtmux,
-            &filesink,
         ])
-        .map_err(|e| ExportError::Construction(format!("add output chain: {e}")))?;
-    gstreamer::Element::link_many([
-        appsrc.upcast_ref::<gstreamer::Element>(),
-        &videoconvert,
-        &videoscale,
-        &capsfilter_target,
-        &video_enc,
-        &h264parse,
-        &qtmux,
-    ])
-    .map_err(|e| ExportError::Construction(format!("link output chain: {e}")))?;
+        .map_err(|e| ExportError::Construction(format!("link output chain: {e}")))?;
+    } else {
+        pipeline
+            .add_many([
+                appsrc.upcast_ref::<gstreamer::Element>(),
+                &videoconvert,
+                &videoscale,
+                &capsfilter_target,
+                &video_enc,
+                &parser,
+                &qtmux,
+                &filesink,
+            ])
+            .map_err(|e| ExportError::Construction(format!("add output chain: {e}")))?;
+        gstreamer::Element::link_many([
+            appsrc.upcast_ref::<gstreamer::Element>(),
+            &videoconvert,
+            &videoscale,
+            &capsfilter_target,
+            &video_enc,
+            &parser,
+            &qtmux,
+        ])
+        .map_err(|e| ExportError::Construction(format!("link output chain: {e}")))?;
+    }
     qtmux
         .link(&filesink)
         .map_err(|e| ExportError::Construction(format!("qtmux→filesink: {e}")))?;
@@ -1658,6 +1750,20 @@ mod tests {
         let clean_count = (1.5_f64 * 30.0).round() as u64;
         assert_eq!(clean_count, 45);
         assert_eq!(clean_count * FRAME_DURATION_NS, 1_499_999_985);
+    }
+
+    /// Phase 11 Plan #3 Task 1: `pick_h265_encoder` returns a usable
+    /// factory. CI runners ship `x265enc` via `gst-plugins-bad`/
+    /// `gst-plugins-good` (lavapipe Linux runner included), so the
+    /// loop falls through to it when no HW encoder is available.
+    #[test]
+    fn pick_h265_encoder_returns_some_factory() {
+        let _ = crate::init();
+        let elem = pick_h265_encoder(7_200_000).expect("pick_h265_encoder should return Ok");
+        // Element factory name is one of our candidates; can't assert
+        // which without env-coupling, but the OK return + non-empty
+        // factory is enough.
+        assert!(elem.factory().is_some(), "encoder element has a factory");
     }
 
     /// Ensures the audio-window byte calculation lands sample-aligned and

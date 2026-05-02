@@ -2523,6 +2523,7 @@ async fn handle_export_compilations(
                     &output_path_for_export,
                     resolution,
                     quality,
+                    video_coach_core::project::Codec::H264, // Plan #3 Task 1: temporary; Task 2 plumbs the actual user choice through Command::ExportCompilations.
                     source_volume,
                     commentary_volume,
                     compositor_for_export,
