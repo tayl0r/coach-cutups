@@ -118,7 +118,7 @@ final class Workspace {
         }
 
         if sourcePlayer == nil {
-            sourcePlayer = try MPVSourcePlayer()
+            sourcePlayer = MPVSourcePlayer()
         }
         sourcePlayer?.setPlaylist(resolved.map { $0.url.path(percentEncoded: false) })
         sourcePlayer?.setVolume(project.preferences.scanVolume)

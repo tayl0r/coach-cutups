@@ -1,68 +1,127 @@
 import Foundation
 import Observation
-import AppKit  // NSOpenGLContext for attachRenderGL (Task 2.1)
-import Metal
+import AppKit
 import QuartzCore
-import OpenGL.GL3  // glBindFramebuffer / glViewport / glFlush / GL_FRAMEBUFFER for renderIntoGL (Task 2.2)
 import Libmpv  // module name confirmed in Phase 1 (NOT "MPVKit"; MPVKit's modulemap names the umbrella module Libmpv)
 
-/// Wraps a persistent mpv_handle for source-playback (D2 in the design).
-/// One instance per Workspace; setPlaylist() reuses it across rebuilds.
+// Render path history:
+//   Phase 1 of mpv migration: vo=libmpv + MPV_RENDER_API_TYPE_SW
+//     (per-frame CPU staging copy; intentional bring-up choice).
+//   Phase 7: vo=libmpv + MPV_RENDER_API_TYPE_OPENGL bridged via IOSurface
+//     to a Metal layer (Path A). Eliminated CPU staging copy but pulled
+//     in deprecated GL APIs. Persistent mpv handle survived view mount/
+//     unmount cycles via attachRenderGL/detachRenderGL.
+//   Phase 8 (current): vo=gpu-next + wid=<CAMetalLayer*> (Path B). mpv
+//     renders directly via libplacebo → Vulkan → MoltenVK → Metal into a
+//     layer we own. The mpv_handle is created on attachLayer (with wid
+//     set before mpv_initialize) and torn down on detachLayer; persistent-
+//     handle is not possible because mpv's wid option/property is read-
+//     only at runtime (verified in plan v2 review). Swift-side fields
+//     (playlist paths, position, paused, volume) replay onto the fresh
+//     handle on each attach. The MPVKit demo's MPVMetalViewController is
+//     the load-bearing reference implementation.
+
+/// Wraps an mpv_handle for source-playback. The handle is not persistent
+/// — it is created lazily by `attachLayer(_:)` and torn down by
+/// `detachLayer()`. One Swift instance per Workspace; setPlaylist() and
+/// other mutations update Swift-side cached state and (when attached)
+/// also issue mpv calls. State replays onto the fresh handle on each
+/// attach, so the player is "headless" between mounts.
 @MainActor
 @Observable
 public final class MPVSourcePlayer {
     /// hwdec value chosen during Phase 1's gate. Recorded here as the
-    /// source of truth. Phase 1 confirmed videotoolbox plays the test
-    /// file smoothly — the assumption that mpv-via-VT shared
-    /// AVFoundation's broken HEVC decoder turned out to be false.
+    /// source of truth.
     private static let hwdecOption = "videotoolbox"
 
-    fileprivate let handle: OpaquePointer
-    // Render-context state lives outside the actor so the CVDisplayLink
-    // thread can call renderInto without hopping to the main actor. The
-    // NSLock guards both renderContext lifecycle and reads.
-    // @ObservationIgnored so the @Observable macro doesn't wrap accesses
-    // (which would defeat nonisolated(unsafe)).
+    /// nonisolated(unsafe) because the event-pump thread and detachLayer
+    /// access the handle off-main; mpv's C API on a single mpv_handle is
+    /// documented thread-safe in client.h. nil between detach and re-
+    /// attach. @ObservationIgnored so the @Observable macro doesn't wrap
+    /// accesses (which would defeat nonisolated(unsafe)).
     @ObservationIgnored
-    nonisolated(unsafe) fileprivate var renderContext: OpaquePointer?
-    fileprivate let renderLock = NSLock()
+    private nonisolated(unsafe) var handle: OpaquePointer?
+
+    /// Strong reference to the layer that's currently embedded. Set in
+    /// `attachLayer` *after* `mpv_initialize` succeeds; cleared in
+    /// `detachLayer` *after* `mpv_terminate_destroy` returns. The
+    /// `wid` we set on mpv is `Unmanaged.passUnretained(layer).toOpaque()`
+    /// which does NOT retain — this field is the strong ref keeping the
+    /// layer alive while mpv has the pointer.
+    @ObservationIgnored
+    private var attachedLayer: CAMetalLayer?
+
+    private let audioOff: Bool
 
     /// Cached playlist paths in the order setPlaylist received them.
-    /// Used by seek() to avoid mpv_get_property("playlist/<i>/filename")
-    /// from the main actor.
+    /// Replayed onto a fresh handle in attachLayer.
     fileprivate var playlistPaths: [String] = []
 
-    // Observed state — all updated from the event pump (Task 3.3).
+    // Observed state — updated from the event pump while attached, and
+    // also written directly by play/pause/setVolume so the Swift-side
+    // truth is correct even between detach and re-attach (state replays).
     public private(set) var isPaused: Bool = true
     public private(set) var playlistCount: Int = 0
     public private(set) var playlistPos: Int = 0
     public private(set) var timePos: Double = 0
     public private(set) var generation: UInt64 = 0
 
+    /// Cached volume (linear, 0...1). Replayed onto the fresh handle.
+    private var volume: Double = 1.0
+
     /// True when at least one file is loaded in the playlist. `playlistPos`
     /// is clamped to 0 even when mpv would report -1 (no file), so callers
     /// must check this instead of `playlistPos >= 0`.
     public var hasLoadedFile: Bool { playlistCount > 0 }
 
-    // Single-slot pending-seek tracking (Task 3.7).
+    // Single-slot pending-seek tracking.
     fileprivate struct PendingSeek {
         let replyID: UInt64
         let generation: UInt64
         let completion: @MainActor () -> Void
         /// Holds the strdup'd argv alive past mpv_command_async's return,
-        /// freed on MPV_EVENT_COMMAND_REPLY (Task 3.7).
+        /// freed on MPV_EVENT_COMMAND_REPLY.
         var cstrings: [UnsafeMutablePointer<CChar>?]
         var commandReplied: Bool
     }
     fileprivate var pending: PendingSeek?
     fileprivate var nextReplyID: UInt64 = 100
 
-    private var pumpThread: Thread?
+    @ObservationIgnored
+    private nonisolated(unsafe) var pumpThread: Thread?
 
-    public init(audioOff: Bool = false) throws {
+    public init(audioOff: Bool = false) {
+        self.audioOff = audioOff
+        // Handle is created lazily in attachLayer. This makes the player
+        // Swift-side construct cheap and aligns lifecycle with the layer
+        // it draws into.
+    }
+
+    deinit {
+        detachLayer()  // idempotent if already detached
+    }
+
+    // MARK: - Layer attach / detach
+
+    /// Create a fresh mpv_handle bound to `layer`, replay Swift-side
+    /// cached state onto it, and start the event pump. `wid` MUST be set
+    /// before `mpv_initialize` — mpv's wid option is documented pre-init-
+    /// only and the property is read-only after init.
+    public func attachLayer(_ layer: CAMetalLayer) throws {
+        precondition(handle == nil, "attachLayer called twice without intervening detachLayer")
+
         guard let h = mpv_create() else { throw MPVSourcePlayerError.createFailed }
+
+        // wid: integer reinterpretation of an unretained pointer to the
+        // layer. attachedLayer (set after mpv_initialize succeeds below)
+        // holds the strong reference for the duration of this attach.
+        var wid: Int64 = Int64(Int(bitPattern: Unmanaged.passUnretained(layer).toOpaque()))
+        mpv_set_option(h, "wid", MPV_FORMAT_INT64, &wid)
+
         for (k, v) in [
-            ("vo", "libmpv"),
+            ("vo", "gpu-next"),
+            ("gpu-api", "vulkan"),
+            ("gpu-context", "moltenvk"),
             ("hwdec", Self.hwdecOption),
             ("prefetch-playlist", "yes"),
             ("keep-open", "yes"),
@@ -73,9 +132,6 @@ public final class MPVSourcePlayer {
             ("osc", "no"),
             ("osd-level", "0"),
             ("target-colorspace-hint", "yes"),
-            // NOTE: "volume-correct" was in the design (D15) but is NOT
-            // a real mpv option — Phase 1 implementer caught this.
-            // mpv's "volume" property is already linear by default.
         ] {
             mpv_set_option_string(h, k, v)
         }
@@ -85,16 +141,94 @@ public final class MPVSourcePlayer {
             // be set BEFORE mpv_initialize — it's not a runtime property.
             mpv_set_option_string(h, "ao", "null")
         }
+
         let rc = mpv_initialize(h)
         guard rc >= 0 else {
             mpv_destroy(h)
             throw MPVSourcePlayerError.initializeFailed(code: Int(rc))
         }
+
+        // Only commit the handle/layer references AFTER successful init.
+        // A failed init must not leak ownership of the layer.
         self.handle = h
+        self.attachedLayer = layer
+
         mpv_observe_property(h, 1, "pause",          MPV_FORMAT_FLAG)
         mpv_observe_property(h, 2, "playlist-count", MPV_FORMAT_INT64)
         mpv_observe_property(h, 3, "playlist-pos",   MPV_FORMAT_INT64)
         mpv_observe_property(h, 4, "time-pos",       MPV_FORMAT_DOUBLE)
+
+        startEventPump()
+
+        // Replay Swift-side state onto the fresh handle. mpv was started
+        // with pause=yes so video doesn't start before our state replay
+        // finishes; we explicitly unpause at the end if we were playing.
+        if !playlistPaths.isEmpty {
+            runCommandSync(["loadfile", playlistPaths[0], "replace"])
+            for p in playlistPaths.dropFirst() {
+                runCommandSync(["loadfile", p, "append"])
+            }
+            if playlistPos > 0 && playlistPos < playlistPaths.count {
+                runCommandSync(["playlist-play-index", String(playlistPos)])
+            }
+            if timePos > 0 {
+                // At replay time we need an explicit seek because the
+                // loadfile already happened above.
+                runCommandSync(["seek", String(timePos), "absolute+keyframes"])
+            }
+        }
+        // Replay volume (independent of playlist).
+        var mpvVolume = max(0, min(100, volume * 100))
+        mpv_set_property(h, "volume", MPV_FORMAT_DOUBLE, &mpvVolume)
+        // Restore paused state — mpv is currently paused; only unpause
+        // if we were playing.
+        if !isPaused {
+            var flag: Int32 = 0
+            mpv_set_property(h, "pause", MPV_FORMAT_FLAG, &flag)
+        }
+    }
+
+    /// Tear down the mpv_handle. Idempotent. `nonisolated` because deinit
+    /// (always nonisolated) calls it; updating @MainActor properties from
+    /// here uses a synchronous main-thread hop.
+    public nonisolated func detachLayer() {
+        guard let h = handle else { return }
+        // Setting handle=nil before terminate_destroy means concurrent
+        // public-method writes (which guard on handle != nil) become
+        // no-ops, so by the time we clear attachedLayer no one is racing
+        // with us on the layer pointer.
+        self.handle = nil
+
+        // Drop any pending strdup'd argv from in-flight async commands.
+        DispatchQueue.main.sync { [weak self] in
+            MainActor.assumeIsolated { self?.dropPending() }
+        }
+
+        // Nil the wakeup callback BEFORE terminate_destroy (mirrors the
+        // MPVKit demo). Without this, mpv could fire one last wakeup with
+        // a nil context after destroy starts.
+        mpv_set_wakeup_callback(h, nil, nil)
+        mpv_terminate_destroy(h)
+
+        // The event pump's mpv_wait_event returns MPV_EVENT_SHUTDOWN as a
+        // result of terminate_destroy and the loop returns. Best-effort
+        // wake in case it's mid-wait, then drop our reference.
+        pumpThread?.cancel()
+        pumpThread = nil
+
+        // Clear the layer reference AFTER mpv is fully torn down. Releasing
+        // the layer earlier could free the IOSurface mpv's MoltenVK context
+        // was sampling.
+        DispatchQueue.main.sync { [weak self] in
+            MainActor.assumeIsolated { self?.attachedLayer = nil }
+        }
+    }
+
+    /// Start the event pump bound to the current handle. Captures the
+    /// handle by value — resilient to `self.handle = nil` racing the pump
+    /// during detach.
+    private func startEventPump() {
+        guard let h = handle else { return }
         let pump = Thread { [handle = h] in
             while true {
                 guard let evt = mpv_wait_event(handle, 0.1) else { continue }
@@ -179,16 +313,11 @@ public final class MPVSourcePlayer {
         self.pumpThread = pump
     }
 
-    deinit {
-        // mpv_terminate_destroy makes mpv_wait_event return MPV_EVENT_SHUTDOWN
-        // which the pump (Task 3.2) uses to exit its loop. detachRender is
-        // normally called from MPVPlayerView's tearDown; we defensively call
-        // it here too in case a code path nils Workspace.sourcePlayer while
-        // a view is still on screen — without this, mpv_terminate_destroy
-        // would leak the render context. detachRender is idempotent.
-        detachRender()
-        mpv_terminate_destroy(handle)
-    }
+    // MARK: - Public mutation API
+    //
+    // All public mutation methods update Swift-side cached state
+    // unconditionally; they additionally issue mpv calls only when
+    // attached. Detached state replays on next attachLayer.
 
     public func bumpGeneration() {
         generation &+= 1
@@ -201,10 +330,10 @@ public final class MPVSourcePlayer {
     public func setPlaylist(_ paths: [String]) {
         // Bump generation FIRST so any in-flight pending seek's completion
         // is dropped before we issue the playlist-clear (which itself can
-        // generate a PLAYBACK_RESTART that we don't want fired). See
-        // adversarial review history in plan front-matter.
+        // generate a PLAYBACK_RESTART that we don't want fired).
         bumpGeneration()
         playlistPaths = paths
+        guard handle != nil else { return }
         if paths.isEmpty {
             runCommandSync(["playlist-clear"])
             return
@@ -220,15 +349,17 @@ public final class MPVSourcePlayer {
     }
 
     public func play() {
-        var flag: Int32 = 0
-        mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
         isPaused = false  // local truth; pump's pause event will be redundant
+        guard let h = handle else { return }
+        var flag: Int32 = 0
+        mpv_set_property(h, "pause", MPV_FORMAT_FLAG, &flag)
     }
 
     public func pause() {
-        var flag: Int32 = 1
-        mpv_set_property(handle, "pause", MPV_FORMAT_FLAG, &flag)
         isPaused = true  // local truth; pump's pause event will be redundant
+        guard let h = handle else { return }
+        var flag: Int32 = 1
+        mpv_set_property(h, "pause", MPV_FORMAT_FLAG, &flag)
     }
 
     public func togglePlay() {
@@ -236,20 +367,23 @@ public final class MPVSourcePlayer {
     }
 
     public func setVolume(_ v: Double) {
+        volume = v
+        guard let h = handle else { return }
         var mpvVolume = max(0, min(100, v * 100))
-        mpv_set_property(handle, "volume", MPV_FORMAT_DOUBLE, &mpvVolume)
+        mpv_set_property(h, "volume", MPV_FORMAT_DOUBLE, &mpvVolume)
     }
 
     private func runCommandSync(_ args: [String]) {
+        guard let h = handle else { return }
         var cstrings = args.map { strdup($0) } + [UnsafeMutablePointer<CChar>?(nil)]
         defer { cstrings.forEach { if let p = $0 { free(p) } } }
         cstrings.withUnsafeMutableBufferPointer { buf in
             let p = UnsafeMutableRawPointer(buf.baseAddress!).assumingMemoryBound(to: UnsafePointer<CChar>?.self)
-            _ = mpv_command(handle, p)
+            _ = mpv_command(h, p)
         }
     }
 
-    // MARK: - Skip primitive (Task 3.6)
+    // MARK: - Skip primitive
 
     public func seek(
         playlistPos targetPos: Int,
@@ -257,6 +391,14 @@ public final class MPVSourcePlayer {
         exact: Bool,
         completion: @escaping @MainActor () -> Void
     ) {
+        // No in-flight seek across detach: if no handle, fire completion
+        // immediately so SkipCoordinator advances. The next attach replays
+        // playlistPos/timePos that's already on this Swift object.
+        guard handle != nil else {
+            Task { @MainActor in completion() }
+            return
+        }
+
         // Single-slot pending model: SkipCoordinator guarantees only one
         // seek in flight at a time, so we never need to track more than
         // one pending. Any prior pending entry was either fired (and would
@@ -289,13 +431,13 @@ public final class MPVSourcePlayer {
         args: [String],
         completion: @escaping @MainActor () -> Void
     ) {
+        // Caller (`seek`) has already guarded `handle != nil`.
+        guard let h = handle else { return }
         let id = nextReplyID
         nextReplyID &+= 1
 
         // strdup each arg; ownership transfers to the PendingSeek struct,
-        // which holds them until MPV_EVENT_COMMAND_REPLY frees them. The
-        // freed-too-soon UAF that motivates this comment was identified in
-        // the v1 plan's adversarial review.
+        // which holds them until MPV_EVENT_COMMAND_REPLY frees them.
         var cstrings: [UnsafeMutablePointer<CChar>?] =
             args.map { strdup($0) } + [UnsafeMutablePointer<CChar>?(nil)]
         pending = PendingSeek(
@@ -308,270 +450,22 @@ public final class MPVSourcePlayer {
 
         cstrings.withUnsafeMutableBufferPointer { buf in
             let p = UnsafeMutableRawPointer(buf.baseAddress!).assumingMemoryBound(to: UnsafePointer<CChar>?.self)
-            _ = mpv_command_async(handle, id, p)
+            _ = mpv_command_async(h, id, p)
         }
     }
 
     /// Free the strdup'd argv currently held by `pending`, then clear it.
-    /// Idempotent against `pending == nil`.
+    /// Idempotent against `pending == nil`. Swift-side only — safe to
+    /// call when handle is nil.
     private func dropPending() {
         if let p = pending {
             for c in p.cstrings { if let c { free(c) } }
         }
         pending = nil
     }
-
-    // MARK: - Render lifecycle (Task 3.5)
-    //
-    // The render context is created/freed here so the production
-    // MPVPlayerView(player:) path can attach/detach against the shared
-    // player. The CVDisplayLink lives on the view; renderInto is called
-    // from that link's callback.
-
-    /// LEGACY: superseded by attachRenderGL/renderIntoGL. Retained as a fallback
-    /// during the soak period. Schedule for removal once the GL path has shipped
-    /// for at least one release without regressions. See MPVRenderBackend.production.
-    public func attachRender() throws {
-        renderLock.lock(); defer { renderLock.unlock() }
-        guard renderContext == nil else { throw MPVSourcePlayerError.alreadyAttached }
-
-        // MPV_RENDER_PARAM_API_TYPE wants a `char *` pointing to "sw".
-        // Hold the C buffer in a local so the pointer survives the call.
-        var apiTypeBuf = Array("sw".utf8CString)
-        var advancedControl: Int32 = 0  // SW backend; advancedControl=1 risks deadlock per render.h
-
-        let rc: CInt = apiTypeBuf.withUnsafeMutableBufferPointer { apiBuf -> CInt in
-            var params = [
-                mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE,
-                                 data: UnsafeMutableRawPointer(apiBuf.baseAddress)),
-                mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL,
-                                 data: withUnsafeMutableBytes(of: &advancedControl) { $0.baseAddress }),
-                mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-            ]
-            var ctx: OpaquePointer?
-            let r = params.withUnsafeMutableBufferPointer {
-                mpv_render_context_create(&ctx, handle, $0.baseAddress)
-            }
-            if r >= 0, let ctx {
-                self.renderContext = ctx
-            }
-            return r
-        }
-        guard rc >= 0, renderContext != nil else {
-            throw MPVSourcePlayerError.renderContextFailed(code: Int(rc))
-        }
-    }
-
-    /// GL render-context attach — parallel to `attachRender()` (SW path).
-    /// The SW path remains as the safe fallback (Phase 5); Phase 3 wires this
-    /// new path into the production view. Unreferenced for now.
-    ///
-    /// `glContext` MUST be made current on this thread before calling
-    /// `mpv_render_context_create`: create() invokes `getProcAddress`
-    /// synchronously, and CGL's resolver requires a current context. After
-    /// create() returns, we clear it on this thread so the CVDisplayLink
-    /// render thread can acquire it for subsequent renders. Leaving the
-    /// context current on main is what causes CGL "context already current
-    /// on another thread" fatals on some drivers, so we always clear —
-    /// even on failure.
-    public func attachRenderGL(
-        glContext: NSOpenGLContext,
-        getProcAddress: @escaping @convention(c) (UnsafeMutableRawPointer?, UnsafePointer<CChar>?) -> UnsafeMutableRawPointer?
-    ) throws {
-        renderLock.lock(); defer { renderLock.unlock() }
-        guard renderContext == nil else { throw MPVSourcePlayerError.alreadyAttached }
-
-        // GL context MUST be current on this thread before mpv_render_context_create —
-        // create() calls get_proc_address synchronously, and CGL's resolver requires a
-        // current context. After create() returns we clear the context on this thread
-        // so the CVDisplayLink render thread can make it current safely.
-        glContext.makeCurrentContext()
-
-        var apiTypeBuf = Array("opengl".utf8CString)
-        var advancedControl: Int32 = 0  // keep simple per render.h "Threading" warning
-
-        let rc: CInt = apiTypeBuf.withUnsafeMutableBufferPointer { apiBuf -> CInt in
-            var glInit = mpv_opengl_init_params(
-                get_proc_address: getProcAddress,
-                get_proc_address_ctx: nil
-            )
-            return withUnsafeMutablePointer(to: &glInit) { glInitPtr -> CInt in
-                var params = [
-                    mpv_render_param(type: MPV_RENDER_PARAM_API_TYPE,
-                                     data: UnsafeMutableRawPointer(apiBuf.baseAddress)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_INIT_PARAMS,
-                                     data: UnsafeMutableRawPointer(glInitPtr)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_ADVANCED_CONTROL,
-                                     data: withUnsafeMutableBytes(of: &advancedControl) { $0.baseAddress }),
-                    mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-                ]
-                var ctx: OpaquePointer?
-                let r = params.withUnsafeMutableBufferPointer {
-                    mpv_render_context_create(&ctx, handle, $0.baseAddress)
-                }
-                if r >= 0, let ctx { self.renderContext = ctx }
-                return r
-            }
-        }
-
-        // Always clear, even on failure — the context is "owned" by the render
-        // thread from this point on. Leaving it current on main is what causes
-        // CGL "context already current on another thread" fatals on some drivers.
-        NSOpenGLContext.clearCurrentContext()
-
-        guard rc >= 0, renderContext != nil else {
-            throw MPVSourcePlayerError.renderContextFailed(code: Int(rc))
-        }
-    }
-
-    public nonisolated func detachRender() {
-        renderLock.lock(); defer { renderLock.unlock() }
-        if let ctx = renderContext {
-            mpv_render_context_free(ctx)
-            renderContext = nil
-        }
-    }
-
-    /// LEGACY: SW render path. Superseded by renderIntoGL. Called by
-    /// MPVRenderingNSView's CVDisplayLink when MPVRenderBackend is .sw.
-    /// Try-locks to avoid blocking the display-link thread on a teardown in
-    /// flight; nil renderContext means a teardown happened, so we skip this
-    /// frame. Schedule for removal alongside attachRender once the GL path
-    /// has soaked for one release.
-    public nonisolated func renderInto(layer: CAMetalLayer, drawableSize: CGSize, commandQueue: MTLCommandQueue) {
-        guard renderLock.try() else {
-            return
-        }
-        defer { renderLock.unlock() }
-        guard let renderContext else {
-            return
-        }
-
-        let w = Int32(drawableSize.width)
-        let h = Int32(drawableSize.height)
-        guard w > 0, h > 0 else {
-            return
-        }
-
-        let bytesPerRow = Int(w) * 4
-        let bufferSize = bytesPerRow * Int(h)
-        let pixelBuffer = UnsafeMutableRawPointer.allocate(byteCount: bufferSize, alignment: 16)
-        defer { pixelBuffer.deallocate() }
-
-        var size: [Int32] = [w, h]
-        var stride = Int(bytesPerRow)
-        var format = "bgr0".utf8CString  // matches Metal bgra8Unorm memory order
-
-        format.withUnsafeMutableBufferPointer { fmtBuf in
-            size.withUnsafeMutableBufferPointer { sizeBuf in
-                withUnsafeMutablePointer(to: &stride) { stridePtr in
-                    var params = [
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_SIZE,
-                                         data: UnsafeMutableRawPointer(sizeBuf.baseAddress)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_FORMAT,
-                                         data: UnsafeMutableRawPointer(fmtBuf.baseAddress)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_STRIDE,
-                                         data: UnsafeMutableRawPointer(stridePtr)),
-                        mpv_render_param(type: MPV_RENDER_PARAM_SW_POINTER,
-                                         data: pixelBuffer),
-                        mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-                    ]
-                    _ = params.withUnsafeMutableBufferPointer {
-                        mpv_render_context_render(renderContext, $0.baseAddress)
-                    }
-                }
-            }
-        }
-
-        guard let drawable = layer.nextDrawable() else {
-            return
-        }
-        drawable.texture.replace(
-            region: MTLRegionMake2D(0, 0, Int(w), Int(h)),
-            mipmapLevel: 0,
-            withBytes: pixelBuffer,
-            bytesPerRow: bytesPerRow
-        )
-        if let cmdBuf = commandQueue.makeCommandBuffer() {
-            cmdBuf.present(drawable)
-            cmdBuf.commit()
-        }
-    }
-
-    /// GL render path — parallel to `renderInto(...)` (SW path). mpv writes
-    /// into `bridge.fbo`; the bridge then blits its IOSurface-backed Metal
-    /// texture into the layer's drawable. Unreferenced for now; Phase 3 wires
-    /// the call site.
-    ///
-    /// Internal (not public) because `GLMetalBridge` is internal — Phase 3
-    /// wires this from inside the same module, so cross-module visibility
-    /// isn't needed. `nonisolated` is what actually matters: the CVDisplayLink
-    /// callback runs off the main actor and must be able to call this.
-    nonisolated func renderIntoGL(
-        layer: CAMetalLayer,
-        drawableSize: CGSize,
-        commandQueue: MTLCommandQueue,
-        bridge: GLMetalBridge
-    ) {
-        guard renderLock.try() else { return }
-        defer { renderLock.unlock() }
-        guard let renderContext else { return }
-
-        let w = Int32(drawableSize.width)
-        let h = Int32(drawableSize.height)
-        guard w > 0, h > 0 else { return }
-
-        // GL context MUST be current before any GL call — bridge.resize() issues
-        // glGenTextures/glDeleteTextures/glGenFramebuffers internally, so the
-        // makeCurrent has to happen before resize, not after. (v1 had this
-        // backwards; the first frame would have silently no-op'd or crashed.)
-        bridge.glContext.makeCurrentContext()
-
-        do {
-            try bridge.resize(to: drawableSize)
-        } catch {
-            return  // resize failed; skip this frame, log handled at bridge layer
-        }
-
-        glBindFramebuffer(GLenum(GL_FRAMEBUFFER), bridge.fbo)
-        glViewport(0, 0, GLsizei(w), GLsizei(h))
-
-        var fbo = mpv_opengl_fbo(
-            fbo: Int32(bridge.fbo),
-            w: w, h: h,
-            internal_format: 0  // 0 = "unknown / default"; mpv tolerates this for our case
-        )
-        // 0 = no flip. We render into a GL_TEXTURE_RECTANGLE-backed FBO via
-        // CGLTexImageIOSurface2D — that path uses top-left origin, matching
-        // what the Metal blit destination expects. flipY=1 (the conventional
-        // value for a default GL framebuffer with bottom-left origin) inverts
-        // the picture for this IOSurface route. Phase 3.2 manual screencap
-        // verification caught the upside-down rendering.
-        var flipY: Int32 = 0
-
-        let _: CInt = withUnsafeMutablePointer(to: &fbo) { fboPtr -> CInt in
-            return withUnsafeMutablePointer(to: &flipY) { flipPtr -> CInt in
-                var params = [
-                    mpv_render_param(type: MPV_RENDER_PARAM_OPENGL_FBO,
-                                     data: UnsafeMutableRawPointer(fboPtr)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_FLIP_Y,
-                                     data: UnsafeMutableRawPointer(flipPtr)),
-                    mpv_render_param(type: MPV_RENDER_PARAM_INVALID, data: nil),
-                ]
-                return params.withUnsafeMutableBufferPointer {
-                    mpv_render_context_render(renderContext, $0.baseAddress)
-                }
-            }
-        }
-        glFlush()  // ensure GL writes are visible to Metal via IOSurface before the blit
-
-        bridge.present(into: layer, commandQueue: commandQueue)
-    }
 }
 
 public enum MPVSourcePlayerError: Error {
     case createFailed
     case initializeFailed(code: Int)
-    case alreadyAttached
-    case renderContextFailed(code: Int)
 }
