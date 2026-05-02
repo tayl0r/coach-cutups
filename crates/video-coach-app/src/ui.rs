@@ -122,6 +122,94 @@ pub(crate) fn drag_reorder_destination(
     raw.min(len)
 }
 
+/// Phase 11 Plan #7 code-review #1. The Slint anon-struct
+/// `{clip-count, duration, label, selected, tag}` is alphabetized to
+/// this 5-tuple shape. Used for the aggregate `export-tag-rows` model.
+pub(crate) type AggregateRow = (i32, f32, slint::SharedString, bool, slint::SharedString);
+
+/// Phase 11 Plan #7 code-review #1. The Slint anon-struct
+/// `{clip-count, duration, label, tag}` (no `selected` — implicit in
+/// which Repeater renders the row) alphabetized to this 4-tuple shape.
+/// Used for both `selected-export-tag-rows` and
+/// `unselected-export-tag-rows`.
+pub(crate) type SplitRow = (i32, f32, slint::SharedString, slint::SharedString);
+
+/// Phase 11 Plan #7 code-review #1. Partition the export-tag rows into
+/// (selected, unselected) 4-tuples ready to write to the dual Repeater
+/// models in main.slint. The aggregate `export-tag-rows` (5-tuple:
+/// `(clip-count, duration, label, selected, tag)` after Slint's
+/// alphabetical struct-field reorder) is the source of truth; the user's
+/// chosen ordering of the selected list is preserved by walking the
+/// existing `selected-export-tag-rows` first and keeping rows whose tag
+/// is still in `selected_set`. Newly-selected tags (in `selected_set` but
+/// not yet in `prev_selected_rows`) are appended in `aggregate`'s natural
+/// order (alphabetic, with `__all__` synthetic pinned first per
+/// `aggregate_tag_rows`'s contract).
+///
+/// The unselected list is rebuilt from `aggregate` in its natural order
+/// — alphabetic with `__all__` first — so the bottom Repeater stays
+/// stable across toggles regardless of user drag-state above.
+///
+/// Returns 4-tuples `(clip-count, duration, label, tag)` in
+/// alphabetized-field order matching the Slint anon-struct
+/// `{tag, label, clip-count, duration}`.
+pub(crate) fn partition_export_tag_rows(
+    aggregate: &[AggregateRow],
+    prev_selected_rows: &[SplitRow],
+    selected_set: &std::collections::HashSet<String>,
+) -> (Vec<SplitRow>, Vec<SplitRow>) {
+    // Index aggregate rows by tag for fast lookup; carry the latest
+    // (count, duration, label) since those can change between rebuilds
+    // even when the tag string is stable.
+    let mut by_tag: std::collections::HashMap<String, SplitRow> =
+        std::collections::HashMap::with_capacity(aggregate.len());
+    for (count, dur, label, _sel, tag) in aggregate {
+        by_tag.insert(tag.to_string(), (*count, *dur, label.clone(), tag.clone()));
+    }
+
+    // Build the selected list: first walk the previous order, keeping
+    // rows whose tag is still selected (preserves user drag-order). Then
+    // append any tags in `selected_set` not yet emitted, in `aggregate`
+    // order (alphabetic with `__all__` first).
+    let mut selected: Vec<SplitRow> = Vec::new();
+    let mut emitted: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for prev in prev_selected_rows {
+        let tag_str = prev.3.to_string();
+        if selected_set.contains(&tag_str) {
+            // Refresh count/duration/label from the latest aggregate so
+            // a clip add/remove reflects in the row even mid-session.
+            if let Some(latest) = by_tag.get(&tag_str) {
+                selected.push(latest.clone());
+            } else {
+                // Tag is in selected_set + prev row but no longer in
+                // aggregate (clip with that tag was deleted). Drop.
+                continue;
+            }
+            emitted.insert(tag_str);
+        }
+    }
+    for (count, dur, label, _sel, tag) in aggregate {
+        let tag_str = tag.to_string();
+        if selected_set.contains(&tag_str) && !emitted.contains(&tag_str) {
+            selected.push((*count, *dur, label.clone(), tag.clone()));
+            emitted.insert(tag_str);
+        }
+    }
+
+    // Build the unselected list from aggregate order (alphabetic with
+    // `__all__` first), keeping only tags NOT in selected_set.
+    let mut unselected: Vec<SplitRow> =
+        Vec::with_capacity(aggregate.len().saturating_sub(selected.len()));
+    for (count, dur, label, _sel, tag) in aggregate {
+        let tag_str = tag.to_string();
+        if !selected_set.contains(&tag_str) {
+            unselected.push((*count, *dur, label.clone(), tag.clone()));
+        }
+    }
+
+    (selected, unselected)
+}
+
 /// Phase 10 Task 3 (per fix #35). Reveal a folder in the platform's
 /// native file manager. Best-effort: on spawn error we log a warning
 /// and return — the export sheet still shows the folder path so the
@@ -780,6 +868,15 @@ pub fn run(
     // row, otherwise a real tag name. We mutate the in-out
     // selected-export-tags property; the 30 Hz timer's tag-row
     // rebuild picks up the new selection on its next tick.
+    //
+    // Plan #7 code-review #1 (SHIP-BLOCKER). Toggling
+    // `selected-export-tags` alone leaves `selected-export-tag-rows`
+    // and `unselected-export-tag-rows` stale, so the row stays in the
+    // wrong Repeater visually and the drag-to-reorder feature is
+    // unreachable. After mutating the membership list we repartition
+    // the dual Repeater models from the aggregate `export-tag-rows`,
+    // preserving the user's drag-order for any tag that remains
+    // selected.
     let weak_for_tag = window.as_weak();
     window.on_export_tag_toggled(move |tag: slint::SharedString| {
         let Some(w) = weak_for_tag.upgrade() else {
@@ -793,7 +890,19 @@ pub fn run(
         } else {
             next.push(slint::SharedString::from(s.as_str()));
         }
+        let next_set: std::collections::HashSet<String> =
+            next.iter().map(|x| x.to_string()).collect();
         w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(next)));
+        // Repartition the dual Repeater models from the latest
+        // aggregate, preserving user drag-order for surviving rows.
+        let aggregate: Vec<(i32, f32, slint::SharedString, bool, slint::SharedString)> =
+            w.get_export_tag_rows().iter().collect();
+        let prev_selected: Vec<(i32, f32, slint::SharedString, slint::SharedString)> =
+            w.get_selected_export_tag_rows().iter().collect();
+        let (sel_rows, unsel_rows) =
+            partition_export_tag_rows(&aggregate, &prev_selected, &next_set);
+        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(sel_rows)));
+        w.set_unselected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(unsel_rows)));
     });
 
     let weak_for_sa = window.as_weak();
@@ -805,7 +914,20 @@ pub fn run(
         // Slint anon-struct field tuple order is alphabetized;
         // tag is the 5th (index 4) field.
         let all: Vec<slint::SharedString> = rows.iter().map(|row| row.4.clone()).collect();
+        let next_set: std::collections::HashSet<String> =
+            all.iter().map(|x| x.to_string()).collect();
         w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(all)));
+        // Plan #7 code-review #1. Repartition so every aggregate row
+        // lands in the top (selected) Repeater and the bottom Repeater
+        // empties out.
+        let aggregate: Vec<(i32, f32, slint::SharedString, bool, slint::SharedString)> =
+            rows.iter().collect();
+        let prev_selected: Vec<(i32, f32, slint::SharedString, slint::SharedString)> =
+            w.get_selected_export_tag_rows().iter().collect();
+        let (sel_rows, unsel_rows) =
+            partition_export_tag_rows(&aggregate, &prev_selected, &next_set);
+        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(sel_rows)));
+        w.set_unselected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(unsel_rows)));
     });
 
     let weak_for_sn = window.as_weak();
@@ -816,6 +938,18 @@ pub fn run(
         w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(Vec::<
             slint::SharedString,
         >::new())));
+        // Plan #7 code-review #1. Repartition so the top Repeater
+        // empties and every aggregate row lands in the bottom
+        // (unselected) Repeater.
+        let aggregate: Vec<(i32, f32, slint::SharedString, bool, slint::SharedString)> =
+            w.get_export_tag_rows().iter().collect();
+        let prev_selected: Vec<(i32, f32, slint::SharedString, slint::SharedString)> =
+            w.get_selected_export_tag_rows().iter().collect();
+        let empty_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let (sel_rows, unsel_rows) =
+            partition_export_tag_rows(&aggregate, &prev_selected, &empty_set);
+        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(sel_rows)));
+        w.set_unselected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(unsel_rows)));
     });
 
     // Resolution / quality pickers — straight property writes.
@@ -931,28 +1065,34 @@ pub fn run(
             template
         };
         w.set_export_filename_template(template_for_ui);
-        // Phase 11 Plan #7 Task 1 PLACEHOLDER split: write empty model
-        // to selected-export-tag-rows and the full export-tag-rows model
-        // to unselected-export-tag-rows. Task 2 partitions properly by
-        // matching against `selected-export-tags`. For Task 1 the visible
-        // result is "everything in the bottom (unselected) list" — the
-        // user toggles to move rows up; once Task 2 ships, sheet-open
-        // hydration restores the user's selection alphabetically into
-        // the top list.
-        let empty_rows: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = Vec::new();
-        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(empty_rows)));
+        // Plan #7 code-review #1. Real partition based on the persisted
+        // `selected-export-tags` membership. Tags currently in
+        // `selected-export-tags` land in the top (selected) Repeater in
+        // aggregate-natural order (alphabetic with `__all__` first —
+        // there is no prior drag-order to preserve at sheet-open since
+        // the Repeater models reset on each instantiation). Remaining
+        // tags land alphabetically in the bottom (unselected) Repeater.
+        //
         // Slint compiles anon-struct list properties to tuples with
         // fields in alphabetical order. `export-tag-rows` carries
         // {clip-count, duration, label, selected, tag} → 5-tuple;
-        // unselected-export-tag-rows carries {clip-count, duration,
-        // label, tag} → 4-tuple (no `selected` since membership is
-        // implicit in which Repeater renders the row). Strip the
-        // `selected` field on the way over.
-        let all_rows = w.get_export_tag_rows();
-        let unsel_rows: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = all_rows
+        // {selected,unselected}-export-tag-rows carry {clip-count,
+        // duration, label, tag} → 4-tuple (no `selected` since
+        // membership is implicit in which Repeater renders the row).
+        let aggregate: Vec<(i32, f32, slint::SharedString, bool, slint::SharedString)> =
+            w.get_export_tag_rows().iter().collect();
+        let selected_set: std::collections::HashSet<String> = w
+            .get_selected_export_tags()
             .iter()
-            .map(|r| (r.0, r.1, r.2.clone(), r.4.clone()))
+            .map(|s| s.to_string())
             .collect();
+        // No prior drag-order at sheet-open — pass an empty
+        // prev-selected slice so the partition emits selected rows in
+        // aggregate (alphabetic) order.
+        let empty_prev: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = Vec::new();
+        let (sel_rows, unsel_rows) =
+            partition_export_tag_rows(&aggregate, &empty_prev, &selected_set);
+        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(sel_rows)));
         w.set_unselected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(unsel_rows)));
         w.set_export_sheet_visible(true);
     });
@@ -1452,6 +1592,165 @@ mod tests {
         let to = super::drag_reorder_destination(2, -50.0, 32.0, list.len() - 1);
         assert_eq!(to, 0);
         assert_eq!(drag_reorder_apply(&list, 2, to), ["c", "a", "b"]);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 11 Plan #7 code-review #1 — partition_export_tag_rows.
+    // ---------------------------------------------------------------
+
+    /// Helper to build a 5-tuple aggregate row in alphabetized field
+    /// order `(clip-count, duration, label, selected, tag)`.
+    fn agg(
+        count: i32,
+        dur: f32,
+        label: &str,
+        selected: bool,
+        tag: &str,
+    ) -> (i32, f32, slint::SharedString, bool, slint::SharedString) {
+        (
+            count,
+            dur,
+            slint::SharedString::from(label),
+            selected,
+            slint::SharedString::from(tag),
+        )
+    }
+
+    /// Helper to build a 4-tuple selected/unselected row in alphabetized
+    /// field order `(clip-count, duration, label, tag)`.
+    fn row(
+        count: i32,
+        dur: f32,
+        label: &str,
+        tag: &str,
+    ) -> (i32, f32, slint::SharedString, slint::SharedString) {
+        (
+            count,
+            dur,
+            slint::SharedString::from(label),
+            slint::SharedString::from(tag),
+        )
+    }
+
+    #[test]
+    fn partition_empty_selection_emits_all_to_unselected() {
+        let aggregate = vec![
+            agg(3, 9.0, "All Clips", false, super::ALL_CLIPS_TAG),
+            agg(2, 6.0, "alpha", false, "alpha"),
+            agg(1, 3.0, "beta", false, "beta"),
+        ];
+        let prev: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = Vec::new();
+        let selected_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let (sel, unsel) = super::partition_export_tag_rows(&aggregate, &prev, &selected_set);
+        assert!(sel.is_empty());
+        assert_eq!(unsel.len(), 3);
+        assert_eq!(unsel[0].3.as_str(), super::ALL_CLIPS_TAG);
+        assert_eq!(unsel[1].3.as_str(), "alpha");
+        assert_eq!(unsel[2].3.as_str(), "beta");
+    }
+
+    #[test]
+    fn partition_full_selection_emits_all_to_selected_in_aggregate_order() {
+        let aggregate = vec![
+            agg(3, 9.0, "All Clips", true, super::ALL_CLIPS_TAG),
+            agg(2, 6.0, "alpha", true, "alpha"),
+            agg(1, 3.0, "beta", true, "beta"),
+        ];
+        let prev: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = Vec::new();
+        let mut selected_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        selected_set.insert(super::ALL_CLIPS_TAG.to_string());
+        selected_set.insert("alpha".to_string());
+        selected_set.insert("beta".to_string());
+        let (sel, unsel) = super::partition_export_tag_rows(&aggregate, &prev, &selected_set);
+        assert!(unsel.is_empty());
+        assert_eq!(sel.len(), 3);
+        // No prior drag-order → aggregate order (alphabetic with
+        // synthetic All Clips first).
+        assert_eq!(sel[0].3.as_str(), super::ALL_CLIPS_TAG);
+        assert_eq!(sel[1].3.as_str(), "alpha");
+        assert_eq!(sel[2].3.as_str(), "beta");
+    }
+
+    #[test]
+    fn partition_preserves_user_drag_order_in_selected() {
+        // User dragged "beta" above "alpha" in the top Repeater.
+        let aggregate = vec![
+            agg(3, 9.0, "All Clips", false, super::ALL_CLIPS_TAG),
+            agg(2, 6.0, "alpha", true, "alpha"),
+            agg(1, 3.0, "beta", true, "beta"),
+        ];
+        let prev = vec![row(1, 3.0, "beta", "beta"), row(2, 6.0, "alpha", "alpha")];
+        let mut selected_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        selected_set.insert("alpha".to_string());
+        selected_set.insert("beta".to_string());
+        let (sel, unsel) = super::partition_export_tag_rows(&aggregate, &prev, &selected_set);
+        // Selected list keeps the user's drag-order: beta, then alpha.
+        assert_eq!(sel.len(), 2);
+        assert_eq!(sel[0].3.as_str(), "beta");
+        assert_eq!(sel[1].3.as_str(), "alpha");
+        // Unselected has the synthetic All Clips row (still in
+        // aggregate, not in selected_set).
+        assert_eq!(unsel.len(), 1);
+        assert_eq!(unsel[0].3.as_str(), super::ALL_CLIPS_TAG);
+    }
+
+    #[test]
+    fn partition_newly_selected_tag_appended_after_drag_order() {
+        // User had beta, alpha (in that drag order). Then toggles
+        // gamma on. Gamma should append AFTER the existing user-order.
+        let aggregate = vec![
+            agg(2, 6.0, "alpha", true, "alpha"),
+            agg(1, 3.0, "beta", true, "beta"),
+            agg(4, 12.0, "gamma", true, "gamma"),
+        ];
+        let prev = vec![row(1, 3.0, "beta", "beta"), row(2, 6.0, "alpha", "alpha")];
+        let mut selected_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        selected_set.insert("alpha".to_string());
+        selected_set.insert("beta".to_string());
+        selected_set.insert("gamma".to_string());
+        let (sel, _unsel) = super::partition_export_tag_rows(&aggregate, &prev, &selected_set);
+        assert_eq!(sel.len(), 3);
+        assert_eq!(sel[0].3.as_str(), "beta");
+        assert_eq!(sel[1].3.as_str(), "alpha");
+        assert_eq!(sel[2].3.as_str(), "gamma");
+    }
+
+    #[test]
+    fn partition_dropped_tag_removed_from_selected() {
+        // User had alpha, beta selected (in that order). Toggles beta
+        // off. Selected list keeps alpha; beta lands in unselected.
+        let aggregate = vec![
+            agg(2, 6.0, "alpha", true, "alpha"),
+            agg(1, 3.0, "beta", false, "beta"),
+        ];
+        let prev = vec![row(2, 6.0, "alpha", "alpha"), row(1, 3.0, "beta", "beta")];
+        let mut selected_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        selected_set.insert("alpha".to_string());
+        let (sel, unsel) = super::partition_export_tag_rows(&aggregate, &prev, &selected_set);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].3.as_str(), "alpha");
+        assert_eq!(unsel.len(), 1);
+        assert_eq!(unsel[0].3.as_str(), "beta");
+    }
+
+    #[test]
+    fn partition_drops_tag_no_longer_in_aggregate() {
+        // User had selected "vanished" (a tag whose only clip got
+        // deleted). Aggregate no longer carries it. Partition silently
+        // drops it from both lists rather than emitting a stale row
+        // with no aggregate match.
+        let aggregate = vec![agg(2, 6.0, "alpha", true, "alpha")];
+        let prev = vec![
+            row(0, 0.0, "vanished", "vanished"),
+            row(2, 6.0, "alpha", "alpha"),
+        ];
+        let mut selected_set: std::collections::HashSet<String> = std::collections::HashSet::new();
+        selected_set.insert("vanished".to_string());
+        selected_set.insert("alpha".to_string());
+        let (sel, unsel) = super::partition_export_tag_rows(&aggregate, &prev, &selected_set);
+        assert_eq!(sel.len(), 1);
+        assert_eq!(sel[0].3.as_str(), "alpha");
+        assert!(unsel.is_empty());
     }
 
     /// Phase 6 Task 6 — proves the Slint component build pipeline + the
