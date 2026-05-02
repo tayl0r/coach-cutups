@@ -524,6 +524,29 @@ own SHIPPED line + CI run id once green.
         a (small, big, big) sequence (initial alloc + capacity miss;
         third call hits cache). 12 tests pass; existing parity guards
         unchanged.
+  - [x] Task 3: Freeze-segment compose memoization via Arc<Frame>
+        identity (commit a7de6d0)
+        Adds compose_with_identity(&Arc<Frame>, &Arc<Frame>,
+        &[VisibleStroke]) -> Result<Arc<Frame>, _> per Fix #44
+        (Arc<Frame> in storage AND return type to avoid 8 MB clones)
+        plus a compose_tick_with_identity sibling in lib.rs.
+        FreezeCacheKey carries content-derived prefix per Fix #43
+        (dims + len + first16 bytes for both source + webcam).
+        hash_stroke_set uses explicit f64::to_bits() + length prefix
+        per Fix #45. lookup_freeze + insert_freeze implement a 16-entry
+        LRU with Fix #51 poison-recovery on this user-data path.
+        Compositor::clear_freeze_cache() called at every seg-idx edge
+        (preview driver loop) and at top of each `for entry in entries`
+        in export. Production wiring: preview_pipeline.rs +
+        export.rs Arc::new wrap each frozen frame at the consumer
+        boundary (Fix #48 — pre_decode_freeze_frames signature
+        unchanged); driver loop Arc-wraps live source/webcam slots.
+        parity_n_frames.rs HashMap value flips to Arc<Frame>. New
+        tests: freeze_cache_hit_returns_byte_identical_output (Arc::
+        ptr_eq + freeze_cache_hits=1 after second call),
+        stroke_hash_distinguishes_drawn_count, stroke_hash_length_
+        prefix_disambiguates. 15 compositor tests pass + parity_n_
+        frames byte-for-byte. +316 LOC.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [ ] Plan #6: VBO churn for strokes / resume failed exports
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
