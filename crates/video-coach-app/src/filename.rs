@@ -24,7 +24,11 @@
 /// Sanitize a string for use as a filename component (no extension).
 ///
 /// Rules:
-/// - Replace `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|` with `-`.
+/// - Replace `/`, `\`, `:`, `*`, `?`, `"`, `<`, `>`, `|`, `\0` with `-`.
+///   NUL was added per Plan #7 code-review #2: POSIX rejects NUL in
+///   pathnames at the syscall layer, so a NUL smuggled through
+///   `apply_template` (e.g. a tag containing a stray `\0` byte) would
+///   otherwise survive sanitize and crash the file-write mid-batch.
 /// - Trim leading/trailing whitespace and dots.
 /// - If the result (case-insensitive) matches a Windows reserved name
 ///   (`CON`, `PRN`, `AUX`, `NUL`, `COM1`–`COM9`, `LPT1`–`LPT9`), prefix
@@ -35,7 +39,7 @@ pub fn sanitize_filename(s: &str) -> String {
     let replaced: String = s
         .chars()
         .map(|c| match c {
-            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '-',
+            '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|' | '\0' => '-',
             _ => c,
         })
         .collect();
@@ -244,6 +248,18 @@ mod tests {
         // to (APFS, NTFS, ext4, exFAT). Don't strip them.
         assert_eq!(sanitize_filename("バスケ"), "バスケ");
         assert_eq!(sanitize_filename("clip-🏀"), "clip-🏀");
+    }
+
+    #[test]
+    fn nul_byte_is_replaced_with_dash() {
+        // Plan #7 code-review #2. POSIX rejects NUL in pathnames at the
+        // syscall layer, so a stray `\0` in a tag/project value (or a
+        // template) MUST be scrubbed. Without this, a tag like
+        // "clip\0name" passes through sanitize and `fs::File::create`
+        // fails with EINVAL mid-batch.
+        assert_eq!(sanitize_filename("clip\0name"), "clip-name");
+        // Standalone NUL collapses to "-" (non-empty, so no fallback).
+        assert_eq!(sanitize_filename("\0"), "-");
     }
 
     #[test]
