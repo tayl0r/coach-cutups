@@ -242,7 +242,11 @@ struct ContentView: View {
                 ZStack {
                     switch appMode {
                     case .scanning, .recordingStarting, .recording:
-                        MPVPlayerView(player: workspace.sourcePlayer)
+                        MPVPlayerView(
+                            player: workspace.sourcePlayer,
+                            currentZoom: workspace.currentZoom,
+                            onZoomChange: { newZoom in workspace.currentZoom = newZoom }
+                        )
                     case .previewLoading:
                         Color.black
                     case .previewClip(let id):

@@ -193,6 +193,13 @@ final class MPVRenderingNSView: NSView {
         p.setPlaylist([filePath])
         p.play()
         self.ownedPlayer = p
+        // Local zoom state for the bring-up window — owned player has no
+        // Workspace to route through, so we apply the zoom directly.
+        self.onZoomChange = { [weak p, weak self] z in
+            guard let self else { return }
+            self.setCurrentZoom(z)
+            p?.setZoom(z)
+        }
     }
 
     /// Production entry — view does not own the player.
@@ -266,15 +273,25 @@ struct MPVDebugRepresentable: NSViewRepresentable {
 /// Production representable — used by ContentView.
 struct MPVPlayerView: NSViewRepresentable {
     let player: MPVSourcePlayer?
+    let currentZoom: Zoom               // workspace-canonical (clamped) value
+    let onZoomChange: (Zoom) -> Void
     func makeNSView(context: Context) -> MPVRenderingNSView {
         let v = MPVRenderingNSView(frame: .zero)
         // Don't attach here — Workspace.sourcePlayer is lazy-init and
         // may be nil at first body evaluation. updateNSView handles
         // the actual attach (nil → non-nil transition + identity changes).
         v.updatePlayer(player)
+        v.onZoomChange = onZoomChange
+        v.setCurrentZoom(currentZoom)
         return v
     }
     func updateNSView(_ nsView: MPVRenderingNSView, context: Context) {
         nsView.updatePlayer(player)
+        nsView.onZoomChange = onZoomChange
+        // Sync the view's local Zoom mirror with the workspace canonical
+        // (clamped) value after every body re-eval. Without this, the view's
+        // internal mirror diverges from Workspace state at clamp boundaries
+        // and the next gesture computes from stale state. (Reviewer finding 8.)
+        nsView.setCurrentZoom(currentZoom)
     }
 }
