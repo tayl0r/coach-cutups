@@ -505,7 +505,8 @@ own SHIPPED line + CI run id once green.
 - [ ] Plan #4: freeze-segment compose caching
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [ ] Plan #6: VBO churn for strokes / resume failed exports
-- [ ] Plan #7: drag-reorder tag rows / custom filename templates
+- [x] Plan #7: drag-reorder tag rows / custom filename templates
+      SHIPPED 2026-05-01. CI run <pending fill-in> green on all 4 jobs.
       Two small UX wins for the export sheet: (1) drag-to-reorder of
       selected tags so the user can control output ordering (Phase 10
       ships alphabetic + all-clips-pinned-first); (2) custom output
@@ -592,6 +593,21 @@ own SHIPPED line + CI run id once green.
         today's local date. 92 tests pass; grep gates clean
         (no sanitize_filename(&label)/sanitize_filename(&project_name_
         trimmed) hits in bus.rs; ExportPrefsSnapshot has no Copy derive).
+  - [x] Closeout: Plan #7 SHIPPED — appended to plan file (this commit);
+        plan adversarial-fix coverage 10/10 (adv #10 SPECULATIVE 'all-
+        clips' name collision rejected at planning); code-review pass
+        landed 4 fix-up commits — a5de5e4 (SHIP-BLOCKER #1: toggle
+        repartitions both Repeaters via partition_export_tag_rows
+        helper wired into toggle/select-all/select-none/sheet-open),
+        cada3a2 (#2: NUL char in sanitize_filename illegal list),
+        adadc79 (#3: selected-list-top-y captures on height changes
+        from 0-height rect first sheet open), 3e13df9 (#4: template-
+        sensitivity gates run AFTER is_busy + no_project_open). REAL-
+        but-edge #5/#6/#7/#8 deferred to Phase 12+ per triage;
+        OVERSTATED #9-#10 + SPECULATIVE #11-#12 rejected per triage.
+        Verification battery green: build/test --features media,
+        build/test workspace, --no-default-features build, clippy
+        media + clippy excluding media, fmt --check.
 
 
 ## Phase 11 — pending

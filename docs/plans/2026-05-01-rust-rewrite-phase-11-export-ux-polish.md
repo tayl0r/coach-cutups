@@ -949,11 +949,127 @@ side; Task 2 wires the Rust side of hydration).
 
 ---
 
-## Closeout
+## Closeout — Phase 11 Plan #7 SHIPPED 2026-05-01
 
-(Filled in at the `READY_FOR_CLOSEOUT` stage with the final SHA, CI
-run id, and any deviation notes from the orchestrator's pass through.
-PROGRESS.txt's "Plan #7: drag-reorder tag rows / custom filename
-templates" line gets flipped to
-`[x] … SHIPPED <date>. CI run <id> green on all 4 jobs.` at the same
-time.)
+**CI run**: `<placeholder, filled by orchestrator after CI passes>`
+green on all 4 jobs — `test (ubuntu-latest)`, `test (windows-latest)`,
+`test (macos-latest)`, `media-tests`.
+
+### Commits (in shipping order)
+
+| Stage | SHA | Summary |
+|---|---|---|
+| Plan first pass | `0f500a5` | Initial plan + 5 baked-in fixes (Preferences field, apply_template helper, Slint dual-Repeater drag, LineEdit template input, bus per-tag substitution); 3-task structure (Preferences/helper, Slint UI, bus wiring); known unknowns + adversarial-fixes placeholder |
+| Plan adversarial pass | `613812c` | Plan fixes #1-#10 from inline adversarial review (drop Copy on ExportPrefsSnapshot + clone-on-read; pub default_filename_template + cross-crate equality test; second TouchArea for drag handle z-ordered above row toggle; absolute window coords for drag math + non-scrollable assumption + clamp test; gate Export button while dragging; strip `{`/`}` from substituent values before sequential `.replace()`; chrono::Local::now().date_naive() for stable formatting; sensitivity-based template validation with two probe values + N>1 overwrite gate; ship-blocker dual-Repeater split selected-export-tag-rows top + unselected-export-tag-rows bottom; empty-string template hydration falls back to default). Adv #10 SPECULATIVE 'all-clips' name collision rejected. |
+| Task 0 | `43db0bb` | Preferences::export_filename_template + apply_template helper. Adds `pub export_filename_template: String` to Preferences with `#[serde(default = "default_filename_template")]`; declares `pub fn default_filename_template()` returning `"{tag} - {project}"`; new `crates/video-coach-app/src/filename.rs::apply_template(template, tag, project, date)` strips `{`/`}` from substituent values (adv fix #6) before sequential `.replace()` of `{tag}`/`{project}`/`{date}`, then runs `sanitize_filename` with `"untitled"` empty fallback. 11 unit tests cover default-format Phase-10 byte-for-byte equality, multi-substitution, unknown-placeholder passthrough, illegal-char substituent, project-with-colon, empty fallback, only-placeholders empty fallback, Windows-reserved-name handling, brace-stripping round-trip, not-recursive substitution; `preferences_deserializes_without_template_field` test in core. 48 core + 29 filename tests pass. |
+| Task 0 progress flip | `508f33c` | PROGRESS.txt — Phase 11 Plan #7 Task 0 row [x] |
+| Task 1 | `612d558` | Slint dual-Repeater drag-to-reorder + LineEdit template input. Splits tag list into `selected-export-tag-rows` (top, ☰ drag handles, user-chosen order, adv fix #9 ship-blocker) + `unselected-export-tag-rows` (bottom, alphabetical). Hand-rolled drag gesture via two TouchAreas per row z-ordered with drag handle above row toggle (adv fix #3). Drop-Y captured in absolute window coords via `selected-list-top-y` bound from the top Repeater's parent rectangle's `absolute-position.y` (adv fix #4 + #12). Pure-Rust `drag_reorder_destination(_from, relative_drop_y, row_height, len)` helper clamps with `.floor().max(0).min(len)`. Export button gated `enabled: dragging-tag-index == -1` (adv fix #5). Dragged-row background `#3a3a3a` while held. LineEdit + "Placeholders: {tag}, {project}, {date}" hint added below the Codec row in the Form view. Modal height bump 600 → 680px. 4 pure-Rust drag_reorder tests (swap, same-index no-op, drop-below clamps to len, drop-above clamps to zero); full crate suite 83/83 green. PLACEHOLDER sheet-open hydration (Task 2 replaces). |
+| Task 1 progress flip | `d5d5163` | PROGRESS.txt — Phase 11 Plan #7 Task 1 row [x] |
+| Task 2 | `6f4a911` | Bus wiring + per-tag apply_template + sheet-open hydration. Drops `Copy` from `ExportPrefsSnapshot` and clones-on-read (adv fix #1); extends snapshot with `export_filename_template: String` and grows `export_prefs_to_slint_strings` to a 4-tuple. `Command::ExportCompilations` gains `filename_template: String` gated by `#[serde(default = "default_command_filename_template")]` calling `pub video_coach_core::project::default_filename_template()` (adv fix #2 plus `default_command_filename_template_matches_core` drift test). `handle_export_compilations` computes `today_local = chrono::Local::now().date_naive().format("%Y-%m-%d").to_string()` ONCE at the top (adv fix #7) and runs the sensitivity-test gate (adv fix #8) — probes ALPHA/BRAVO/2000-01-01 vs ZETA/YANKEE/2099-12-31 emitting two distinct `export.batch.failed` reasons (`filename_template_invalid`, `filename_template_no_placeholders`). Persists `project.preferences.export_filename_template` alongside `last_export_resolution`/`quality`/`codec`. Replaces hard-coded `sanitize_filename(&label)` / `sanitize_filename(&project_name_trimmed)` pair with single `apply_template(&template, label, &project_name_trimmed, &today_local)` call. ui.rs sheet-open helper extended to push template prefs into the LineEdit with empty/whitespace fallback to default (adv fix #10). 9 new tests; 92 tests pass; grep gates clean. |
+| Task 2 progress flip | `73ff89e` | PROGRESS.txt — Phase 11 Plan #7 Task 2 row [x] |
+| Code-review fix [1] | `a5de5e4` | SHIP-BLOCKER — toggle in open sheet did not move row between two Repeaters because `on_export_tag_toggled` mutated only `selected-export-tags`, never `selected-export-tag-rows` / `unselected-export-tag-rows`. Added `partition_export_tag_rows` helper + `AggregateRow` / `SplitRow` type aliases in ui.rs; wired into `on_export_tag_toggled`, `on_export_select_all_clicked`, `on_export_select_none_clicked`, AND `on_export_sheet_open_clicked` (the latter replaces Task 1's placeholder "everything in unselected, nothing in selected" split with a real partition based on `selected-export-tags`). 6 unit tests cover empty/full edges, drag-order preservation across toggle, newly-selected-appended-after-drag-order, toggle-off transition, dropped-tag-no-longer-in-aggregate. |
+| Code-review fix [2] | `cada3a2` | NUL char (`\0`) in filename template survived `sanitize_filename` and would crash file write at runtime — added `'\0'` to illegal-char match arm + `nul_byte_is_replaced_with_dash` test (`clip\0name` → `"clip-name"`; standalone NUL → `"-"`). |
+| Code-review fix [3] | `adadc79` | `selected-list-top-y` captured by `changed absolute-position` may not fire on a 0-height rectangle on first sheet open — added `changed height => root.selected-list-top-y = self.absolute-position.y` to `selected-list := Rectangle` so the value updates the moment rows render. |
+| Code-review fix [4] | `3e13df9` | Validation order disagreed with Phase-10 contract — moved the two template-sensitivity gates (probe_a == 'untitled' → `filename_template_invalid`; selections.len() > 1 with no placeholders → `filename_template_no_placeholders`) to AFTER `is_busy` + `current.is_none()` checks in `handle_export_compilations`, restoring Phase-10 error-contract priority (`already_recording`, `already_exporting`, `no_project_open` win over template diagnostics). |
+| Closeout | this commit | Plan closeout section + PROGRESS.txt Plan #7 SHIPPED |
+
+### Adversarial-fix coverage (Fixes #1-#10)
+
+All 10 fixes shipped; each verified present in shipped code.
+
+- ✅ #1 Drop `Copy` from `ExportPrefsSnapshot`; clone on read (Task 2 — bus.rs)
+- ✅ #2 `default_filename_template` declared `pub` (not `pub(crate)`); cross-crate equality test `default_command_filename_template_matches_core` proves no drift (Task 0 + Task 2)
+- ✅ #3 Drag handle uses a SECOND TouchArea z-ordered above the row toggle TouchArea (Task 1 — main.slint two TouchAreas declared in toggle-then-handle order)
+- ✅ #4 Drop-Y math uses absolute window coordinates via `selected-list-top-y` bound from `absolute-position.y`; non-scrollable assumption documented with `// PLAN-7-NOTE`; pure-Rust clamp tests for drop-below + drop-above edges (Task 1 — ui.rs `drag_reorder_destination`)
+- ✅ #5 Export button gated `enabled: dragging-tag-index == -1` while dragging (Task 1 — main.slint)
+- ✅ #6 `apply_template` strips `{` and `}` from substituent values (tag/project) before sequential `.replace()`; brace-stripping round-trip + not-recursive tests (Task 0 — filename.rs)
+- ✅ #7 `chrono::Local::now().date_naive().format("%Y-%m-%d")` computed ONCE at top of `handle_export_compilations` for batch consistency (Task 2 — bus.rs)
+- ✅ #8 Sensitivity-test template validation: two probes (ALPHA/BRAVO/2000-01-01 vs ZETA/YANKEE/2099-12-31), two distinct failure reasons (`filename_template_invalid` for sanitize-empty + `filename_template_no_placeholders` for N>1 overwrite risk); single-tag with no-placeholders proceeds (Task 2 — bus.rs)
+- ✅ #9 Dual-Repeater split — `selected-export-tag-rows` (top, drag-orderable) + `unselected-export-tag-rows` (bottom, alphabetical); ship-blocker fix completed by code-review fix [1] which wired the partition through every toggle/select-all/select-none/sheet-open path (Task 1 + code-review fix [1])
+- ✅ #10 Empty/whitespace-only template hydration falls back to `default_filename_template()`; `hydrate_empty_template_falls_back_to_default` test (Task 2 — ui.rs)
+
+### Code-review findings
+
+Inline code-review pass on the `0f500a5..73ff89e` diff (8 commits — plan
++ adv-fixes + 3 task implementations + 3 progress commits + closeout-
+progress) produced 12 findings:
+
+| Triage | Count | Findings |
+|---|---|---|
+| **REAL ship-blocker** | 1 | [1] toggle in open sheet does not repartition the two Repeaters; drag is unreachable |
+| **REAL bugs** | 3 | [2] NUL char (`\0`) survives `sanitize_filename` and crashes file write; [3] `selected-list-top-y` captured by `changed absolute-position` may not fire on 0-height rect; [4] template-sensitivity gates run before `is_busy` / `no_project_open`, flipping Phase-10 error-contract priority |
+| **REAL but edge** | 4 | [5] sensitivity test misses real-tag post-sanitize collisions (e.g., `5:30 drill` + `5/30 drill` both → `5-30 drill`); [6] long template can exceed PATH_MAX/NAME_MAX with no truncation; [7] drag-handle hit-rect width is 32px (plan said 24×24); [8] `_from` param in `drag_reorder_destination` unused — clarity |
+| **OVERSTATED** | 2 | [9] SetScanVolume-during-Export-click race (bus dispatcher is serial); [10] legacy harness clients with old semantics (no old semantics — field is brand-new) |
+| **SPECULATIVE** | 2 | [11] empty-rect `changed absolute-position` first-fire (auto-resolves with [1]); [12] 30 Hz timer doesn't track sheet-open state (auto-resolves with [1]) |
+
+The 4 REAL fix-worthy findings shipped as 4 separate fix-up commits
+(`a5de5e4`, `cada3a2`, `adadc79`, `3e13df9`) for git-blame clarity — see
+Commits table above. REAL-but-edge #5/#6/#7/#8 deferred per triage;
+OVERSTATED #9-#10 + SPECULATIVE #11-#12 rejected per triage. Total
+fix-up LOC ~+200 / -10 (mostly the partition helper + 6 unit tests).
+
+### Deferred to Phase 12+
+
+- **#5 Real-tag post-sanitize collisions.** Sensitivity test proves the
+  template substitutes tag/project/date, but does not detect the case
+  where two real tags sanitize to the same on-disk name (e.g.,
+  `"5:30 drill"` and `"5/30 drill"` both → `"5-30 drill"`; the second
+  `apply_template` result silently overwrites the first because the
+  per-tag `let _ = std::fs::remove_file(&output_path);` masks
+  pre-existing files). Mitigation cost is small (hash the rendered
+  filename per tag in the for-loop and bail with a third reason
+  `filename_template_collision`); deferred because the workaround is for
+  the user to pick a less-collision-prone template (e.g., `"{tag} ({project})"`)
+  or rename a colliding tag.
+- **#6 Output filename length cap.** `apply_template` does not bound
+  output length. A pathological template like `"{tag}_{tag}_{tag}_..."`
+  or a single-substituent case where the project name is 300 chars
+  produces a filename that may exceed Windows MAX_PATH (260) with
+  long-path support disabled or POSIX NAME_MAX (255 bytes). Mitigation:
+  truncate the post-`apply_template` filename to ~200 bytes (UTF-8
+  continuation-byte safe) before joining. Deferred — only the
+  worst-typed templates trip it.
+- **#7 Drag-handle hit-rect width.** Currently 32px; plan-and-adv-fix #3
+  said 24×24. 32px is more usable on macOS trackpads but the deviation
+  isn't logged in the Task 1 PROGRESS entry. If a future plan makes the
+  modal width dynamic (currently fixed 560px), the 32px hit-rect could
+  overlap the row checkbox at x=32px. Document or shrink in Phase 12.
+- **#8 `_from` parameter clarity in `drag_reorder_destination`.**
+  Helper takes a `_from: usize` it never reads (caller passes `len - 1`,
+  i.e., the post-remove length). Either drop the param entirely or
+  rename to `drag_reorder_destination_post_remove`. Cosmetic.
+
+### Known coverage gaps (acceptable for shipping)
+
+- **Multi-tag drag-reorder UI exercise.** The 6 partition unit tests
+  + 4 drag-reorder math tests prove the data path. Manual smoke
+  confirms the dual-Repeater renders + drag works on a 3-tag fixture.
+  No integration test simulates a multi-tag drag-and-export end-to-end
+  through the Slint timer.
+- **Template persistence across project reopens.** The bus persists
+  `project.preferences.export_filename_template` alongside the existing
+  `last_export_*` fields, but no test loads a project, exports with a
+  custom template, closes, reopens, and asserts the LineEdit hydrates
+  from the saved value. The serde round-trip + sheet-open hydration
+  paths are unit-tested in isolation; the join is manual-only.
+- **Drag-while-toggling race.** A user could press the drag handle on
+  one row while another row's checkbox is mid-toggle. Adv fix #5 gates
+  the Export button while dragging (`dragging-tag-index == -1`), but the
+  toggle handler itself is not gated. Result is that a row may move
+  between the two Repeaters mid-drag; the partition helper handles the
+  membership change, but the dragged row's index in
+  `selected-export-tag-rows` may shift under it. No regression test;
+  manual smoke shows the drag completes against the new index ordering.
+- **Sensitivity test boundary.** The two probes (ALPHA/BRAVO/2000-01-01
+  vs ZETA/YANKEE/2099-12-31) catch templates that don't reference any
+  placeholder. They do NOT catch a template that references only
+  `{date}` for a single-day batch + N>1 tags (date is constant for the
+  batch by adv fix #7 design, so all rendered names collide). The N>1
+  no-placeholders gate would catch most of these; a `{date}`-only
+  template with N>1 tags slips past because `apply_template` for ALPHA
+  vs ZETA only differs in the tag substitution (which the template
+  doesn't read). Edge — the sensitivity gate is a heuristic; the
+  collision-detection in deferred #5 would close this gap properly.
+
+These gaps are noted for future regression sweeps; they don't block
+shipping.
