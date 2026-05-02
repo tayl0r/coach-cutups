@@ -127,6 +127,11 @@ pub enum Command {
         output_folder: String,
         resolution: video_coach_core::project::Resolution,
         quality: video_coach_core::project::Quality,
+        /// Phase 11 Plan #3 Task 2: HEVC vs H.264 dispatch. Persisted
+        /// alongside `last_export_resolution` / `last_export_quality`;
+        /// hydrated into the export-sheet's Codec radio on sheet open
+        /// from `Preferences::last_export_codec`.
+        codec: video_coach_core::project::Codec,
         project_name: String,
     },
     /// Phase 10. Request cancellation of the in-flight batch export.
@@ -240,9 +245,46 @@ pub struct CommandReply {
     pub error: Option<String>,
 }
 
+/// Phase 11 Plan #3 Task 2 (fix #8). Snapshot of the persisted export
+/// preferences for sheet-open hydration. Slint properties reset to their
+/// declared defaults on each component instantiation; the
+/// "persisted on Export click" pattern (fix #11) writes the prefs but
+/// doesn't read them back. The bus task owns the live `Project` so it
+/// publishes a clone of the three relevant fields into this slot
+/// whenever a project loads (NewProject / OpenProject) or the user
+/// clicks Export. The UI reads the slot synchronously when the
+/// File → Export menu item activates and writes the three Slint
+/// properties before flipping `export-sheet-visible = true`.
+#[derive(Debug, Clone, Copy)]
+pub struct ExportPrefsSnapshot {
+    pub resolution: video_coach_core::project::Resolution,
+    pub quality: video_coach_core::project::Quality,
+    pub codec: video_coach_core::project::Codec,
+}
+
+impl Default for ExportPrefsSnapshot {
+    fn default() -> Self {
+        let p = video_coach_core::project::Preferences::default();
+        Self {
+            resolution: p.last_export_resolution,
+            quality: p.last_export_quality,
+            codec: p.last_export_codec,
+        }
+    }
+}
+
+pub type ExportPrefsSlot = std::sync::Arc<std::sync::Mutex<ExportPrefsSnapshot>>;
+
+pub fn new_export_prefs_slot() -> ExportPrefsSlot {
+    std::sync::Arc::new(std::sync::Mutex::new(ExportPrefsSnapshot::default()))
+}
+
 #[derive(Clone)]
 pub struct BusHandle {
     tx: mpsc::Sender<Envelope>,
+    /// Phase 11 Plan #3 Task 2: shared snapshot the UI reads on sheet
+    /// open to hydrate the three export-form Slint properties.
+    export_prefs: ExportPrefsSlot,
 }
 
 impl BusHandle {
@@ -264,6 +306,54 @@ impl BusHandle {
             error: Some("reply dropped".into()),
         })
     }
+
+    /// Phase 11 Plan #3 Task 2 (fix #8). Synchronous accessor for the
+    /// last-written export preferences. Cheap (lock + Copy of three
+    /// enums); safe to call from the Slint UI thread.
+    pub fn export_prefs_snapshot(&self) -> ExportPrefsSnapshot {
+        *self
+            .export_prefs
+            .lock()
+            .expect("export_prefs slot poisoned")
+    }
+}
+
+/// Phase 11 Plan #3 Task 2. Project preferences → the three Slint string
+/// values the export-sheet's radio rows compare against. Pure function
+/// so a hydration test can assert the mapping without spinning a
+/// MainWindow.
+pub fn export_prefs_to_slint_strings(
+    snap: ExportPrefsSnapshot,
+) -> (&'static str, &'static str, &'static str) {
+    use video_coach_core::project::{Codec, Quality, Resolution};
+    let res = match snap.resolution {
+        Resolution::Source => "source",
+        Resolution::R1080 => "1080",
+        Resolution::R720 => "720",
+    };
+    let qual = match snap.quality {
+        Quality::Low => "low",
+        Quality::Medium => "medium",
+        Quality::High => "high",
+    };
+    let codec = match snap.codec {
+        Codec::H264 => "h264",
+        Codec::Hevc => "hevc",
+    };
+    (res, qual, codec)
+}
+
+#[cfg(feature = "media")]
+fn write_export_prefs_snapshot(
+    slot: &ExportPrefsSlot,
+    prefs: &video_coach_core::project::Preferences,
+) {
+    let mut g = slot.lock().expect("export_prefs slot poisoned");
+    *g = ExportPrefsSnapshot {
+        resolution: prefs.last_export_resolution,
+        quality: prefs.last_export_quality,
+        codec: prefs.last_export_codec,
+    };
 }
 
 /// Build a fresh `FrameSink` (paired with the atomics needed to control
@@ -314,6 +404,9 @@ pub fn spawn_on(
     #[cfg(feature = "media")] fixture_recording_source: Option<std::path::PathBuf>,
 ) -> BusHandle {
     let (tx, mut rx) = mpsc::channel::<Envelope>(64);
+    let export_prefs_slot: ExportPrefsSlot = new_export_prefs_slot();
+    #[cfg(feature = "media")]
+    let export_prefs_slot_for_task = export_prefs_slot.clone();
     #[cfg(feature = "media")]
     let rt_for_poll = rt.clone();
     #[cfg(feature = "media")]
@@ -466,6 +559,8 @@ pub fn spawn_on(
                 #[cfg(feature = "media")]
                 &export_progress,
                 #[cfg(feature = "media")]
+                &export_prefs_slot_for_task,
+                #[cfg(feature = "media")]
                 &mut current_mode,
                 #[cfg(feature = "media")]
                 &mut recording_clip,
@@ -480,7 +575,10 @@ pub fn spawn_on(
             let _ = env.reply.send(reply);
         }
     });
-    BusHandle { tx }
+    BusHandle {
+        tx,
+        export_prefs: export_prefs_slot,
+    }
 }
 
 /// Phase 7 Task 5. Position-polling task. Spawned alongside each
@@ -714,6 +812,7 @@ async fn handle(
     #[cfg(feature = "media")] recording_state: &crate::frame_sink::RecordingStateSlot,
     #[cfg(feature = "media")] clip_list: &crate::frame_sink::ClipListSlot,
     #[cfg(feature = "media")] export_progress: &crate::frame_sink::ExportProgressSlot,
+    #[cfg(feature = "media")] export_prefs_slot: &ExportPrefsSlot,
     #[cfg(feature = "media")] current_mode: &mut AppMode,
     #[cfg(feature = "media")] recording_clip: &mut Option<RecordingClipInProgress>,
     #[cfg(feature = "media")] current_export_cancel: &mut Option<
@@ -891,6 +990,11 @@ async fn handle(
                         // sidebar matches the now-current project.
                         if let Some((p, _)) = current.as_ref() {
                             write_clip_list(clip_list, &p.clips);
+                            // Phase 11 Plan #3 Task 2 (fix #8). Publish
+                            // export-prefs to the slot the UI reads on
+                            // sheet open. Defaults for a fresh project
+                            // (H.264, R1080, Medium).
+                            write_export_prefs_snapshot(export_prefs_slot, &p.preferences);
                         }
                     }
                     CommandReply {
@@ -946,6 +1050,11 @@ async fn handle(
                         // freshly-loaded project.clips.
                         if let Some((p, _)) = current.as_ref() {
                             write_clip_list(clip_list, &p.clips);
+                            // Phase 11 Plan #3 Task 2 (fix #8). Hydrate
+                            // export-prefs slot from the freshly-loaded
+                            // preferences so the sheet's first open after
+                            // load reflects the user's last choices.
+                            write_export_prefs_snapshot(export_prefs_slot, &p.preferences);
                         }
                     }
                     CommandReply {
@@ -2059,11 +2168,19 @@ async fn handle(
             output_folder,
             resolution,
             quality,
+            codec,
             project_name,
         } => {
             #[cfg(not(feature = "media"))]
             {
-                let _ = (selections, output_folder, resolution, quality, project_name);
+                let _ = (
+                    selections,
+                    output_folder,
+                    resolution,
+                    quality,
+                    codec,
+                    project_name,
+                );
                 CommandReply {
                     ok: false,
                     error: Some("media feature disabled in this build".into()),
@@ -2076,6 +2193,7 @@ async fn handle(
                     output_folder,
                     resolution,
                     quality,
+                    codec,
                     project_name,
                     current,
                     current_mode,
@@ -2083,6 +2201,7 @@ async fn handle(
                     recording_clip,
                     recording_state,
                     export_progress,
+                    export_prefs_slot,
                     current_export_cancel,
                     compositor,
                     export_cleanup_tx,
@@ -2146,6 +2265,7 @@ async fn handle_export_compilations(
     output_folder: String,
     resolution: video_coach_core::project::Resolution,
     quality: video_coach_core::project::Quality,
+    codec: video_coach_core::project::Codec,
     project_name: String,
     current: &mut Option<(video_coach_core::project::Project, std::path::PathBuf)>,
     current_mode: &mut AppMode,
@@ -2153,6 +2273,7 @@ async fn handle_export_compilations(
     recording_clip: &Option<RecordingClipInProgress>,
     recording_state: &crate::frame_sink::RecordingStateSlot,
     export_progress: &crate::frame_sink::ExportProgressSlot,
+    export_prefs_slot: &ExportPrefsSlot,
     current_export_cancel: &mut Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     compositor: &std::sync::Arc<video_coach_compositor::Compositor>,
     export_cleanup_tx: &tokio::sync::mpsc::UnboundedSender<()>,
@@ -2257,6 +2378,13 @@ async fn handle_export_compilations(
         let (project, folder) = current.as_mut().expect("re-checked");
         project.preferences.last_export_resolution = resolution;
         project.preferences.last_export_quality = quality;
+        // Phase 11 Plan #3 Task 2: persist codec next to res/quality so a
+        // sheet reopen reflects the user's last codec choice.
+        project.preferences.last_export_codec = codec;
+        // Phase 11 Plan #3 Task 2 (fix #8): publish to the slot the UI
+        // reads on subsequent sheet opens. Done before the spawn-blocking
+        // disk write so a slow disk doesn't delay the in-memory snapshot.
+        write_export_prefs_snapshot(export_prefs_slot, &project.preferences);
         let project_clone = project.clone();
         let folder_clone = folder.clone();
         let persist_result = tokio::task::spawn_blocking(move || {
@@ -2330,6 +2458,7 @@ async fn handle_export_compilations(
         output_folder = %output_folder_path.display(),
         resolution = ?resolution,
         quality = ?quality,
+        codec = ?codec,
     );
 
     // ── 10. Spawn the per-tag for-loop into a detached tokio task. ───────
@@ -2523,7 +2652,7 @@ async fn handle_export_compilations(
                     &output_path_for_export,
                     resolution,
                     quality,
-                    video_coach_core::project::Codec::H264, // Plan #3 Task 1: temporary; Task 2 plumbs the actual user choice through Command::ExportCompilations.
+                    codec,
                     source_volume,
                     commentary_volume,
                     compositor_for_export,
@@ -3229,6 +3358,7 @@ mod tests {
             output_folder: "/Users/x/Exports".into(),
             resolution: video_coach_core::project::Resolution::R1080,
             quality: video_coach_core::project::Quality::High,
+            codec: video_coach_core::project::Codec::H264,
             project_name: "Practice 2026-04-30".into(),
         };
         let v = serde_json::to_value(&cmd).unwrap();
@@ -3237,6 +3367,7 @@ mod tests {
         assert_eq!(v["project_name"], "Practice 2026-04-30");
         assert_eq!(v["resolution"], "r1080");
         assert_eq!(v["quality"], "high");
+        assert_eq!(v["codec"], "h264");
         assert_eq!(v["selections"][0]["kind"], "all_clips");
         assert_eq!(v["selections"][1]["kind"], "tag");
         assert_eq!(v["selections"][1]["name"], "basketball");
@@ -3248,6 +3379,7 @@ mod tests {
                 output_folder,
                 resolution,
                 quality,
+                codec,
                 project_name,
             } => {
                 assert_eq!(selections.len(), 2);
@@ -3261,10 +3393,72 @@ mod tests {
                 assert_eq!(output_folder, "/Users/x/Exports");
                 assert_eq!(resolution, video_coach_core::project::Resolution::R1080);
                 assert_eq!(quality, video_coach_core::project::Quality::High);
+                assert_eq!(codec, video_coach_core::project::Codec::H264);
                 assert_eq!(project_name, "Practice 2026-04-30");
             }
             _ => panic!("expected ExportCompilations"),
         }
+    }
+
+    #[test]
+    fn export_command_with_hevc_codec_round_trips() {
+        // Phase 11 Plan #3 Task 2: serde round-trip with codec set to
+        // Hevc proves the new field flows through the control-socket
+        // protocol unchanged. Mirrors `export_compilations_serde_roundtrips`
+        // for the H.264 default path.
+        let cmd = Command::ExportCompilations {
+            selections: vec![TagSelection::AllClips],
+            output_folder: "/Users/x/Exports".into(),
+            resolution: video_coach_core::project::Resolution::R720,
+            quality: video_coach_core::project::Quality::Medium,
+            codec: video_coach_core::project::Codec::Hevc,
+            project_name: "Practice".into(),
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["cmd"], "export_compilations");
+        assert_eq!(v["codec"], "hevc");
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::ExportCompilations { codec, .. } => {
+                assert_eq!(codec, video_coach_core::project::Codec::Hevc);
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn opening_export_sheet_hydrates_codec_from_preferences() {
+        // Phase 11 Plan #3 Task 2 (fix #8). Pure-helper test for the
+        // sheet-open hydration mapping: a snapshot built from a
+        // preferences value with `last_export_codec: Hevc` must map to
+        // the Slint string `"hevc"`. The same helper drives the live
+        // `on_export_sheet_open_clicked` binding in ui.rs, so a
+        // regression here would surface as the Codec radio reverting to
+        // H.264 on every reopen.
+        let prefs = video_coach_core::project::Preferences {
+            last_export_resolution: video_coach_core::project::Resolution::R720,
+            last_export_quality: video_coach_core::project::Quality::Low,
+            last_export_codec: video_coach_core::project::Codec::Hevc,
+            ..Default::default()
+        };
+        let snap = ExportPrefsSnapshot {
+            resolution: prefs.last_export_resolution,
+            quality: prefs.last_export_quality,
+            codec: prefs.last_export_codec,
+        };
+        let (res, qual, codec) = export_prefs_to_slint_strings(snap);
+        assert_eq!(res, "720");
+        assert_eq!(qual, "low");
+        assert_eq!(codec, "hevc");
+
+        // Default Preferences (fresh project, never exported) hydrates
+        // to H.264 — guards the Phase 10-era project.json compatibility
+        // path.
+        let default_snap = ExportPrefsSnapshot::default();
+        let (res, qual, codec) = export_prefs_to_slint_strings(default_snap);
+        assert_eq!(res, "1080");
+        assert_eq!(qual, "medium");
+        assert_eq!(codec, "h264");
     }
 
     #[test]
@@ -3338,6 +3532,7 @@ mod tests {
             output_folder: "/tmp/exports".into(),
             resolution: video_coach_core::project::Resolution::Source,
             quality: video_coach_core::project::Quality::Low,
+            codec: video_coach_core::project::Codec::H264,
             project_name: "Test".into(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
@@ -3415,6 +3610,7 @@ mod tests {
         let recording_clip: Option<RecordingClipInProgress> = None;
         let recording_state = crate::frame_sink::new_recording_state();
         let export_progress = crate::frame_sink::new_export_progress();
+        let export_prefs_slot = new_export_prefs_slot();
         let mut current_export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
         let compositor = std::sync::Arc::new(
             video_coach_compositor::Compositor::new_headless().expect("compositor"),
@@ -3426,6 +3622,7 @@ mod tests {
             "/tmp/exports".into(),
             video_coach_core::project::Resolution::R720,
             video_coach_core::project::Quality::Low,
+            video_coach_core::project::Codec::H264,
             "Test".into(),
             &mut current,
             &mut current_mode,
@@ -3433,6 +3630,7 @@ mod tests {
             &recording_clip,
             &recording_state,
             &export_progress,
+            &export_prefs_slot,
             &mut current_export_cancel,
             &compositor,
             &export_cleanup_tx,
@@ -3467,6 +3665,7 @@ mod tests {
         let recording_clip: Option<RecordingClipInProgress> = None;
         let recording_state = crate::frame_sink::new_recording_state();
         let export_progress = crate::frame_sink::new_export_progress();
+        let export_prefs_slot = new_export_prefs_slot();
         let mut current_export_cancel: Option<std::sync::Arc<std::sync::atomic::AtomicBool>> = None;
         let compositor = std::sync::Arc::new(
             video_coach_compositor::Compositor::new_headless().expect("compositor"),
@@ -3478,6 +3677,7 @@ mod tests {
             dir.path().to_string_lossy().into_owned(),
             video_coach_core::project::Resolution::R720,
             video_coach_core::project::Quality::Low,
+            video_coach_core::project::Codec::H264,
             "Test".into(),
             &mut current,
             &mut current_mode,
@@ -3485,6 +3685,7 @@ mod tests {
             &recording_clip,
             &recording_state,
             &export_progress,
+            &export_prefs_slot,
             &mut current_export_cancel,
             &compositor,
             &export_cleanup_tx,

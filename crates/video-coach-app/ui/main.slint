@@ -113,6 +113,10 @@ export component MainWindow inherits Window {
     in-out property <string> export-output-folder: "";
     in-out property <string> export-resolution: "1080";
     in-out property <string> export-quality: "medium";
+    // Phase 11 Plan #3 Task 2: HEVC vs H.264 picker. "h264" / "hevc"
+    // discriminants the Rust side maps to `Codec::H264` / `Codec::Hevc`.
+    // Default mirrors Project::Preferences (H.264).
+    in-out property <string> export-codec: "h264";
     in-out property <string> export-project-name: "";
 
     // Mirrored from `ExportProgressSlot` in ui.rs's 30 Hz timer. The
@@ -161,6 +165,13 @@ export component MainWindow inherits Window {
     callback export-select-none-clicked();
     callback export-resolution-changed(string);
     callback export-quality-changed(string);
+    // Phase 11 Plan #3 Task 2: Codec radio change ("h264" / "hevc").
+    callback export-codec-changed(string);
+    // Phase 11 Plan #3 Task 2 (fix #8): mandatory sheet-open hydration.
+    // Replaces an inline `export-sheet-visible = true` assignment in the
+    // File menu so the Rust side can hydrate the three pickers from
+    // persisted prefs BEFORE the sheet appears.
+    callback export-sheet-open-clicked();
     callback export-start-clicked();
     callback export-cancel-clicked();
     callback export-close-clicked();
@@ -195,8 +206,15 @@ export component MainWindow inherits Window {
             MenuItem {
                 title: "Export Compilations…";
                 activated => {
+                    // Phase 11 Plan #3 Task 2 (fix #8): defer the
+                    // visibility flip to the Rust binding for
+                    // `export-sheet-open-clicked`, which hydrates
+                    // resolution / quality / codec from prefs before
+                    // showing the sheet. The project-open gate stays
+                    // here so disabled-but-visible MenuItem clicks
+                    // remain a no-op.
                     if (root.project-open) {
-                        root.export-sheet-visible = true;
+                        root.export-sheet-open-clicked();
                     }
                 }
             }
@@ -803,7 +821,13 @@ export component MainWindow inherits Window {
                 x: (parent.width - self.width) / 2;
                 y: (parent.height - self.height) / 2;
                 width: 560px;
-                height: 540px;
+                // Phase 11 Plan #3 Task 2: bumped from 540px to 600px to
+                // fit the new Codec radio row at y:430-480px. The
+                // Cancel/Export bottom buttons are anchored to
+                // `parent.height - 52px` so they ride down with the new
+                // height; the Codec row sits cleanly between Quality
+                // (ends y:416) and the bottom buttons (start y:548).
+                height: 600px;
                 border-radius: 8px;
                 background: #1f1f1f;
                 border-width: 1px;
@@ -1209,6 +1233,67 @@ export component MainWindow inherits Window {
                             width: parent.width;
                             height: parent.height;
                             clicked => { root.export-quality-changed("high"); }
+                        }
+                    }
+
+                    // Phase 11 Plan #3 Task 2: Codec picker row. Two
+                    // buttons (H.264 / HEVC) below Quality; mirrors the
+                    // Quality row's Rectangle/TouchArea shape exactly.
+                    Text {
+                        x: 24px;
+                        y: 430px;
+                        width: 120px;
+                        height: 18px;
+                        text: "Codec";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    c-h264-btn := Rectangle {
+                        x: 24px;
+                        y: 452px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-codec == "h264"
+                            ? #4a90e2
+                            : (ch264-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "H.264";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        ch264-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-codec-changed("h264"); }
+                        }
+                    }
+                    c-hevc-btn := Rectangle {
+                        x: 116px;
+                        y: 452px;
+                        width: 88px;
+                        height: 28px;
+                        border-radius: 4px;
+                        background: root.export-codec == "hevc"
+                            ? #4a90e2
+                            : (chevc-area.has-hover ? #2e2e2e : #262626);
+                        Text {
+                            x: 0; y: 0;
+                            width: parent.width; height: parent.height;
+                            text: "HEVC";
+                            font-size: 12px;
+                            color: #ffffff;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                        chevc-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => { root.export-codec-changed("hevc"); }
                         }
                     }
 

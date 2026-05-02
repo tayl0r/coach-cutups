@@ -801,6 +801,34 @@ pub fn run(
             w.set_export_quality(s);
         }
     });
+    // Phase 11 Plan #3 Task 2: Codec radio mirrors resolution/quality.
+    let weak_for_codec = window.as_weak();
+    window.on_export_codec_changed(move |s: slint::SharedString| {
+        if let Some(w) = weak_for_codec.upgrade() {
+            w.set_export_codec(s);
+        }
+    });
+    // Phase 11 Plan #3 Task 2 (fix #8). Mandatory sheet-open hydration:
+    // Slint properties reset to their declared defaults on each
+    // component instantiation, so the "persisted on Export click"
+    // pattern (fix #11) is necessary but not sufficient. On every
+    // sheet-open trigger the UI reads the bus's snapshot of the
+    // persisted prefs and writes ALL THREE Slint properties before
+    // flipping `export-sheet-visible = true`. All-or-nothing: never
+    // hydrate only codec.
+    let bus_for_sheet_open = bus.clone();
+    let weak_for_sheet_open = window.as_weak();
+    window.on_export_sheet_open_clicked(move || {
+        let Some(w) = weak_for_sheet_open.upgrade() else {
+            return;
+        };
+        let snap = bus_for_sheet_open.export_prefs_snapshot();
+        let (res, qual, codec) = crate::bus::export_prefs_to_slint_strings(snap);
+        w.set_export_resolution(slint::SharedString::from(res));
+        w.set_export_quality(slint::SharedString::from(qual));
+        w.set_export_codec(slint::SharedString::from(codec));
+        w.set_export_sheet_visible(true);
+    });
 
     // Folder picker. Same async-rfd pattern as new/open-project.
     // Path written back to the in-out export-output-folder property
@@ -865,6 +893,26 @@ pub fn run(
             "high" => video_coach_core::project::Quality::High,
             _ => video_coach_core::project::Quality::Medium,
         };
+        // Phase 11 Plan #3 Task 2 (fix #6). Codec parser with
+        // warn-and-fall-back-to-prefs on unknown values. A typo, future
+        // codec rename, or a callback-vs-click race must NOT silently
+        // downgrade to H.264 — fall back to whatever the user last
+        // persisted instead so the regression mode at least matches the
+        // user's most-recent expressed preference, and log a warning
+        // for diagnostics.
+        let codec = match w.get_export_codec().as_str() {
+            "h264" => video_coach_core::project::Codec::H264,
+            "hevc" => video_coach_core::project::Codec::Hevc,
+            other => {
+                tracing::warn!(
+                    target: "export.lifecycle",
+                    event = "export.codec_string_unknown",
+                    value = other,
+                    "falling back to last_export_codec",
+                );
+                bus.export_prefs_snapshot().codec
+            }
+        };
         let project_name = w.get_export_project_name().to_string();
         rt_for_start.spawn(async move {
             bus.send(
@@ -874,6 +922,7 @@ pub fn run(
                     output_folder,
                     resolution,
                     quality,
+                    codec,
                     project_name,
                 },
             )
