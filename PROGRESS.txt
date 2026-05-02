@@ -407,6 +407,25 @@ own SHIPPED line + CI run id once green.
         ~60% of H.264; updates the single existing caller in
         video-coach-media/src/export.rs to pass Codec::H264 (no
         behavior change). 45 core tests + 11 media tests pass.
+  - [x] Task 1: pick_h265_encoder + Codec dispatch in
+        build_video_output_chain (commit 80e1521)
+        Adds pick_h265_encoder mirroring the H.264 picker with
+        candidate list [vtenc_h265_hw, vtenc_h265, mfh265enc,
+        vaapih265enc, nvh265enc, x265enc] (HW-first per fix #2);
+        switches try_set_encoder_bitrate VideoToolbox dispatch to
+        name.starts_with("vtenc_") so vtenc_h265_hw gets bps scaling
+        (fix #3); build_video_output_chain takes a Codec param and
+        dispatches encoder/parser pair, with HEVC inserting an
+        explicit video/x-h265,stream-format=hvc1,alignment=au
+        capsfilter between h265parse and qtmux (fix #4);
+        export_compilation public signature gains codec: Codec
+        between quality and _source_volume (single bus.rs caller
+        threaded with Codec::H264 glue + a comment naming Task 2 as
+        the resolver). Adds export_compilation_with_hevc_writes_non
+        _empty_mp4 smoke (caps_str.starts_with("video/x-h265") +
+        > 50_000 bytes per fixes #3 + #7) plus
+        pick_h265_encoder_returns_some_factory unit. vtenc_h265_hw
+        picked on Apple Silicon, ~8 s test runtime.
 - [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run 25237628702 green on all 4 jobs.
       Replaced indeterminate spinner with a real 0..1 progress bar fed
       from export.rs's existing ExportProgress callback. Plan:
