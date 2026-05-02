@@ -733,6 +733,11 @@ struct ContentView: View {
                 let fallback = capture.lastFallbackReason
                 await MainActor.run {
                     let controller = RecordingController(t0Seconds: t0)
+                    // Inherit-on-record: capture the live zoom snapshot at
+                    // recordTime=0 BEFORE the .pause anchor, so replay sees
+                    // [zoom @ t=0, pause @ t=0+ε] rather than briefly rendering
+                    // at identity before snapping to the inherited zoom.
+                    controller.appendInitialZoom(workspace.currentZoom)
                     // Source was paused on R-press and KeyCommandView blocks
                     // space during .recordingStarting, so the source is
                     // guaranteed paused at t0. Anchor the event log with
@@ -740,6 +745,7 @@ struct ContentView: View {
                     // .freeze segment (rather than its rate=1.0 default).
                     controller.appendPause()
                     self.recordingController = controller
+                    workspace.recordingController = controller
                     self.appMode = .recording
                     self.recordingStartedAtHostTime = t0
                     self.recordingFlashToken &+= 1
@@ -797,6 +803,7 @@ struct ContentView: View {
                     )
                     workspace.addClip(clip)
                     self.recordingController = nil
+                    workspace.recordingController = nil
                     self.pendingRecording = nil
                     self.appMode = .scanning
                     self.recordingStartedAtHostTime = nil
@@ -807,6 +814,7 @@ struct ContentView: View {
             } catch {
                 await MainActor.run {
                     self.recordingController = nil
+                    workspace.recordingController = nil
                     self.pendingRecording = nil
                     self.appMode = .scanning
                     self.recordingStartedAtHostTime = nil

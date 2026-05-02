@@ -51,7 +51,7 @@ final class Workspace {
         guard clamped != _currentZoom else { return }
         self._currentZoom = clamped
         sourcePlayer?.setZoom(clamped)
-        // TODO(Phase 4.2): recordingController?.appendZoom(clamped)
+        recordingController?.appendZoom(clamped)
     }
 
     /// Set by ContentView when recording starts; cleared when recording
