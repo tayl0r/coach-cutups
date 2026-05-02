@@ -81,7 +81,7 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
 }
 
 public struct Project: Codable, Hashable, Sendable {
-    public var formatVersion: Int = 1
+    public var formatVersion: Int = 2  // bumped from 1 for .zoom event variant
     public var name: String
     public var sourceVideos: [SourceRef] = []
     public var clips: [Clip] = []

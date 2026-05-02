@@ -14,7 +14,7 @@ final class ProjectTests: XCTestCase {
         let data = try JSONEncoder().encode(p)
         let decoded = try JSONDecoder().decode(Project.self, from: data)
         XCTAssertEqual(decoded.name, "MyMatch")
-        XCTAssertEqual(decoded.formatVersion, 1)
+        XCTAssertEqual(decoded.formatVersion, 2)
         XCTAssertTrue(decoded.clips.isEmpty)
     }
 

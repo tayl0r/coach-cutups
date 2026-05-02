@@ -245,7 +245,7 @@ public actor CompilationExporter {
             let drawingEvents: [CommentaryEvent] = clip.events.filter { event in
                 switch event.kind {
                 case .stroke, .clearAll: return true
-                case .play, .pause, .skip: return false
+                case .play, .pause, .skip, .zoom, .unknown: return false
                 }
             }
             // Bottom-bar info: `<n> / <total> | <name> | tag1, tag2, tag3`.

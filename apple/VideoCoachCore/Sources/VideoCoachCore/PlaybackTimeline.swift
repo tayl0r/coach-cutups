@@ -28,7 +28,7 @@ public extension Clip {
             case .play:           rate = 1.0
             case .pause:          rate = 0.0
             case .skip(let d):    sourceTime += d
-            case .stroke, .clearAll: break
+            case .stroke, .clearAll, .zoom, .unknown: break
             }
         }
         sourceTime += (t - recordCursor) * rate
@@ -56,7 +56,7 @@ public extension Clip {
             case .play:           rate = 1.0
             case .pause:          rate = 0.0
             case .skip(let d):    sourceCursor = max(0, min(sourceDuration, sourceCursor + d))
-            case .stroke, .clearAll: break
+            case .stroke, .clearAll, .zoom, .unknown: break
             }
         }
         emit(to: recordingDuration)

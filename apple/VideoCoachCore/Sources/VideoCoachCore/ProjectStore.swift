@@ -18,7 +18,11 @@ public enum ProjectStore {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let project = try decoder.decode(Project.self, from: data)
-        if project.formatVersion != 1 {
+        // Accept v1 (legacy) and v2 (added .zoom event variant). Newer formats
+        // are rejected so we don't silently misinterpret unknown future fields.
+        // Unknown CommentaryEvent.Kind discriminators within a v2 file decode
+        // as `.unknown` rather than throwing — see CommentaryEvent.swift.
+        if project.formatVersion < 1 || project.formatVersion > 2 {
             throw ProjectStoreError.unsupportedFormatVersion(project.formatVersion)
         }
         return project
