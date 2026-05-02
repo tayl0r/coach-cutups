@@ -71,6 +71,15 @@ final class MPVRenderingNSView: NSView {
     @MainActor
     func setCurrentZoom(_ zoom: Zoom) { currentZoom = zoom }
 
+    override func magnify(with event: NSEvent) {
+        let cursor = cursorInBounds(event)
+        // event.magnification is a delta (-1...1 typical per gesture step).
+        // Compounding into scale: nextScale = scale * (1 + magnification).
+        let nextScale = currentZoom.scale * (1.0 + event.magnification)
+        let next = currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor)
+        commit(next)
+    }
+
     override func scrollWheel(with event: NSEvent) {
         let cursor = cursorInBounds(event)
         if event.hasPreciseScrollingDeltas {
