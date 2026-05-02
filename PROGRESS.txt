@@ -674,6 +674,30 @@ own SHIPPED line + CI run id once green.
         exist on disk and the AllClips file is >= each per-tag file
         + 20 KB. Guaranteed-quit shape (adv-fix #7). NO #[ignore] —
         runs end-to-end against the 1080p fixture in ~33s wall.
+  - [x] Task 3: PartialFailure E2E
+        (commit 1be0190)
+        Adds crates/video-coach-harness/tests/export_partial_failure_smoke.rs
+        (~200 LOC) with export_partial_failure_completes_first_tag_fails_
+        second_skips_third: launches a project with the 1080p fixture,
+        records 3 clips at the playhead, quits + mutates clip tags
+        (clips[0]=['good-1'], clips[1]=['bad'], clips[2]=['good-2']) AND
+        clips[1].recording_filename = 'missing.mov' to force the middle
+        tag's per-tag pipeline into MissingRecording, relaunches +
+        OpenProject + ExportCompilations with three real-tag selections
+        in order good-1 → bad → good-2 (NO AllClips) + explicit
+        filename_template '{tag} - {project}' (adv-fix #8). Wait
+        sequence matches bus emission EXACTLY (adv-fix #3):
+        batch.started (tag_count == 3 per adv-fix #4) →
+        tag.started/tag.completed for good-1 (selection match +
+        frames_pushed >= 15) → tag.started/tag.failed for bad
+        (selection match + non-empty error string ONLY, NO substring
+        match per adv-fix #5) → batch.failed (reason='tag_failed' +
+        selection='bad') → 5s negative-timeout for absent third
+        tag.started using anyhow::bail! NOT panic! on regression
+        (adv-fix #7). Asserts good-1.mp4 exists + > 1 KB, bad.mp4
+        absent OR < 1 KB (adv-fix #2), good-2.mp4 absent.
+        Guaranteed-quit shape (adv-fix #7). NO #[ignore] — runs
+        end-to-end ~18s wall.
 
 ## Phase 11 — pending
 Per the design doc:
