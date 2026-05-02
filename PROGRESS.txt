@@ -511,6 +511,19 @@ own SHIPPED line + CI run id once green.
         Arc-wrap of cache values since wgpu::RenderPipeline +
         wgpu::BindGroup do not implement Clone in this version. 11 tests
         pass; parity byte-for-byte. +84 LOC.
+  - [x] Task 2: Pooled stroke VBO via write_buffer (commit c4fd83f)
+        Replaces per-call create_buffer_init in encode_stroke_pass with
+        a Mutex<Option<PooledVbo>> stroke_vbo_pool: lookup → clone wgpu
+        Buffer handle out (Arc-wrapped since wgpu 22 Buffer is not
+        Clone) → drop guard → queue.write_buffer + set_vertex_buffer
+        unlocked (Fix #41). Grows on capacity miss with
+        next_power_of_two().max(64). Fix #50 debug_assert!(!vertices
+        .is_empty()) gates the path. #[cfg(test)] stroke_vbo_grows
+        AtomicU64 increments on each grow. New unit test
+        pooled_vbo_grows_on_capacity_miss verifies grow count = 2 over
+        a (small, big, big) sequence (initial alloc + capacity miss;
+        third call hits cache). 12 tests pass; existing parity guards
+        unchanged.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [ ] Plan #6: VBO churn for strokes / resume failed exports
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
