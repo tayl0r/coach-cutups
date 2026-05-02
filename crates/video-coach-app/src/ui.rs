@@ -984,6 +984,20 @@ pub fn run(
             w.set_export_filename_template(s);
         }
     });
+    // Phase 11 Plan #6 Task 2: "Overwrite existing files" checkbox toggle.
+    // Mirrors the codec change handler — straight property write-through;
+    // the value is read AT EXPORT CLICK TIME (in on_export_start_clicked
+    // below) and threaded into Command::ExportCompilations.overwrite_policy.
+    // NO bus command dispatch here (adv-fix #5 + #6 — Command::SetPreferences
+    // doesn't exist; we persist on Export click via the existing
+    // `persist_prefs` block in handle_export_compilations). Toggle without
+    // click is discarded on quit, same UX as every other export pref today.
+    let weak_for_overwrite = window.as_weak();
+    window.on_export_overwrite_existing_changed(move |b: bool| {
+        if let Some(w) = weak_for_overwrite.upgrade() {
+            w.set_export_overwrite_existing(b);
+        }
+    });
     // Phase 11 Plan #7 Task 1 (fix #9). Drag-released callback for the
     // top (selected) tag list. Reads the current `selected-export-tag-rows`
     // model + `selected-export-tags` membership list, computes the
@@ -1046,6 +1060,10 @@ pub fn run(
             return;
         };
         let snap = bus_for_sheet_open.export_prefs_snapshot();
+        // Phase 11 Plan #6 Task 2: capture the overwrite policy BEFORE the
+        // snapshot is moved into `export_prefs_to_slint_strings` below.
+        // `ExportOverwritePolicy` is `Copy`, so this read is free.
+        let overwrite_policy_for_hydration = snap.overwrite_policy;
         // Phase 11 Plan #7 Task 2 (adv fix #1 + #10). The snapshot now
         // carries `export_filename_template`; the helper returns it as
         // a SharedString in the 4th tuple slot. Apply the
@@ -1065,6 +1083,15 @@ pub fn run(
             template
         };
         w.set_export_filename_template(template_for_ui);
+        // Phase 11 Plan #6 Task 2: hydrate the "Overwrite existing"
+        // checkbox from the persisted policy. true = OverwriteAll, false =
+        // Resume. Slint properties reset to their declared defaults on
+        // each component instantiation (per Plan #3 fix #8), so this read
+        // MUST happen on every sheet-open trigger — not once at startup.
+        w.set_export_overwrite_existing(matches!(
+            overwrite_policy_for_hydration,
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+        ));
         // Plan #7 code-review #1. Real partition based on the persisted
         // `selected-export-tags` membership. Tags currently in
         // `selected-export-tags` land in the top (selected) Repeater in
@@ -1188,6 +1215,19 @@ pub fn run(
         // tracing reasons (`filename_template_invalid` or
         // `filename_template_no_placeholders`).
         let filename_template = w.get_export_filename_template().to_string();
+        // Phase 11 Plan #6 Task 2: read the "Overwrite existing" checkbox
+        // AT EXPORT CLICK TIME (per adv-fix #5: Slint properties reset on
+        // each component instantiation, so the only durable source of
+        // truth is the click-time read + bus persist on the same
+        // dispatch). false = Resume (skip already-completed tag outputs);
+        // true = OverwriteAll (re-render every selected tag from
+        // scratch). Replaces the Plan #6 Task 0 placeholder that sent
+        // `default_overwrite_policy()` unconditionally.
+        let overwrite_policy = if w.get_export_overwrite_existing() {
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll
+        } else {
+            video_coach_core::project::ExportOverwritePolicy::Resume
+        };
         rt_for_start.spawn(async move {
             bus.send(
                 UI_COMMAND_ID.into(),
@@ -1199,16 +1239,7 @@ pub fn run(
                     codec,
                     project_name,
                     filename_template,
-                    // Phase 11 Plan #6 Task 0. Plumb the new field
-                    // through the existing UI Export-click site so the
-                    // crate compiles. Task 2 wires the
-                    // "Overwrite existing" checkbox; until then the
-                    // UI sends the named-default (Resume — the new
-                    // Plan-#6 default) so live runs follow the new
-                    // policy. Mirrors the bus
-                    // `default_overwrite_policy_for_command` named
-                    // default.
-                    overwrite_policy: video_coach_core::project::default_overwrite_policy(),
+                    overwrite_policy,
                 },
             )
             .await;

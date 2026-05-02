@@ -126,6 +126,16 @@ export component MainWindow inherits Window {
     // sheet appears (Task 2 wires the prefs read; Task 1 ships placeholder
     // hydration to the default).
     in-out property <string> export-filename-template: "{tag} - {project}";
+    // Phase 11 Plan #6 Task 2: "Overwrite existing files" checkbox state.
+    // `false` = Resume (skip already-completed tag outputs on a retry of a
+    // failed batch — the new default). `true` = OverwriteAll (re-render
+    // every selected tag, deleting any prior output first). Sheet-open
+    // hydration in ui.rs reads bus.export_prefs_snapshot().overwrite_policy
+    // and writes this property; the value is read AT EXPORT CLICK TIME and
+    // threaded into Command::ExportCompilations.overwrite_policy. Toggle
+    // without click is discarded on quit (matches every other export pref
+    // today). Default unchecked = Resume.
+    in-out property <bool> export-overwrite-existing: false;
     in-out property <string> export-project-name: "";
 
     // Phase 11 Plan #7 Task 1 (fix #9). Top Repeater renders selected tags
@@ -201,6 +211,11 @@ export component MainWindow inherits Window {
     // every keystroke (Slint's LineEdit `edited` signal). Rust handler
     // mirrors the codec one — straight property write-through.
     callback export-filename-template-changed(string);
+    // Phase 11 Plan #6 Task 2: "Overwrite existing files" checkbox toggle.
+    // Fires on every click on the checkbox row. Rust handler is a straight
+    // property write-through — no bus command dispatch. Click value is read
+    // at Export-click time, NOT here. Mirrors export-codec-changed in shape.
+    callback export-overwrite-existing-changed(bool);
     // Phase 11 Plan #7 Task 1 (fix #9). Drag-released callback for the
     // top (selected) Repeater. `from-index` is the row index in the
     // top model; `relative-drop-y` is the cursor Y at release minus
@@ -869,7 +884,11 @@ export component MainWindow inherits Window {
                 // the Codec row (~80px). The Cancel/Export bottom buttons
                 // are anchored to `parent.height - 52px` so they ride
                 // down with the new height.
-                height: 680px;
+                // Phase 11 Plan #6 Task 2: bumped from 680px to 712px to
+                // fit the new "Overwrite existing files" checkbox row at
+                // y:580-608 between the Filename helper text (ends y:566)
+                // and the Cancel/Export buttons (now at y:660 = 712 - 52).
+                height: 712px;
                 border-radius: 8px;
                 background: #1f1f1f;
                 border-width: 1px;
@@ -1521,6 +1540,66 @@ export component MainWindow inherits Window {
                         text: "Placeholders: {tag}, {project}, {date}";
                         font-size: 11px;
                         color: #999999;
+                    }
+
+                    // Phase 11 Plan #6 Task 2: "Overwrite existing files"
+                    // checkbox row. Sits below the Filename helper (ends
+                    // y:566) and above the Cancel/Export buttons. Mirrors
+                    // the codec radio's custom-Rectangle pattern (no Slint
+                    // built-in CheckBox widget — keeps the form's visual
+                    // language consistent). False (unchecked) = Resume;
+                    // true (checked) = OverwriteAll. The full-row TouchArea
+                    // is declared LAST so the box + label paint above it
+                    // and clicking anywhere in the row toggles the bool.
+                    overwrite-row := Rectangle {
+                        x: 24px;
+                        y: 580px;
+                        width: parent.width - 48px;
+                        height: 28px;
+                        background: transparent;
+
+                        // Box indicator (18×18 with a filled inner square
+                        // when checked).
+                        overwrite-box := Rectangle {
+                            x: 0;
+                            y: (parent.height - self.height) / 2;
+                            width: 18px;
+                            height: 18px;
+                            border-radius: 3px;
+                            border-width: 1px;
+                            border-color: root.export-overwrite-existing ? #4a90e2 : #707070;
+                            background: root.export-overwrite-existing ? #4a90e2 : transparent;
+
+                            // Inner check mark (smaller filled square when
+                            // checked).
+                            Rectangle {
+                                x: 4px;
+                                y: 4px;
+                                width: 10px;
+                                height: 10px;
+                                border-radius: 1px;
+                                background: root.export-overwrite-existing ? #ffffff : transparent;
+                            }
+                        }
+
+                        Text {
+                            x: 30px;
+                            y: 0;
+                            width: parent.width - 30px;
+                            height: parent.height;
+                            text: "Overwrite existing files";
+                            font-size: 13px;
+                            color: #ffffff;
+                            vertical-alignment: center;
+                        }
+
+                        overwrite-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            clicked => {
+                                root.export-overwrite-existing-changed(!root.export-overwrite-existing);
+                            }
+                        }
                     }
 
                     // Cancel + Export bottom buttons.

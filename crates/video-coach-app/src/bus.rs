@@ -447,15 +447,13 @@ pub struct ExportPrefsSnapshot {
     /// for fresh projects and Phase-10-era project.json files (the
     /// `Preferences` field carries `#[serde(default = "default_filename_template")]`).
     pub export_filename_template: String,
-    /// Phase 11 Plan #6 Task 0. The last-persisted overwrite policy,
-    /// hydrated into the export sheet's "Overwrite existing" checkbox
-    /// on open. Plan #6 Task 2 wires the read-side; this field is
-    /// already populated by `write_export_prefs_snapshot` so a sheet
-    /// reopen reflects the user's last choice. `#[allow(dead_code)]`
-    /// is temporary — non-test builds have no reader yet (Task 2 adds
-    /// one); the test build exercises the field via the
-    /// `export_prefs_snapshot_default_overwrite_policy_is_resume` test.
-    #[allow(dead_code)]
+    /// Phase 11 Plan #6 Task 0 + Task 2. The last-persisted overwrite
+    /// policy, hydrated into the export sheet's "Overwrite existing"
+    /// checkbox on every sheet open (Task 2's `on_export_sheet_open_clicked`
+    /// reads this field and `set_export_overwrite_existing`s the Slint
+    /// property to `true` for `OverwriteAll`, `false` for `Resume`). The
+    /// field is populated by `write_export_prefs_snapshot` from
+    /// `Preferences::export_overwrite_policy` after each Export click.
     pub overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
 }
 
@@ -2694,6 +2692,13 @@ async fn handle_export_compilations(
         // Validation (sensitivity gate + sanitize-fallback gate) ran
         // earlier, so the template stored here is safe to round-trip.
         project.preferences.export_filename_template = filename_template.clone();
+        // Phase 11 Plan #6 Task 2: persist the click-time overwrite
+        // policy alongside res/qual/codec/template so the next sheet
+        // reopen reflects the user's last choice. The bool-vs-enum
+        // mapping happens UI-side at the Export-click dispatch (see
+        // ui.rs::on_export_start_clicked); by the time the value lands
+        // here it's already the canonical ExportOverwritePolicy variant.
+        project.preferences.export_overwrite_policy = overwrite_policy;
         // Phase 11 Plan #3 Task 2 (fix #8): publish to the slot the UI
         // reads on subsequent sheet opens. Done before the spawn-blocking
         // disk write so a slow disk doesn't delay the in-memory snapshot.
@@ -3958,6 +3963,41 @@ mod tests {
         assert_eq!(res, "1080");
         assert_eq!(qual, "medium");
         assert_eq!(codec, "h264");
+    }
+
+    #[test]
+    fn opening_export_sheet_hydrates_overwrite_policy_from_preferences() {
+        // Phase 11 Plan #6 Task 2. The sheet-open hydration reads the
+        // ExportPrefsSnapshot's `overwrite_policy` field directly (NOT
+        // via `export_prefs_to_slint_strings` — the bool-vs-enum mapping
+        // is simple enough to live at the call site in ui.rs). This test
+        // pins the snapshot population path: a Preferences with
+        // `OverwriteAll` must surface as `OverwriteAll` on the snapshot,
+        // and the default Preferences (fresh project) must surface as
+        // `Resume`. Sibling to `opening_export_sheet_hydrates_codec_from_
+        // preferences` above.
+        let prefs = video_coach_core::project::Preferences {
+            export_overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            ..Default::default()
+        };
+        let snap = ExportPrefsSnapshot {
+            resolution: prefs.last_export_resolution,
+            quality: prefs.last_export_quality,
+            codec: prefs.last_export_codec,
+            export_filename_template: prefs.export_filename_template.clone(),
+            overwrite_policy: prefs.export_overwrite_policy,
+        };
+        assert!(matches!(
+            snap.overwrite_policy,
+            video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+        ));
+
+        // Default (fresh project, never exported) hydrates to Resume.
+        let default_snap = ExportPrefsSnapshot::default();
+        assert!(matches!(
+            default_snap.overwrite_policy,
+            video_coach_core::project::ExportOverwritePolicy::Resume,
+        ));
     }
 
     #[test]
