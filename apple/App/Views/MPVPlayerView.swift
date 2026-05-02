@@ -30,6 +30,11 @@ final class MPVRenderingNSView: NSView {
     /// production representable's updateNSView via setCurrentZoom (Task 3.4).
     private var currentZoom: Zoom = .identity
 
+    private var dragAnchor: CGPoint?       // mouseDown location, in view local coords
+    private var dragStartZoom: Zoom?       // zoom at mouseDown
+    private var didCrossDragThreshold: Bool = false
+    private static let dragThresholdSqr: CGFloat = 16  // 4 px squared
+
     override init(frame: NSRect) {
         super.init(frame: frame)
         wantsLayer = true
@@ -61,11 +66,43 @@ final class MPVRenderingNSView: NSView {
     override var acceptsFirstResponder: Bool { true }
 
     override func mouseDown(with event: NSEvent) {
-        // Steal first-responder status on click so a TextField currently
-        // holding focus releases. KeyCommandView sits on top with
-        // hitTest returning nil, so the click falls through to here.
-        window?.makeFirstResponder(self)
-        super.mouseDown(with: event)
+        dragAnchor = convert(event.locationInWindow, from: nil)
+        dragStartZoom = currentZoom
+        didCrossDragThreshold = false
+        // Do NOT grab first-responder yet — defer until mouseUp without drag.
+        // (The existing first-responder steal is moved out of mouseDown into
+        // mouseUp's no-drag path, preserving the focus-out-of-TextField fix
+        // from commit 3ab22aa.)
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let anchor = dragAnchor, let startZoom = dragStartZoom,
+              startZoom.scale > 1.0 else { return }
+        let now = convert(event.locationInWindow, from: nil)
+        let dx = now.x - anchor.x
+        let dy = now.y - anchor.y
+        if !didCrossDragThreshold && dx * dx + dy * dy < Self.dragThresholdSqr {
+            return
+        }
+        didCrossDragThreshold = true
+        // Pan delta: dragging right reveals more of right-hand source, so pan
+        // moves in the opposite direction from the cursor.
+        let viewW = max(1, bounds.width)
+        let viewH = max(1, bounds.height)
+        let nextPanX = startZoom.panX - (dx / (viewW * startZoom.scale))
+        let nextPanY = startZoom.panY + (dy / (viewH * startZoom.scale))  // y-axis flip
+        let next = Zoom(scale: startZoom.scale, panX: nextPanX, panY: nextPanY)
+        commit(next)
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        if !didCrossDragThreshold {
+            // Plain click — original first-responder grab semantics.
+            window?.makeFirstResponder(self)
+        }
+        dragAnchor = nil
+        dragStartZoom = nil
+        didCrossDragThreshold = false
     }
 
     @MainActor
