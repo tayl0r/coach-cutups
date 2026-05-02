@@ -138,7 +138,16 @@ pub(crate) struct StrokePassCache {
 
 #[allow(dead_code)]
 pub(crate) struct PooledVbo {
-    pub buffer: wgpu::Buffer,
+    // wgpu 22's `Buffer` is NOT `Clone` (verified against
+    // wgpu-22.1.0/src/lib.rs line 450 — `pub struct Buffer { .. }` with
+    // no `derive(Clone)`). To honor Fix #41's lock-discipline rule
+    // (drop the Mutex guard BEFORE encode), we wrap in `Arc` so
+    // cache-lookup clones an `Arc` handle out (cheap atomic refcount
+    // bump), and the underlying GPU resource is dropped exactly once
+    // when the last clone goes away. This mirrors the `Arc<…>`
+    // wrapping inside `PipPassCache` / `StrokePassCache` for the same
+    // reason.
+    pub buffer: Arc<wgpu::Buffer>,
     pub capacity_vertices: usize,
 }
 
@@ -520,13 +529,49 @@ impl Compositor {
         target: &wgpu::Texture,
         vertices: &[StrokeVertex],
     ) {
-        let vbo = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("stroke-vbo"),
-                contents: bytemuck::cast_slice(vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        // Fix #50: caller (compose at line ~450) already filters empty
+        // vertex slices; lock that invariant in so a future regression
+        // can't pass through to a zero-byte write_buffer call.
+        debug_assert!(
+            !vertices.is_empty(),
+            "encode_stroke_pass called with empty vertex slice"
+        );
+        let bytes = bytemuck::cast_slice(vertices);
+        let needed_bytes = bytes.len();
+
+        // Plan #4 Task 2: pooled VBO. Lookup-grow-clone-out under the
+        // guard, then drop the guard before queue.write_buffer +
+        // set_vertex_buffer (Fix #41). wgpu::Buffer in wgpu 22 IS Clone
+        // (refcounted internally), so cloning the handle is a cheap
+        // atomic refcount bump — no Arc wrapper needed. Pure-compute
+        // path so .expect() on poison per Fix #51.
+        let buffer = {
+            let mut g = self
+                .stroke_vbo_pool
+                .lock()
+                .expect("stroke_vbo_pool poisoned");
+            let need_grow = match g.as_ref() {
+                None => true,
+                Some(p) => p.capacity_vertices * std::mem::size_of::<StrokeVertex>() < needed_bytes,
+            };
+            if need_grow {
+                #[cfg(test)]
+                self.stroke_vbo_grows
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let new_cap = vertices.len().next_power_of_two().max(64);
+                let new_buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
+                    label: Some("stroke-vbo-pool"),
+                    size: (new_cap * std::mem::size_of::<StrokeVertex>()) as u64,
+                    usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                    mapped_at_creation: false,
+                });
+                *g = Some(PooledVbo {
+                    buffer: Arc::new(new_buffer),
+                    capacity_vertices: new_cap,
+                });
+            }
+            g.as_ref().expect("populated above").buffer.clone()
+        }; // guard dropped here
 
         // Cached pipeline. Per Fix #41 the guard is dropped before encode;
         // per Fix #51 this is a pure-compute path so panic on poison.
@@ -542,6 +587,12 @@ impl Compositor {
             }
             g.as_ref().expect("populated above").pipeline.clone()
         }; // guard dropped here
+
+        // Upload after both guards have dropped. wgpu 22 guarantees the
+        // DMA copy scheduled by Queue::write_buffer is ordered before
+        // the encoder's commands when they share a single queue.submit
+        // (the same single-submit flow already used in compose).
+        self.queue.write_buffer(&buffer, 0, bytes);
 
         let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
         let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -559,7 +610,9 @@ impl Compositor {
             occlusion_query_set: None,
         });
         rpass.set_pipeline(&stroke_pipeline);
-        rpass.set_vertex_buffer(0, vbo.slice(..));
+        // Slice to the live byte range so the trailing pool capacity is
+        // invisible to the render pass (the buffer may be sized > needed).
+        rpass.set_vertex_buffer(0, buffer.slice(..needed_bytes as u64));
         let vertex_count = vertices.len() as u32;
         rpass.draw(0..vertex_count, 0..1);
     }
@@ -986,6 +1039,71 @@ mod tests {
             (off_stroke[0] as i32 - 255).abs() <= 2 && off_stroke[1] <= 2 && off_stroke[2] <= 2,
             "expected source red off the stroke path; got {:?}",
             off_stroke
+        );
+    }
+
+    #[test]
+    fn pooled_vbo_grows_on_capacity_miss() {
+        // Plan #4 Task 2: stroke VBO is pooled. First call allocates the
+        // pool buffer (grow #1). A larger stroke that exceeds capacity
+        // triggers exactly one grow (grow #2). A repeat of the same large
+        // stroke MUST reuse the buffer (no grow). After three calls the
+        // grow counter lands at exactly 2.
+        use std::sync::atomic::Ordering;
+        use video_coach_core::stroke::{Rgba, Stroke, StrokePoint};
+
+        let comp = Compositor::new_headless().expect("compositor");
+        let source = Frame::solid(640, 360, [255, 0, 0, 255]);
+        let webcam = Frame::solid(160, 90, [0, 0, 0, 255]);
+
+        let make_stroke = |n_points: usize| -> VisibleStroke {
+            let denom = (n_points.saturating_sub(1).max(1)) as f64;
+            let points: Vec<StrokePoint> = (0..n_points)
+                .map(|i| {
+                    let t = i as f64 / denom;
+                    StrokePoint {
+                        x: 0.2 + 0.6 * t,
+                        y: 0.5,
+                        t,
+                    }
+                })
+                .collect();
+            let drawn = points.len();
+            let stroke = Stroke {
+                id: uuid::Uuid::nil(),
+                color: Rgba::RED,
+                line_width: 0.01,
+                points,
+                auto_clear_after_seconds: None,
+            };
+            VisibleStroke {
+                stroke,
+                first_point_record_time: 0.0,
+                drawn_point_count: drawn,
+            }
+        };
+
+        let small = make_stroke(2);
+        let _ = comp
+            .compose(&source, &webcam, std::slice::from_ref(&small))
+            .expect("compose small");
+        let after_first = comp.stroke_vbo_grows.load(Ordering::Relaxed);
+        assert_eq!(after_first, 1, "first call should allocate the pool once");
+
+        let big = make_stroke(200);
+        let _ = comp
+            .compose(&source, &webcam, std::slice::from_ref(&big))
+            .expect("compose big");
+        let after_second = comp.stroke_vbo_grows.load(Ordering::Relaxed);
+        assert_eq!(after_second, 2, "big stroke should trigger one grow");
+
+        let _ = comp
+            .compose(&source, &webcam, std::slice::from_ref(&big))
+            .expect("compose big again");
+        let after_third = comp.stroke_vbo_grows.load(Ordering::Relaxed);
+        assert_eq!(
+            after_third, 2,
+            "third call (same size) must NOT grow; capacity already covers"
         );
     }
 
