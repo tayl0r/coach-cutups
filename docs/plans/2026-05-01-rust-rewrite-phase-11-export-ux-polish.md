@@ -951,9 +951,8 @@ side; Task 2 wires the Rust side of hydration).
 
 ## Closeout — Phase 11 Plan #7 SHIPPED 2026-05-01
 
-**CI run**: `<placeholder, filled by orchestrator after CI passes>`
-green on all 4 jobs — `test (ubuntu-latest)`, `test (windows-latest)`,
-`test (macos-latest)`, `media-tests`.
+**CI run**: `25241681131` green on all 4 jobs — `test (ubuntu-latest)`,
+`test (windows-latest)`, `test (macos-latest)`, `media-tests`.
 
 ### Commits (in shipping order)
 

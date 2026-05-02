@@ -506,7 +506,7 @@ own SHIPPED line + CI run id once green.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [ ] Plan #6: VBO churn for strokes / resume failed exports
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
-      SHIPPED 2026-05-01. CI run <pending fill-in> green on all 4 jobs.
+      SHIPPED 2026-05-01. CI run 25241681131 green on all 4 jobs.
       Two small UX wins for the export sheet: (1) drag-to-reorder of
       selected tags so the user can control output ordering (Phase 10
       ships alphabetic + all-clips-pinned-first); (2) custom output
