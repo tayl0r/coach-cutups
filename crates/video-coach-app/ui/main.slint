@@ -1,3 +1,5 @@
+import { LineEdit } from "std-widgets.slint";
+
 export component MainWindow inherits Window {
     title: "Video Coach";
     preferred-width: 1280px;
@@ -117,7 +119,35 @@ export component MainWindow inherits Window {
     // discriminants the Rust side maps to `Codec::H264` / `Codec::Hevc`.
     // Default mirrors Project::Preferences (H.264).
     in-out property <string> export-codec: "h264";
+    // Phase 11 Plan #7 Task 1: free-form filename template. Supported
+    // placeholders: `{tag}`, `{project}`, `{date}`. Default value matches
+    // Phase 10's hard-coded format byte-for-byte. Sheet-open hydration in
+    // ui.rs writes the persisted prefs value over this default before the
+    // sheet appears (Task 2 wires the prefs read; Task 1 ships placeholder
+    // hydration to the default).
+    in-out property <string> export-filename-template: "{tag} - {project}";
     in-out property <string> export-project-name: "";
+
+    // Phase 11 Plan #7 Task 1 (fix #9). Top Repeater renders selected tags
+    // in user-chosen order with drag handles; bottom Repeater renders
+    // unselected tags alphabetically. `export-tag-rows` is retained as the
+    // hidden source-of-truth model used during hydration to compute the
+    // split — it isn't visible. Task 2 partitions the model properly; Task
+    // 1 ships placeholder splits (selected = empty, unselected = all).
+    in-out property <[{tag: string, label: string, clip-count: int, duration: float}]> selected-export-tag-rows: [];
+    in-out property <[{tag: string, label: string, clip-count: int, duration: float}]> unselected-export-tag-rows: [];
+
+    // Phase 11 Plan #7 Task 1 (fixes #3, #4, #5). Drag-reorder gesture
+    // state for the selected-tag list. `dragging-tag-index == -1` means
+    // no drag in flight (also gates the Export button per fix #5);
+    // `drag-start-y` / `drag-current-y` are absolute window coordinates;
+    // `selected-list-top-y` is the absolute Y of the top Repeater's
+    // parent rectangle (used by the Rust handler to compute the drop's
+    // relative Y per fix #4).
+    in-out property <int> dragging-tag-index: -1;
+    in-out property <length> drag-start-y: 0px;
+    in-out property <length> drag-current-y: 0px;
+    in-out property <length> selected-list-top-y: 0px;
 
     // Mirrored from `ExportProgressSlot` in ui.rs's 30 Hz timer. The
     // outcome-kind string is the canonical view selector — one of
@@ -167,6 +197,17 @@ export component MainWindow inherits Window {
     callback export-quality-changed(string);
     // Phase 11 Plan #3 Task 2: Codec radio change ("h264" / "hevc").
     callback export-codec-changed(string);
+    // Phase 11 Plan #7 Task 1: filename-template LineEdit edit. Fires on
+    // every keystroke (Slint's LineEdit `edited` signal). Rust handler
+    // mirrors the codec one — straight property write-through.
+    callback export-filename-template-changed(string);
+    // Phase 11 Plan #7 Task 1 (fix #9). Drag-released callback for the
+    // top (selected) Repeater. `from-index` is the row index in the
+    // top model; `relative-drop-y` is the cursor Y at release minus
+    // `selected-list-top-y` so the Rust side can divide by row height
+    // to find the destination index without caring about the list's
+    // absolute window position.
+    callback export-tag-drag-released(int, length);
     // Phase 11 Plan #3 Task 2 (fix #8): mandatory sheet-open hydration.
     // Replaces an inline `export-sheet-visible = true` assignment in the
     // File menu so the Rust side can hydrate the three pickers from
@@ -822,12 +863,13 @@ export component MainWindow inherits Window {
                 y: (parent.height - self.height) / 2;
                 width: 560px;
                 // Phase 11 Plan #3 Task 2: bumped from 540px to 600px to
-                // fit the new Codec radio row at y:430-480px. The
-                // Cancel/Export bottom buttons are anchored to
-                // `parent.height - 52px` so they ride down with the new
-                // height; the Codec row sits cleanly between Quality
-                // (ends y:416) and the bottom buttons (start y:548).
-                height: 600px;
+                // fit the new Codec radio row at y:430-480px.
+                // Phase 11 Plan #7 Task 1: bumped from 600px to 680px to
+                // fit the new Filename label + LineEdit + hint text below
+                // the Codec row (~80px). The Cancel/Export bottom buttons
+                // are anchored to `parent.height - 52px` so they ride
+                // down with the new height.
+                height: 680px;
                 border-radius: 8px;
                 background: #1f1f1f;
                 border-width: 1px;
@@ -924,7 +966,12 @@ export component MainWindow inherits Window {
                         }
                     }
 
-                    // Tag-list scrollable area.
+                    // Tag-list scrollable area. Phase 11 Plan #7 Task 1
+                    // (fix #9): split into TWO stacked Repeaters — top
+                    // renders `selected-export-tag-rows` (user-chosen
+                    // order, with `☰` drag handles); bottom renders
+                    // `unselected-export-tag-rows` (alphabetic, no drag
+                    // handles).
                     Rectangle {
                         x: 24px;
                         y: 28px;
@@ -940,71 +987,205 @@ export component MainWindow inherits Window {
                             width: parent.width;
                             height: parent.height;
                             viewport-width: parent.width;
-                            viewport-height: max(parent.height, root.export-tag-rows.length * 32px + 4px);
+                            viewport-height: max(
+                                parent.height,
+                                (root.selected-export-tag-rows.length + root.unselected-export-tag-rows.length) * 32px + 4px
+                            );
 
                             VerticalLayout {
                                 x: 0; y: 2px;
                                 width: parent.width;
                                 spacing: 0;
                                 padding: 0;
-                                for row[idx] in root.export-tag-rows: Rectangle {
-                                    height: 32px;
-                                    background: tag-area.pressed
-                                        ? #2c5d8a
-                                        : (tag-area.has-hover ? #232323 : transparent);
 
-                                    // Checkbox indicator.
-                                    Rectangle {
-                                        x: 8px;
-                                        y: (parent.height - self.height) / 2;
-                                        width: 16px;
-                                        height: 16px;
-                                        border-radius: 3px;
-                                        border-width: 1px;
-                                        border-color: #707070;
-                                        background: row.selected ? #4a90e2 : transparent;
+                                // Top Repeater: SELECTED tag rows in user-
+                                // chosen order. Each row carries TWO
+                                // TouchAreas (fix #3) — `row-toggle-area`
+                                // (full-row click → toggle) declared
+                                // first, `drag-handle-area` (24×24 px far
+                                // left, ☰ glyph) declared SECOND so it
+                                // z-orders above and consumes presses
+                                // there before the row toggle sees them.
+                                selected-list := Rectangle {
+                                    width: parent.width;
+                                    height: root.selected-export-tag-rows.length * 32px;
+                                    background: transparent;
+
+                                    // Capture absolute window-Y of this
+                                    // rectangle so the Rust handler can
+                                    // compute the relative drop Y on
+                                    // release (fix #4).
+                                    changed absolute-position => {
+                                        root.selected-list-top-y = self.absolute-position.y;
+                                    }
+
+                                    for row[idx] in root.selected-export-tag-rows: Rectangle {
+                                        x: 0;
+                                        y: idx * 32px;
+                                        width: parent.width;
+                                        height: 32px;
+                                        background: root.dragging-tag-index == idx
+                                            ? #3a3a3a
+                                            : (sel-toggle-area.pressed
+                                                ? #2c5d8a
+                                                : (sel-toggle-area.has-hover ? #232323 : #262626));
+
+                                        // Checkbox indicator (always selected on top list).
+                                        Rectangle {
+                                            x: 32px;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 16px;
+                                            height: 16px;
+                                            border-radius: 3px;
+                                            border-width: 1px;
+                                            border-color: #707070;
+                                            background: #4a90e2;
+                                            Text {
+                                                x: 0; y: 0;
+                                                width: parent.width;
+                                                height: parent.height;
+                                                text: "✓";
+                                                font-size: 12px;
+                                                color: #ffffff;
+                                                horizontal-alignment: center;
+                                                vertical-alignment: center;
+                                            }
+                                        }
+
+                                        // Label.
                                         Text {
-                                            x: 0; y: 0;
+                                            x: 56px;
+                                            y: 0;
+                                            width: parent.width - 224px;
+                                            height: parent.height;
+                                            text: row.label;
+                                            font-size: 13px;
+                                            color: #ffffff;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+
+                                        // Right-aligned count + duration.
+                                        Text {
+                                            x: parent.width - 168px;
+                                            y: 0;
+                                            width: 160px;
+                                            height: parent.height;
+                                            text: row.clip-count + " clip" + (row.clip-count == 1 ? "" : "s") + " · " + format-mmss(row.duration);
+                                            font-size: 11px;
+                                            color: #aaaaaa;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: right;
+                                        }
+
+                                        // Row-wide toggle area (declared FIRST so it sits below).
+                                        sel-toggle-area := TouchArea {
                                             width: parent.width;
                                             height: parent.height;
-                                            text: row.selected ? "✓" : "";
-                                            font-size: 12px;
-                                            color: #ffffff;
+                                            clicked => { root.export-tag-toggled(row.tag); }
+                                        }
+
+                                        // Drag handle: ☰ glyph + 24×24 hit-rect at far left
+                                        // (declared SECOND so it z-orders ABOVE the row toggle
+                                        // — Slint orders by declaration; fix #3).
+                                        Text {
+                                            x: 4px;
+                                            y: 0;
+                                            width: 24px;
+                                            height: parent.height;
+                                            text: "☰";
+                                            font-size: 14px;
+                                            color: #aaaaaa;
                                             horizontal-alignment: center;
                                             vertical-alignment: center;
                                         }
+                                        drag-handle-area := TouchArea {
+                                            x: 0;
+                                            y: 0;
+                                            width: 32px;
+                                            height: parent.height;
+                                            mouse-cursor: grab;
+                                            pointer-event(event) => {
+                                                if (event.kind == PointerEventKind.down && event.button == PointerEventButton.left) {
+                                                    root.dragging-tag-index = idx;
+                                                    root.drag-start-y = self.absolute-position.y + self.mouse-y;
+                                                    root.drag-current-y = root.drag-start-y;
+                                                }
+                                                if (event.kind == PointerEventKind.move && root.dragging-tag-index == idx) {
+                                                    root.drag-current-y = self.absolute-position.y + self.mouse-y;
+                                                }
+                                                if (event.kind == PointerEventKind.up && root.dragging-tag-index == idx) {
+                                                    root.drag-current-y = self.absolute-position.y + self.mouse-y;
+                                                    root.export-tag-drag-released(idx, root.drag-current-y - root.selected-list-top-y);
+                                                    root.dragging-tag-index = -1;
+                                                }
+                                                if (event.kind == PointerEventKind.cancel && root.dragging-tag-index == idx) {
+                                                    root.dragging-tag-index = -1;
+                                                }
+                                            }
+                                        }
                                     }
+                                }
 
-                                    // Label.
-                                    Text {
-                                        x: 32px;
-                                        y: 0;
-                                        width: parent.width - 200px;
-                                        height: parent.height;
-                                        text: row.label;
-                                        font-size: 13px;
-                                        color: #ffffff;
-                                        vertical-alignment: center;
-                                        overflow: elide;
-                                    }
+                                // Bottom Repeater: UNSELECTED tag rows in
+                                // alphabetical order. No drag handles.
+                                unselected-list := Rectangle {
+                                    width: parent.width;
+                                    height: root.unselected-export-tag-rows.length * 32px;
+                                    background: transparent;
 
-                                    // Right-aligned count + duration.
-                                    Text {
-                                        x: parent.width - 168px;
-                                        y: 0;
-                                        width: 160px;
-                                        height: parent.height;
-                                        text: row.clip-count + " clip" + (row.clip-count == 1 ? "" : "s") + " · " + format-mmss(row.duration);
-                                        font-size: 11px;
-                                        color: #aaaaaa;
-                                        vertical-alignment: center;
-                                        horizontal-alignment: right;
-                                    }
-
-                                    tag-area := TouchArea {
+                                    for row[idx] in root.unselected-export-tag-rows: Rectangle {
+                                        x: 0;
+                                        y: idx * 32px;
                                         width: parent.width;
-                                        height: parent.height;
-                                        clicked => { root.export-tag-toggled(row.tag); }
+                                        height: 32px;
+                                        background: unsel-toggle-area.pressed
+                                            ? #2c5d8a
+                                            : (unsel-toggle-area.has-hover ? #232323 : transparent);
+
+                                        // Empty checkbox indicator.
+                                        Rectangle {
+                                            x: 32px;
+                                            y: (parent.height - self.height) / 2;
+                                            width: 16px;
+                                            height: 16px;
+                                            border-radius: 3px;
+                                            border-width: 1px;
+                                            border-color: #707070;
+                                            background: transparent;
+                                        }
+
+                                        // Label.
+                                        Text {
+                                            x: 56px;
+                                            y: 0;
+                                            width: parent.width - 224px;
+                                            height: parent.height;
+                                            text: row.label;
+                                            font-size: 13px;
+                                            color: #ffffff;
+                                            vertical-alignment: center;
+                                            overflow: elide;
+                                        }
+
+                                        // Right-aligned count + duration.
+                                        Text {
+                                            x: parent.width - 168px;
+                                            y: 0;
+                                            width: 160px;
+                                            height: parent.height;
+                                            text: row.clip-count + " clip" + (row.clip-count == 1 ? "" : "s") + " · " + format-mmss(row.duration);
+                                            font-size: 11px;
+                                            color: #aaaaaa;
+                                            vertical-alignment: center;
+                                            horizontal-alignment: right;
+                                        }
+
+                                        unsel-toggle-area := TouchArea {
+                                            width: parent.width;
+                                            height: parent.height;
+                                            clicked => { root.export-tag-toggled(row.tag); }
+                                        }
                                     }
                                 }
                             }
@@ -1295,6 +1476,35 @@ export component MainWindow inherits Window {
                             height: parent.height;
                             clicked => { root.export-codec-changed("hevc"); }
                         }
+                    }
+
+                    // Phase 11 Plan #7 Task 1: Filename template input row.
+                    // Sits below the Codec row (Codec ends at y:480).
+                    Text {
+                        x: 24px;
+                        y: 494px;
+                        width: 120px;
+                        height: 18px;
+                        text: "Filename";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    LineEdit {
+                        x: 24px;
+                        y: 516px;
+                        width: 280px;
+                        height: 28px;
+                        text <=> root.export-filename-template;
+                        edited(text) => { root.export-filename-template-changed(text); }
+                    }
+                    Text {
+                        x: 24px;
+                        y: 550px;
+                        width: parent.width - 48px;
+                        height: 16px;
+                        text: "Placeholders: {tag}, {project}, {date}";
+                        font-size: 11px;
+                        color: #999999;
                     }
 
                     // Cancel + Export bottom buttons.
@@ -1705,9 +1915,14 @@ export component MainWindow inherits Window {
     // lists, so the `selected` membership query lives on the row
     // model itself (Rust-side hydrated, see comment on
     // export-tag-rows above).
+    //
+    // Phase 11 Plan #7 Task 1 (fix #5): also gated on
+    // `dragging-tag-index == -1` so a click-Export-during-drag race
+    // can't dispatch with the pre-drag selection order.
     pure function can-export() -> bool {
         return root.selected-export-tags.length > 0
-            && root.export-output-folder != "";
+            && root.export-output-folder != ""
+            && root.dragging-tag-index == -1;
     }
 
     // mm:ss formatter as a pure function. Slint 1.16 supports

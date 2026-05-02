@@ -27,6 +27,7 @@ use crate::frame_sink::{
 use crate::last_project;
 use slint::{ComponentHandle, Model};
 use std::path::PathBuf;
+use video_coach_core::project::default_filename_template;
 
 slint::include_modules!();
 
@@ -90,6 +91,35 @@ fn aggregate_tag_rows(
         rows.push((tag.clone(), tag, count, dur as f32, selected));
     }
     rows
+}
+
+/// Phase 11 Plan #7 Task 1 (fix #4). Compute the destination index for a
+/// drag-released row in the selected-tag list, given the cursor's drop-Y
+/// relative to the top of the list, the per-row pixel height, and the
+/// list's current length. Pure helper extracted so tests don't need a
+/// Slint window.
+///
+/// `relative_drop_y` is the cursor's Y at release minus the list's
+/// absolute-Y (computed Slint-side via `selected-list-top-y`). Negative
+/// values clamp to 0 (drop above the top of the list = move to position
+/// 0). Values past the end clamp to `len` (drop below the last row =
+/// append). Floor + clamp ensures no panic on extreme drops and matches
+/// the visual expectation that the row lands in whichever slot the
+/// cursor's Y falls inside.
+///
+/// Note: this returns the destination as if the source row were already
+/// removed from the list. The caller does `let tag = list.remove(from);
+/// list.insert(drag_reorder_destination(from, drop_y, h, list.len()),
+/// tag);` — `list.len()` after the remove is the original length minus 1,
+/// which clamps `to` correctly even when the drop is past the end.
+pub(crate) fn drag_reorder_destination(
+    _from: usize,
+    relative_drop_y: f32,
+    row_height: f32,
+    len: usize,
+) -> usize {
+    let raw = (relative_drop_y / row_height).floor().max(0.0) as usize;
+    raw.min(len)
 }
 
 /// Phase 10 Task 3 (per fix #35). Reveal a folder in the platform's
@@ -808,6 +838,65 @@ pub fn run(
             w.set_export_codec(s);
         }
     });
+    // Phase 11 Plan #7 Task 1: filename-template LineEdit edit. Mirrors the
+    // codec change handler — straight property write-through. The two-way
+    // binding in main.slint (`text <=> root.export-filename-template`)
+    // already keeps the property in sync; this callback exists for
+    // symmetry with the other pickers and to be a future hook for live
+    // validation hints.
+    let weak_for_template = window.as_weak();
+    window.on_export_filename_template_changed(move |s: slint::SharedString| {
+        if let Some(w) = weak_for_template.upgrade() {
+            w.set_export_filename_template(s);
+        }
+    });
+    // Phase 11 Plan #7 Task 1 (fix #9). Drag-released callback for the
+    // top (selected) tag list. Reads the current `selected-export-tag-rows`
+    // model + `selected-export-tags` membership list, computes the
+    // destination index from the cursor's relative drop-Y, performs an
+    // in-place remove-then-insert on both, and writes them back. The
+    // tags-list reorder is what flows through to the bus's per-tag
+    // for-loop; the rows-list reorder is purely visual (so the dragged
+    // row appears in its new position immediately on release).
+    let weak_for_drag = window.as_weak();
+    window.on_export_tag_drag_released(move |from_index: i32, relative_drop_y: f32| {
+        let Some(w) = weak_for_drag.upgrade() else {
+            return;
+        };
+        // Slint row height is hardcoded at 32px in the top Repeater
+        // (see `selected-list` block in main.slint); kept in sync here.
+        const ROW_HEIGHT_PX: f32 = 32.0;
+        let rows = w.get_selected_export_tag_rows();
+        let len = rows.row_count();
+        if from_index < 0 || (from_index as usize) >= len {
+            return;
+        }
+        let from = from_index as usize;
+        // Compute destination AFTER the source row is removed (len - 1
+        // is the post-remove length so the clamp lands correctly).
+        let to = drag_reorder_destination(from, relative_drop_y, ROW_HEIGHT_PX, len - 1);
+        if from == to {
+            return;
+        }
+        // Snapshot the row model into a Vec, mutate, write back.
+        let mut row_vec: Vec<(i32, f32, slint::SharedString, slint::SharedString)> =
+            rows.iter().collect();
+        let row = row_vec.remove(from);
+        row_vec.insert(to, row);
+        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(row_vec)));
+
+        // Mirror the same reorder onto `selected-export-tags` so the bus
+        // dispatch (which iterates that string list) matches the visible
+        // top-Repeater order.
+        let tags = w.get_selected_export_tags();
+        let mut tag_vec: Vec<slint::SharedString> = tags.iter().collect();
+        if from < tag_vec.len() && to <= tag_vec.len() {
+            let tag = tag_vec.remove(from);
+            let to = to.min(tag_vec.len());
+            tag_vec.insert(to, tag);
+            w.set_selected_export_tags(slint::ModelRc::new(slint::VecModel::from(tag_vec)));
+        }
+    });
     // Phase 11 Plan #3 Task 2 (fix #8). Mandatory sheet-open hydration:
     // Slint properties reset to their declared defaults on each
     // component instantiation, so the "persisted on Export click"
@@ -827,6 +916,35 @@ pub fn run(
         w.set_export_resolution(slint::SharedString::from(res));
         w.set_export_quality(slint::SharedString::from(qual));
         w.set_export_codec(slint::SharedString::from(codec));
+        // Phase 11 Plan #7 Task 1 PLACEHOLDER hydration. Task 2 replaces
+        // this with a read of `prefs.export_filename_template` from the
+        // ExportPrefsSnapshot once the snapshot carries that field. For
+        // Task 1 we hydrate the default template so the LineEdit shows
+        // a sensible value on first open instead of an empty string.
+        w.set_export_filename_template(slint::SharedString::from(default_filename_template()));
+        // Phase 11 Plan #7 Task 1 PLACEHOLDER split: write empty model
+        // to selected-export-tag-rows and the full export-tag-rows model
+        // to unselected-export-tag-rows. Task 2 partitions properly by
+        // matching against `selected-export-tags`. For Task 1 the visible
+        // result is "everything in the bottom (unselected) list" — the
+        // user toggles to move rows up; once Task 2 ships, sheet-open
+        // hydration restores the user's selection alphabetically into
+        // the top list.
+        let empty_rows: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = Vec::new();
+        w.set_selected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(empty_rows)));
+        // Slint compiles anon-struct list properties to tuples with
+        // fields in alphabetical order. `export-tag-rows` carries
+        // {clip-count, duration, label, selected, tag} → 5-tuple;
+        // unselected-export-tag-rows carries {clip-count, duration,
+        // label, tag} → 4-tuple (no `selected` since membership is
+        // implicit in which Repeater renders the row). Strip the
+        // `selected` field on the way over.
+        let all_rows = w.get_export_tag_rows();
+        let unsel_rows: Vec<(i32, f32, slint::SharedString, slint::SharedString)> = all_rows
+            .iter()
+            .map(|r| (r.0, r.1, r.2.clone(), r.4.clone()))
+            .collect();
+        w.set_unselected_export_tag_rows(slint::ModelRc::new(slint::VecModel::from(unsel_rows)));
         w.set_export_sheet_visible(true);
     });
 
@@ -1256,6 +1374,67 @@ mod tests {
         assert!(!rows[2].4); // not selected
         assert_eq!(rows[3].0, "zebra");
         assert!(!rows[3].4);
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 11 Plan #7 Task 1 (fix #4) — drag_reorder_destination tests.
+    // ---------------------------------------------------------------
+
+    /// Helper that performs the same remove-then-insert mutation the
+    /// drag-released callback runs against `selected-export-tags`. Pure
+    /// over `Vec<&str>` so each test can express its expected ordering
+    /// without spinning up a Slint window.
+    fn drag_reorder_apply<T: Clone>(list: &[T], from: usize, to: usize) -> Vec<T> {
+        let mut out: Vec<T> = list.to_vec();
+        let item = out.remove(from);
+        let to = to.min(out.len());
+        out.insert(to, item);
+        out
+    }
+
+    #[test]
+    fn drag_reorder_swap_within_selected_tags() {
+        // Drop with relative-Y past the second row but within the third
+        // row's slot lands at index 2 — `floor(64.5/32) = 2` which is
+        // inside the post-remove length of 2 (clamps to 2). Effectively
+        // a swap of "a" to the end.
+        let list = ["a", "b", "c"];
+        // post-remove len = 2, drop_y = 80 → floor(80/32)=2 → clamp to 2.
+        let to = super::drag_reorder_destination(0, 80.0, 32.0, list.len() - 1);
+        assert_eq!(to, 2);
+        assert_eq!(drag_reorder_apply(&list, 0, to), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn drag_reorder_same_index_is_noop() {
+        // A drop-Y inside the source row's own slot resolves to the
+        // source index, which the caller treats as a no-op.
+        let list = ["a", "b", "c"];
+        // from=1, drop_y = 32 → floor(32/32) = 1, clamp to post-remove
+        // len 2 → 1.
+        let to = super::drag_reorder_destination(1, 32.0, 32.0, list.len() - 1);
+        assert_eq!(to, 1);
+    }
+
+    #[test]
+    fn drag_reorder_to_index_clamps_to_len() {
+        // Drop past the bottom of the list clamps to the post-remove
+        // length (append). For a 3-element list with from=0, post-
+        // remove len = 2, so a drop at y=999 lands at index 2.
+        let list = ["a", "b", "c"];
+        let to = super::drag_reorder_destination(0, 999.0, 32.0, list.len() - 1);
+        assert_eq!(to, 2);
+        assert_eq!(drag_reorder_apply(&list, 0, to), ["b", "c", "a"]);
+    }
+
+    #[test]
+    fn drag_reorder_drop_above_top_clamps_to_zero() {
+        // Negative relative-Y (drop above the top of the list) clamps
+        // to 0 via `.max(0.0) as usize`.
+        let list = ["a", "b", "c"];
+        let to = super::drag_reorder_destination(2, -50.0, 32.0, list.len() - 1);
+        assert_eq!(to, 0);
+        assert_eq!(drag_reorder_apply(&list, 2, to), ["c", "a", "b"]);
     }
 
     /// Phase 6 Task 6 — proves the Slint component build pipeline + the
