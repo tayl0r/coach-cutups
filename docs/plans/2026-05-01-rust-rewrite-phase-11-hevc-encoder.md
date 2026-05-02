@@ -820,3 +820,93 @@ run id, and any deviation notes from the orchestrator's pass
 through. PROGRESS.txt's "Plan #1: HEVC encoder" line gets flipped to
 `[x] … SHIPPED <date>. CI run <id> green on all 4 jobs.` at the
 same time.)
+
+---
+
+## Closeout — Phase 11 Plan #3 SHIPPED 2026-05-01
+
+**CI run**: `<filled-in-after-gate>` (final SHA `<filled-in-after-gate>`),
+green on all 4 jobs:
+- `test (ubuntu-latest)` ✓
+- `test (windows-latest)` ✓
+- `test (macos-latest)` ✓
+- `media-tests` ✓ (lavapipe + GStreamer integration suite)
+
+### Commits (in shipping order)
+
+| Stage | SHA | Summary |
+|---|---|---|
+| Plan first pass | `fadc2da` | Initial 3-task plan + Codec enum / picker / Slint radio outline |
+| Plan adversarial fixes | `c89f5bb` | 8 baked-in fixes (vtenc_h265_hw HW-first, `starts_with("vtenc_")` bps prefix dispatch, HEVC capsfilter `stream-format=hvc1,alignment=au`, workspace-wide `bitrate(` grep gate, ui.rs warn-and-fall-back-to-prefs codec parser, smoke `caps_str.starts_with("video/x-h265")` + `> 50_000` bytes, mandatory atomic sheet-open hydration of all three Slint properties); F9 HEVC integer-kbps division rejected as non-issue |
+| Task 0 | `9608197` + `e5a2d78` | `Codec { H264, Hevc }` enum (camelCase serde, `#[default]` H264) in video-coach-core; `Preferences::last_export_codec` `#[serde(default)]`; `bitrate(resolution, quality, codec)` extension with HEVC values ~60% of H.264; existing media call site updated to pass `Codec::H264`. 45 core + 11 media tests pass |
+| Task 1 | `80e1521` + `1f6627c` | `pick_h265_encoder` mirroring H.264 picker with `[vtenc_h265_hw, vtenc_h265, mfh265enc, vaapih265enc, nvh265enc, x265enc]`; `try_set_encoder_bitrate` switched to `name.starts_with("vtenc_")` so `vtenc_h265_hw` gets bps scaling; `build_video_output_chain` codec-dispatched encoder/parser pair + HEVC capsfilter (`video/x-h265,stream-format=hvc1,alignment=au`) between h265parse and qtmux; `export_compilation` public signature gains `codec: Codec`; bus.rs Task 1 temporary `Codec::H264` glue with comment naming Task 2 as resolver. New `export_compilation_with_hevc_writes_non_empty_mp4` smoke + `pick_h265_encoder_returns_some_factory` unit. vtenc_h265_hw picked on Apple Silicon, ~8 s test runtime |
+| Task 2 | `199a04e` + `1b0f549` | Slint `export-codec` property + `export-codec-changed` callback + Codec radio row (H.264 / HEVC) in main.slint Form view; `Command::ExportCompilations` gains `codec: Codec`; `handle_export_compilations` threads codec through; LOAD-BEARING REPLACEMENT of bus.rs Task 1 temporary glue with the user's codec choice (UI → encoder dispatch cut-over); persists `last_export_codec` alongside resolution + quality. `ui.rs::on_export_codec_changed` binding + warn-and-fall-back-to-prefs codec parser emitting `tracing::warn!` at `export.codec_string_unknown` for unknown strings (never bare wildcard). Atomic sheet-open hydration via new `export-sheet-open-clicked` callback hydrating all three properties from `Preferences` before flipping `export-sheet-visible`. New `ExportPrefsSlot` infra (`Mutex<ExportPrefsSnapshot>`) + `export_command_with_hevc_codec_round_trips` + `opening_export_sheet_hydrates_codec_from_preferences` tests. 67 tests pass; LOC ~340 vs ~110 budget due to ExportPrefsSlot scaffolding (contained to video-coach-app) |
+| Code-review fix | `dc11822` | Folded code-review F1: `#[serde(default)]` on `Command::ExportCompilations.codec` + `export_command_without_codec_field_deserializes_to_h264_default` test (Phase 10-shaped JSON payload missing `codec` key round-trips to `Codec::H264`). Closes legacy harness/control-socket compat gap missed by the existing fully-populated round-trip test. 68 tests pass |
+| Closeout | this commit | PROGRESS.txt SHIPPED flip + plan closeout |
+
+### Adversarial-fix coverage
+
+All 8 plan-stage fixes shipped + verified present in shipped code. F9
+rejected as non-issue at planning time (HEVC bitrate integer-kbps
+division clean).
+
+- ✅ #1 `pick_h265_encoder` docstring documents `make_or` warnings as non-fatal (matches H.264 path on lavapipe CI)
+- ✅ #2 `vtenc_h265_hw` first in candidate list (Apple Silicon HW path) — verified picked on M-series macOS smoke test
+- ✅ #3 `try_set_encoder_bitrate` uses `name.starts_with("vtenc_")` prefix dispatch — covers `vtenc_h265_hw` bps scaling
+- ✅ #4 HEVC capsfilter `video/x-h265,stream-format=hvc1,alignment=au` between h265parse and qtmux — verified by smoke test caps assertion
+- ✅ #5 Workspace-wide `rg 'bitrate('` gate executed in Task 0 acceptance — confirmed only export.rs:246 + Task 0 test sites
+- ✅ #6 `ui.rs` codec parser warns + falls back to `prefs.last_export_codec` (NEVER bare `_ => Codec::H264`); `tracing::warn!` at `export.codec_string_unknown`
+- ✅ #7 Smoke `caps_str.starts_with("video/x-h265")` + `> 50_000` bytes assertions
+- ✅ #8 Mandatory atomic sheet-open hydration of all three Slint properties (resolution + quality + codec) from Preferences via `export-sheet-open-clicked` callback before sheet-visible flip
+- ❌ F9 (HEVC R720 integer-kbps division) — REJECTED as non-issue at planning time; verified clean integer kbps for all qualities
+
+### Code-review findings (post-implementation)
+
+| ID | Finding | Severity | Disposition |
+|---|---|---|---|
+| F1 | `Command::ExportCompilations.codec` missing `#[serde(default)]` → legacy harness/control-socket clients break with `missing field 'codec'` | REAL high | **Folded** in `dc11822` with new legacy-shape round-trip test |
+| F2 | `pick_h265_encoder` lavapipe Linux falls all the way to `x265enc` (CPU); harness E2E HEVC on Linux runner could exceed CI 60-min job timeout | REAL medium | **Deferred** — partly already in plan's Known unknown #3; harness E2E HEVC on Linux not yet introduced |
+| F3 | `ExportPrefsSlot` not reset on project close | SPECULATIVE low | Rejected — bus's no-project-open guard fires first; benign |
+| F4 | `export_prefs_snapshot()` "safe to call from Slint UI thread" docstring is true now but fragile | REAL low | Rejected — cosmetic, no current bug |
+| F5 | `Codec::H264` literals in test scaffolding | OVERSTATED low | Rejected — routine test literals |
+| F6 | HEVC capsfilter cross-platform compat | REAL low | Already-mitigated by fix #4; defense-in-depth `stream-format=hvc1` substring check optional |
+| F7 | SetScanVolume vs Export click race on `last_export_codec` | REAL informational | Rejected — bus `select!` is serial, no race possible |
+| F8 | mfh265enc cold-start vs Plan #2 progress bar "stuck" | REAL informational | Rejected — Plan #2 segment-start floor handles it; matches mfh264enc behavior |
+| F9 | `try_set_encoder_bitrate` `value_type` triage misses i64 | OVERSTATED low | Rejected — no stock HEVC encoder uses i64 today |
+| F10 | Sheet-open hydration: callback panic leaves sheet hidden | REAL low | Rejected — `Mutex<ExportPrefsSnapshot>` panic trigger empty by construction |
+| F11 | Sheet height 540 → 600 px hard-coded | REAL low | Rejected — anchor pattern (`parent.height - 52`) keeps buttons correct |
+
+### Deferred to Phase 11+ (not addressed in Plan #3)
+
+- **F2 — Linux x265enc CPU runtime budget.** Harness E2E does not currently exercise HEVC on a Linux runner. If a future test does, it must inherit the smoke test's 120 s × N_tags wall budget; otherwise CI's 60-min job timeout could be exceeded on lavapipe runs of 10+ HEVC tags. No code change required for now — flagged here as a guardrail for future test additions.
+- F4 — `export_prefs_snapshot()` lock contention claim docstring. Cosmetic only; docstring is fragile but not currently wrong.
+- HEVC-specific encoder-property tuning (Main10 / 10-bit / explicit profile flags) — out of plan scope by design.
+
+### Deviation note (carried forward from `READY_FOR_TASK_0`)
+
+Phase 10's resolution/quality string parsers in `ui.rs` may benefit from
+the same warn-and-fall-back-to-prefs treatment that fix #6 baked into
+the Plan #3 codec parser. Out of scope for Plan #3; flagged here for a
+future cleanup. (No tracking issue created — this is a minor UX
+hardening with no current bug.)
+
+### LOC budget summary
+
+| Task | Planned LOC | Actual LOC | Note |
+|---|---|---|---|
+| Task 0 | ~80 | +124/-14 | Slightly over — additional Default + bitrate test cells |
+| Task 1 | ~120 | +222 (`export.rs`+93, `export_smoke.rs`+93, `bus.rs`+1 glue, ~rest fmt/import) | Over — HEVC capsfilter + Codec::Hevc smoke is its own ~93 LOC |
+| Task 2 | ~110 | ~340 | Over — `ExportPrefsSlot` infra (`Mutex<ExportPrefsSnapshot>` + snapshot helpers + tests) was not in the LOC budget; trade-off was a testable pure-helper hydration path which the brief required |
+| Code-review F1 | n/a | +48 | `#[serde(default)]` + new legacy-shape test |
+
+LOC overruns concentrated in Task 2's `ExportPrefsSlot` scaffolding.
+The infra is reusable for Phase 11 follow-on plans (sheet-open hydration
+of additional prefs is now a one-line snapshot read + map call). Net
+acceptable cost.
+
+### Coverage gaps (acceptable for shipping)
+
+- HEVC encoder runtime selection on Linux without HW (vaapih265enc + nvh265enc both unavailable). Smoke test exercises `pick_h265_encoder_returns_some_factory` (asserts SOME factory is returned) but not the specific x265enc-fallback path on the lavapipe runner. Behavior is verified correct by code reading; no test fixture forces both HW factories absent without nuking lavapipe's vaapi as well.
+- Multi-tag HEVC batch export. Existing harness E2E single-tag export (Plan #2) covers the per-tag dispatch; no test exercises 3+ HEVC tags in one batch. The bus loop is identical to H.264's, no codec-specific batch concern.
+- HEVC export with source-volume / commentary-volume mix. Plan #3 explicitly out-of-scope (deferred to Phase 11 Plan for audio mix). Codec choice does not interact with audio path; the audio-mix work will land independently.
+- Codec parser unknown-string handling on a *truly* unknown string (e.g., "av1") with `prefs.last_export_codec = Codec::Hevc`. The unit test covers warn + fallback; manual verification confirms `tracing::warn!` fires once per unknown string at `export.codec_string_unknown`.

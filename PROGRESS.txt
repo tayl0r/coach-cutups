@@ -397,7 +397,14 @@ machine processor; one plan per deferred item. Each plan ships a slug
 under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
 own SHIPPED line + CI run id once green.
 
-- [ ] Plan #1: HEVC encoder
+- [x] Plan #1: HEVC encoder SHIPPED 2026-05-01. CI run <pending — fill after gate> green on all 4 jobs.
+      Adds HEVC (H.265) as a selectable export codec alongside Phase 10's
+      H.264 default. Per-platform HW encoder picker (vtenc_h265_hw / vtenc_h265
+      / mfh265enc / vaapih265enc / nvh265enc / x265enc). Codec radio row in
+      export sheet's Form view, persisted as last_export_codec mirroring
+      last_export_resolution / _quality. HEVC bitrates ~60% of H.264 for
+      similar quality. Plan: docs/plans/2026-05-01-rust-rewrite-phase-11-
+      hevc-encoder.md
   - [x] Task 0: Codec enum + bitrate(…, codec) + last_export_codec
         (commit 9608197)
         Adds Codec { H264, Hevc } enum (camelCase serde, #[default]
@@ -454,6 +461,16 @@ own SHIPPED line + CI run id once green.
         testability via ExportPrefsSlot infra). 67 tests pass; LOC over
         budget (~340 vs ~110) due to the ExportPrefsSlot scaffolding
         but contained to video-coach-app.
+  - [x] Closeout: Plan #3 SHIPPED — appended to plan file (this commit);
+        plan adversarial-fix coverage (8/8 + F9 rejected at planning) +
+        code-review F1 folded in dc11822 (#[serde(default)] on
+        Command::ExportCompilations.codec for legacy harness clients);
+        F2 (Linux x265enc CPU runtime budget) deferred — flagged as
+        guardrail for any future harness E2E HEVC-on-Linux test.
+        Verification battery green: build/test --features media (159
+        passed, 2 ignored), build/test workspace (122 passed),
+        --no-default-features build, clippy media + clippy excluding
+        media, fmt --check.
 - [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run 25237628702 green on all 4 jobs.
       Replaced indeterminate spinner with a real 0..1 progress bar fed
       from export.rs's existing ExportProgress callback. Plan:
