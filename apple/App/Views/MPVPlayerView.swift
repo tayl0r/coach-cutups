@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import QuartzCore
 import Libmpv  // for MPVSourcePlayerError surfaced from attachLayer
+import VideoCoachCore  // for Zoom
 
 /// NSView that hosts an `MPVMetalLayer`. mpv (vo=gpu-next + gpu-context=
 /// moltenvk) draws directly into the layer via `wid`; the view exists to
@@ -15,6 +16,19 @@ final class MPVRenderingNSView: NSView {
     private var ownedPlayer: MPVSourcePlayer?
     private weak var sharedPlayer: MPVSourcePlayer?
     private var player: MPVSourcePlayer? { ownedPlayer ?? sharedPlayer }
+
+    /// Called whenever the user produces a zoom/pan input. The handler is
+    /// expected to clamp and route the new Zoom to MPVSourcePlayer.setZoom.
+    /// Bring-up window passes a closure that updates an internal Zoom var
+    /// and calls player.setZoom directly. Production passes a closure that
+    /// updates Workspace.currentZoom (whose setCurrentZoom calls setZoom).
+    var onZoomChange: ((Zoom) -> Void)?
+
+    /// Most recent Zoom committed by onZoomChange. Mirrored locally so the
+    /// view can compute incremental updates (e.g. cursor-pivot zoom needs
+    /// the current state to compute the next state). Synced by the
+    /// production representable's updateNSView via setCurrentZoom (Task 3.4).
+    private var currentZoom: Zoom = .identity
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -52,6 +66,58 @@ final class MPVRenderingNSView: NSView {
         // hitTest returning nil, so the click falls through to here.
         window?.makeFirstResponder(self)
         super.mouseDown(with: event)
+    }
+
+    @MainActor
+    func setCurrentZoom(_ zoom: Zoom) { currentZoom = zoom }
+
+    override func scrollWheel(with event: NSEvent) {
+        let cursor = cursorInBounds(event)
+        if event.hasPreciseScrollingDeltas {
+            // Trackpad two-finger swipe → pan.
+            // Direction: positive scrollingDeltaY = swipe up = expose more of top
+            // (so the visible center moves toward smaller y in source). The flip
+            // already incorporates the user's natural-scrolling preference; mpv
+            // and Apple's docs both treat scrollingDeltaY as content-direction.
+            guard currentZoom.scale > 1.0 else { return }
+            let viewW = max(1, bounds.width)
+            let viewH = max(1, bounds.height)
+            let dx = -event.scrollingDeltaX / (viewW * currentZoom.scale)
+            let dy = -event.scrollingDeltaY / (viewH * currentZoom.scale)
+            let next = Zoom(
+                scale: currentZoom.scale,
+                panX: currentZoom.panX + dx,
+                panY: currentZoom.panY + dy
+            )
+            commit(next)
+        } else {
+            // Coarse mouse wheel → zoom toward cursor.
+            // Direction: scrollingDeltaY > 0 = wheel scrolled up (away from user)
+            // = zoom IN. This matches Maps, Safari, Final Cut, every macOS app
+            // that supports wheel-to-zoom. macOS's natural-scrolling preference
+            // is already baked into scrollingDeltaY; we don't read
+            // isDirectionInvertedFromDevice separately. (Verified against reviewer
+            // finding 7 in v2 review history.)
+            let step = 0.1
+            let factor = 1.0 + step * (event.scrollingDeltaY > 0 ? 1.0 : -1.0)
+            let nextScale = currentZoom.scale * factor
+            let next = currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor)
+            commit(next)
+        }
+    }
+
+    /// Cursor position normalized to [0,1] in view bounds.
+    private func cursorInBounds(_ event: NSEvent) -> CGPoint {
+        let p = convert(event.locationInWindow, from: nil)
+        let x = bounds.width > 0 ? p.x / bounds.width : 0.5
+        let y = bounds.height > 0 ? (bounds.height - p.y) / bounds.height : 0.5
+        return CGPoint(x: max(0, min(1, x)), y: max(0, min(1, y)))
+    }
+
+    private func commit(_ zoom: Zoom) {
+        let clamped = zoom.clamped()
+        currentZoom = clamped
+        onZoomChange?(clamped)
     }
 
     private func updateDrawableSize() {
