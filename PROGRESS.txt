@@ -398,6 +398,15 @@ under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
 own SHIPPED line + CI run id once green.
 
 - [ ] Plan #1: HEVC encoder
+  - [x] Task 0: Codec enum + bitrate(…, codec) + last_export_codec
+        (commit 9608197)
+        Adds Codec { H264, Hevc } enum (camelCase serde, #[default]
+        H264) to video-coach-core::project; extends Preferences with
+        last_export_codec (#[serde(default)] for legacy-JSON compat);
+        extends bitrate(resolution, quality, codec) with HEVC values
+        ~60% of H.264; updates the single existing caller in
+        video-coach-media/src/export.rs to pass Codec::H264 (no
+        behavior change). 45 core tests + 11 media tests pass.
 - [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run 25237628702 green on all 4 jobs.
       Replaced indeterminate spinner with a real 0..1 progress bar fed
       from export.rs's existing ExportProgress callback. Plan:
