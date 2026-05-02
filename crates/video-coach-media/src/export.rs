@@ -16,8 +16,8 @@
 //!
 //!   appsrc(source-w × source-h, RGBA, 30/1)
 //!     → videoconvert → videoscale
-//!     → capsfilter(target-w × target-h, NV12, 30/1)        # fix #28
-//!     → encoder(picked) → h264parse → qtmux → filesink
+//!     → capsfilter(target-w × target-h, NV12|I420, 30/1)   # fix #28; H.264→NV12, HEVC→I420 (x265enc compat)
+//!     → encoder(picked) → h264parse|h265parse → qtmux → filesink
 //!
 //!   audio-appsrc(audio/x-raw,F32LE,2ch,48000)
 //!     → audioconvert → aacenc → aacparse → qtmux audio sink-pad
@@ -894,11 +894,21 @@ fn build_video_output_chain(
 
     let videoconvert = make_or("videoconvert")?;
     let videoscale = make_or("videoscale")?;
+    // Phase 11 Plan #3 CI-fix-up: encoder-input format is codec-aware.
+    // x264enc + vtenc_h264 + mfh264enc + vaapih264enc all accept NV12.
+    // x265enc (the Linux SW fallback for HEVC) does NOT accept NV12 — it
+    // requires I420 or I420_10LE. vtenc_h265_hw + vtenc_h265 + mfh265enc +
+    // vaapih265enc all accept I420 too, so I420 on the HEVC path is
+    // backward-compatible across every encoder we pick.
+    let encoder_input_format = match codec {
+        Codec::H264 => "NV12",
+        Codec::Hevc => "I420",
+    };
     let capsfilter_target = gstreamer::ElementFactory::make("capsfilter")
         .property(
             "caps",
             gstreamer::Caps::from_str(&format!(
-                "video/x-raw,format=NV12,width={target_w},height={target_h},framerate=30/1"
+                "video/x-raw,format={encoder_input_format},width={target_w},height={target_h},framerate=30/1"
             ))
             .unwrap(),
         )
