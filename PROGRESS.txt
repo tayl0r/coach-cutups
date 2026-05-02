@@ -504,6 +504,13 @@ own SHIPPED line + CI run id once green.
 - [ ] Plan #3: source/commentary audio mix in export + preview
 - [ ] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
   - [x] Task 0: Preflight + perf smoke + cache scaffolding (commit 3e05c1a)
+  - [x] Task 1: RenderPipeline cache (PiP + stroke passes) (commit e90343d)
+        Wires pip_cache + stroke_cache into compose / encode_stroke_pass
+        with Fix #41 lock-scope discipline (lookup → clone refcounted
+        wgpu handles out → drop guard → encode unlocked). wgpu 22 needed
+        Arc-wrap of cache values since wgpu::RenderPipeline +
+        wgpu::BindGroup do not implement Clone in this version. 11 tests
+        pass; parity byte-for-byte. +84 LOC.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [ ] Plan #6: VBO churn for strokes / resume failed exports
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
