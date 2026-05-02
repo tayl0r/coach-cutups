@@ -426,6 +426,34 @@ own SHIPPED line + CI run id once green.
         > 50_000 bytes per fixes #3 + #7) plus
         pick_h265_encoder_returns_some_factory unit. vtenc_h265_hw
         picked on Apple Silicon, ~8 s test runtime.
+  - [x] Task 2: Slint Codec radio + Command::ExportCompilations codec
+        field + bus persistence (commit 199a04e)
+        Adds export-codec string property + export-codec-changed
+        callback + Codec radio row (H.264 / HEVC) to main.slint Form
+        view mirroring the Quality row's shape; extends
+        Command::ExportCompilations with a codec: Codec field (and the
+        #[cfg(not(feature="media"))] tuple), threads it through
+        handle_export_compilations, and REPLACES the Task 1 temporary
+        Codec::H264 glue at the spawn_blocking export_compilation call
+        site with the user's codec choice (the load-bearing cut-over
+        connecting UI → encoder dispatch); persists codec to
+        project.preferences.last_export_codec alongside resolution +
+        quality. ui.rs gains on_export_codec_changed binding plus a
+        warn-and-fall-back-to-prefs codec parser (fix #6) emitting
+        tracing::warn! at target export.lifecycle event
+        export.codec_string_unknown for unknown strings — never a bare
+        wildcard to Codec::H264. Mandatory atomic sheet-open hydration
+        per fix #8: new export-sheet-open-clicked callback runs ui.rs
+        glue reading prefs.last_export_resolution / last_export_quality
+        / last_export_codec, mapping each enum to its string form, and
+        calling all three set_export_* before flipping
+        export-sheet-visible. Adds bus serde round-trip
+        export_command_with_hevc_codec_round_trips and
+        opening_export_sheet_hydrates_codec_from_preferences hydration
+        test (extracting the hydration logic into a pure helper for
+        testability via ExportPrefsSlot infra). 67 tests pass; LOC over
+        budget (~340 vs ~110) due to the ExportPrefsSlot scaffolding
+        but contained to video-coach-app.
 - [x] Plan #2: real-progress-pct SHIPPED 2026-05-01. CI run 25237628702 green on all 4 jobs.
       Replaced indeterminate spinner with a real 0..1 progress bar fed
       from export.rs's existing ExportProgress callback. Plan:
