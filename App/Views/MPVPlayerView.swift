@@ -56,6 +56,13 @@ final class MPVRenderingNSView: NSView {
 
     private func updateDrawableSize() {
         let scale = window?.backingScaleFactor ?? NSScreen.main?.backingScaleFactor ?? 2.0
+        // contentsScale must match backingScale so the layer interprets its
+        // drawable's pixel dimensions correctly relative to its point-sized
+        // bounds. Without this the default 1.0 makes the layer treat the
+        // 2x-resolution drawable as if it were 1× content, producing a
+        // zoomed/cropped picture on Retina displays. (MPVKit's demo sets
+        // this explicitly in viewDidLoad for the same reason.)
+        metalLayer.contentsScale = scale
         metalLayer.drawableSize = CGSize(
             width: max(1, bounds.width * scale),
             height: max(1, bounds.height * scale)
