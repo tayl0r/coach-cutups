@@ -110,15 +110,210 @@ silently regress these scenarios.
 
 ## Adversarial-review fixes baked in
 
-**This section is populated by the orchestrator's PLAN_WRITTEN → ADV_REVIEWED
-stage transition.** The adversarial reviewer reads this plan, returns net-new
-findings (Phase 10's 40 fixes are off-limits to re-raise), the orchestrator
-triages REAL / SPECULATIVE / OVERSTATED, and folds REAL/OVERSTATED-trimmed
-into this section as numbered Fix entries. Initial draft has zero fixes —
-the reviewer hasn't run yet. Numbering matches Phase 10's plan style
-(`Fix #N — title`, REAL/HIGH style).
+**Populated by the orchestrator's PLAN_WRITTEN → ADV_REVIEWED triage.**
+The reviewer scanned the plan against `bus.rs` (esp.
+`handle_add_source_video`, `StartClipRecording`, `handle_export_compilations`),
+`export.rs` (esp. error-path partial-delete behaviour and filesrc preroll
+failure mode), and `harness/src/lib.rs` (esp. `wait_for_event`'s
+non-matching-event handling). 7 REAL + 1 OVERSTATED-trimmed findings folded
+in below; 5 SPECULATIVE rejected (logged in "Rejected findings" further
+down). Numbering follows Phase 10's style — Fix #N + title + classification.
 
-_(empty — populated post-adversarial-review)_
+### Fix #1 — `add_source_video` against an open project does NOT swap the player; clip recording always sets `source_index = 0` (HIGH, REAL)
+
+`bus.rs::AddSourceVideo` (line ~1245) calls `try_spawn_current_player`
+*after* pushing the new SourceRef. `try_spawn_current_player`
+(`bus.rs:3022`) returns early on `if current_player.is_some()`, so the
+second source-add is purely a project-state update — **no `player.opened`
+event fires**. Worse, `bus.rs::StartClipRecording` line 1539 hard-codes
+`let source_index = 0_usize;` ("MVP: sourceVideos[0]. Phase 7.5+ will
+track an active index when multi-source lands"). Both halves of the
+plan's "auto-swap → record from new source" strategy are wrong.
+
+**Fix.** Restructure the multi-source path:
+
+- Task 0's `add_second_source` helper sends `add_source_video` and waits
+  for `source.added` ONLY (no `player.opened`). The doc-comment says
+  "second-source-add does NOT remount the player; this is by design per
+  bus.rs::try_spawn_current_player's `is_some()` early-return."
+- Task 1 records BOTH clips against the 1080p player (the only active
+  one). Both clips get `source_index = 0` from the recording flow.
+- The `quit_and_mutate_project` step **also sets `clips[1].source_index = 1`**
+  in addition to setting tags. The relaunched export then sees two
+  distinct `source_index` values, builds two `SourceVideoChain`s, and
+  exercises the `transition_to_source_chain` PAUSED↔PLAYING flip — which
+  is what fix #19/#27 actually wants tested.
+- The recording bytes for clip B are unchanged (the second source is
+  never the actual capture target — the FixtureSource in CI replays
+  `webcam.mov` regardless). Source dedup is exercised at the
+  export-decoder layer, which is the layer fix #19/#27 protects.
+
+Update Task 0's helper-API spec, Task 1's body sketch, and the "Test
+design — multi-source" section accordingly. Add a comment in
+`tests/common/mod.rs` reproducing the above reasoning verbatim so a
+future reader doesn't try to "fix" the source_index hand-mutation.
+
+### Fix #2 — `export.rs` does NOT delete partial output on non-Cancelled errors (HIGH, REAL)
+
+Plan's Test 3 asserts `<dir>/bad - <project>.mp4` does NOT exist citing
+"fix #10's cancel/error path". `export.rs:320-326` only deletes the
+partial on `ExportError::Cancelled`. Other errors fall through to
+`teardown_pipeline` (line 335) without `fs::remove_file`. GStreamer's
+filesink opens its file during the `Ready→Paused` state transition, so
+a 0-byte (or partial-mux header) `bad - <project>.mp4` may exist on
+disk after the recording-chain `filesrc` fails preroll. Behaviour is
+platform-/version-dependent.
+
+**Fix.** Soften Test 3's assertion to:
+
+```rust
+let bad_path = export_dir.path().join("bad - <project>.mp4");
+let bad_size = std::fs::metadata(&bad_path).map(|m| m.len()).unwrap_or(0);
+assert!(
+    bad_size < 1_024,
+    "partial output for failed tag should be empty/header-only or absent; \
+     got {bad_size} bytes at {}",
+    bad_path.display(),
+);
+```
+
+Add a doc-comment in the test pointing at `export.rs:320-326` and noting
+that `fix #10`'s "delete partial" only applies to `Cancelled`, not to
+generic errors. List "delete partial on PartialFailure as well" as a
+candidate Phase 11 follow-up in the plan's "Risks / unknowns" — but do
+not fix in this plan (tests-only).
+
+### Fix #3 — `wait_for_event` silently DISCARDS non-matching events; tests must mirror exact bus emission order (MEDIUM, REAL)
+
+`harness/src/lib.rs:189-198`: the `recv().await`-loop inside
+`wait_for_event` does NOT push non-matching events back into `pending`.
+This means a test that calls `wait_for_event("export.tag.completed", ...)`
+while a `tag.failed` is en-route silently drops the failure event and
+deadlocks (until timeout) on the `.completed` that will never come.
+
+**Fix.** This is a harness defect, but the plan defends against it
+without fixing the harness:
+
+- Each test's body sketch spells out the EXACT bus emission sequence
+  (cross-checked against `bus.rs:2625-2916`'s emission order). For a
+  3-tag success run: `batch.started` → 3 × (`tag.started` → `tag.completed`)
+  → `batch.completed`. For Test 3's PartialFailure: `batch.started` →
+  `tag.started` "good-1" → `tag.completed` "good-1" → `tag.started` "bad"
+  → `tag.failed` "bad" → `batch.failed` "bad". Tests wait in this exact
+  order; no out-of-order waits.
+- Task 0's `tests/common/mod.rs` ships a doc-comment on the file header
+  documenting `wait_for_event`'s drop-on-mismatch contract. Authors
+  writing future tests get the warning at the top of the helper file.
+- A `wait_for_event_matching(name, predicate)` helper that filters by
+  both event-name AND a JSON-field predicate is **deferred**; Task 0's
+  scope is already ~120 LOC and adding the matcher would push past
+  ~150. Track as a Plan #5 follow-up if the bare `wait_for_event`
+  causes a flake.
+
+### Fix #4 — `export.batch.started` and `batch.completed` events carry `tag_count`, not `total_tags` (LOW, REAL)
+
+Plan's Tests 2 + 3 assertion-spec sections refer to `batch.started`
+field as `total_tags = 3`. Actual field name from `bus.rs:2605` and
+`bus.rs:2926` is `tag_count`. `total_tags` exists only as a local
+variable inside `handle_export_compilations`.
+
+**Fix.** Rename `total_tags` → `tag_count` in the assertion specs of
+Tests 2 + 3. Test 1's spec doesn't explicitly read this field on
+`batch.started` so no change needed there.
+
+### Fix #5 — `ExportError` string for missing recording does NOT contain "missing.mov" or "recording" (MEDIUM, REAL)
+
+`build_webcam_chain` (export.rs:658) succeeds for any string passed to
+filesrc's `location` — no existence check at construction time. The
+PAUSED state-change at `export.rs:277-278` then fails with the variant
+`ExportError::StateChange(format!("preroll: {e:?}"))`, where `e` is a
+`gstreamer::StateChangeError`. Its `Debug` form is just
+`StateChangeError` with no path/element info. Final string:
+`"pipeline state change: preroll: StateChangeError"` — contains neither
+`"missing.mov"` nor `"recording"`. The actual file-not-found signal
+lives on the GStreamer bus as a separate `Element::Error` message that
+the export driver does not currently forward.
+
+**Fix.** Test 3's `error`-field assertion drops the substring claim.
+Replace with: assert `error` is non-empty AND `tag.failed` carries
+`selection = "bad"`. The body-sketch comment cites `export.rs:278` and
+notes that future GStreamer-bus-error forwarding could let us tighten
+the assertion (track as a Phase 12 hardening item).
+
+### Fix #6 — `add_source_video` against an open project does not fire `player.opened`; helper waits for `source.added` only (LOW, REAL)
+
+Subset of Fix #1. Plan's "Test design — multi-source" step 4 + Task 0's
+`add_second_source` helper-spec both await `player.opened`. They must
+not.
+
+**Fix.** Strike the `player.opened` wait from `add_second_source` and
+from the prose. Document explicitly: "the bus's add-source codepath
+returns to a no-op for player remount when a player is already mounted,
+per `try_spawn_current_player`'s `is_some()` early return at
+`bus.rs:3022`. This is by design (the v2 player has no source-swap
+command yet)."
+
+### Fix #7 — Test 3 negative-assertion arm must NOT panic; orphan child process leaks on cargo-test panic (LOW, REAL)
+
+Plan's "Known performance risks #3" documents `App` has no `Drop` impl,
+but the per-test body sketches don't act on it. Test 3's negative
+assertion (third tag.started) panics on regression. A panicked test
+leaves a leaked Slint subprocess holding the recording fixture; on
+Windows this blocks `TempDir` cleanup with "directory not empty".
+
+**Fix.** Restructure each test body to a guaranteed-quit shape:
+
+```rust
+let result = async {
+    // … all assertions here …
+    Ok::<_, anyhow::Error>(())
+}.await;
+let _ = app.quit().await; // best-effort, ignore quit errors
+result?;
+Ok(())
+```
+
+Spelled out in Task 0's "convention" docstring + each Task 1/2/3 body
+sketch. The negative assertion in Test 3 returns `Err(...)` instead of
+panicking, so the wrapped-quit pattern reaps the child cleanly.
+
+### Fix #8 — Test 3 dispatch must explicitly set `filename_template` to defeat the no-placeholders gate (LOW, OVERSTATED → trimmed)
+
+`bus.rs:2467-2478` rejects multi-tag dispatches with
+`filename_template_no_placeholders` if the template renders identically
+for two probe tags. Test 3 has 3 selections → multi-tag → gate runs.
+Plan's Tests 1 + 2 explicitly set `"filename_template": "{tag} -
+{project}"`; Test 3's body sketch (around line 655) doesn't show the
+field. The default template *does* include `{tag}` (per
+`default_command_filename_template`), so omitting the field also passes
+— but stating it explicitly defends against a future default change
+silently breaking Test 3. **Trimmed**: the failure mode is theoretical;
+the fix is a one-line addition to the body sketch.
+
+**Fix.** Test 3's body sketch shows `"filename_template": "{tag} -
+{project}"` explicitly, matching Tests 1 + 2.
+
+---
+
+## Rejected findings (SPECULATIVE)
+
+- **S1 — Fixture LFS bandwidth.** Already covered by "Known performance
+  risks #2" — no new fixtures. Re-raise of Phase 10 discussion.
+- **S2 — Media-tests job exceeds 60s budget.** Plan's "Known performance
+  risks #1" already estimates 13-15 min total against the 15-min cap.
+  No concrete trigger for over-budget; the per-test 60s number from
+  the orchestrator brief is stale (existing `export_smoke.rs` already
+  uses 60s for `tag.completed`).
+- **S3 — 4K source is too expensive on lavapipe.** `source-4k.mp4` is
+  H.264, not HEVC; decode runs on libav software H.264, not lavapipe.
+  Doubling source-1080p instead would just trade fixture realism for no
+  net runtime gain.
+- **S4 — Parallel cargo-test socket port collisions.** Harness binds
+  port 0 (`--control-socket 0`); OS picks. No concrete trigger.
+- **S5 — `App::Drop` impl needed.** Already documented as a deferred
+  hardening item in "Known performance risks #3". Adding it would be a
+  production-code change, which this plan explicitly excludes (item 4
+  of "deliberately does NOT include").
 
 ---
 
@@ -146,36 +341,44 @@ clips:
   - source_index=1, recording=clip-B, tags=["drills"]
 ```
 
-### Recording two clips from two different sources
+### Recording two clips, then hand-mutating `source_index` (per adv-fix #1)
 
-The bus's `add_source_video` command swaps the player onto the new source
-when called against an existing project. Sequence:
+**The recording flow always sets `clip.source_index = 0`** — this is
+hard-coded at `bus.rs::StartClipRecording` line 1539
+(`let source_index = 0_usize;`, with the inline comment "MVP:
+sourceVideos[0]. Phase 7.5+ will track an active index when multi-source
+lands"). And `add_source_video` against an already-open project does
+NOT remount the player onto the new source — `try_spawn_current_player`
+at `bus.rs:3022` returns early on `current_player.is_some()`, so the
+second source-add is purely a project-state update with `source.added`
+emitted but no `player.opened`.
+
+Sequence:
 
 1. `new_project`
 2. `add_source_video` (1080p) → fires `source.added` + `player.opened`
-3. `start_clip_recording` → record ~1.0s → `stop_clip_recording`. The clip
-   gets `source_index=0` (the first source). Capture `clip_id` from
-   `clip_recording.started`.
-4. `add_source_video` (4k) → fires `source.added` + (per Phase 7) the
-   player reopens onto the second source.
-5. `start_clip_recording` → record ~1.0s → `stop_clip_recording`. The clip
-   gets `source_index=1`.
+   (first source, no player yet → `try_spawn_current_player` opens one).
+3. `start_clip_recording` → record ~1.0s → `stop_clip_recording`. Clip A
+   has `source_index = 0`.
+4. `add_source_video` (4k) → fires `source.added` ONLY. No
+   `player.opened` (player is still on 1080p; bus is no-op for player
+   remount).
+5. `start_clip_recording` → record ~1.0s → `stop_clip_recording`. Clip B
+   has `source_index = 0` too (the recording flow's hardcoded index).
+6. `app.quit().await?`. `project_store::read` → mutate
+   `clips[1].source_index = 1` AND set both clips' tags →
+   `project_store::write`.
+7. `relaunch_and_open` → `OpenProject` → export.
 
-`clip.source_index` is set by the recording flow at the time the clip is
-created (`bus.rs::StartClipRecording`); it picks up whichever source the
-player is currently mounted on (per Phase 7 source-transport plan). That's
-how we get one clip per source without needing a "set source" intermediate
-command.
-
-**Open question to verify in Task 1**: does `add_source_video` against an
-already-open project actually swap the player, or does it require a quit
-+ relaunch? The implementer must confirm by reading `bus.rs::handle_add
-_source_video` and the `source.added` / `player.opened` event firing
-order before proceeding. If it does NOT auto-swap, fall back to: quit →
-edit `project.json` to add the second source → relaunch → OpenProject →
-record both clips with explicit "switch source" command (which doesn't
-exist; would need a quit-and-relaunch between clips). Plan B is uglier
-but still tests the multi-source export path.
+The relaunched export sees two distinct `source_index` values across the
+two clips, builds two `SourceVideoChain`s in `export.rs:208-222`, and
+exercises the `transition_to_source_chain` PAUSED↔PLAYING flip at
+`export.rs:1367-1524`. **That** is what fix #19/#27 protects, and what
+this test was always meant to exercise. The recording bytes themselves
+are unaffected — both clips replay the same `webcam.mov` fixture (the
+production camera capture isn't running in CI), so the audio/video
+content of clip B is identical regardless of the source it nominally
+references.
 
 ### Tagging both clips
 
@@ -275,7 +478,8 @@ Then: quit, mutate `project.json` to set `clips[0].tags = ["a"]`,
 
 ### Assertions
 
-- `export.batch.started` fires once with `total_tags = 3`.
+- `export.batch.started` fires once with `tag_count = 3` (per adv-fix
+  #4 — bus.rs:2605 names this field `tag_count`, not `total_tags`).
 - Three `export.tag.started` events, in dispatch order: selection `"a"`
   → `"b"` → `"all-clips"`.
 - Three `export.tag.completed` events, in same order, each with
@@ -372,23 +576,35 @@ the same — the export pipeline reports a recording open failure.
 
 ### Assertions
 
-- `export.batch.started` fires once with `total_tags = 3`.
+- `export.batch.started` fires once with `tag_count = 3` (per adv-fix
+  #4 — `bus.rs:2605` field name is `tag_count`, not `total_tags`).
 - `export.tag.started` for "good-1" fires.
 - `export.tag.completed` for "good-1" fires with `frames_pushed >= 15`.
 - `export.tag.started` for "bad" fires.
 - `export.tag.failed` for "bad" fires with non-empty `error` field.
+  Per adv-fix #5 do NOT assert the error string contains
+  "missing.mov" or "recording" — the actual error is
+  `ExportError::StateChange("preroll: StateChangeError")` from
+  `export.rs:278`, which has no path/element info. Asserting non-empty
+  + `selection = "bad"` is the strongest defensible assertion until
+  GStreamer-bus-error forwarding lands in `export.rs`.
 - `export.batch.failed` fires with `reason = "tag_failed"` and
   `selection = "bad"`. (See `bus.rs:2878-2884`.)
 - **Neither** `export.tag.started` nor `export.tag.completed` for
-  "good-2" fires within a 5s window after `batch.failed`. (Negative
-  assertion via `tokio::time::timeout` on `wait_for_event` — expect
-  a timeout error.)
+  "good-2" fires within a 5s window after `batch.failed`. Negative
+  assertion via `tokio::time::timeout` on `wait_for_event`. Per
+  adv-fix #7 the assertion arm returns `Err(...)` on regression
+  rather than panicking, so the wrapped-quit pattern still runs.
 - The output file `<dir>/good-1 - phase11-partial-test.mp4` exists
   (per fix #36 — Reveal needs partial successes preserved).
-- The output file `<dir>/bad - phase11-partial-test.mp4` does NOT
-  exist (the failed tag's partial output is deleted per fix #10's
-  cancel/error path; verify by reading `export.rs`'s error path —
-  Phase 10 Task 1 step "delete partial on Cancelled or other error").
+- The output file `<dir>/bad - phase11-partial-test.mp4` is **either
+  absent OR < 1 KB** (per adv-fix #2). `export.rs:320-326` only
+  deletes the partial output on `ExportError::Cancelled`; on other
+  errors (including the missing-recording state-change failure under
+  test) filesink's already-opened output file is left on disk. The
+  1 KB threshold catches an empty-or-header-only mux. Listed as a
+  Phase 11 follow-up in "Risks / unknowns" but out of scope here
+  (tests-only).
 - The output file `<dir>/good-2 - phase11-partial-test.mp4` does NOT
   exist (the tag was skipped, never started writing).
 - The slot's `outcome` is NOT directly observable from the harness
@@ -399,15 +615,32 @@ the same — the export pipeline reports a recording open failure.
   `selection` fields, which we assert above. Document this in the test
   comment.
 
-### Error string assertion
+### Error string assertion (per adv-fix #5)
 
 The `error` field on `tag.failed` is the `Display` of the
-`ExportError`. The exact string depends on which `ExportError` variant
-fires (e.g. `Construction`, `StateChange`, or some platform-specific
-GStreamer error message). We assert the string is non-empty and
-contains `"missing.mov"` OR contains `"recording"` (case-insensitive)
-— either of those proves the failure is the recording-open path. Hard-
-coding the exact `ExportError` variant would be brittle.
+`ExportError`. For the missing-recording forcing function, the actual
+variant is `ExportError::StateChange("preroll: StateChangeError")`
+emitted at `export.rs:278` after `pipeline.set_state(Paused)` fails.
+The `Debug` form of `gstreamer::StateChangeError` does NOT include
+the offending element name, the file path, or the underlying
+"file not found" diagnostic — that information lives on the GStreamer
+bus as a separate `Element::Error` message that the export driver
+does not currently forward into `ExportError`.
+
+So the test asserts only:
+
+```rust
+let err = tag_failed.other.get("error")
+    .and_then(|v| v.as_str())
+    .expect("tag.failed carries error string");
+anyhow::ensure!(!err.is_empty(), "tag.failed.error is empty");
+```
+
+Plus `selection = "bad"` on the same event. Asserting the error
+substring contains "missing.mov" / "recording" was tempting but
+non-deterministic — flagged as a Phase 12 hardening candidate
+(forward bus errors into `ExportError` so we can tighten the
+assertion).
 
 ---
 
@@ -452,7 +685,12 @@ pub async fn record_clip(
 ) -> anyhow::Result<uuid::Uuid>;
 
 /// Sends `add_source_video` against an already-open project. Awaits
-/// `source.added` + `player.opened`.
+/// `source.added` ONLY — per adv-fix #1 / #6, the bus's add-source
+/// codepath is a no-op for player remount when a player is already
+/// mounted (try_spawn_current_player early-returns at bus.rs:3022 on
+/// `current_player.is_some()`), so NO `player.opened` event fires for
+/// a second-or-later source-add. This is by design: v2 has no
+/// source-swap command yet.
 pub async fn add_second_source(
     app: &mut App,
     source: &Path,
@@ -497,13 +735,15 @@ quit+relaunch with two sources pre-injected", that quirk lives in
   three new test functions (added in Tasks 1-3) but no test from
   `common.rs` itself (it's a helper, not a test).
 
-**Exit gate before progressing to Task 1:** the implementer must
-verify by reading `bus.rs::handle_add_source_video` whether
-`add_source_video` against an open project swaps the player or
-errors. Document the answer in a comment on `add_second_source`.
-If it errors, `add_second_source` is implemented as: quit, edit
-project.json to insert the second source as a second `SourceRef`,
-relaunch with `OpenProject`. Document which branch was taken.
+**Exit gate before progressing to Task 1:** the implementer
+re-confirms the adv-fix #1 / #6 finding by reading
+`bus.rs::handle_add_source_video` (line ~1245) +
+`try_spawn_current_player` (line ~3022) — the second source-add is
+**a no-op for player remount** + the recording flow always sets
+`clip.source_index = 0`. The `tests/common/mod.rs` file-header
+docstring reproduces this reasoning verbatim so a future reader
+doesn't try to "fix" the source_index hand-mutation in
+`quit_and_mutate_project`.
 
 **Commit:** `phase11(coverage-hardening, task 0): shared test helpers
 + multi-clip recording`.
@@ -543,10 +783,21 @@ async fn export_multi_source_compilation_writes_one_mp4()
     // Clip from source 1.
     let _clip_b = record_clip(&mut lp.app, 1000).await?;
 
-    // Tag both clips with "drills" via project_store.
+    // Per adv-fix #1: tag both clips with "drills" AND set
+    // clips[1].source_index = 1 so the export's referenced_source_indices
+    // set has two entries — exercising the multi-source decoder dedup
+    // (export.rs:208-222) + transition_to_source_chain PAUSED↔PLAYING
+    // flip (export.rs:1367-1524). Without this hand-mutation the
+    // recording flow's hardcoded source_index = 0 would mean both clips
+    // share one decoder chain and the test exercises only the
+    // single-source path.
     quit_and_mutate_project(lp.app, &lp.project_path, |p| {
         for clip in &mut p.clips {
             clip.tags = vec!["drills".into()];
+        }
+        // p.clips is in recording order; clip B is at index 1.
+        if p.clips.len() == 2 {
+            p.clips[1].source_index = 1;
         }
     }).await?;
 
@@ -582,15 +833,20 @@ async fn export_multi_source_compilation_writes_one_mp4()
     let _ = app.wait_for_event("export.batch.completed",
         Duration::from_secs(10)).await?;
 
-    let expected = export_dir.path()
-        .join(format!("drills - {project_name}.mp4"));
-    assert!(expected.exists(), "{}", expected.display());
-    let bytes = std::fs::read(&expected)?;
-    assert!(bytes.len() > 100_000, "size {}", bytes.len());
-    assert_eq!(&bytes[4..8], b"ftyp");
-
-    app.quit().await?;
-    Ok(())
+    // Per adv-fix #7: wrap final assertions in a guaranteed-quit shape so
+    // a panic doesn't leak the Slint subprocess + GStreamer fixture
+    // handle, which on Windows would block TempDir cleanup.
+    let result = (|| -> anyhow::Result<()> {
+        let expected = export_dir.path()
+            .join(format!("drills - {project_name}.mp4"));
+        anyhow::ensure!(expected.exists(), "{}", expected.display());
+        let bytes = std::fs::read(&expected)?;
+        anyhow::ensure!(bytes.len() > 100_000, "size {}", bytes.len());
+        anyhow::ensure!(&bytes[4..8] == b"ftyp");
+        Ok(())
+    })();
+    let _ = app.quit().await; // best-effort
+    result
 }
 ```
 
@@ -619,10 +875,12 @@ Quit. Edit `clips[0].tags = ["a"]`, `clips[1].tags = ["a", "b"]`,
 with three `TagSelection`s.
 
 Assertions:
-- `batch.started` with `total_tags = 3`.
+- `batch.started` with `tag_count = 3` (per adv-fix #4).
 - Three `tag.started` in order: `"a"`, `"b"`, `"all-clips"`. Use
   `wait_for_event("export.tag.started", ...)` 3× and assert each
-  `selection`.
+  `selection`. Per adv-fix #3 the test mirrors the bus's exact
+  emission order so `wait_for_event`'s drop-on-mismatch semantics
+  don't lose events.
 - Three `tag.completed`, each `frames_pushed >= 15`.
 - One `batch.completed` with `tag_count = 3`.
 - Three files exist with correct names.
@@ -630,6 +888,8 @@ Assertions:
 - No `tag.failed` / `batch.failed` events fire (inferred — if either
   did, `batch.completed` wouldn't, so the batch.completed wait would
   time out).
+- All assertions wrapped in the guaranteed-quit shape (per adv-fix
+  #7) so a failed assertion still reaps the Slint child.
 
 **Lavapipe runtime budget.** Three ~0.8s clips × 3 tags = 9 effective
 clip-encodes. ~30-50s total on lavapipe. Each `tag.completed` waits up
@@ -652,22 +912,32 @@ E2E`.
 **Body sketch:** record 3 clips. Quit. Edit tags AND mutate
 `clips[1].recording_filename = "missing.mov"`. Relaunch + OpenProject
 + ExportCompilations with three real-tag selections (no AllClips,
-order: `"good-1"`, `"bad"`, `"good-2"`).
+order: `"good-1"`, `"bad"`, `"good-2"`). Per adv-fix #8 the dispatch
+explicitly sets `"filename_template": "{tag} - {project}"` to defeat
+the no-placeholders gate.
 
 Assertions:
-- `batch.started` with `total_tags = 3`.
+- `batch.started` with `tag_count = 3` (per adv-fix #4).
 - `tag.started` "good-1" → `tag.completed` "good-1" (frames_pushed ≥
   15).
-- `tag.started` "bad" → `tag.failed` "bad" with non-empty `error`,
-  AND `error` contains either `"missing.mov"` OR (case-insensitive)
-  `"recording"`.
+- `tag.started` "bad" → `tag.failed` "bad" with non-empty `error`.
+  Per adv-fix #5 do NOT substring-match on "missing.mov" or
+  "recording" — the actual error variant is
+  `ExportError::StateChange("preroll: StateChangeError")` from
+  `export.rs:278`. Asserting non-empty + `selection = "bad"` is the
+  strongest defensible signal.
 - `batch.failed` with `reason = "tag_failed"`, `selection = "bad"`.
 - Negative assertion: 5-second timeout on `wait_for_event(
   "export.tag.started", ...)` after `batch.failed` returns Err
-  (no third tag fired).
+  (no third tag fired). Per adv-fix #7 the assertion arm returns
+  `Err(...)` on regression instead of panicking, so the
+  guaranteed-quit wrapper still reaps the child.
 - `<dir>/good-1 - <project>.mp4` exists (per fix #36).
-- `<dir>/bad - <project>.mp4` does NOT exist (failed tag's partial
-  output deleted; verify in `export.rs`'s error path).
+- `<dir>/bad - <project>.mp4` is **either absent OR < 1 KB** (per
+  adv-fix #2). `export.rs:320-326` only deletes partial output on
+  `ExportError::Cancelled`; on other errors filesink's
+  already-opened file is left on disk. The 1 KB threshold catches an
+  empty/header-only mux.
 - `<dir>/good-2 - <project>.mp4` does NOT exist (skipped).
 
 **Why a 4-test plan landed here.** The decomposition could have folded
@@ -746,32 +1016,41 @@ Total: ~540 LOC across 4 test files. No production code change.
 
 ## Risks / unknowns (sub-agent may need to make calls)
 
-1. **`add_source_video` against an open project.** Does it auto-swap
-   the player or error? Task 0 must read `bus.rs::handle_add_source_video`
-   and document the answer. If "auto-swap", `add_second_source` is a
-   single bus call; if "error", it's a quit + edit project.json + relaunch.
-   The plan handles both branches.
-2. **Exact `ExportError` variant on missing recording.** Task 3
-   asserts `error` field contains `"missing.mov"` OR `"recording"`.
-   If the actual error string contains neither (e.g. some platform
-   reports "filesrc: No such file or directory" with no leading
-   path), Task 3 must adjust the assertion based on what fires.
-   Document the actual string in a comment.
-3. **Source swap on `add_source_video`.** If the player swap takes
-   longer than `wait_for_event`'s 5s default timeout (the existing
-   `export_smoke` uses 5s for `source.added` + `player.opened`),
-   raise the per-event timeout in `add_second_source` to 15s.
-4. **Negative-assertion timeout window.** Task 3's "no third
+1. **`add_source_video` against an open project — RESOLVED by adv-review
+   pass.** Reading `bus.rs::handle_add_source_video` (line ~1245) +
+   `try_spawn_current_player` (line ~3022) confirms: the second
+   source-add fires `source.added` only — no `player.opened`, no player
+   remount. AND `bus.rs::StartClipRecording` line 1539 hardcodes
+   `source_index = 0`. Task 0's helper waits only for `source.added`,
+   and Task 1 hand-mutates `clips[1].source_index = 1` in
+   `quit_and_mutate_project` to force the export-decoder dedup path.
+2. **Exact `ExportError` variant on missing recording — RESOLVED.**
+   Per adv-fix #5 it's `ExportError::StateChange("preroll:
+   StateChangeError")`. The plan no longer substring-matches; asserts
+   only non-empty + `selection = "bad"`. Future Phase 12 candidate:
+   forward GStreamer bus errors into `ExportError` so we can tighten.
+3. **Negative-assertion timeout window.** Task 3's "no third
    tag.started fires" assertion uses a 5s window. If `batch.failed`
-   fires faster than the test's downstream wait_for_event(no-third-
-   tag), there's no race — events arrive in the order they fire,
+   fires faster than the test's downstream `wait_for_event(no-third-
+   tag)`, there's no race — events arrive in the order they fire,
    so a third tag.started would have already arrived if it were going
    to. 5s is the lavapipe-margin floor.
-5. **Tag iteration order.** `bus.rs::handle_export_compilations`
+4. **Tag iteration order.** `bus.rs::handle_export_compilations`
    iterates `selections` in the order the harness sent them. The
    tests rely on this. If a future refactor sorts or shuffles
    selections (none planned), Tasks 2 + 3's order assertions break
    and the orchestrator triages the regression as a real change.
+5. **Phase 12 candidate — extend `export.rs` partial-output deletion
+   to cover non-Cancelled errors.** Per adv-fix #2, `export.rs:320-326`
+   only deletes the partial output on `ExportError::Cancelled`. On
+   other errors filesink's already-opened file is left on disk
+   (0-byte / header-only / partial mux). Plan #5 softens Test 3's
+   assertion to "absent OR < 1 KB" rather than fix the production
+   behaviour. A Phase 12 hardening plan should evaluate whether
+   PartialFailure / generic-error paths should also delete the
+   half-written output (offsetting against fix #36's "preserve
+   partial successes for Reveal" — these are the FAILED tag's
+   incomplete file, not the previously-completed tag's good output).
 
 ---
 
