@@ -2394,9 +2394,48 @@ async fn handle_export_compilations(
         .format("%Y-%m-%d")
         .to_string();
 
+    // ── 2. Refuse if busy (per fix #9 + #22). ────────────────────────────
+    if is_busy(recording, recording_clip, current_mode) {
+        let reason = match *current_mode {
+            AppMode::RecordingStarting | AppMode::Recording => "already_recording",
+            AppMode::PreviewClip(_) => "close_preview_first",
+            AppMode::Exporting => "already_exporting",
+            // is_busy true with mode == Scanning means a low-level
+            // recording slot is somehow live — treat as already_recording.
+            AppMode::Scanning => "already_recording",
+        };
+        tracing::warn!(
+            target: "export.lifecycle",
+            event = "export.batch.failed",
+            reason = reason,
+        );
+        return CommandReply {
+            ok: false,
+            error: Some(reason.into()),
+        };
+    }
+
+    // ── 3. Refuse if no project open (per plan step 3). ──────────────────
+    if current.is_none() {
+        tracing::warn!(
+            target: "export.lifecycle",
+            event = "export.batch.failed",
+            reason = "no_project_open",
+        );
+        return CommandReply {
+            ok: false,
+            error: Some("no_project_open".into()),
+        };
+    }
+
     // Phase 11 Plan #7 Task 2 (adv fix #8). Sensitivity-based template
-    // validation, BEFORE persistence and BEFORE the export run kicks
-    // off. Two probes with disjoint substituent values: if the rendered
+    // validation, AFTER is_busy + no_project_open (Plan #7 code-review
+    // #4) so a Phase-10-era harness or in-app banner sees the more
+    // diagnostic `already_recording` / `no_project_open` reason rather
+    // than `filename_template_invalid` for the same misuse. Validation
+    // still runs BEFORE persistence and BEFORE the export run kicks off.
+    //
+    // Two probes with disjoint substituent values: if the rendered
     // output is identical, the template has no effective placeholders
     // (a single-tag run is fine, but a multi-tag run would write N
     // files all to the same path, overwriting one another). A degenerate
@@ -2435,40 +2474,6 @@ async fn handle_export_compilations(
         return CommandReply {
             ok: false,
             error: Some("filename_template_no_placeholders".into()),
-        };
-    }
-
-    // ── 2. Refuse if busy (per fix #9 + #22). ────────────────────────────
-    if is_busy(recording, recording_clip, current_mode) {
-        let reason = match *current_mode {
-            AppMode::RecordingStarting | AppMode::Recording => "already_recording",
-            AppMode::PreviewClip(_) => "close_preview_first",
-            AppMode::Exporting => "already_exporting",
-            // is_busy true with mode == Scanning means a low-level
-            // recording slot is somehow live — treat as already_recording.
-            AppMode::Scanning => "already_recording",
-        };
-        tracing::warn!(
-            target: "export.lifecycle",
-            event = "export.batch.failed",
-            reason = reason,
-        );
-        return CommandReply {
-            ok: false,
-            error: Some(reason.into()),
-        };
-    }
-
-    // ── 3. Refuse if no project open (per plan step 3). ──────────────────
-    if current.is_none() {
-        tracing::warn!(
-            target: "export.lifecycle",
-            event = "export.batch.failed",
-            reason = "no_project_open",
-        );
-        return CommandReply {
-            ok: false,
-            error: Some("no_project_open".into()),
         };
     }
 
