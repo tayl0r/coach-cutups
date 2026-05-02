@@ -502,7 +502,8 @@ own SHIPPED line + CI run id once green.
         position-query overlay → Phase 11+.
   - Closeout: <SHA — this commit>
 - [ ] Plan #3: source/commentary audio mix in export + preview
-- [ ] Plan #4: freeze-segment compose caching
+- [ ] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
+  - [x] Task 0: Preflight + perf smoke + cache scaffolding (commit 3e05c1a)
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [ ] Plan #6: VBO churn for strokes / resume failed exports
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
