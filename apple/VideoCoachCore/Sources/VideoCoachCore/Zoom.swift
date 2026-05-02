@@ -50,3 +50,36 @@ public extension Zoom {
         return Zoom(scale: s2, panX: panX2, panY: panY2).clamped()
     }
 }
+
+public extension Zoom {
+    /// Transform that maps source-frame pixel coords → destination pixel
+    /// coords using a letterbox-fit base scale. At identity (and matching
+    /// aspect ratios), this is the identity transform.
+    func transform(sourceSize: CGSize, destSize: CGSize) -> CGAffineTransform {
+        let baseScale = min(destSize.width / sourceSize.width,
+                            destSize.height / sourceSize.height)
+        let s = scale * baseScale
+        let dx = (destSize.width - sourceSize.width * s) / 2
+        let dy = (destSize.height - sourceSize.height * s) / 2
+        let tx = dx - panX * sourceSize.width * s
+        let ty = dy - panY * sourceSize.height * s
+        return CGAffineTransform(a: s, b: 0, c: 0, d: s, tx: tx, ty: ty)
+    }
+
+    /// Zoom-and-pan delta in viewport pixel coordinates, to be applied
+    /// AFTER any existing layout transform. At identity returns the
+    /// identity transform (no behavior change for existing compositors).
+    /// At scale=2, panX=0.1: scale up by 2 around the viewport center,
+    /// then translate by 0.1 of viewport width.
+    func deltaTransform(viewportSize: CGSize) -> CGAffineTransform {
+        guard scale != 1.0 || panX != 0 || panY != 0 else { return .identity }
+        let cx = viewportSize.width / 2
+        let cy = viewportSize.height / 2
+        let tx = -panX * viewportSize.width
+        let ty = -panY * viewportSize.height
+        return CGAffineTransform.identity
+            .translatedBy(x: cx + tx, y: cy + ty)
+            .scaledBy(x: scale, y: scale)
+            .translatedBy(x: -cx, y: -cy)
+    }
+}

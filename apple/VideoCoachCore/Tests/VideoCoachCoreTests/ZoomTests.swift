@@ -55,4 +55,50 @@ final class ZoomTests: XCTestCase {
         XCTAssertEqual(src.x, identitySrc.x, accuracy: 1e-9)
         XCTAssertEqual(src.y, identitySrc.y, accuracy: 1e-9)
     }
+
+    // MARK: - transform tests
+
+    func test_identity_transform_is_letterbox_fit() {
+        let src = CGSize(width: 1920, height: 1080)
+        let dst = CGSize(width: 1920, height: 1080)
+        let t = Zoom.identity.transform(sourceSize: src, destSize: dst)
+        // No scaling change, no offset.
+        XCTAssertEqual(t.a, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(t.d, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(t.tx, 0, accuracy: 1e-9)
+        XCTAssertEqual(t.ty, 0, accuracy: 1e-9)
+    }
+
+    func test_scale_2_centers_zoomed_source_in_dest() {
+        let src = CGSize(width: 1000, height: 500)
+        let dst = CGSize(width: 1000, height: 500)
+        let z = Zoom(scale: 2, panX: 0, panY: 0)
+        let t = z.transform(sourceSize: src, destSize: dst)
+        XCTAssertEqual(t.a, 2.0, accuracy: 1e-9)
+        // Origin (0,0) of the source must map to (-500, -250) in dest space so
+        // the source center stays centered.
+        let origin = CGPoint.zero.applying(t)
+        XCTAssertEqual(origin.x, -500, accuracy: 1e-9)
+        XCTAssertEqual(origin.y, -250, accuracy: 1e-9)
+    }
+
+    // MARK: - deltaTransform tests
+
+    func test_deltaTransform_at_identity_is_identity() {
+        let t = Zoom.identity.deltaTransform(viewportSize: CGSize(width: 1920, height: 1080))
+        XCTAssertEqual(t, .identity)
+    }
+
+    func test_deltaTransform_at_scale_2_centers_zoomed_viewport() {
+        let vp = CGSize(width: 1000, height: 500)
+        let t = Zoom(scale: 2, panX: 0, panY: 0).deltaTransform(viewportSize: vp)
+        // Center of viewport (500, 250) should map to itself.
+        let center = CGPoint(x: 500, y: 250).applying(t)
+        XCTAssertEqual(center.x, 500, accuracy: 1e-9)
+        XCTAssertEqual(center.y, 250, accuracy: 1e-9)
+        // Top-left of viewport (0,0) should map to (-500, -250) — pulled outside.
+        let origin = CGPoint.zero.applying(t)
+        XCTAssertEqual(origin.x, -500, accuracy: 1e-9)
+        XCTAssertEqual(origin.y, -250, accuracy: 1e-9)
+    }
 }
