@@ -227,7 +227,8 @@ enum ClipPreviewBuilder {
             compositionStart: .zero,
             clipDuration: clipDuration,
             segments: segments,
-            frozenFrames: frozenFrames
+            frozenFrames: frozenFrames,
+            events: clip.events
         )
         videoComp.instructions = [inst]
 

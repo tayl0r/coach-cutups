@@ -58,7 +58,8 @@ final class PreviewCompositorTests: XCTestCase {
             compositionStart: .zero,
             clipDuration: srcDur,
             segments: [PlaybackSegment(kind: .play, sourceStart: 0, outDuration: 1.0)],
-            frozenFrames: [:]
+            frozenFrames: [:],
+            events: []
         )
         videoComp.instructions = [inst]
 

@@ -1,14 +1,13 @@
 import Foundation
 
-public extension Clip {
+public extension Array where Element == CommentaryEvent {
     /// Active Zoom at recordTime t, with linear interpolation between
-    /// adjacent keyframes. Empty / before-first → identity (or first
-    /// value if any). After-last → last value. Non-zoom events
-    /// (.play, .pause, .skip, .stroke, .clearAll, .unknown) are ignored.
+    /// adjacent .zoom keyframes. Empty / before-first → identity (or first
+    /// value if any). After-last → last value. Non-zoom events are ignored.
     func zoomAt(recordTime t: Double) -> Zoom {
         var prev: (time: Double, zoom: Zoom)?
         var next: (time: Double, zoom: Zoom)?
-        for e in events {
+        for e in self {
             guard case let .zoom(z) = e.kind else { continue }
             if e.recordTime <= t {
                 prev = (e.recordTime, z)
@@ -30,6 +29,13 @@ public extension Clip {
             let alpha = (t - p.time) / span
             return Zoom.lerp(p.zoom, n.zoom, alpha: alpha)
         }
+    }
+}
+
+public extension Clip {
+    /// Active Zoom at recordTime t. Thin delegator over events.zoomAt.
+    func zoomAt(recordTime t: Double) -> Zoom {
+        events.zoomAt(recordTime: t)
     }
 }
 

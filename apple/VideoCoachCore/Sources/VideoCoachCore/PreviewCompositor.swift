@@ -116,7 +116,23 @@ public final class PreviewCompositor: NSObject, AVVideoCompositing {
                 scaleX: outW / max(baseCI.extent.width, 1),
                 y: outH / max(baseCI.extent.height, 1)
             )
-            composite = baseCI.transformed(by: baseScale).composited(over: composite)
+            // Look up zoom for this frame's record time. When the subclass is
+            // missing (AVPlayer playback path strips it on some macOS versions),
+            // we don't have events — fall back to identity (no zoom).
+            let recordTime = inst.map { (request.compositionTime - $0.clipCompositionStart).seconds } ?? 0
+            let zoom = inst?.events.zoomAt(recordTime: recordTime) ?? .identity
+            let zoomDelta = zoom.deltaTransform(viewportSize: outRect.size)
+            let stretched = baseCI.transformed(by: baseScale)
+            // Explicit identity check: skip the `.cropped(to: outRect)` op when
+            // zoom is identity so behavior is bit-identical to the prior
+            // pipeline. `deltaTransform` already early-outs at identity, but
+            // `.cropped` is a non-trivial CIImage op we don't want on the hot
+            // identity path. At any non-identity zoom the cropped path is
+            // required to keep the zoomed image bounded by outRect.
+            let zoomed = (zoom == .identity)
+                ? stretched
+                : stretched.transformed(by: zoomDelta).cropped(to: outRect)
+            composite = zoomed.composited(over: composite)
         }
 
         // 3. Webcam PiP, bottom-right at 22% width with 2.2% margin — same

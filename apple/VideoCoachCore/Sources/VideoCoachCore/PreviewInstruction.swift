@@ -30,6 +30,11 @@ public final class PreviewInstruction: AVMutableVideoCompositionInstruction, @un
     /// freeze segment display the correct frame instead of a stale runtime
     /// cache (which AVPlayer can poison with out-of-order seek requests).
     public var frozenFrames: [Int: CVPixelBuffer] = [:]
+    /// Recording-time events for the clip in this instruction. The compositor
+    /// reads `.zoom` keyframes off this array to apply per-frame zoom delta;
+    /// other event kinds are ignored at composite time. Default `[]` keeps
+    /// existing call sites compiling unchanged with identity-zoom behavior.
+    public var events: [CommentaryEvent] = []
 
     private var _requiredSourceTrackIDs: [NSValue] = []
     public override var requiredSourceTrackIDs: [NSValue] {
@@ -45,7 +50,8 @@ public final class PreviewInstruction: AVMutableVideoCompositionInstruction, @un
         compositionStart: CMTime,
         clipDuration: CMTime,
         segments: [PlaybackSegment],
-        frozenFrames: [Int: CVPixelBuffer]
+        frozenFrames: [Int: CVPixelBuffer],
+        events: [CommentaryEvent] = []
     ) -> PreviewInstruction {
         let i = PreviewInstruction()
         i.timeRange = CMTimeRange(start: compositionStart, duration: clipDuration)
@@ -59,6 +65,7 @@ public final class PreviewInstruction: AVMutableVideoCompositionInstruction, @un
         i.clipCompositionStart = compositionStart
         i.segments = segments
         i.frozenFrames = frozenFrames
+        i.events = events
         return i
     }
 
