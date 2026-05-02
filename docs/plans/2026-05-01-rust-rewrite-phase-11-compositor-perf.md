@@ -1161,7 +1161,7 @@ Plan #4 SHIPPED 2026-05-01.
 | Task 2 PROGRESS | `e8cd546` | docs: PROGRESS.txt — Phase 11 compositor-perf Task 2 shipped |
 | Task 3 impl | `a7de6d0` | phase11(compositor-perf, task 3): freeze-segment compose memoization |
 | Task 3 PROGRESS | `7e3624d` | docs: PROGRESS.txt — Phase 11 compositor-perf Task 3 shipped |
-| Closeout (this commit) | `<TBD>` | phase11(compositor-perf, closeout): Plan #4 SHIPPED |
+| Closeout (this commit) | `170eb88` | phase11(compositor-perf, closeout): Plan #4 SHIPPED |
 
 ### Adversarial-pass fix coverage
 
@@ -1243,4 +1243,4 @@ Full battery run from the closeout commit:
 | 7 | `cargo clippy --workspace --exclude video-coach-media --all-targets -- -D warnings` | clean (no issues) |
 | 8 | `cargo fmt --check` | clean (no diffs) |
 
-CI run id captured in PROGRESS.txt and `state.json::ci_run_id`.
+CI run 25244914848 — green on all 4 jobs (also captured in PROGRESS.txt and `state.json::ci_run_id`).

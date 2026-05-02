@@ -503,7 +503,7 @@ own SHIPPED line + CI run id once green.
   - Closeout: <SHA — this commit>
 - [ ] Plan #3: source/commentary audio mix in export + preview
 - [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
-      SHIPPED 2026-05-01. CI run <TBD> green on all 4 jobs.
+      SHIPPED 2026-05-01. CI run 25244914848 green on all 4 jobs.
       Three compositor performance optimizations all in
       crates/video-coach-compositor: (a) freeze-segment compose
       memoization via Arc<Frame> identity + content-prefix-defended
