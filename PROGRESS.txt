@@ -531,6 +531,28 @@ own SHIPPED line + CI run id once green.
         brace-stripping round-trip, and not-recursive substitution.
         Plus a preferences_deserializes_without_template_field test in
         video-coach-core. 48 core tests + 29 filename tests pass.
+  - [x] Task 1: Slint dual-Repeater drag-to-reorder + LineEdit template
+        input (commit 612d558)
+        Splits the export sheet's tag list into two stacked Repeaters
+        (selected-export-tag-rows on top with ☰ drag handles in user-
+        chosen order per adv fix #9 ship-blocker; unselected-export-
+        tag-rows on bottom alphabetically). Hand-rolled drag gesture
+        via two TouchAreas per row — toggle + drag declared in that
+        z-order so Slint stacks the drag handle above the row toggle
+        (adv fix #3). Drop-Y captured in absolute window coords then
+        converted to list-relative on release via selected-list-top-y
+        (bound from the top Repeater's parent rect absolute-position.y
+        per adv fix #4 + #12); pure-Rust drag_reorder_destination
+        helper clamps with .floor().max(0).min(len). Export button
+        gates on dragging-tag-index == -1 (adv fix #5). Adds LineEdit
+        for filename template + "Placeholders: {tag}, {project},
+        {date}" hint below the Codec row; modal grows from 600px to
+        680px. PLACEHOLDER sheet-open hydration (Task 2 replaces):
+        writes default_filename_template() to the LineEdit; writes
+        empty model to selected-rows + full model to unselected-rows.
+        4 pure-Rust drag_reorder tests pass (swap, same-index no-op,
+        drop-below clamps to len, drop-above clamps to zero); full
+        crate suite 83/83 green; clippy + fmt clean.
 
 
 ## Phase 11 — pending
