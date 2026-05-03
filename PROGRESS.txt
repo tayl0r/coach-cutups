@@ -561,7 +561,7 @@ own SHIPPED line + CI run id once green.
         prefix_disambiguates. 15 compositor tests pass + parity_n_
         frames byte-for-byte. +316 LOC.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
-- [ ] Plan #6: resume failed exports (tag-level resume on PartialFailure)
+- [x] Plan #6: resume failed exports (tag-level resume on PartialFailure)
       Phase 10 ships "failure deletes the partial output and returns to
       the form" — no resume. Plan #6 adds tag-level resume: when a batch
       export fails partway through (PartialFailure outcome), the user
@@ -638,6 +638,20 @@ own SHIPPED line + CI run id once green.
         #[allow(dead_code)] on ExportPrefsSnapshot.overwrite_policy
         now that the UI reads it. 116 app tests pass; clippy + fmt
         clean. +170/-20 LOC.
+  - [x] Task 3: Harness E2E for resume skip-on-exists (commit 5a76248)
+        New tests/export_resume_skips_existing_tags.rs harness covering
+        the Plan #6 resume contract end-to-end. Test 1 (skip-on-resume):
+        run AllClips export with overwrite_policy=Resume, capture
+        SHA-256 of first 1024 bytes of the output .mp4, re-export the
+        same selection with Resume, assert export.tag.skipped {
+        reason="already_exists" } fires + first-1-KiB SHA matches +
+        SucceededAll.tag_count==1 (per adv-fix #1, includes skipped
+        rows). Test 2 (cancel-then-resume): two-tag plan; run 1 cancels
+        after the first tag completes, run 2 resumes and skips the
+        first tag (skipped event) + renders the second tag (started +
+        completed). SHA-256 of first 1 KiB is the canonical witness;
+        mtime informational only (adv-fix #7). Mirrors export_partial_
+        failure_smoke.rs harness setup. Test passes 13.07s. +220 LOC.
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
       SHIPPED 2026-05-01. CI run 25241681131 green on all 4 jobs.
       Two small UX wins for the export sheet: (1) drag-to-reorder of
