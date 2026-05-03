@@ -502,6 +502,40 @@ own SHIPPED line + CI run id once green.
         position-query overlay → Phase 11+.
   - Closeout: <SHA — this commit>
 - [ ] Plan #3: source/commentary audio mix in export + preview
+      Restores v1's source-volume + commentary-volume audio mix in batch
+      export AND clip preview. Phase 10 fix #8 deferred this; current
+      behavior is RECORDING-AUDIO-ONLY. Plan: docs/plans/2026-05-01-rust-
+      rewrite-phase-11-audio-mix.md
+  - [x] Task 0: Preflight — Preferences breadcrumb + Command/
+        ExportPrefsSnapshot volume plumbing (commit 6ae239b)
+        Data-plumbing-only preflight across video-coach-core::project +
+        video-coach-app::bus (+ one-line ui.rs structural compile fix —
+        slider callbacks land in Task 3). Adv-fix #8 (scan_volume
+        independence): expanded doc-comments on scan_volume /
+        preview_source_volume / preview_commentary_volume + new test
+        scan_volume_does_not_change_when_preview_source_volume_changes.
+        Adv-fix #9 (audio-mix breadcrumb): new Preferences::
+        audio_mix_baseline_set bool (default false via #[serde(default)]
+        for legacy-JSON compat) — Task 1's export_compilation flips to
+        true on first mix + emits preferences.audio_mix_default_applied
+        tracing event (no toast/dialog per finding #9 trim). New
+        default_preview_source_volume / default_preview_commentary_volume
+        helpers on core::project (both 1.0). Command::ExportCompilations
+        gains source_volume / commentary_volume f64 fields with
+        #[serde(default = "...")] named-default delegating to the core
+        helpers (anti-drift guards
+        default_command_source_volume_matches_core +
+        default_command_commentary_volume_matches_core).
+        ExportPrefsSnapshot carries source_volume + commentary_volume +
+        audio_mix_baseline_set; Default impl + write_export_prefs_snapshot
+        mirror from Preferences. handle_export_compilations destructures
+        Command volumes, clamps each to [0.0, 1.0] via clamp_unit (NaN
+        folds to 0.0), persists onto Preferences alongside res/quality/
+        codec/template/policy, threads clamped values into
+        export_compilation. ~10 tests added across core+app (camelCase
+        round-trip, default-is-1.0, baseline-flag round-trip, drift
+        guards, snapshot round-trip, legacy-payload defaulting,
+        clamp-on-save). 534 LOC inserted; build/test/clippy/fmt green.
 - [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
       SHIPPED 2026-05-01. CI run 25244914848 green on all 4 jobs.
       Three compositor performance optimizations all in
