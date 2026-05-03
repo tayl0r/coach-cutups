@@ -70,6 +70,12 @@ public final class MPVSourcePlayer {
     /// Cached volume (linear, 0...1). Replayed onto the fresh handle.
     private var volume: Double = 1.0
 
+    /// Cached zoom state. Replayed onto the fresh handle in `attachLayer`
+    /// so the user's zoom/pan survives the view-tree swap when they enter
+    /// preview mode and return to scanning. `setZoom` is the single
+    /// mutation point: it both updates this and writes to mpv (when attached).
+    private var zoom: Zoom = .identity
+
     /// True when at least one file is loaded in the playlist. `playlistPos`
     /// is clamped to 0 even when mpv would report -1 (no file), so callers
     /// must check this instead of `playlistPos >= 0`.
@@ -175,23 +181,45 @@ public final class MPVSourcePlayer {
         // Replay Swift-side state onto the fresh handle. mpv was started
         // with pause=yes so video doesn't start before our state replay
         // finishes; we explicitly unpause at the end if we were playing.
+        NSLog("[MPVSourcePlayer] attach replay: playlistCount=\(playlistPaths.count) playlistPos=\(playlistPos) timePos=\(timePos) zoom.scale=\(zoom.scale) zoom.panX=\(zoom.panX) zoom.panY=\(zoom.panY)")
         if !playlistPaths.isEmpty {
-            runCommandSync(["loadfile", playlistPaths[0], "replace"])
+            // Bake the start time into the loadfile command via `start=<t>`
+            // when the active file is index 0. A separate `seek` issued
+            // after `loadfile replace` races with mpv's load — mpv often
+            // resets time to 0 partway through, dropping our seek and
+            // landing at the start of the file. The start= option avoids
+            // the race entirely.
+            if playlistPos == 0 && timePos > 0 {
+                runCommandSync(["loadfile", playlistPaths[0], "replace", "0", "start=\(timePos)"])
+            } else {
+                runCommandSync(["loadfile", playlistPaths[0], "replace"])
+            }
             for p in playlistPaths.dropFirst() {
                 runCommandSync(["loadfile", p, "append"])
             }
             if playlistPos > 0 && playlistPos < playlistPaths.count {
                 runCommandSync(["playlist-play-index", String(playlistPos)])
-            }
-            if timePos > 0 {
-                // At replay time we need an explicit seek because the
-                // loadfile already happened above.
-                runCommandSync(["seek", String(timePos), "absolute+keyframes"])
+                if timePos > 0 {
+                    // playlist-play-index restarts at t=0 on the new file;
+                    // exact-seek to the user's saved position. (Same loadfile
+                    // race exists here in theory, but multi-file playlists
+                    // are rare in this app and the user-visible drift is
+                    // acceptable as a follow-up if needed.)
+                    runCommandSync(["seek", String(timePos), "absolute+exact"])
+                }
             }
         }
         // Replay volume (independent of playlist).
         var mpvVolume = max(0, min(100, volume * 100))
         mpv_set_property(h, "volume", MPV_FORMAT_DOUBLE, &mpvVolume)
+        // Replay zoom/pan onto the fresh handle. The user's gesture state
+        // lives on Workspace.currentZoom and is mirrored here by setZoom;
+        // without this replay, returning from a preview clip would reset
+        // the user's zoom to identity even though Workspace still has it.
+        // Skip when identity to avoid a redundant write at startup.
+        if zoom != .identity {
+            setZoom(zoom)
+        }
         // Restore paused state — mpv is currently paused; only unpause
         // if we were playing.
         if !isPaused {
@@ -410,6 +438,10 @@ public final class MPVSourcePlayer {
     }
 
     public func setZoom(_ zoom: Zoom) {
+        // Cache the value so attachLayer can replay it after a detach
+        // (preview round-trip). Update unconditionally — when detached the
+        // mpv writes are skipped below but the next attach will replay this.
+        self.zoom = zoom
         guard let h = handle else { return }
         // mpv's video-zoom is logarithmic (each unit = 2x). Our Zoom.scale is
         // linear, so log2 the scale.
