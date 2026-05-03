@@ -14,9 +14,11 @@
 //! between batches) — must hit the skip-on-exists branch and emit
 //! `export.tag.skipped { selection: "drills", reason: "already_exists" }`
 //! while leaving the .mp4's bytes byte-for-byte unchanged
-//! (`metadata.len()` + `metadata.modified()`). Adv-fix #1: the skip
-//! path bumps `completed_tags` so the batch ends with `tag_count=1`,
-//! NOT 0.
+//! (`metadata.len()` + SHA-256 of the first 1 KiB; code-review fix F5
+//! / plan adv-fix #7 — SHA is the canonical witness, mtime is
+//! informational and can drift on Windows VM filesystems unrelated to
+//! writes). Adv-fix #1: the skip path bumps `completed_tags` so the
+//! batch ends with `tag_count=1`, NOT 0.
 //!
 //! Body wrapped in the Plan #5 guaranteed-quit shape (anyhow::ensure!
 //! inside the inner async block, then explicit `app.quit().await`,
@@ -25,10 +27,27 @@
 
 mod common;
 
+use std::io::Read;
 use std::time::Duration;
+
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 
 use common::{launch_with_first_source, quit_and_mutate_project, record_clip_at_playhead};
+
+/// SHA-256 of the first 1 KiB of `path`. Plan #6 adv-fix #7's canonical
+/// witness for "file unchanged across a Resume skip" — strictly stronger
+/// than mtime equality (no filesystem timestamp resolution / VM clock
+/// drift / NFS-no-mtime-update concerns) and cheaper than full-file
+/// hashing. Reads up to 1024 bytes; if the file is shorter, hashes
+/// whatever is there. Code-review fix F5 (replaces the original
+/// `metadata.modified()` equality assertion).
+fn sha256_first_1kib(path: &std::path::Path) -> anyhow::Result<[u8; 32]> {
+    let mut buf = vec![0u8; 1024];
+    let n = std::fs::File::open(path)?.read(&mut buf)?;
+    buf.truncate(n);
+    Ok(Sha256::digest(&buf).into())
+}
 
 #[tokio::test]
 async fn export_resume_skips_existing_tag_on_second_run() -> anyhow::Result<()> {
@@ -131,7 +150,15 @@ async fn export_resume_skips_existing_tag_on_second_run() -> anyhow::Result<()> 
         );
         let first_metadata = std::fs::metadata(&output_path)?;
         let first_size = first_metadata.len();
-        let first_mtime = first_metadata.modified()?;
+        // Code-review fix F5 (Plan #6 adv-fix #7): SHA-256 of the first
+        // 1 KiB is the canonical witness for "file unchanged across a
+        // Resume skip". Strictly stronger than `metadata.modified()`
+        // equality — mtime can drift on filesystems that update access
+        // time only, on Windows VM filesystems (Hyper-V CSV, network
+        // mounts), and across `set_modified` rounding. Hashing the first
+        // 1 KiB pins the ftyp + first moov fragment bytes, which would
+        // change on any byte-level rewrite.
+        let first_hash = sha256_first_1kib(&output_path)?;
         anyhow::ensure!(
             first_size > 50_000,
             "run 1 expected output > 50 KB, got {first_size} B at {}",
@@ -190,21 +217,23 @@ async fn export_resume_skips_existing_tag_on_second_run() -> anyhow::Result<()> 
             "run 2 batch.completed tag_count: {tc} (expected 1; adv-fix #1 contract)"
         );
 
-        // File invariance: skip path does NOT touch the .mp4. Size +
-        // mtime equality is the canonical witness — the bus's skip
-        // branch performs zero writes against `output_path`, so even on
-        // filesystems with coarse mtime resolution (NTFS 100 ns, some
-        // ext4 setups: seconds), the assertion holds because nothing
-        // updated the inode at all.
+        // File invariance: skip path does NOT touch the .mp4. Size is
+        // kept as a redundant cheap guard; SHA-256 of the first 1 KiB is
+        // the canonical witness (code-review fix F5; Plan #6 adv-fix
+        // #7). The bus's skip branch performs zero writes against
+        // `output_path`, so the bytes — including the ftyp box at offset
+        // 0 and any moov fragment that fell into the first KiB — are
+        // byte-for-byte identical.
         let second_metadata = std::fs::metadata(&output_path)?;
         anyhow::ensure!(
             second_metadata.len() == first_size,
             "run 2 expected output size unchanged ({first_size} B), got {} B",
             second_metadata.len(),
         );
+        let second_hash = sha256_first_1kib(&output_path)?;
         anyhow::ensure!(
-            second_metadata.modified()? == first_mtime,
-            "run 2 expected output mtime unchanged (skip path performs no writes)"
+            first_hash == second_hash,
+            "run 2 expected file content unchanged across resume skip (SHA-256 of first 1 KiB; first={first_hash:02x?}, second={second_hash:02x?})"
         );
 
         Ok::<_, anyhow::Error>(())

@@ -24,3 +24,11 @@ tokio = { version = "1", features = ["test-util"] }
 tempfile = "3"
 uuid = { workspace = true }
 video-coach-core = { path = "../video-coach-core" }
+# Phase 11 Plan #6 code-review fix F5. The Resume-skip E2E test asserts
+# byte-for-byte file invariance across a skip via SHA-256 of the first
+# 1 KiB — strictly stronger than the mtime-equality check it replaced
+# (per plan adv-fix #7: SHA is the canonical witness; mtime is
+# informational and can drift on Windows VM filesystems unrelated to
+# writes). sha2 is already pulled in as a transitive dep so this adds
+# zero net build cost.
+sha2 = "0.10"
