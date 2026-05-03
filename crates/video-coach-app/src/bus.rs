@@ -170,6 +170,36 @@ pub enum Command {
         /// anti-drift guard.
         #[serde(default = "default_overwrite_policy_for_command")]
         overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
+        /// Phase 11 Plan #1 Task 0. Per-export source-audio gain in
+        /// `[0.0, 1.0]`. The bus clamps to that range and threads the
+        /// value to `export_compilation`; the export driver applies it
+        /// to the source-audio chain (Task 1). The bus also persists
+        /// the click-time value back onto
+        /// `Preferences::preview_source_volume` alongside res/quality/
+        /// codec/template/policy so the next sheet open hydrates the
+        /// slider to the user's last choice.
+        ///
+        /// `#[serde(default = "default_command_source_volume")]` so a
+        /// Phase-10-era control-socket client (or any test fixture
+        /// predating Plan #1) deserializes cleanly without the field;
+        /// the default delegates to
+        /// `video_coach_core::project::default_preview_source_volume`
+        /// so the value lives in exactly one place across crates — see
+        /// `default_command_source_volume_matches_core` for the
+        /// anti-drift guard.
+        #[serde(default = "default_command_source_volume")]
+        source_volume: f64,
+        /// Phase 11 Plan #1 Task 0. Per-export commentary-audio gain
+        /// in `[0.0, 1.0]`. See `source_volume` above for the full
+        /// rationale; the same shape applies to the commentary side.
+        ///
+        /// `#[serde(default = "default_command_commentary_volume")]`
+        /// delegates to
+        /// `video_coach_core::project::default_preview_commentary_volume`
+        /// — see `default_command_commentary_volume_matches_core` for
+        /// the anti-drift guard.
+        #[serde(default = "default_command_commentary_volume")]
+        commentary_volume: f64,
     },
     /// Phase 10. Request cancellation of the in-flight batch export.
     /// The bus flips its `current_export_cancel` AtomicBool; the export
@@ -203,6 +233,50 @@ fn default_command_filename_template() -> String {
 /// the anti-drift guard.
 fn default_overwrite_policy_for_command() -> video_coach_core::project::ExportOverwritePolicy {
     video_coach_core::project::default_overwrite_policy()
+}
+
+/// Phase 11 Plan #1 Task 0. Default value for
+/// `Command::ExportCompilations::source_volume` when a Phase-10-era
+/// JSON payload (or a test fixture predating Plan #1) lacks the field.
+/// Delegates to `video_coach_core::project::default_preview_source_volume`
+/// so the default lives in exactly one place across crates — see the
+/// `default_command_source_volume_matches_core` test below for the
+/// anti-drift guard.
+fn default_command_source_volume() -> f64 {
+    video_coach_core::project::default_preview_source_volume()
+}
+
+/// Phase 11 Plan #1 Task 0. Default value for
+/// `Command::ExportCompilations::commentary_volume` when a Phase-10-era
+/// JSON payload (or a test fixture predating Plan #1) lacks the field.
+/// Delegates to `video_coach_core::project::default_preview_commentary_volume`
+/// so the default lives in exactly one place across crates — see the
+/// `default_command_commentary_volume_matches_core` test below for the
+/// anti-drift guard.
+fn default_command_commentary_volume() -> f64 {
+    video_coach_core::project::default_preview_commentary_volume()
+}
+
+/// Phase 11 Plan #1 Task 0. Clamp an audio gain value to the unit
+/// range `[0.0, 1.0]`. Defends against malformed control-socket
+/// payloads (e.g. a harness fixture sending `1.5` or `-0.2`) and
+/// against UI bugs that might emit out-of-range slider values. NaN
+/// folds to `0.0` (silent) — `f64::clamp` returns NaN on a NaN
+/// input, which would propagate downstream into the export driver
+/// and corrupt audio buffers, so we short-circuit NaN here.
+///
+/// Production callers live behind `#[cfg(feature = "media")]`
+/// (`handle_export_compilations`); the unit tests below exercise the
+/// helper directly without the gate. `#[allow(dead_code)]` keeps the
+/// no-media build warning-free without hiding the function from the
+/// test path.
+#[allow(dead_code)]
+fn clamp_unit(v: f64) -> f64 {
+    if v.is_nan() {
+        0.0
+    } else {
+        v.clamp(0.0, 1.0)
+    }
 }
 
 /// Phase 11 Plan #6 Task 1. Result of the per-tag skip-on-exists
@@ -462,6 +536,33 @@ pub struct ExportPrefsSnapshot {
     /// field is populated by `write_export_prefs_snapshot` from
     /// `Preferences::export_overwrite_policy` after each Export click.
     pub overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
+    /// Phase 11 Plan #1 Task 0. Last-persisted source-audio gain,
+    /// hydrated into Task 3's "Source volume" slider on each sheet
+    /// open. Mirrors `Preferences::preview_source_volume`. Default
+    /// `1.0` (full source gain).
+    ///
+    /// `#[allow(dead_code)]` because Task 0 only wires the
+    /// write-side; the read-side (ui.rs's slider hydration) lands in
+    /// Task 3. Tests below exercise the field; the gate stops
+    /// `clippy -- -D warnings` from failing in the meantime.
+    #[allow(dead_code)]
+    pub source_volume: f64,
+    /// Phase 11 Plan #1 Task 0. Last-persisted commentary-audio gain,
+    /// hydrated into Task 3's "Commentary volume" slider on each sheet
+    /// open. Mirrors `Preferences::preview_commentary_volume`. Default
+    /// `1.0` (full commentary gain). See `source_volume` for the
+    /// `#[allow(dead_code)]` rationale.
+    #[allow(dead_code)]
+    pub commentary_volume: f64,
+    /// Phase 11 Plan #1 adv-fix #9. Mirrors
+    /// `Preferences::audio_mix_baseline_set`. Carried in the snapshot
+    /// because Task 1's `export_compilation` reads the project-loaded
+    /// breadcrumb to decide whether to emit the
+    /// `preferences.audio_mix_default_applied` event on first export
+    /// after upgrade. Default `false`. See `source_volume` for the
+    /// `#[allow(dead_code)]` rationale (Task 1 reads it).
+    #[allow(dead_code)]
+    pub audio_mix_baseline_set: bool,
 }
 
 impl Default for ExportPrefsSnapshot {
@@ -473,6 +574,12 @@ impl Default for ExportPrefsSnapshot {
             codec: p.last_export_codec,
             export_filename_template: p.export_filename_template,
             overwrite_policy: p.export_overwrite_policy,
+            // Phase 11 Plan #1 Task 0. Carry the volume + breadcrumb
+            // defaults from `Preferences::default()` so a fresh sheet
+            // open hydrates the sliders to 1.0 / 1.0 (full mix).
+            source_volume: p.preview_source_volume,
+            commentary_volume: p.preview_commentary_volume,
+            audio_mix_baseline_set: p.audio_mix_baseline_set,
         }
     }
 }
@@ -589,6 +696,13 @@ fn write_export_prefs_snapshot(
         // so a reopen of the export sheet shows the user's last choice
         // (Task 2 wires the UI read side).
         overwrite_policy: prefs.export_overwrite_policy,
+        // Phase 11 Plan #1 Task 0. Mirror the preview-volume prefs +
+        // upgrade breadcrumb so Task 3's sheet-open hydration shows
+        // the user's last slider positions and so Task 1's
+        // `export_compilation` can detect upgrading projects.
+        source_volume: prefs.preview_source_volume,
+        commentary_volume: prefs.preview_commentary_volume,
+        audio_mix_baseline_set: prefs.audio_mix_baseline_set,
     };
 }
 
@@ -2408,6 +2522,8 @@ async fn handle(
             project_name,
             filename_template,
             overwrite_policy,
+            source_volume,
+            commentary_volume,
         } => {
             #[cfg(not(feature = "media"))]
             {
@@ -2420,6 +2536,8 @@ async fn handle(
                     project_name,
                     filename_template,
                     overwrite_policy,
+                    source_volume,
+                    commentary_volume,
                 );
                 CommandReply {
                     ok: false,
@@ -2437,6 +2555,8 @@ async fn handle(
                     project_name,
                     filename_template,
                     overwrite_policy,
+                    source_volume,
+                    commentary_volume,
                     current,
                     current_mode,
                     recording,
@@ -2511,6 +2631,8 @@ async fn handle_export_compilations(
     project_name: String,
     filename_template: String,
     overwrite_policy: video_coach_core::project::ExportOverwritePolicy,
+    source_volume: f64,
+    commentary_volume: f64,
     current: &mut Option<(video_coach_core::project::Project, std::path::PathBuf)>,
     current_mode: &mut AppMode,
     recording: &Option<video_coach_media::recording::Recording>,
@@ -2687,6 +2809,15 @@ async fn handle_export_compilations(
     }
 
     // ── 6. Persist preferences BEFORE kicking off the loop (fix #11). ────
+    //
+    // Phase 11 Plan #1 Task 0. Clamp the Command-supplied volumes to
+    // `[0.0, 1.0]` BEFORE persisting them and BEFORE handing them to
+    // `export_compilation` so a malformed control-socket payload (or a
+    // UI bug) can't write out-of-range values onto disk or into the
+    // export driver. The clamp happens once here; downstream code
+    // assumes the unit-range invariant.
+    let source_volume_clamped = clamp_unit(source_volume);
+    let commentary_volume_clamped = clamp_unit(commentary_volume);
     {
         let (project, folder) = current.as_mut().expect("re-checked");
         project.preferences.last_export_resolution = resolution;
@@ -2706,6 +2837,13 @@ async fn handle_export_compilations(
         // ui.rs::on_export_start_clicked); by the time the value lands
         // here it's already the canonical ExportOverwritePolicy variant.
         project.preferences.export_overwrite_policy = overwrite_policy;
+        // Phase 11 Plan #1 Task 0: persist the Command-supplied volumes
+        // (already clamped to `[0.0, 1.0]` above) onto Preferences so a
+        // reopen of the export sheet shows the user's last slider
+        // positions. Mirrors the resolution/quality/codec/template
+        // persistence pattern.
+        project.preferences.preview_source_volume = source_volume_clamped;
+        project.preferences.preview_commentary_volume = commentary_volume_clamped;
         // Phase 11 Plan #3 Task 2 (fix #8): publish to the slot the UI
         // reads on subsequent sheet opens. Done before the spawn-blocking
         // disk write so a slow disk doesn't delay the in-memory snapshot.
@@ -2753,10 +2891,17 @@ async fn handle_export_compilations(
     *current_mode = AppMode::Exporting;
     write_recording_state(recording_state, current_mode, None);
 
-    // Capture preview-volume preferences for export.rs's API (Phase 10
-    // ignores them per fix #8 but the field is in the API signature).
-    let source_volume = project_snapshot.preferences.preview_source_volume;
-    let commentary_volume = project_snapshot.preferences.preview_commentary_volume;
+    // Phase 11 Plan #1 Task 0: thread the Command-supplied volumes
+    // (clamped to `[0.0, 1.0]` in step 6 above) into the export driver
+    // instead of re-reading the Preferences. The Command-supplied
+    // values are the canonical "what the user clicked Export with"
+    // signal; `project_snapshot` was cloned before the persist block
+    // ran (step 4) and so still carries the PRIOR session's
+    // preview_*_volume values, not the click-time choice. The persist
+    // block then mirrored the clamped values onto disk so the next
+    // sheet reopen hydrates the sliders to the right positions.
+    let source_volume = source_volume_clamped;
+    let commentary_volume = commentary_volume_clamped;
 
     let total_tags = selections.len();
 
@@ -3801,6 +3946,11 @@ mod tests {
             // to assert the legacy Phase-10 behavior shape rather than
             // implicitly inheriting the new Resume default.
             overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults match the Preferences
+            // (1.0 / 1.0); the dedicated round-trip test below covers
+            // non-default values explicitly.
+            source_volume: default_command_source_volume(),
+            commentary_volume: default_command_commentary_volume(),
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["cmd"], "export_compilations");
@@ -3825,6 +3975,8 @@ mod tests {
                 project_name,
                 filename_template,
                 overwrite_policy,
+                source_volume,
+                commentary_volume,
             } => {
                 assert_eq!(selections.len(), 2);
                 assert_eq!(selections[0], TagSelection::AllClips);
@@ -3844,6 +3996,11 @@ mod tests {
                     overwrite_policy,
                     video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
                 );
+                // Phase 11 Plan #1 Task 0. Default volumes round-trip
+                // unchanged; the dedicated non-default round-trip test
+                // below exercises the 0.5 / 0.25 case.
+                assert_eq!(source_volume, default_command_source_volume());
+                assert_eq!(commentary_volume, default_command_commentary_volume());
             }
             _ => panic!("expected ExportCompilations"),
         }
@@ -3866,6 +4023,10 @@ mod tests {
             // Phase 11 Plan #6 Task 0. Pin OverwriteAll for legacy
             // assertion stability under the new Resume default.
             overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults are fine for the Hevc
+            // codec round-trip; this test pins codec, not volumes.
+            source_volume: default_command_source_volume(),
+            commentary_volume: default_command_commentary_volume(),
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["cmd"], "export_compilations");
@@ -3908,6 +4069,8 @@ mod tests {
                 project_name,
                 filename_template,
                 overwrite_policy,
+                source_volume,
+                commentary_volume,
             } => {
                 assert_eq!(selections.len(), 1);
                 assert_eq!(selections[0], TagSelection::AllClips);
@@ -3916,6 +4079,12 @@ mod tests {
                 assert_eq!(quality, video_coach_core::project::Quality::Medium);
                 assert_eq!(codec, video_coach_core::project::Codec::H264);
                 assert_eq!(project_name, "Legacy Practice");
+                // Phase 11 Plan #1 Task 0. Pre-Plan-#1 JSON without
+                // `source_volume`/`commentary_volume` defaults to 1.0
+                // each — the dedicated legacy-payload test below
+                // exercises this path more thoroughly.
+                assert_eq!(source_volume, 1.0);
+                assert_eq!(commentary_volume, 1.0);
                 // Phase 11 Plan #6 Task 0. Pre-Plan-#6 JSON without
                 // `overwrite_policy` defaults to Resume.
                 assert_eq!(
@@ -3956,6 +4125,10 @@ mod tests {
             export_filename_template: prefs.export_filename_template.clone(),
             // Phase 11 Plan #6 Task 0.
             overwrite_policy: prefs.export_overwrite_policy,
+            // Phase 11 Plan #1 Task 0.
+            source_volume: prefs.preview_source_volume,
+            commentary_volume: prefs.preview_commentary_volume,
+            audio_mix_baseline_set: prefs.audio_mix_baseline_set,
         };
         let (res, qual, codec, _template) = export_prefs_to_slint_strings(snap);
         assert_eq!(res, "720");
@@ -3993,6 +4166,10 @@ mod tests {
             codec: prefs.last_export_codec,
             export_filename_template: prefs.export_filename_template.clone(),
             overwrite_policy: prefs.export_overwrite_policy,
+            // Phase 11 Plan #1 Task 0.
+            source_volume: prefs.preview_source_volume,
+            commentary_volume: prefs.preview_commentary_volume,
+            audio_mix_baseline_set: prefs.audio_mix_baseline_set,
         };
         assert!(matches!(
             snap.overwrite_policy,
@@ -4084,6 +4261,10 @@ mod tests {
             // Phase 11 Plan #6 Task 0. Pin OverwriteAll for legacy
             // assertion stability under the new Resume default.
             overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults are fine for the
+            // tag-selection round-trip; this test pins selections.
+            source_volume: default_command_source_volume(),
+            commentary_volume: default_command_commentary_volume(),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let cmd2: Command = serde_json::from_str(&json).unwrap();
@@ -4176,6 +4357,11 @@ mod tests {
             "Test".into(),
             default_command_filename_template(),
             video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Pin defaults — this test
+            // pins the no-project-open refusal path, not the volume
+            // path.
+            default_command_source_volume(),
+            default_command_commentary_volume(),
             &mut current,
             &mut current_mode,
             &recording,
@@ -4233,6 +4419,10 @@ mod tests {
             "Test".into(),
             default_command_filename_template(),
             video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults; this test pins a
+            // different code path.
+            default_command_source_volume(),
+            default_command_commentary_volume(),
             &mut current,
             &mut current_mode,
             &recording,
@@ -4278,6 +4468,10 @@ mod tests {
             // Phase 11 Plan #6 Task 0. Pin OverwriteAll for legacy
             // assertion stability under the new Resume default.
             overwrite_policy: video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults; this test pins
+            // filename_template, not volumes.
+            source_volume: default_command_source_volume(),
+            commentary_volume: default_command_commentary_volume(),
         };
         let v = serde_json::to_value(&cmd).unwrap();
         assert_eq!(v["filename_template"], "{date}_{tag}_{project}");
@@ -4357,6 +4551,10 @@ mod tests {
             export_filename_template: prefs.export_filename_template.clone(),
             // Phase 11 Plan #6 Task 0.
             overwrite_policy: prefs.export_overwrite_policy,
+            // Phase 11 Plan #1 Task 0.
+            source_volume: prefs.preview_source_volume,
+            commentary_volume: prefs.preview_commentary_volume,
+            audio_mix_baseline_set: prefs.audio_mix_baseline_set,
         };
         let (_res, _qual, _codec, template) = export_prefs_to_slint_strings(snap);
         assert_eq!(template.as_str(), "{tag}_{project}_{date}");
@@ -4437,6 +4635,10 @@ mod tests {
             // dot-trim contract — caught by the invalid gate.
             ".".into(),
             video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults; this test pins the
+            // template-validation refusal path.
+            default_command_source_volume(),
+            default_command_commentary_volume(),
             &mut current,
             &mut current_mode,
             &recording,
@@ -4502,6 +4704,10 @@ mod tests {
             "Test".into(),
             "static-name".into(),
             video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+            // Phase 11 Plan #1 Task 0. Defaults; this test pins the
+            // collision-detection refusal path.
+            default_command_source_volume(),
+            default_command_commentary_volume(),
             &mut current,
             &mut current_mode,
             &recording,
@@ -4721,6 +4927,166 @@ mod tests {
             }
             _ => panic!("expected ExportCompilations"),
         }
+    }
+
+    // ── Phase 11 Plan #1 Task 0 — audio-mix volume plumbing tests ─────
+
+    #[test]
+    fn default_command_source_volume_matches_core() {
+        // Phase 11 Plan #1 Task 0 (anti-drift guard, mirrors
+        // `default_command_filename_template_matches_core`). The bus's
+        // `default_command_source_volume` and core's
+        // `video_coach_core::project::default_preview_source_volume`
+        // MUST agree. If a future plan flips one, this test fails
+        // loudly, forcing the other to follow.
+        assert_eq!(
+            default_command_source_volume(),
+            video_coach_core::project::default_preview_source_volume(),
+        );
+        assert_eq!(default_command_source_volume(), 1.0);
+    }
+
+    #[test]
+    fn default_command_commentary_volume_matches_core() {
+        // Phase 11 Plan #1 Task 0 (anti-drift guard, mirrors
+        // `default_command_source_volume_matches_core`).
+        assert_eq!(
+            default_command_commentary_volume(),
+            video_coach_core::project::default_preview_commentary_volume(),
+        );
+        assert_eq!(default_command_commentary_volume(), 1.0);
+    }
+
+    #[test]
+    fn export_prefs_snapshot_default_carries_volumes_from_preferences() {
+        // Phase 11 Plan #1 Task 0. The snapshot's default must mirror
+        // `Preferences::default()` for the new volume fields so a
+        // fresh sheet open hydrates the sliders to 1.0 / 1.0 (full
+        // mix) and the breadcrumb starts un-flipped. Sibling to
+        // `export_prefs_snapshot_default_overwrite_policy_is_resume`.
+        let snap = ExportPrefsSnapshot::default();
+        let prefs = video_coach_core::project::Preferences::default();
+        assert_eq!(snap.source_volume, prefs.preview_source_volume);
+        assert_eq!(snap.commentary_volume, prefs.preview_commentary_volume);
+        assert_eq!(snap.audio_mix_baseline_set, prefs.audio_mix_baseline_set);
+        assert_eq!(snap.source_volume, 1.0);
+        assert_eq!(snap.commentary_volume, 1.0);
+        assert!(!snap.audio_mix_baseline_set);
+    }
+
+    #[test]
+    fn command_export_compilations_round_trips_volumes() {
+        // Phase 11 Plan #1 Task 0. JSON round-trip with non-default
+        // volumes (0.5 / 0.25) — proves the new Command fields travel
+        // intact through the same serde path the control socket uses.
+        let cmd = Command::ExportCompilations {
+            selections: vec![TagSelection::AllClips],
+            output_folder: "/tmp/exports".into(),
+            resolution: video_coach_core::project::Resolution::R1080,
+            quality: video_coach_core::project::Quality::Medium,
+            codec: video_coach_core::project::Codec::H264,
+            project_name: "Practice".into(),
+            filename_template: default_command_filename_template(),
+            overwrite_policy: video_coach_core::project::ExportOverwritePolicy::Resume,
+            source_volume: 0.5,
+            commentary_volume: 0.25,
+        };
+        let v = serde_json::to_value(&cmd).unwrap();
+        assert_eq!(v["source_volume"], 0.5);
+        assert_eq!(v["commentary_volume"], 0.25);
+        let cmd: Command = serde_json::from_value(v).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                source_volume,
+                commentary_volume,
+                ..
+            } => {
+                assert_eq!(source_volume, 0.5);
+                assert_eq!(commentary_volume, 0.25);
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn command_export_compilations_legacy_payload_defaults_volumes_to_1_0() {
+        // Phase 11 Plan #1 Task 0. A Phase-10-era / Plan-#7-era
+        // control-socket client / harness fixture sends
+        // `Command::ExportCompilations` JSON without `source_volume` /
+        // `commentary_volume` keys. With `#[serde(default = ...)]` on
+        // each field, both fill in to `1.0` — matching the
+        // `Preferences` default and the prior implicit behavior. Mirrors
+        // `export_command_omitted_overwrite_policy_field_deserializes_to_resume`.
+        let json = r#"{
+            "cmd": "export_compilations",
+            "selections": [{"kind": "all_clips"}],
+            "output_folder": "/tmp/exports",
+            "resolution": "r720",
+            "quality": "low",
+            "codec": "h264",
+            "project_name": "Legacy",
+            "filename_template": "{tag} - {project}",
+            "overwrite_policy": "resume"
+        }"#;
+        let cmd: Command = serde_json::from_str(json).unwrap();
+        match cmd {
+            Command::ExportCompilations {
+                source_volume,
+                commentary_volume,
+                ..
+            } => {
+                assert_eq!(source_volume, 1.0);
+                assert_eq!(commentary_volume, 1.0);
+            }
+            _ => panic!("expected ExportCompilations"),
+        }
+    }
+
+    #[test]
+    fn preferences_volume_clamps_to_unit_range_on_save() {
+        // Phase 11 Plan #1 Task 0. `clamp_unit` is the single
+        // gatekeeper that defends `export_compilation` and the
+        // persisted `Preferences::preview_*_volume` from out-of-range
+        // values (malformed control-socket payloads, harness fixtures,
+        // future UI bugs). 1.5 → 1.0; -0.2 → 0.0; values inside the
+        // range pass through unchanged; NaN folds to 0.0 (silent).
+        assert_eq!(clamp_unit(1.5), 1.0);
+        assert_eq!(clamp_unit(2.0), 1.0);
+        assert_eq!(clamp_unit(-0.2), 0.0);
+        assert_eq!(clamp_unit(-1.0), 0.0);
+        assert_eq!(clamp_unit(0.0), 0.0);
+        assert_eq!(clamp_unit(1.0), 1.0);
+        assert_eq!(clamp_unit(0.5), 0.5);
+        assert_eq!(clamp_unit(0.999_999), 0.999_999);
+        // NaN folds to 0.0 (silent) so a malformed payload never
+        // produces NaN-amplified samples downstream.
+        assert_eq!(clamp_unit(f64::NAN), 0.0);
+    }
+
+    // The full snapshot round-trip (which writes via the media-gated
+    // `write_export_prefs_snapshot`) lives in the
+    // `#[cfg(feature = "media")]` test below; the pure-default
+    // assertion above runs on every build.
+    #[cfg(feature = "media")]
+    #[test]
+    fn write_export_prefs_snapshot_round_trips_volumes() {
+        // Phase 11 Plan #1 Task 0. A non-default Preferences
+        // (source=0.7, commentary=0.3, baseline=true) round-trips
+        // through `write_export_prefs_snapshot` unchanged — guards
+        // against a future refactor that drops one of the three new
+        // fields from the snapshot copy.
+        let prefs = video_coach_core::project::Preferences {
+            preview_source_volume: 0.7,
+            preview_commentary_volume: 0.3,
+            audio_mix_baseline_set: true,
+            ..video_coach_core::project::Preferences::default()
+        };
+        let slot = new_export_prefs_slot();
+        write_export_prefs_snapshot(&slot, &prefs);
+        let g = slot.lock().unwrap();
+        assert_eq!(g.source_volume, 0.7);
+        assert_eq!(g.commentary_volume, 0.3);
+        assert!(g.audio_mix_baseline_set);
     }
 
     #[test]
@@ -4993,6 +5359,10 @@ mod tests {
             "ResumeTest".into(),
             default_command_filename_template(),
             policy,
+            // Phase 11 Plan #1 Task 0. Defaults; this test pins the
+            // resume / overwrite-policy contract.
+            default_command_source_volume(),
+            default_command_commentary_volume(),
             &mut current,
             &mut current_mode,
             &recording,

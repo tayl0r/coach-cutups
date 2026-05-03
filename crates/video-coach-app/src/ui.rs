@@ -1240,6 +1240,19 @@ pub fn run(
                     project_name,
                     filename_template,
                     overwrite_policy,
+                    // Phase 11 Plan #1 Task 0 — preflight only. The
+                    // Command shape now carries the per-export volumes
+                    // but the export-sheet sliders that read user-set
+                    // values land in Task 3. Until then, dispatch the
+                    // Preferences defaults (1.0 / 1.0) so behavior
+                    // matches the prior "read from Preferences" path
+                    // exactly: the bus persists these onto Preferences
+                    // (a no-op when they already match), then threads
+                    // them into export_compilation. Task 3 replaces
+                    // these with the live slider values.
+                    source_volume: video_coach_core::project::default_preview_source_volume(),
+                    commentary_volume: video_coach_core::project::default_preview_commentary_volume(
+                    ),
                 },
             )
             .await;

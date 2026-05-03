@@ -70,8 +70,35 @@ pub fn default_overwrite_policy() -> ExportOverwritePolicy {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Preferences {
+    /// Source-video audio gain applied ONLY by the source player during
+    /// scrubbing / scan playback. Does NOT influence preview clip
+    /// playback or batch export. Independent from `preview_source_volume`
+    /// (Phase 11 Plan #1 adv-fix #8): a user who has dialed
+    /// `scan_volume` to 0.3 still hears source audio at
+    /// `preview_source_volume` during clip preview and batch export.
     pub scan_volume: f64,
+    /// Source-video audio gain in the `[0.0, 1.0]` range, applied to
+    /// BOTH the clip-preview pipeline AND batch export's per-tag mix.
+    /// Independent from `scan_volume` (Phase 11 Plan #1 adv-fix #8) —
+    /// `scan_volume` only affects scrubbing playback, this field only
+    /// affects preview + export. Despite the `preview_` name prefix,
+    /// this field also drives export-time source-audio gain; the prefix
+    /// is preserved across Phase 11 Plan #1 to avoid churning 5+ files
+    /// for cosmetic gain. Default `1.0` (full source gain) — see
+    /// `default_preview_source_volume` for the single source of truth
+    /// referenced by the bus's `Command::ExportCompilations` named-
+    /// default.
     pub preview_source_volume: f64,
+    /// Commentary-recording audio gain in the `[0.0, 1.0]` range,
+    /// applied to BOTH the clip-preview pipeline AND batch export's
+    /// per-tag mix. Independent from `scan_volume` (Phase 11 Plan #1
+    /// adv-fix #8). Despite the `preview_` name prefix, this field
+    /// also drives export-time commentary-audio gain; the prefix is
+    /// preserved across Phase 11 Plan #1 to avoid churning 5+ files
+    /// for cosmetic gain. Default `1.0` (full commentary gain) — see
+    /// `default_preview_commentary_volume` for the single source of
+    /// truth referenced by the bus's `Command::ExportCompilations`
+    /// named-default.
     pub preview_commentary_volume: f64,
     pub last_export_resolution: Resolution,
     pub last_export_quality: Quality,
@@ -102,6 +129,36 @@ pub struct Preferences {
     pub export_overwrite_policy: ExportOverwritePolicy,
     pub preferred_camera_id: Option<String>,
     pub preferred_mic_id: Option<String>,
+    /// Phase 11 Plan #1 (adv-fix #9). One-shot tracing breadcrumb for
+    /// projects upgrading from Phase 10 (commentary-only audio) to
+    /// Phase 11 Plan #1 (source + commentary mix at 1.0 / 1.0 default).
+    /// `false` on a fresh-or-upgraded project.json; flipped to `true`
+    /// the first time `export_compilation` runs and emits the
+    /// `preferences.audio_mix_default_applied` event so the user can
+    /// hear the new mix and we have telemetry on the upgrade. NO
+    /// toast/dialog — finding #9 was OVERSTATED and trimmed to the
+    /// breadcrumb only. The `#[serde(default)]` attribute means a
+    /// pre-Plan-#1 project.json deserializes as `false` — exactly the
+    /// desired upgrade behavior. Task 0 wires the storage; Task 1
+    /// (export.rs) flips the flag on first audio mix.
+    #[serde(default)]
+    pub audio_mix_baseline_set: bool,
+}
+
+/// Default value for `Preferences::preview_source_volume`. Declared
+/// `pub` (not `pub(crate)`) so cross-crate callers in `video-coach-app`
+/// (the bus's `default_command_source_volume`) can reference it as the
+/// single source of truth. Phase 11 Plan #1 adv-fix #8 / Task 0.
+pub fn default_preview_source_volume() -> f64 {
+    1.0
+}
+
+/// Default value for `Preferences::preview_commentary_volume`. Declared
+/// `pub` (not `pub(crate)`) so cross-crate callers in `video-coach-app`
+/// (the bus's `default_command_commentary_volume`) can reference it as
+/// the single source of truth. Phase 11 Plan #1 adv-fix #8 / Task 0.
+pub fn default_preview_commentary_volume() -> f64 {
+    1.0
 }
 
 /// Default value for `Preferences::export_filename_template`. Declared
@@ -116,8 +173,8 @@ impl Default for Preferences {
     fn default() -> Self {
         Self {
             scan_volume: 1.0,
-            preview_source_volume: 1.0,
-            preview_commentary_volume: 1.0,
+            preview_source_volume: default_preview_source_volume(),
+            preview_commentary_volume: default_preview_commentary_volume(),
             last_export_resolution: Resolution::R1080,
             last_export_quality: Quality::Medium,
             last_export_codec: Codec::H264,
@@ -125,6 +182,10 @@ impl Default for Preferences {
             export_overwrite_policy: default_overwrite_policy(),
             preferred_camera_id: None,
             preferred_mic_id: None,
+            // Phase 11 Plan #1 adv-fix #9. New projects start
+            // unflipped; the first `export_compilation` flips this to
+            // `true` after emitting the upgrade-breadcrumb event.
+            audio_mix_baseline_set: false,
         }
     }
 }
@@ -355,6 +416,90 @@ mod tests {
         let prefs: Preferences = serde_json::from_str(legacy_json).unwrap();
         assert_eq!(prefs.export_overwrite_policy, ExportOverwritePolicy::Resume,);
         assert_eq!(prefs, Preferences::default());
+    }
+
+    #[test]
+    fn preferences_default_volumes_are_1_0() {
+        // Phase 11 Plan #1 Task 0. Both preview-volume defaults must be
+        // 1.0 (full gain) — Plan #1's behavior change vs Phase 10 is
+        // documented in the closeout, NOT adjusted here. The named
+        // helpers and the Default impl must agree.
+        let prefs = Preferences::default();
+        assert_eq!(prefs.preview_source_volume, 1.0);
+        assert_eq!(prefs.preview_commentary_volume, 1.0);
+        assert_eq!(default_preview_source_volume(), 1.0);
+        assert_eq!(default_preview_commentary_volume(), 1.0);
+    }
+
+    #[test]
+    fn preferences_audio_mix_baseline_set_default_is_false() {
+        // Phase 11 Plan #1 adv-fix #9. Fresh + upgraded projects start
+        // unflipped; Task 1's first `export_compilation` flips it to
+        // `true` after emitting the upgrade breadcrumb.
+        assert!(!Preferences::default().audio_mix_baseline_set);
+    }
+
+    #[test]
+    fn preferences_audio_mix_baseline_set_round_trip_through_serde() {
+        // Phase 11 Plan #1 adv-fix #9. Both states must round-trip
+        // through JSON unchanged so a flipped breadcrumb survives a
+        // project save/load cycle.
+        for state in [false, true] {
+            let prefs = Preferences {
+                audio_mix_baseline_set: state,
+                ..Preferences::default()
+            };
+            let json = serde_json::to_string(&prefs).unwrap();
+            let back: Preferences = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.audio_mix_baseline_set, state);
+        }
+        // And a Phase-10-era project.json (no `audioMixBaselineSet`
+        // key) deserializes to `false` via `#[serde(default)]` — the
+        // desired upgrade behavior so the very next export emits the
+        // breadcrumb event.
+        let legacy_json = r#"{
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "lastExportCodec": "h264",
+            "exportFilenameTemplate": "{tag} - {project}",
+            "exportOverwritePolicy": "resume",
+            "preferredCameraId": null,
+            "preferredMicId": null
+        }"#;
+        let prefs: Preferences = serde_json::from_str(legacy_json).unwrap();
+        assert!(!prefs.audio_mix_baseline_set);
+        assert_eq!(prefs, Preferences::default());
+    }
+
+    #[test]
+    fn scan_volume_does_not_change_when_preview_source_volume_changes() {
+        // Phase 11 Plan #1 adv-fix #8. `scan_volume` and
+        // `preview_source_volume` are INDEPENDENT preferences;
+        // mutating one must never bleed into the other. Light-weight
+        // defense against future refactors that conflate them.
+        let prefs = Preferences {
+            scan_volume: 0.3,
+            preview_source_volume: 0.8,
+            ..Preferences::default()
+        };
+        assert_eq!(prefs.scan_volume, 0.3);
+        assert_eq!(prefs.preview_source_volume, 0.8);
+        // Round-trip through serde to confirm independence survives
+        // persistence.
+        let json = serde_json::to_string(&prefs).unwrap();
+        let back: Preferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.scan_volume, 0.3);
+        assert_eq!(back.preview_source_volume, 0.8);
+        // And the inverse: changing scan_volume on a fresh prefs
+        // leaves preview_source_volume at its default.
+        let prefs2 = Preferences {
+            scan_volume: 0.1,
+            ..Preferences::default()
+        };
+        assert_eq!(prefs2.preview_source_volume, 1.0);
     }
 
     #[test]
