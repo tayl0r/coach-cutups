@@ -91,6 +91,13 @@ public final class MPVSourcePlayer {
     @ObservationIgnored
     private nonisolated(unsafe) var pumpThread: Thread?
 
+    /// Signaled by the pump thread when it exits its loop. detachLayer
+    /// blocks on this BEFORE calling mpv_terminate_destroy so the pump
+    /// can never iterate wait_event on a freed handle. Allocated fresh
+    /// per attach (one-shot semaphore: signal() once, wait() once).
+    @ObservationIgnored
+    private nonisolated(unsafe) var pumpExited: DispatchSemaphore?
+
     public init(audioOff: Bool = false) {
         self.audioOff = audioOff
         // Handle is created lazily in attachLayer. This makes the player
@@ -133,6 +140,10 @@ public final class MPVSourcePlayer {
             ("osc", "no"),
             ("osd-level", "0"),
             ("target-colorspace-hint", "yes"),
+            // panscan starts at 0 (letterbox) so the source's aspect is
+            // preserved at identity zoom. setZoom flips panscan to 1.0
+            // (cover-fill) once scale > 1.0, so no black pixels are exposed
+            // by pan once the user has zoomed in.
         ] {
             mpv_set_option_string(h, k, v)
         }
@@ -191,7 +202,8 @@ public final class MPVSourcePlayer {
 
     /// Tear down the mpv_handle. Idempotent. `nonisolated` because deinit
     /// (always nonisolated) calls it; updating @MainActor properties from
-    /// here uses a synchronous main-thread hop.
+    /// here uses `runOnMain` so we don't deadlock when SwiftUI tears the
+    /// view down on the main thread.
     public nonisolated func detachLayer() {
         guard let h = handle else { return }
         // Setting handle=nil before terminate_destroy means concurrent
@@ -201,9 +213,19 @@ public final class MPVSourcePlayer {
         self.handle = nil
 
         // Drop any pending strdup'd argv from in-flight async commands.
-        DispatchQueue.main.sync { [weak self] in
-            MainActor.assumeIsolated { self?.dropPending() }
-        }
+        runOnMain { [weak self] in self?.dropPending() }
+
+        // Stop the pump BEFORE destroying mpv. The pump captured the handle
+        // pointer by value, so once mpv_terminate_destroy frees it any
+        // subsequent wait_event call dereferences freed memory → SIGSEGV.
+        // cancel() flips Thread.isCancelled, the pump observes it at the top
+        // of its next iteration and signals pumpExited. Worst-case latency
+        // is one wait_event timeout (~100 ms) if it was mid-wait when we
+        // cancelled.
+        pumpThread?.cancel()
+        pumpExited?.wait()
+        pumpThread = nil
+        pumpExited = nil
 
         // Nil the wakeup callback BEFORE terminate_destroy (mirrors the
         // MPVKit demo). Without this, mpv could fire one last wakeup with
@@ -211,27 +233,40 @@ public final class MPVSourcePlayer {
         mpv_set_wakeup_callback(h, nil, nil)
         mpv_terminate_destroy(h)
 
-        // The event pump's mpv_wait_event returns MPV_EVENT_SHUTDOWN as a
-        // result of terminate_destroy and the loop returns. Best-effort
-        // wake in case it's mid-wait, then drop our reference.
-        pumpThread?.cancel()
-        pumpThread = nil
-
         // Clear the layer reference AFTER mpv is fully torn down. Releasing
         // the layer earlier could free the IOSurface mpv's MoltenVK context
         // was sampling.
-        DispatchQueue.main.sync { [weak self] in
-            MainActor.assumeIsolated { self?.attachedLayer = nil }
+        runOnMain { [weak self] in self?.attachedLayer = nil }
+    }
+
+    /// Run a @MainActor closure synchronously. If we're already on the
+    /// main thread, run it inline (DispatchQueue.main.sync from the main
+    /// thread is a deadlock trap). Otherwise sync-hop. Used by detachLayer,
+    /// which can be called either from SwiftUI's view-removal path
+    /// (main thread) or from deinit (any thread).
+    private nonisolated func runOnMain(_ block: @escaping @MainActor () -> Void) {
+        if Thread.isMainThread {
+            MainActor.assumeIsolated { block() }
+        } else {
+            DispatchQueue.main.sync {
+                MainActor.assumeIsolated { block() }
+            }
         }
     }
 
     /// Start the event pump bound to the current handle. Captures the
     /// handle by value — resilient to `self.handle = nil` racing the pump
-    /// during detach.
+    /// during detach. The pump exits when (a) cancel() flips
+    /// Thread.isCancelled (observed at the top of each iteration), or
+    /// (b) mpv_wait_event returns MPV_EVENT_SHUTDOWN. On exit it signals
+    /// `pumpExited` so detachLayer can wait before destroying mpv.
     private func startEventPump() {
         guard let h = handle else { return }
+        let exited = DispatchSemaphore(value: 0)
+        self.pumpExited = exited
         let pump = Thread { [handle = h] in
-            while true {
+            defer { exited.signal() }
+            while !Thread.current.isCancelled {
                 guard let evt = mpv_wait_event(handle, 0.1) else { continue }
                 let id = evt.pointee.event_id
                 if id == MPV_EVENT_NONE { continue }
@@ -379,17 +414,27 @@ public final class MPVSourcePlayer {
         // mpv's video-zoom is logarithmic (each unit = 2x). Our Zoom.scale is
         // linear, so log2 the scale.
         var mpvZoom = log2(zoom.scale)
-        // mpv's video-pan-x/-y are fractions of the UNZOOMED fit-width, NOT of
-        // the source. To get zoom-invariant panning that matches our convention
-        // (pan is a fraction of source width, centered), multiply by scale before
-        // writing. See mpv issue #3038 for the mpv-side rationale; the
-        // adversarial-review history at the top of this plan documents the bug
-        // this conversion fixes.
-        var px = zoom.panX * zoom.scale
-        var py = zoom.panY * zoom.scale
+        // mpv's video-pan-x/-y semantics in this build: "fraction of the
+        // zoomed source size" — already zoom-invariant. The plan v2 review
+        // cited mpv issue #3038 saying we needed `* scale`, but empirical
+        // testing on the bundled MPVKit binary shows that produces over-shoot
+        // (visible black at the source edges when zoomed). Send the raw
+        // negated panX/panY instead.
+        //
+        // Sign convention: mpv's pan is "shift the video by pan" — positive
+        // pan-x moves the video right (visible window sees LEFT side of
+        // source). Our Zoom.panX is "fraction of source from the center,
+        // positive = visible center on RIGHT." Opposite signs → negate.
+        var px = -zoom.panX
+        var py = -zoom.panY
+        // panscan=0 at identity preserves source aspect (letterbox if needed);
+        // panscan=1 once zoomed scales the source to cover the viewport so the
+        // pan-clamp guarantees no black is exposed.
+        var panscan: Double = zoom.scale > 1.0 ? 1.0 : 0.0
         mpv_set_property(h, "video-zoom",  MPV_FORMAT_DOUBLE, &mpvZoom)
         mpv_set_property(h, "video-pan-x", MPV_FORMAT_DOUBLE, &px)
         mpv_set_property(h, "video-pan-y", MPV_FORMAT_DOUBLE, &py)
+        mpv_set_property(h, "panscan",     MPV_FORMAT_DOUBLE, &panscan)
     }
 
     private func runCommandSync(_ args: [String]) {
