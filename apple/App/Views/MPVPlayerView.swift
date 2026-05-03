@@ -273,28 +273,15 @@ enum ZoomGesture {
         return CGPoint(x: max(0, min(1, x)), y: max(0, min(1, y)))
     }
 
-    /// Compute the next zoom for a scroll-wheel event. Routing:
-    ///   * Mouse wheel (no precise deltas) → cursor-pivoted zoom, fixed
-    ///     ±10% step per click.
-    ///   * Trackpad two-finger swipe (precise deltas) →
-    ///       - Cmd held → cursor-pivoted zoom, scaled by `deltaY / 200`
-    ///         per event. Lets trackpad users zoom without pinching.
-    ///       - No modifier → pan (no-op at scale=1).
+    /// Compute the next zoom for a scroll-wheel event.
+    /// `hasPreciseScrollingDeltas == true` → trackpad two-finger swipe →
+    /// pan (no-op at scale=1.0, returns nil).
+    /// `false` → coarse mouse wheel → cursor-pivoted zoom.
     /// Direction matches Maps/Safari/Final Cut: deltaY>0 = away from user
     /// = zoom in. macOS's natural-scrolling preference is already baked into
     /// scrollingDeltaY.
     static func nextZoom(forScrollWheel event: NSEvent, in view: NSView, currentZoom: Zoom) -> Zoom? {
         if event.hasPreciseScrollingDeltas {
-            if event.modifierFlags.contains(.command) {
-                // Cmd + swipe → cursor-pivoted zoom. The /200 divisor brings
-                // a typical ~5px/event light swipe to ~2.5% scale change per
-                // event, comparable to pinch sensitivity. Skip no-op deltas
-                // that fire at gesture start/end.
-                let factor = 1.0 + event.scrollingDeltaY / 200.0
-                guard factor != 1.0 else { return nil }
-                let nextScale = currentZoom.scale * factor
-                return currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor(in: view, event: event))
-            }
             guard currentZoom.scale > 1.0 else { return nil }
             let viewW = max(1, view.bounds.width)
             let viewH = max(1, view.bounds.height)
