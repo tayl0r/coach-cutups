@@ -23,6 +23,23 @@ public struct Zoom: Codable, Hashable, Sendable {
         let py = max(-limit, min(limit, panY))
         return Zoom(scale: s, panX: px, panY: py)
     }
+
+    /// Standard snap notches — common camera/video multipliers users tend to
+    /// expect. Match these in any UI tick-mark rendering so the visible track
+    /// agrees with the snap behavior.
+    public static let snapNotches: [Double] = [1.0, 1.25, 1.5, 2.0, 3.0, 5.0, 7.5, 10.0]
+
+    /// Snap `scale` to the nearest notch when within 3% relative tolerance,
+    /// otherwise return self. Pan is preserved. Called from interactive
+    /// gesture commits — replay paths skip this so authored zoom values
+    /// pass through unchanged.
+    public func snapped() -> Zoom {
+        let tol = 0.03
+        for n in Self.snapNotches where abs(scale - n) <= n * tol {
+            return Zoom(scale: n, panX: panX, panY: panY)
+        }
+        return self
+    }
 }
 
 public extension Zoom {

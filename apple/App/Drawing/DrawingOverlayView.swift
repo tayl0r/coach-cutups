@@ -158,7 +158,7 @@ final class DrawingOverlayView: NSView {
     }
 
     private func commitZoom(_ zoom: Zoom) {
-        let clamped = zoom.clamped()
+        let clamped = zoom.snapped().clamped()
         currentZoom = clamped
         onZoomChange?(clamped)
     }

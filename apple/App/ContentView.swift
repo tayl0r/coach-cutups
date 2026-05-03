@@ -278,6 +278,20 @@ struct ContentView: View {
                             onZoomChange: { newZoom in workspace.currentZoom = newZoom }
                         )
                     }
+                    // Zoom level + snap-track indicator. Auto-hides at identity
+                    // (handled inside the view), so it only appears once the
+                    // user has zoomed in. Pinned to the top-right of the
+                    // player area so it doesn't compete with the bottom PiP.
+                    VStack {
+                        HStack {
+                            Spacer()
+                            ZoomIndicator(zoom: workspace.currentZoom)
+                                .padding(.top, 12)
+                                .padding(.trailing, 12)
+                        }
+                        Spacer()
+                    }
+                    .allowsHitTesting(false)
                     KeyCommandView(
                         appMode: appMode,
                         onSkip: handleSkip,

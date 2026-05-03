@@ -118,7 +118,7 @@ final class MPVRenderingNSView: NSView {
     }
 
     private func commit(_ zoom: Zoom) {
-        let clamped = zoom.clamped()
+        let clamped = zoom.snapped().clamped()
         currentZoom = clamped
         onZoomChange?(clamped)
     }
