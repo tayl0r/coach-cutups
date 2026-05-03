@@ -66,10 +66,14 @@ own (Phase 10 fix #37's whole reason for existing).
 1.0 default and two correlated signals (e.g. recorded commentary
 that includes the source's audible audio bleed-through from the
 laptop speakers), the sample-domain sum can exceed `[-1.0, 1.0]`.
-The export path applies a `tanh`-style soft-clip; the preview path
-relies on the audio sink's natural hard clip + audiomixer's
-`normalize` property (off by default — Plan #1 leaves it off,
-matching v1's "trust the user, full gain by default" behavior).
+The export path applies a deterministic rational soft-clip
+`x / (1.0 + x.abs())` (adv-fix #5 — transcendentals like `tanh`
+are forbidden because libm's last-ULP results differ across macOS
+Accelerate vs Linux glibc, which would flake any future N-frame
+audio parity test). The preview path relies on the audio sink's
+natural hard clip + audiomixer's `normalize` property (off by
+default — Plan #1 leaves it off, matching v1's "trust the user,
+full gain by default" behavior).
 
 ---
 
@@ -120,12 +124,148 @@ matching v1's "trust the user, full gain by default" behavior).
 
 ## Adversarial-review fixes baked in
 
-> _**To main session writing this plan**: run an adversarial-review
-> pass before committing. Paste fixes below, then commit. If you
-> skip and the section stays empty, the sub-agent should stop and
-> ask the user._
+> Findings come from `/tmp/phase11-plans/plan-1/adv-review.md` (10 net-
+> new findings). Triage: 9 REAL (folded below), 1 OVERSTATED (#9,
+> trimmed to a tracing breadcrumb only; full toast/dialog deferred).
+> Numbered fixes are non-negotiable for sub-agents.
 
-(awaiting adversarial-review pass)
+**Fix #1 — Bound each `AudioSampleQueue` to ~2-4s of audio so a fast
+`sync=false` source decoder can't accumulate 50-150 MB of decoded
+samples before the driver consumes them.** (REAL, high; finding #1.)
+Each `AudioSampleQueue` (both commentary and source variants) gains
+a `MAX_QUEUED_BYTES = 4 * AUDIO_RATE * AUDIO_BYTES_PER_SAMPLE`
+(~1.5 MB at 48k stereo F32). Implementation: set the audio appsink's
+`max-buffers` property so GStreamer holds the decoder when the queue
+is full. Document in a code comment that this is back-pressure for
+hw-decoded sources running well above real-time on Apple Silicon.
+*Touches Task 1 implementation note 1 + 3.*
+
+**Fix #2 — Drain the active source-audio queue on EVERY entry
+transition, not only when `source_index` changes.** (REAL, medium;
+finding #2.) Two consecutive entries on the same source with a Skip
+segment between them will leave stale source samples in the queue
+that pre-roll covered the OLD `record_time` window; the driver
+would read them as the NEW entry's first samples. The seek-flush
+refills within ~33ms; one frame of silence is inaudible. Document:
+"source-decoder seek policy is flush-on-entry-boundary, identical
+to webcam." *Replaces Task 1 implementation note 8/12 partially —
+drain unconditionally on every entry transition for both queues.*
+
+**Fix #3 — `audiomixer` MUST have a downstream capsfilter pinning
+F32LE/48k/2ch to anchor caps negotiation.** (REAL, high; finding
+#3.) audiomixer negotiates output caps from the FIRST sinkpad to
+get caps; pad-added ordering between source and recording is non-
+deterministic (decodebin async). Without a downstream anchor a
+race can land the mixer at S16LE before our upstream capsfilter
+forces F32LE, causing the second sinkpad's renegotiation to fail.
+Wiring is `... → volume → capsfilter(F32LE,48k,2ch) → audiomixer →
+capsfilter(F32LE,48k,2ch) → audiosink`. Plan note 4 mentioned this
+AFTER the mixer; promoted to hard requirement. *Touches Task 2
+implementation note 1 + 4.*
+
+**Fix #4 — Add explicit "both volumes 0.0" tests so the silent-
+audio-track regression doesn't slip past CI.** (REAL, medium;
+finding #4.) Two new tests:
+- Unit: `both_volumes_zero_pushes_silent_buffer_not_noop` — assert
+  the appsrc receives a `target_bytes`-sized zero-filled buffer
+  with `pts_ns = audio_pts_ns` and the cursor advances.
+- Integration: `export_with_both_volumes_zero_yields_silent_audio_
+  track` — run export with both volumes 0.0 and use Discoverer to
+  confirm an audio track exists with non-zero duration.
+*Touches Task 1 tests + reinforces note 6 + 11.*
+
+**Fix #5 — Soft-clip MUST be deterministic across libm impls.
+Replace `x.tanh()` with `x / (1.0 + x.abs())`.** (REAL, medium;
+finding #5.) `tanh` is a transcendental whose last-ULP result
+differs between macOS Accelerate and Linux glibc; future N-frame
+audio parity tests would flake across the CI matrix. The rational
+approximation is bit-identical across platforms and produces a
+similar soft-knee. Document in code comment: "soft-clip MUST be
+bit-identical across platforms; transcendentals forbidden."
+*Touches Architecture overview "Volume range and clipping",
+Task 1 note 4, Risks #4.*
+
+**Fix #6 — Pin volumes to `f32` end-to-end through the mix chain
+and assert `chunk.len() % 8 == 0` in the mix function.** (REAL,
+medium; finding #6.) Plan pseudocode mixed `f32` (note 4) and
+`f64` (note 10) — silent precision loss with no compile warning.
+Convert volumes from `Preferences::preview_*_volume` (`f64`) to
+`f32` exactly once at the `export_compilation` boundary; thread
+`f32` everywhere downstream. The mix function asserts each input
+chunk is a multiple of 8 bytes (stereo F32) and panics with context
+on mismatch — better to crash a buggy export than silently produce
+audio with cumulative drift. *Touches Task 1 note 4, 6, 10 +
+cross-task touchpoint #2.*
+
+**Fix #7 — Wire a phantom silence sinkpad on the preview audiomixer
+at construction time so PAUSED state-change can't deadlock when
+both real sources delay pad-added.** (REAL, medium; finding #7.)
+audiomixer needs ≥1 sinkpad to transition to PAUSED. If both
+decodebins are still probing, the mixer has zero pads and PAUSED
+blocks indefinitely; osxaudiosink never prerolls. Construction:
+`audiotestsrc wave=silence is-live=true → volume(volume=0.0) →
+capsfilter(F32LE,48k,2ch) → audiomixer.sink_%u`, wired BEFORE the
+PAUSED transition. Same trick `playbin3`'s internal mixer uses.
+Document why in a code comment. *Touches Task 2 notes 2, 6, 9 +
+Risks #3.*
+
+**Fix #8 — Slider tooltip + closeout must call out that
+`Preferences::scan_volume` (line 73 of project.rs, controls SCAN-
+mode source playback) is INDEPENDENT from the new export/preview
+source-volume setting.** (REAL, high; finding #8.) Users who set
+`scan_volume` to 0.3 will hear source at 100% during clip preview
+unless told. Pick option (a) — independence — for simplicity:
+- Slider tooltip on Source-volume slider: "Source audio volume
+  during preview and export (separate from Scan volume)."
+- Closeout note in PROGRESS.txt's Plan #1 SHIPPED line explicitly
+  states: "scan_volume unchanged; new export/preview source
+  volume is a SEPARATE preference."
+*Touches Task 0 implementation notes + Task 3 implementation
+note 1.*
+
+**Fix #9 — Emit a tracing breadcrumb when the default 1.0/1.0 mix
+is applied to an upgrading project; SKIP the toast/dialog.**
+(OVERSTATED → trimmed; finding #9.) Original finding asked for a
+one-shot toast on first project-open after Plan #1 lands. That's
+over-engineered for a pre-1.0 rewrite — defer the user-visible
+notification. Keep only the cheap belt-and-suspenders:
+- Emit `tracing::info!(event = "preferences.audio_mix_default_
+  applied", source_volume, commentary_volume)` at the top of
+  `export_compilation` whenever both volumes equal exactly 1.0
+  AND the project's `Preferences` was deserialized from a file
+  predating Plan #1. (Detected via a no-existing-`audio_mix_
+  baseline_set: bool` field that defaults `false` and is flipped
+  `true` once after first export.)
+- Closeout PROGRESS.txt line includes a "BEHAVIOR CHANGE" callout
+  in plain text so users grepping logs see it.
+*Rationale for the trim*: toast/dialog churns Slint UI work for a
+once-per-user notification. The tracing event covers the support-
+log breadcrumb need; users discover the change on their first
+export and can adjust via the new sliders. Defer richer
+notification to Phase 12+ if user feedback warrants. *Touches
+Architecture overview + Task 0 + Task 4 closeout.*
+
+**Fix #10 — Closeout's "Phase 11 SHIPPED" line is GUARDED by a
+verification grep; if other Plan #X SHIPPED lines are missing,
+write the per-plan line only and skip the overall claim.** (REAL,
+high; finding #10.) PROGRESS.txt suggests Phase 11 plans were not
+drafted in numerical order; Plan #7 already references "adv fix
+#1" so Plan #1 may not actually be the LAST to ship. Closeout
+sequence (Task 4):
+1. `grep -c "PHASE 11 PLAN .* SHIPPED" PROGRESS.txt` BEFORE
+   writing the overall line.
+2. If the count is ≥ 6 (one per other plan), write the
+   "Phase 11 SHIPPED" overall line.
+3. Otherwise, write only "Phase 11 Plan #1 SHIPPED" and add a
+   plain-text note: "Phase 11 overall SHIPPED line deferred —
+   Plans <list missing> not yet shipped."
+*Touches Task 4 + Done-when last bullet.*
+
+---
+
+### Rejected findings
+
+(none — all 10 findings folded; #9 trimmed but not rejected)
 
 ---
 
@@ -182,6 +322,18 @@ matching v1's "trust the user, full gain by default" behavior).
   for the soft-clip strategy.
 - Update PROGRESS.txt with a Phase 11 Plan #1 section + Task 0 row
   marked shipped + commit SHA.
+- **adv-fix #8**: `Preferences::scan_volume` (project.rs line 73)
+  is INDEPENDENT from `preview_source_volume`. Document this in
+  the doc-comment for both fields. Task 3's slider tooltip (see
+  below) carries the user-facing copy.
+- **adv-fix #9**: add a `audio_mix_baseline_set: bool` field to
+  `Preferences` (defaults `false` via `#[serde(default)]`) so
+  `export_compilation` can detect the first export on an upgrading
+  project and emit `tracing::info!(event = "preferences.audio_mix_
+  default_applied", source_volume, commentary_volume)` exactly
+  once. Flip to `true` after the first emit; persist via
+  `save_project_meta`. NO toast/dialog — the trim from finding #9
+  keeps the breadcrumb only.
 
 **Tests:**
 - `preview_source_volume_default_is_1_0` — already exists if the
@@ -220,12 +372,17 @@ matching v1's "trust the user, full gain by default" behavior).
    ```
    filesrc → decodebin → [pad-added: audio/* branch]
        → queue → audioconvert → audioresample → capsfilter(F32LE 2ch 48k)
-       → audio-appsink (sync=false, name="src_audio_<idx>")
+       → audio-appsink (sync=false, max-buffers=N, name="src_audio_<idx>")
    ```
    Build alongside the existing video chain. The decodebin pad-added
    handler routes `video/*` to the existing video queue and `audio/*`
    to a new audio chain that's added dynamically (decodebin doesn't
-   surface caps until prerolled).
+   surface caps until prerolled). **adv-fix #1**: set the appsink's
+   `max-buffers` so a `sync=false` hw-decoded source can't run far
+   ahead of the driver and accumulate decoded samples in RAM. Pick
+   `max-buffers` such that the appsink internal queue + the
+   `AudioSampleQueue` together cap at ~4s of audio
+   (`MAX_QUEUED_BYTES = 4 * AUDIO_RATE * AUDIO_BYTES_PER_SAMPLE`).
 2. **Source-with-no-audio fallback.** Some source files have no audio
    track (e.g. silent reference videos). The `pad-added` handler may
    never fire for an audio pad. After pipeline preroll completes
@@ -248,12 +405,20 @@ matching v1's "trust the user, full gain by default" behavior).
        }
    }
    ```
-   `SourceVideoChain` gains `audio_appsink: Option<AppSink>`.
+   `SourceVideoChain` gains `audio_appsink: Option<AppSink>`. **adv-
+   fix #1**: every `AudioSampleQueue` (commentary AND source) honors
+   the same `MAX_QUEUED_BYTES` cap; the queue's push path either
+   drops oldest bytes or relies on the upstream `max-buffers` back-
+   pressure (preferred). Add an assertion in tests that the queue
+   never exceeds `MAX_QUEUED_BYTES + one buffer`.
 4. **Hand-rolled mix in `push_audio_for_window`**. Per tick, pull
    `target_bytes` from the active commentary queue and the active
    source queue. Both produce `[f32; 2]` samples (F32LE stereo, 48k).
-   Sample-domain mix:
+   Sample-domain mix (`source_volume: f32`, `commentary_volume: f32`
+   — see adv-fix #6):
    ```rust
+   debug_assert_eq!(source_chunk.len() % 8, 0);
+   debug_assert_eq!(commentary_chunk.len() % 8, 0);
    for (sample_idx, (s_pair, c_pair)) in
        source_chunk.chunks_exact(8).zip(commentary_chunk.chunks_exact(8))
    {
@@ -265,12 +430,15 @@ matching v1's "trust the user, full gain by default" behavior).
        write_f32(out_pair, 4, soft_clip(s_r + c_r));
    }
    ```
-   Use a tanh-style soft-clip (`x.tanh()` or `x / (1.0 + x.abs())`)
-   to avoid digital clipping when both volumes are 1.0 and signals
-   align in phase. Document the choice in a code comment: "v1 used
-   AVMutableComposition's preferredVolume which is also a linear
-   gain + system clip; we approximate with soft-clip for slightly
-   gentler artifacts at the high end."
+   **adv-fix #5**: soft-clip is `x / (1.0 + x.abs())` —
+   deterministic across libm impls. Do NOT use `x.tanh()`; macOS
+   Accelerate vs Linux glibc disagree at last-ULP, which would
+   flake any future N-frame audio parity test. Document in code
+   comment: "soft-clip MUST be bit-identical across platforms;
+   transcendentals forbidden. v1 used AVMutableComposition's
+   preferredVolume which is linear gain + system clip; this rational
+   approximation is gentler at the high end while staying
+   deterministic."
 5. **Length mismatch handling.** Source audio chunk and commentary
    audio chunk may not have the same number of bytes available
    (decoder fragmentation, EOS-near-end-of-clip). Strategy:
@@ -282,21 +450,29 @@ matching v1's "trust the user, full gain by default" behavior).
      existing fallback path).
 6. **Volume = 0.0 short-circuit.** If `source_volume == 0.0` skip
    pulling source samples entirely (commentary path only). If
-   `commentary_volume == 0.0` skip commentary. If both 0.0, push
-   silence. Save decoder work on the silent-source-channel case
-   (common: the user wants commentary-only behavior identical to
-   Phase 10).
+   `commentary_volume == 0.0` skip commentary. If both 0.0, push a
+   `target_bytes`-sized zero-filled F32 buffer (still pushes — see
+   note 11 + adv-fix #4). Save decoder work on the silent-source-
+   channel case (common: the user wants commentary-only behavior
+   identical to Phase 10). **adv-fix #6**: even on the
+   commentary-only fast path, assert the commentary chunk is a
+   multiple of 8 bytes; never let `chunks_exact(8)` silently drop
+   trailing bytes that would cause `audio_pts_ns` cumulative drift.
 7. **Cancel polling unchanged.** The existing per-frame cancel
    check covers audio-sample pulling implicitly (audio mix runs
    inside the same per-frame loop). Document this in a code comment.
-8. **Entry transition unchanged for source audio queues.** When the
-   driver activates a new entry whose `source_index` differs from
-   the previous entry's, the new source's `set_state(Playing)` plus
-   seek-to-segment-start will start that source's audio decoder.
-   The previous source's queue is drained on activation (mirror the
-   existing commentary-queue drain at line ~1413). Stale samples
-   from the previous source must NOT bleed into the new entry's
-   audio.
+8. **Entry transition: drain BOTH active queues on every entry
+   boundary (adv-fix #2).** When the driver activates a new entry,
+   drain the active commentary queue (existing Phase 10 behavior at
+   line ~1413) AND the active source-audio queue UNCONDITIONALLY —
+   not only when `source_index` changes. Two consecutive entries on
+   the same source with a Skip segment between them will leave
+   stale source samples in the queue covering the OLD `record_time`
+   window; the driver would otherwise read them as the NEW entry's
+   first samples. The seek-flush refills within ~33ms; one frame of
+   silence is inaudible. Document: "source-decoder seek policy is
+   flush-on-entry-boundary, identical to webcam." This SUPERSEDES
+   the original "DO NOT drain if same source_index" guidance.
 9. **Format pinning.** Source decoder output may be S16LE 44.1k mono;
    audioconvert + audioresample + capsfilter to F32LE 48k 2ch BEFORE
    the appsink, so the driver's mix function sees a consistent
@@ -305,25 +481,33 @@ matching v1's "trust the user, full gain by default" behavior).
 10. **`export_compilation` signature.** Change `_source_volume` →
     `source_volume` and `_commentary_volume` → `commentary_volume`.
     Both are `f64` clamped to `[0.0, 1.0]` at the top of the function
-    (defensive; UI also clamps).
+    (defensive; UI also clamps). **adv-fix #6**: convert each clamped
+    `f64` to `f32` exactly once at this boundary, then thread `f32`
+    through every downstream function (mix function, soft-clip,
+    short-circuit branches). f64/f32 mismatch in the mix chain is
+    silent precision loss with no compile warning.
 11. **Both volumes 0.0 → silent track, NOT skipped audio track.** The
     output .mp4 must always have an audio track — qtmux's audio
     sink-pad was requested at pipeline-construction time, removing it
     mid-flight is fragile. When both volumes are 0.0, push silent
-    F32 buffers (sample-aligned) on every tick; encoder produces a
-    valid silent AAC stream. Document the choice: a fully silent
-    export is rare and the consistency win (always one audio track)
-    outweighs the few KB of silent AAC.
-12. **AudioSampleQueue drain on entry boundary — both queues.** The
-    Phase 10 driver drains the active commentary queue at line ~1413
-    on entry transition. Plan #1 also drains the active source
-    queue when `source_index` differs between consecutive entries.
-    If the same source_index continues across entries (typical
-    single-source compilation), DO NOT drain — the source decoder
-    just continues feeding samples after a seek, and the seek
-    itself flushes pending samples upstream. Verify experimentally;
-    if cross-segment seeks within one source produce stale samples,
-    add a drain there too.
+    F32 buffers (sample-aligned, exact `target_bytes` size) on every
+    tick; encoder produces a valid silent AAC stream. Document the
+    choice: a fully silent export is rare and the consistency win
+    (always one audio track) outweighs the few KB of silent AAC.
+    **adv-fix #4**: explicit unit test
+    `both_volumes_zero_pushes_silent_buffer_not_noop` confirms the
+    appsrc gets the buffer and the cursor advances; integration
+    test `export_with_both_volumes_zero_yields_silent_audio_track`
+    runs export and uses Discoverer to verify the output has an
+    audio track. Without these, a regression silently strips the
+    audio track.
+12. **AudioSampleQueue drain on entry boundary — both queues, every
+    transition.** SUPERSEDED by note 8 + adv-fix #2 above. Always
+    drain the active commentary queue AND the active source-audio
+    queue on every entry transition, regardless of whether
+    `source_index` changes. The seek-flush plus one frame of
+    silence is inaudible; the safety win is preventing stale OLD-
+    `record_time` samples from polluting the NEW entry's audio.
 
 **Tests:**
 - `export_smoke.rs::audio_mix_produces_audio_track` — record a clip
@@ -346,9 +530,28 @@ matching v1's "trust the user, full gain by default" behavior).
   `source=1, commentary=1` over the same clip.
 - Unit test for the mix function itself: `audio_mix_sums_two_streams_
   with_volume_scaling` — feed two known F32 byte chunks, assert the
-  output bytes equal `s*sv + c*cv` per sample (with `soft_clip`
-  applied; if soft-clip is `x.tanh()` the test uses values < 0.5 so
-  tanh ≈ identity).
+  output bytes equal `soft_clip(s*sv + c*cv)` per sample. Use small
+  values (< 0.4) where `x / (1.0 + x.abs())` is approximately linear
+  so the assertion can be tight.
+- **adv-fix #4** unit test: `both_volumes_zero_pushes_silent_buffer_
+  not_noop` — call mix with `source_volume=0.0, commentary_volume=
+  0.0`; assert the output is `target_bytes` of zero F32 samples and
+  the cursor advances by `target_bytes`.
+- **adv-fix #4** integration test: `export_with_both_volumes_zero_
+  yields_silent_audio_track` — run export with both volumes 0.0;
+  use Discoverer on the output .mp4 to assert an audio track
+  exists with non-zero duration.
+- **adv-fix #1** stress test: `source_audio_queue_caps_at_max_
+  queued_bytes` — feed a fast appsink push loop that would otherwise
+  unboundedly grow the queue; assert queue length never exceeds
+  `MAX_QUEUED_BYTES + one buffer`.
+- **adv-fix #2** test: `entry_transition_drains_both_queues_even_
+  when_source_unchanged` — seed both queues with stale bytes,
+  trigger an entry transition with the same `source_index`, assert
+  both queues are empty after.
+- **adv-fix #6** test: `mix_panics_on_misaligned_chunk_length` —
+  pass a 7-byte chunk; assert the mix function panics (or returns
+  Err) with a context message.
 
 ---
 
@@ -374,10 +577,21 @@ matching v1's "trust the user, full gain by default" behavior).
 1. **Shared audio output** — instead of each per-recording chain
    building its own audio path to the audiosink (currently
    `build_and_link_webcam_audio_chain` inlines the audiosink), the
-   preview pipeline builds ONE audiosink + ONE audiomixer at
-   pipeline construction. Source-audio and commentary-audio chains
-   each link to a NEW audiomixer sink-pad via `audiomixer.request_
-   pad_simple("sink_%u")`.
+   preview pipeline builds ONE audiosink + ONE audiomixer + ONE
+   downstream capsfilter at pipeline construction (adv-fix #3).
+   Source-audio and commentary-audio chains each link to a NEW
+   audiomixer sink-pad via `audiomixer.request_pad_simple("sink_%u")`.
+   Pipeline shape:
+   ```
+   <each chain> → volume(named) → capsfilter(F32LE,48k,2ch)
+       → audiomixer.sink_%u
+   audiomixer → capsfilter(F32LE,48k,2ch) → audiosink
+   ```
+   The downstream capsfilter is HARD REQUIRED; without it audiomixer's
+   output caps are negotiated from whichever sinkpad gets caps first
+   and we hit a non-deterministic race that can land at S16LE before
+   the upstream capsfilter forces F32LE, failing the second sinkpad's
+   renegotiation.
 2. **Preview-side source audio.** Currently
    `build_video_input_chain`'s pad-added handler routes audio to
    fakesink. Replace with:
@@ -387,7 +601,10 @@ matching v1's "trust the user, full gain by default" behavior).
        → audiomixer's sink-pad
    ```
    No appsink — preview is wall-clock-paced and the audiomixer
-   handles real-time blending.
+   handles real-time blending. **adv-fix #7**: a phantom silence
+   sinkpad (see note 11 below) must already be wired before this
+   chain is added, guaranteeing audiomixer can transition to PAUSED
+   even if decodebin's audio pad-added is delayed.
 3. **Preview-side commentary audio.** Modify `build_and_link_
    webcam_audio_chain`: replace the direct audiosink with a link to
    the audiomixer's next sink-pad. Keep the `volume(name=
@@ -396,10 +613,15 @@ matching v1's "trust the user, full gain by default" behavior).
 4. **audiomixer caps + latency.** audiomixer has a `latency`
    property (default 60ms); leave at default for Plan #1. The mixer
    imposes a bounded delay for blending — acceptable for preview
-   playback. The output of audiomixer is `audio/x-raw,F32LE,2ch,
-   48000` (or whatever the sink-pads negotiate); add a capsfilter
-   AFTER audiomixer pinning to F32LE 2ch 48k for deterministic
-   downstream encoder/sink negotiation.
+   playback. **adv-fix #3 (HARD REQUIREMENT)**: the downstream
+   capsfilter pinning F32LE/48k/2ch AFTER audiomixer is non-
+   negotiable. audiomixer negotiates output caps from the FIRST
+   sinkpad to get caps; pad-added ordering between source and
+   recording is non-deterministic (decodebin async). Without the
+   downstream anchor, the mixer can land at S16LE before our
+   upstream capsfilters force F32LE, and the second sinkpad's
+   renegotiation fails. With the anchor, audiomixer negotiates
+   upward from the downstream capsfilter and the race vanishes.
 5. **Volume property updates from UI.** The existing UI scan-volume
    slider pattern updates the source-player's `volume` element via
    `set_property`. Plan #1 mirrors this for two new volume elements
@@ -416,7 +638,10 @@ matching v1's "trust the user, full gain by default" behavior).
    no audio track, the source-audio chain is never built (pad-added
    doesn't fire for audio). audiomixer handles missing pads
    gracefully — it just blends the available pad. No special-case
-   needed in driver code.
+   needed in driver code. **adv-fix #7 caveat**: "blends the
+   available pad" assumes the mixer has ≥1 sinkpad when transitioning
+   to PAUSED. The phantom silence sinkpad (note 11) guarantees this
+   even when neither real source has prerolled.
 7. **Headless / `VIDEO_COACH_NO_AUDIO=1` mode.** Existing behavior:
    the audiosink is replaced with `fakesink (sync=true)` for CI
    determinism. Plan #1 keeps this; the audiomixer still mixes (its
@@ -430,9 +655,12 @@ matching v1's "trust the user, full gain by default" behavior).
    audiomixer's request-pads are released automatically as part of
    element destruction. No new cleanup logic — but verify in the
    Phase 9 stepped-teardown sequence (PAUSED → READY → NULL) that
-   audiomixer doesn't deadlock on the PAUSED step. If it does (audio
-   element pause-races are well-known), document with a comment and
-   skip directly to NULL on the audiomixer-bearing path.
+   audiomixer doesn't deadlock on the PAUSED step. **adv-fix #7**:
+   the phantom silence sinkpad guarantees the mixer always has ≥1
+   pad through PAUSED, so the stepped-teardown sequence won't hang
+   on a zero-pad mixer. If teardown still surfaces a deadlock,
+   document with a comment and skip directly to NULL on the
+   audiomixer-bearing path.
 10. **Volume element placement matters.** Place the `volume` element
     AFTER `audioconvert + audioresample` and BEFORE the audiomixer
     sink-pad. Placing volume before audioconvert means scaling raw
@@ -442,14 +670,40 @@ matching v1's "trust the user, full gain by default" behavior).
     so volumes operating on F32 inputs guarantees consistent caps to
     the mixer.
 
+11. **Phantom silence sinkpad (adv-fix #7).** At pipeline construction
+    time, BEFORE the PAUSED transition, wire a silence-source to the
+    audiomixer:
+    ```
+    audiotestsrc wave=silence is-live=true
+        → volume(volume=0.0)
+        → capsfilter(F32LE,48k,2ch)
+        → audiomixer.sink_%u
+    ```
+    This guarantees the mixer has ≥1 sinkpad when transitioning to
+    PAUSED, even if both real sources delay pad-added (decodebin still
+    probing). Without this, the mixer transitions block indefinitely
+    on PAUSED and osxaudiosink never prerolls. The volume=0.0 makes
+    the silence inaudible; document why in a code comment ("phantom
+    silence-source: same trick `playbin3`'s internal mixer uses").
+
 **Tests:**
 - `preview_pipeline_smoke.rs::audiomixer_builds_with_two_input_pads` —
   construct preview with a source + recording, query the pipeline
-  for the `audiomixer` element by name, assert it has 2 sink-pads.
+  for the `audiomixer` element by name, assert it has 2 real sink-
+  pads (3 total counting the phantom silence pad).
 - `preview_pipeline_smoke.rs::source_volume_property_is_live_tunable` —
   build pipeline, set preview state to PLAYING, call `set_preview_
   source_volume(0.5)`, query `volume` element's `volume` property,
   assert it's 0.5.
+- **adv-fix #3** test: `audiomixer_downstream_capsfilter_pins_f32le_
+  48k_2ch` — query the capsfilter immediately downstream of the
+  mixer, assert its caps property matches `audio/x-raw,format=
+  F32LE,channels=2,rate=48000,layout=interleaved`.
+- **adv-fix #7** test: `audiomixer_paused_transition_succeeds_with_
+  no_real_sources` — construct preview WITHOUT any decodebin
+  prerolling (e.g. with a fixture that returns no audio pads
+  promptly); transition pipeline to PAUSED with a 5s timeout; assert
+  the transition succeeds (the phantom silence sinkpad is sufficient).
 - Existing preview smoke tests must keep passing (commentary path
   unchanged from user-visible side).
 
@@ -483,6 +737,11 @@ matching v1's "trust the user, full gain by default" behavior).
    pressed and on-moved sets `root.export-source-volume = max(0,
    min(1, self.mouse-x / self.width))`. Repeat for commentary.
    Label each slider with text + a numeric readout (e.g. "0.85").
+   **adv-fix #8** — the Source-volume slider's tooltip / helper
+   text reads exactly: "Source audio volume during preview and
+   export (separate from Scan volume)." This explicitly tells users
+   that `Preferences::scan_volume` (controls source playback during
+   SCAN mode) is independent and unaffected by this slider.
 2. **Initial values.** When the export sheet opens (File → Export
    Compilations menu activation), the sheet's `init` callback (or
    the menu-handler in `ui.rs`) hydrates `export-source-volume` and
@@ -553,9 +812,29 @@ matching v1's "trust the user, full gain by default" behavior).
   commits table, adversarial-fix verification, deferred items.
 - Mark Phase 11 Plan #1 SHIPPED in PROGRESS.txt with the final CI
   run id.
-- **Phase 11 closeout** — Plan #1 is the LAST of Phase 11's seven
-  plans. Add an overall "Phase 11 SHIPPED" line in PROGRESS.txt
-  summarizing all seven plans + their cumulative CI run.
+- **Phase 11 closeout (adv-fix #10) — GUARDED.** Plan #1 is the
+  last of Phase 11's seven plans BY FILE INDEX, but PROGRESS.txt
+  ordering suggests plans were drafted out of numerical order
+  (Plan #7 already references "adv fix #1"). Closeout sequence:
+  1. Run `grep -c "PHASE 11 PLAN .* SHIPPED" PROGRESS.txt`
+     BEFORE writing the overall line.
+  2. If the count is ≥ 6 (one SHIPPED line per other plan), write
+     the overall "Phase 11 SHIPPED" line summarizing all seven
+     plans + their cumulative CI run.
+  3. Otherwise, write only the per-plan "Phase 11 Plan #1
+     SHIPPED" line plus a plain-text note: "Phase 11 overall
+     SHIPPED line deferred — Plans <list missing> not yet
+     shipped." A future plan's closeout will write the overall
+     line when the count finally reaches 7.
+- **adv-fix #8** closeout note in PROGRESS.txt explicitly states:
+  "scan_volume unchanged; new export/preview source volume is a
+  SEPARATE preference."
+- **adv-fix #9** closeout note: include a "BEHAVIOR CHANGE" callout
+  in plain text (not buried in a code comment): existing projects
+  upgrading to Plan #1 default to 1.0/1.0 source/commentary mix —
+  louder + includes source audio vs Phase 10's commentary-only
+  output. Detection breadcrumb is the
+  `preferences.audio_mix_default_applied` tracing event.
 
 ---
 
@@ -626,13 +905,15 @@ matching v1's "trust the user, full gain by default" behavior).
    pops at preview-start, the fallback is to hold the audiomixer
    in PLAYING from pipeline construction (instead of state-following
    the pipeline) — same trick the existing source-player.rs uses.
-4. **Soft-clip choice.** `x.tanh()` (smooth, slightly compressive)
-   vs `x.clamp(-1.0, 1.0)` (hard, classic clipping) vs `x / (1.0 +
-   x.abs())` (soft, asymptotic). Plan #1 picks `x.tanh()`; if the
-   resulting export sounds noticeably different from v1's hard-clip
-   (which is what AVMutableComposition + AAC encoding effectively
-   produces), switch to `clamp`. Defer to ear-test by the user
-   during closeout review.
+4. **Soft-clip choice.** Plan #1 picks `x / (1.0 + x.abs())` (soft,
+   asymptotic, deterministic across libm impls — see adv-fix #5).
+   `x.tanh()` was the original draft choice but rejected because
+   macOS Accelerate vs Linux glibc disagree at last-ULP, flaking
+   any future audio parity test. `x.clamp(-1.0, 1.0)` (hard,
+   classic) remains an option if the rational approximation sounds
+   noticeably worse than v1's effective AVMutableComposition +
+   AAC hard-clip. Defer the ear-test to closeout review; a swap is
+   a one-line code change.
 5. **Source audio with mismatched channel count** (mono source +
    stereo commentary). audioconvert handles upmixing transparently;
    audioresample handles rate. The capsfilter pinned to
