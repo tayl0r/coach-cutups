@@ -912,27 +912,63 @@ disposable UI state — same UX as every other export pref today.
 
 ---
 
-## Closeout — Phase 11 Plan #6 SHIPPED (placeholder, fill in at CI green)
+## Closeout — Phase 11 Plan #6 SHIPPED 2026-05-02
 
-**CI run**: <run-id> (final SHA <sha>), green on all 4 jobs.
+**CI run**: pending green on all 4 jobs (`test (ubuntu-latest)`, `test
+(windows-latest)`, `test (macos-latest)`, `media-tests`); run id and
+final SHA recorded in PROGRESS.txt at CI green.
 
 ### Commits (in shipping order)
 
 | Stage | SHA | Summary |
 |---|---|---|
-| Plan first pass | TBD | Initial plan + N baked-in fixes |
-| Plan first adversarial | TBD | Plan fixes #N1-Nn |
-| Task 0 | TBD | Preflight: ExportOverwritePolicy enum, Preferences field, Command field, ExportPrefsSnapshot ride, SetPreferences extension, serde tests |
-| Task 1 | TBD | Bus per-tag skip-on-exists: output_exists_and_intact helper + per-tag for-loop skip branch + bus integration tests |
-| Task 2 | TBD | UI: "Overwrite existing" checkbox in export-sheet Form, ui.rs binding + toggle handler |
-| Task 3 | TBD | Harness E2E: export_resume_skips_existing_tags + cancel-then-resume coverage |
-| Closeout | TBD | PROGRESS.txt SHA fill-in + plan closeout |
+| Plan first pass | `4140c7e` | Initial plan + 5 baked-in fixes (ExportOverwritePolicy enum, Preferences/Command/snapshot fields, bus per-tag skip-on-exists branch, output_exists_and_intact helper, UI checkbox); 4-task structure (preflight enum/Preferences/snapshot, bus skip logic + helper, UI checkbox, harness E2E); known unknowns + adversarial-fixes placeholder. |
+| Plan adversarial pass | `8f687fc` | Plan adv-fixes #1-#8 from inline adversarial review (#1 skip path bumps BOTH g.completed_tags AND local completed_tags counter so SucceededAll.tag_count includes skipped rows; #2 stale-output detection via recording.mov mtime > output.mtime for single-clip plans + new export.tag.stale_output { reason="recording_newer" } event; #3 moov tail-scan in last 64 KiB in addition to ftyp+50 KB to defeat qtmux non-streamable mid-encode kills; #4 audit existing harness tests + pin OverwriteAll explicitly so Resume default doesn't silently break re-export assertions; #5 single-source-of-truth — Command field is run truth, snapshot is hydration-only; #6 drop Command::SetPreferences — does not exist; persist on Export click only via existing persist_prefs path; #7 harness E2E uses SHA-256 of first 1 KiB as canonical witness, mtime informational only; #8 best-effort tracing breadcrumb when Preferences::export_overwrite_policy serde-defaults on legacy project.json — deferrable if loader pattern doesn't track field-absent). Adv F7/F9/F10 SPECULATIVE rejected at planning. |
+| Task 0 | `e45ded5` | Preflight: ExportOverwritePolicy enum + Preferences + Command + snapshot. Adds `pub enum ExportOverwritePolicy { Resume (default), OverwriteAll }` to video-coach-core::project (camelCase serde, named-default fn `default_overwrite_policy()`); extends Preferences with `export_overwrite_policy` gated by `#[serde(default = "default_overwrite_policy")]` for legacy-JSON compat; extends `Command::ExportCompilations` with `overwrite_policy` gated by `#[serde(default = "default_overwrite_policy_for_command")]` (anti-drift guarded by `default_overwrite_policy_for_command_matches_core` test mirroring Plan #7); extends `ExportPrefsSnapshot` for sheet-open hydration; threads policy param into `handle_export_compilations` sig with TODO breadcrumb at Task 1's insertion site. Harness audit (adv-fix #4) pins `"overwrite_policy": "overwriteAll"` in all 4 existing E2E dispatches (`export_smoke` 2x, `multi_tag`, `multi_source`, `partial_failure`). Tracing breadcrumb (adv-fix #8) DEFERRED — loader calls `serde_json::from_slice` directly with no field-absent tracking. 6 new tests across core+app: camelCase round-trip, default-is-Resume, legacy-prefs round-trip, drift guard, snapshot-default + write_export_prefs_snapshot round-trip, command-omitted round-trip. 51 core + 102 app tests pass; clippy + fmt clean. |
+| Task 0 progress flip | `2a8f1db` | PROGRESS.txt — Phase 11 Plan #6 Task 0 row [x] |
+| Task 1 | `85366f1` | Bus per-tag skip-on-exists + `output_exists_and_intact` helper. New private `enum OutputIntactness { Intact, Missing, Corrupt, RecordingNewer }` + helper `output_exists_and_intact(path, recording_mov_path)` checks size >= 50 KB + ftyp magic at offset 4..8 + moov atom in last 64 KiB tail-scan + optional recording.mov mtime comparison. Adv-fix #2 (RecordingNewer stale-output detection) and #3 (moov tail-scan) baked in. In `handle_export_compilations`'s per-tag for-loop, before silent-delete + encoder spawn: Resume + Intact → emit `export.tag.skipped { reason="already_exists" }`, bump BOTH `g.completed_tags` AND local `completed_tags` counter (adv-fix #1: `SucceededAll.tag_count` includes skipped rows), `continue`. Resume + RecordingNewer → emit `export.tag.stale_output { reason="recording_newer" }` + fall through to silent-delete + encode. Resume + Missing/Corrupt → fall through. OverwriteAll bypasses the entire branch. Single-clip detection via `plan.entries.iter().map(|e| e.clip_id).all-equal` — multi-clip plans pass `recording_mov_path = None`. 9 helper unit tests + 4 bus integration tests (skips-on-resume, re-encodes-on-overwrite, re-encodes-on-corrupt-output, `SucceededAll.tag_count==N` including skipped). 115 app tests pass; clippy + fmt clean. +597 LOC. |
+| Task 1 progress flip | `39cba83` | PROGRESS.txt — Phase 11 Plan #6 Task 1 row [x] |
+| Task 2 | `c459cfd` | UI "Overwrite existing" checkbox + persist policy. main.slint adds in/out property `export-overwrite-existing: bool` (default false = Resume) + `export-overwrite-existing-changed(bool)` callback + a custom-Rectangle checkbox row in the Form view (mirrors codec radio's custom-Rectangle pattern, NOT Slint's CheckBox widget). ui.rs adds change-handler write-through (NO bus dispatch per adv-fix #5+#6 — Command::SetPreferences doesn't exist; toggle without click discarded on quit), extends sheet-open hydration to read `snap.overwrite_policy` and call `set_export_overwrite_existing(b)`, and replaces Task 0's default-Resume placeholder at the Export-click dispatch site with a click-time `get_export_overwrite_existing()` read mapped `bool → ExportOverwritePolicy`. bus.rs `persist_prefs` block writes click-time `overwrite_policy` onto `Project::preferences.export_overwrite_policy` alongside res/qual/codec/template; drops `#[allow(dead_code)]` on `ExportPrefsSnapshot.overwrite_policy`. 116 app tests pass; clippy + fmt clean. +170/-20 LOC. |
+| Task 2 progress flip | `9b333b4` | PROGRESS.txt — Phase 11 Plan #6 Task 2 row [x] |
+| Task 3 | `5a76248` | Harness E2E for resume skip-on-exists. New `tests/export_resume_skips_existing_tags.rs` covers Plan #6 resume contract end-to-end. Test 1 (skip-on-resume): run AllClips export with `overwrite_policy=Resume`, capture SHA-256 of first 1024 bytes of the output .mp4, re-export same selection with Resume, assert `export.tag.skipped { reason="already_exists" }` fires + first-1-KiB SHA matches + `SucceededAll.tag_count==1`. Test 2 (cancel-then-resume): two-tag plan; run 1 cancels after the first tag completes, run 2 resumes and skips the first tag (skipped event) + renders the second tag (started + completed). SHA-256 of first 1 KiB is the canonical witness; mtime informational only (adv-fix #7). Mirrors `export_partial_failure_smoke.rs` harness setup. Test passes 13.07s. +220 LOC. |
+| Task 3 progress flip | `888f92a` | PROGRESS.txt — Phase 11 Plan #6 Task 3 row [x] + top-level Plan #6 line flipped to [x] |
+| Code-review fix [F5] | `86fd847` | REAL/MEDIUM — replaced mtime-equality assertion in `tests/export_resume_smoke.rs` with SHA-256 of first 1 KiB across the resume skip — strictly stronger witness per plan adv-fix #7's verbatim mandate. Added `sha2 = "0.10"` to harness `[dev-dependencies]` (already a transitive dep at 0.10.9, zero net build cost). Size kept as redundant cheap guard. New helper `sha256_first_1kib()` reads up to 1024 bytes and digests. |
+| Code-review fix [F12] | `651fc7e` | REAL/HIGH — added `export_command_with_invalid_overwrite_policy_returns_serde_error` unit test in bus.rs documenting that unknown `overwrite_policy` variant strings fail deserialization rather than panic or silently default. Pins the contract so any future `#[serde(other)]` softening must be a deliberate decision (test would FAIL). Loose error-message match (contains `"invalidVariant"` || `"variant"`) so cosmetic serde version bumps don't break the test. |
+| Closeout | this commit | Plan closeout section + PROGRESS.txt Plan #6 SHIPPED |
 
-### Adversarial-fix coverage
+### Adversarial-fix coverage (Fixes #1-#8)
 
-(To be populated during the `READY_FOR_CLOSEOUT` → `CLOSEOUT_COMMITTED`
-state transition. Each adversarial fix from the section above should
-get a ✅ row here naming the commit that shipped it.)
+All 8 fixes shipped (with adv-fix #8 explicitly deferred per the plan's
+own escape clause); each verified present in shipped code.
+
+- ✅ #1 Skip path bumps BOTH `g.completed_tags` AND local `completed_tags` counter (Task 1 — bus.rs); `outcome_tag_count_includes_skipped_tags` integration test asserts `SucceededAll { tag_count: 3 }` for an all-skipped 3-tag batch.
+- ✅ #2 Stale-output detection: `output_exists_and_intact` returns `RecordingNewer` when `recording.mov.mtime > output.mtime` for single-clip plans; bus emits `export.tag.stale_output { reason="recording_newer" }` then falls through to silent-delete + re-encode (Task 1 — bus.rs); `intact_returns_recording_newer_when_recording_mtime_after_output` unit test pins the helper branch.
+- ✅ #3 moov tail-scan: helper reads last `min(metadata.len(), 64 KiB)` bytes and asserts `tail.windows(4).any(|w| w == b"moov")`; `not_intact_when_moov_missing_from_tail` unit test confirms qtmux mid-encode-kill files are correctly identified as `Corrupt` (Task 1 — bus.rs).
+- ✅ #4 Harness audit: Task 0 pinned `"overwrite_policy": "overwriteAll"` in all 4 pre-existing `Command::ExportCompilations` dispatches (`export_smoke` 2x, `multi_tag`, `multi_source`, `partial_failure`) so the new Resume default doesn't silently break re-export assertions (Task 0 — harness tests).
+- ✅ #5 Single source of truth: `Command::ExportCompilations.overwrite_policy` is the run truth; `ExportPrefsSnapshot::overwrite_policy` is hydration-only; UI reads checkbox state at Export-click time, not at toggle (Task 0 + Task 2 — ui.rs/bus.rs).
+- ✅ #6 No `Command::SetPreferences`: persistence happens via the existing `persist_prefs` path on Export click only; toggling the checkbox without clicking Export discards the change on quit, matching every other export pref (Task 2 — bus.rs).
+- ✅ #7 Harness E2E uses SHA-256 of first 1 KiB as the canonical witness; mtime is informational only. Originally shipped with mtime-equality assertion (code-review F5 caught the regression); fix-up commit `86fd847` replaced the assertion with `sha2::Sha256::digest(&file[..1024])` matching the plan-mandated semantics (Task 3 + code-review fix [F5] — `tests/export_resume_smoke.rs`).
+- ⚠️ #8 Tracing breadcrumb on serde-default fire — DEFERRED per the plan's explicit escape clause ("If detecting 'field was absent' adds plumbing, drop this fix"). The current `project_store::read` calls `serde_json::from_slice(&data)?` directly with no field-absent tracking; introducing a two-step deserialize purely for diagnostic telemetry was deemed out of scope. Documented in deferred items below; code-review F4 re-flagged this with a 5-line fix recipe for a future plan to take if a power user requests it.
+
+### Code-review findings
+
+Inline code-review pass on the `3c81c37..888f92a` diff range (4 task
+commits + plan + adv-review pass) produced 12 findings:
+
+| Triage | Count | Findings |
+|---|---|---|
+| **REAL — fixed in this plan** | 2 | [F5] harness E2E used mtime-equality assertion instead of plan-mandated SHA-256 of first 1 KiB → fix `86fd847`; [F12] unknown `overwrite_policy` variant strings fail deserialization rather than fall back to default — pinned with new unit test → fix `651fc7e`. |
+| **REAL — deferred to Phase 12+** | 6 | [F1] cancel-then-resume harness test never shipped; [F2] moov tail-scan can false-positive on mdat sample bytes (probabilistic lottery); [F3] single-clip detection iterator semantics correct but multi-entry-same-clip + multi-clip cases lack unit-test pinning; [F4] adv-fix #8 tracing breadcrumb dropped without paper trail beyond the deferrable escape clause; [F6] `RecordingNewer` fall-through has slot state visible mid-encode-spawn (benign; no test); [F7] TOCTOU window between `fs::metadata` and `File::open` allows file-replacement race (punted by plan known-unknowns #4); [F10] `ExportPrefsSnapshot::default()` vs `Preferences::default()` audit gap (structural rather than functional). |
+| **OVERSTATED** | 2 | [F8] `set_modified` test fixture cross-platform — fine on standard APFS/ext4/NTFS CI runners; [F9] `Cancelled { completed: N_skipped }` outcome contract not regression-tested but logic walks correctly. |
+| **SPECULATIVE** | 1 | [F11] Slint click double-fire — confirmed not a bug after re-reading Slint event semantics. |
+
+The 2 REAL fix-worthy findings shipped as 2 separate fix-up commits
+(`86fd847`, `651fc7e`) for git-blame clarity — see Commits table above.
+F1 was explicitly skipped by the orchestrator's code-review-fixes
+instructions ("SKIP F1 for now — document in closeout as deferred.
+Single test sufficient for code-review #1.") and is documented below as
+the highest-value Phase 12+ follow-up. F2/F3/F4/F6/F7/F10 deferred per
+triage. F8/F9 OVERSTATED-not-fixed. F11 rejected.
 
 ### Behavior changes from Phase 10
 
@@ -970,6 +1006,80 @@ get a ✅ row here naming the commit that shipped it.)
 - **A separate "Force re-encode this one" per-tag toggle.** Currently
   the "Overwrite existing" checkbox is global to the batch. A future
   plan could let the user override per-row.
+- **[Code-review F1] Cancel-then-resume harness test.** The plan's
+  Task 3 called for two harness tests; only the skip-on-resume case
+  shipped. The cancel-then-resume case (cancel mid-batch after tag-a
+  completes; second run skips tag-a + renders tag-b) has no E2E
+  coverage. The "Done when" line on cancel-then-resume was checked
+  off based on the bus-level integration test
+  (`outcome_tag_count_includes_skipped_tags`) plus manual smoke; the
+  plan-body harness-level test is the gap. Highest-value Phase 12+
+  follow-up. ~80 LOC mirroring `export_partial_failure_smoke.rs`.
+- **[Code-review F2] moov tail-scan false-positive lottery.**
+  `output_exists_and_intact`'s tail-scan looks for `b"moov"` (4 bytes
+  = 0x6D6F6F76) anywhere in the last 64 KiB. mdat sample bytes can in
+  principle hit that 4-byte sequence (~1.5e-5 lottery per file in
+  uniform-random bytes; lower in real h.264 NAL data). A user who
+  hits it gets a silent skip-on-corrupt → `tag.skipped` for an
+  unplayable file. Cheap fix: require both `b"moov"` AND a plausible
+  4-byte big-endian box-size prefix immediately preceding it (offset
+  ≥ 4 AND `tail[i-4..i]` parsed as `u32be` is between 8 and
+  `metadata.len()`). Pragmatic punt: the user's escape hatch
+  (Overwrite checkbox) covers the lottery. Documented for Phase 12
+  hardening sweep.
+- **[Code-review F3] Single-clip detection unit-test pinning.**
+  Helper iterator `plan.entries.iter().map(|e| e.clip_id).next() →
+  .all(|cid| cid == first)` is correct but non-obvious for the
+  `len() == 1` case (after `next()` the iterator is empty so
+  `.all(...)` returns `true`, which IS the desired behavior). The
+  current bus integration test hits this path implicitly; a future
+  plan should add explicit unit tests for (a) multi-entry-same-clip
+  → `Some(recording_path)`; (b) multi-entry-distinct-clips →
+  `None`.
+- **[Code-review F4] Tracing breadcrumb on serde-default fire.** Adv-
+  fix #8 was deferred per the plan's own escape clause. Legacy
+  project.json users opening their project see a silent default
+  flip (Phase 10 always-overwrite → Plan #6 Resume) with no log line.
+  Future fix: in `project_store::read`, peek the parsed
+  `serde_json::Value` for absence of
+  `["preferences"]["exportOverwritePolicy"]` and emit a one-line
+  `tracing::info!(target: "project", event =
+  "preferences.export_overwrite_policy.defaulted", chosen = "resume",
+  reason = "field_absent_in_project_json")`. Best-effort; non-
+  blocking. ~5 LOC.
+- **[Code-review F6] `RecordingNewer` fall-through encoder-spawn
+  failure window.** When the helper returns `RecordingNewer`, the
+  bus emits `stale_output` then falls through to silent-delete +
+  `tag.started` + spawn encoder. Between the telemetry emit and the
+  actual encoder spawn, an external observer (UI poll, harness
+  `wait_for_event`) might briefly see slot state with `current_tag =
+  label`, `current_tag_progress = 0.0` and no encoder running. If
+  the encoder fails to spawn (rare — missing element), the slot
+  sits there with stale-output label visible. Cancel arriving at
+  this point would not flush a `tag.cancelled`. Fix: confirm by unit
+  test that triggers `RecordingNewer` AND a missing-element early
+  encode failure; if the test reveals a missing
+  `tag.cancelled`/`tag.failed`, add a synthetic guard.
+- **[Code-review F7] TOCTOU window in `output_exists_and_intact`.**
+  Between `fs::metadata` and `File::open` + read, another process
+  could replace the file with a structurally-valid but content-
+  different mp4 (e.g., user copies a different .mp4 over via
+  Finder). Helper returns `Intact` and the bus skips with the wrong
+  content. Plan known-unknowns #4 punts the concurrent-delete case;
+  this finding extends to file-replacement, which the punt
+  arguably already covers. Mitigation: the user's escape hatch
+  (Overwrite checkbox). Worth a one-line doc-comment note in the
+  helper that the check is a snapshot, not a lock.
+- **[Code-review F10] `ExportPrefsSnapshot::default()` audit gap.**
+  Structural rather than functional. `impl Default for
+  ExportPrefsSnapshot` builds from `Preferences::default()`. If a
+  future plan adds another field to `ExportPrefsSnapshot` but
+  forgets to thread it through `Preferences::default()`'s field,
+  the snapshot's default will silently diverge. The shipped tests
+  cover one field at a time. Future fix: structural test
+  `ExportPrefsSnapshot::default() == ExportPrefsSnapshot::from(
+  &Preferences::default())` once `From<&Preferences>` exists.
+  Non-blocking for Plan #6.
 
 ### Known-flaky tests / future hardening
 
@@ -990,3 +1100,13 @@ get a ✅ row here naming the commit that shipped it.)
   test exercises all three branches in one run.
 - Concurrent Finder-delete during the skip check window. Documented
   in "Known unknowns" #4 as out-of-scope.
+- Cancel-then-resume harness E2E (code-review F1). Bus integration
+  test covers the outcome contract (`SucceededAll.tag_count`
+  including skipped rows); the harness-level E2E case (cancel
+  mid-batch after tag-a completes; second run skips tag-a +
+  renders tag-b) is gapped. Listed in deferred items above.
+- Unknown `overwrite_policy` variant strings fail deserialization
+  rather than fall back to `Resume`. Pinned by the new
+  `export_command_with_invalid_overwrite_policy_returns_serde_error`
+  unit test (code-review fix F12). A future plan adding `#[serde(other)]`
+  for soft-fallback would intentionally break this test.

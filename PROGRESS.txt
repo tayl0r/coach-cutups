@@ -562,6 +562,7 @@ own SHIPPED line + CI run id once green.
         frames byte-for-byte. +316 LOC.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [x] Plan #6: resume failed exports (tag-level resume on PartialFailure)
+      SHIPPED 2026-05-02. CI run pending green on all 4 jobs.
       Phase 10 ships "failure deletes the partial output and returns to
       the form" — no resume. Plan #6 adds tag-level resume: when a batch
       export fails partway through (PartialFailure outcome), the user
@@ -652,6 +653,32 @@ own SHIPPED line + CI run id once green.
         completed). SHA-256 of first 1 KiB is the canonical witness;
         mtime informational only (adv-fix #7). Mirrors export_partial_
         failure_smoke.rs harness setup. Test passes 13.07s. +220 LOC.
+  - [x] Closeout: Plan #6 SHIPPED — appended to plan file (this commit);
+        adversarial-fix coverage 7/8 shipped + adv #8 tracing breadcrumb
+        DEFERRED per the plan's explicit escape clause (loader does not
+        track field-absent today; documented for Phase 12+). Code-review
+        pass landed 2 fix-up commits — 86fd847 (F5 REAL/MEDIUM: replace
+        mtime-equality assertion in tests/export_resume_smoke.rs with
+        SHA-256 of first 1 KiB across the resume skip per plan adv-fix
+        #7's verbatim mandate; sha2 = "0.10" added to harness [dev-
+        dependencies] — already a transitive dep at 0.10.9, zero net
+        build cost), 651fc7e (F12 REAL/HIGH: pin contract that unknown
+        overwrite_policy variant strings fail deserialization rather
+        than panic or silently default — new export_command_with_
+        invalid_overwrite_policy_returns_serde_error unit test with
+        loose error-message match contains "invalidVariant" || "variant"
+        so cosmetic serde version bumps don't break the test). REAL-
+        but-deferred F1 (cancel-then-resume harness test), F2 (moov
+        tail-scan false-positive lottery), F3 (single-clip detection
+        unit-test pinning gap), F4 (tracing breadcrumb dropped paper
+        trail), F6 (RecordingNewer fall-through encoder-spawn window),
+        F7 (TOCTOU between fs::metadata and File::open), F10 (Export
+        PrefsSnapshot::default audit gap) — all documented in plan
+        Deferred section. OVERSTATED F8/F9 + SPECULATIVE F11 rejected
+        per triage. Verification battery green: cargo build/test
+        --workspace --features media, cargo build/test --workspace,
+        cargo build --workspace --no-default-features, clippy --features
+        media + clippy excluding media (-D warnings), cargo fmt --check.
 - [x] Plan #7: drag-reorder tag rows / custom filename templates
       SHIPPED 2026-05-01. CI run 25241681131 green on all 4 jobs.
       Two small UX wins for the export sheet: (1) drag-to-reorder of

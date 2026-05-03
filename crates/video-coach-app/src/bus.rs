@@ -217,6 +217,12 @@ fn default_overwrite_policy_for_command() -> video_coach_core::project::ExportOv
 /// adv-fix #2's stale-output telemetry one branch above the encode
 /// path without re-running `std::fs::metadata` on the .mp4 + the
 /// recording.mov a second time.
+// `#[allow(dead_code)]` because the only production callers are gated
+// behind `#[cfg(feature = "media")]` in `handle_export_compilations`,
+// while the unit tests below exercise the helper directly without the
+// `media` feature. Dropping the gate on the enum/helper lets the test
+// suite run on default-features builds.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OutputIntactness {
     /// File exists, size + ftyp + moov tail-scan all pass, and (if a
@@ -260,6 +266,7 @@ enum OutputIntactness {
 /// I/O errors (permission denied, etc.) are treated as `Missing` —
 /// the export pipeline's silent-delete + re-encode path then
 /// surfaces the real error.
+#[allow(dead_code)] // production callers gated behind media; unit tests run without it
 fn output_exists_and_intact(
     path: &std::path::Path,
     recording_mov_path: Option<&std::path::Path>,
@@ -4638,6 +4645,11 @@ mod tests {
         );
     }
 
+    // `write_export_prefs_snapshot` lives behind `#[cfg(feature = "media")]`
+    // (it writes the snapshot the GStreamer-backed export pipeline reads),
+    // so this round-trip test is gated on the same feature. The pure-default
+    // arm of the test runs unconditionally below.
+    #[cfg(feature = "media")]
     #[test]
     fn export_prefs_snapshot_default_overwrite_policy_is_resume() {
         // Phase 11 Plan #6 Task 0. The snapshot's default must mirror
@@ -4662,6 +4674,20 @@ mod tests {
         assert_eq!(
             g.overwrite_policy,
             video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
+        );
+    }
+
+    #[test]
+    fn export_prefs_snapshot_default_is_resume_no_media() {
+        // Phase 11 Plan #6 Task 0 — no-media variant of the snapshot
+        // default check. The full round-trip (which writes via the
+        // media-gated `write_export_prefs_snapshot`) lives in the
+        // `#[cfg(feature = "media")]` test above. This pure-default
+        // assertion runs on every build.
+        let snap = ExportPrefsSnapshot::default();
+        assert_eq!(
+            snap.overwrite_policy,
+            video_coach_core::project::ExportOverwritePolicy::Resume,
         );
     }
 
