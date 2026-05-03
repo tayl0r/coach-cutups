@@ -38,7 +38,12 @@ final class Workspace {
     /// (or assign via the computed setter, which delegates). The setter
     /// clamps the input to the valid range, propagates to mpv, and emits a
     /// keyframe to the in-progress recording (if any).
-    @ObservationIgnored
+    ///
+    /// NOT @ObservationIgnored: SwiftUI views read this through
+    /// `workspace.currentZoom` (e.g. ZoomIndicator) and need to re-evaluate
+    /// when it changes. Per-gesture body re-evals are cheap with @Observable's
+    /// targeted invalidation — only views that actually read the property
+    /// re-render.
     private var _currentZoom: Zoom = .identity
 
     var currentZoom: Zoom {
