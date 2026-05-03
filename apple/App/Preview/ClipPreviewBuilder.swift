@@ -49,6 +49,10 @@ enum ClipPreviewBuilder {
         // 2. Resolve the webcam recording URL.
         let webcamURL = ProjectStore.recordingsDir(in: projectFolder)
             .appendingPathComponent(clip.recordingFilename)
+        NSLog("[Preview] building for clip \(clip.id) src=\(srcURL.lastPathComponent) webcam=\(webcamURL.lastPathComponent)")
+        let webcamExists = FileManager.default.fileExists(atPath: webcamURL.path)
+        let webcamSize = (try? FileManager.default.attributesOfItem(atPath: webcamURL.path)[.size] as? Int) ?? -1
+        NSLog("[Preview] webcam file exists=\(webcamExists) size=\(webcamSize)")
 
         // 3. Load both assets.
         let srcAsset = AVURLAsset(url: srcURL)
@@ -58,13 +62,24 @@ enum ClipPreviewBuilder {
         async let srcVideoTrackLoad = srcAsset.primaryVideoTrack()
         async let srcAudioTrackLoad = srcAsset.optionalAudioTrack()
 
-        let webcamDuration = try await webcamAsset.load(.duration)
-        let webcamVideoTrack = try await webcamAsset.primaryVideoTrack()
-        let webcamAudioTrack = try await webcamAsset.optionalAudioTrack()
-
-        let srcDuration = try await srcDurationLoad
-        let srcVideoTrack = try await srcVideoTrackLoad
-        let srcAudioTrack = try await srcAudioTrackLoad
+        let webcamDuration: CMTime
+        let webcamVideoTrack: AVAssetTrack
+        let webcamAudioTrack: AVAssetTrack?
+        let srcDuration: CMTime
+        let srcVideoTrack: AVAssetTrack
+        let srcAudioTrack: AVAssetTrack?
+        do {
+            NSLog("[Preview] loading webcam.duration"); webcamDuration = try await webcamAsset.load(.duration)
+            NSLog("[Preview] loading webcam.videoTrack"); webcamVideoTrack = try await webcamAsset.primaryVideoTrack()
+            NSLog("[Preview] loading webcam.audioTrack"); webcamAudioTrack = try await webcamAsset.optionalAudioTrack()
+            NSLog("[Preview] loading src.duration"); srcDuration = try await srcDurationLoad
+            NSLog("[Preview] loading src.videoTrack"); srcVideoTrack = try await srcVideoTrackLoad
+            NSLog("[Preview] loading src.audioTrack"); srcAudioTrack = try await srcAudioTrackLoad
+        } catch {
+            NSLog("[Preview] asset load step failed: \(error)")
+            throw error
+        }
+        NSLog("[Preview] loads done. srcDur=\(srcDuration.seconds) webcamDur=\(webcamDuration.seconds)")
 
         let sourceDurationSeconds = srcDuration.seconds.isFinite
             ? srcDuration.seconds
@@ -106,23 +121,57 @@ enum ClipPreviewBuilder {
         // synthesized at render time by re-emitting the pre-decoded frame.
         // Use a 600-tick timescale to match the rest of the project's
         // CMTime conventions.
+        // Sub-frame granule for freeze inserts (1.67ms at timescale 600).
+        // Smaller than any practical source frame duration (30 fps = 33ms,
+        // 60 fps = 16.7ms), so the inserted slice contains exactly one
+        // source frame — the one displayed at `srcStart`. We then stretch
+        // it across the freeze's full duration via `scaleTimeRange`, which
+        // makes AVPlayer hold that single frame for as long as the user
+        // paused. Using a wider slice (e.g. 1/30s) risks straddling a
+        // source frame boundary and showing the *next* frame partway
+        // through the freeze, which the user perceives as the pause
+        // happening at a slightly wrong moment.
+        let freezeSlice = CMTime(value: 1, timescale: 600)
         var compCursor = CMTime.zero
-        for seg in segments {
+        for (segIdx, seg) in segments.enumerated() {
             let segDur = CMTime(seconds: seg.outDuration, preferredTimescale: 600)
+            // Sub-frame segments (e.g. two events <1ms apart from a continuous
+            // zoom gesture) round to 0 ticks at timescale 600. AVFoundation
+            // rejects empty insertTimeRange calls with -11800/-12780, so skip
+            // both the source insert and the cursor advance — there's nothing
+            // to render either way.
+            guard segDur > .zero else { continue }
+            let srcStart = CMTime(seconds: seg.sourceStart, preferredTimescale: 600)
             switch seg.kind {
             case .play:
-                let srcStart = CMTime(seconds: seg.sourceStart, preferredTimescale: 600)
                 let srcRange = CMTimeRange(start: srcStart, duration: segDur)
-                try sourceVideoComp.insertTimeRange(srcRange, of: srcVideoTrack, at: compCursor)
+                do {
+                    try sourceVideoComp.insertTimeRange(srcRange, of: srcVideoTrack, at: compCursor)
+                } catch {
+                    NSLog("[Preview] sourceVideoComp.insertTimeRange failed seg=\(segIdx) range=\(srcRange) at=\(compCursor): \(error)")
+                    throw error
+                }
                 if let sourceAudioComp, let srcAudioTrack {
                     try? sourceAudioComp.insertTimeRange(srcRange, of: srcAudioTrack, at: compCursor)
                 }
             case .freeze:
-                // No insert — the compositor returns the frozen frame for
-                // these output times. `requiredSourceTrackIDs` keeps the
-                // track in the request even when no media is attached at
-                // this output time.
-                break
+                // Insert one source frame at the freeze's source-time, then
+                // stretch it to fill the freeze's output duration. AVPlayer
+                // sees a regular source slice and delivers it on every
+                // composite request, so the compositor can render it without
+                // needing the PreviewInstruction's pre-decoded frozenFrames
+                // (which the playback path can't reach).
+                let frameRange = CMTimeRange(start: srcStart, duration: freezeSlice)
+                do {
+                    try sourceVideoComp.insertTimeRange(frameRange, of: srcVideoTrack, at: compCursor)
+                } catch {
+                    NSLog("[Preview] sourceVideoComp.insertTimeRange (freeze) failed seg=\(segIdx) range=\(frameRange) at=\(compCursor): \(error)")
+                    throw error
+                }
+                sourceVideoComp.scaleTimeRange(
+                    CMTimeRange(start: compCursor, duration: freezeSlice),
+                    toDuration: segDur
+                )
             }
             compCursor = compCursor + segDur
         }
@@ -133,12 +182,18 @@ enum ClipPreviewBuilder {
         // we don't try to insert past EOF.
         let clipDuration = compCursor
         let webcamUseDuration = min(clipDuration, webcamDuration)
+        NSLog("[Preview] segments=\(segments.count) clipDur=\(clipDuration.seconds) webcamUse=\(webcamUseDuration.seconds)")
         if webcamUseDuration > .zero {
-            try webcamVideoComp.insertTimeRange(
-                CMTimeRange(start: .zero, duration: webcamUseDuration),
-                of: webcamVideoTrack,
-                at: .zero
-            )
+            do {
+                try webcamVideoComp.insertTimeRange(
+                    CMTimeRange(start: .zero, duration: webcamUseDuration),
+                    of: webcamVideoTrack,
+                    at: .zero
+                )
+            } catch {
+                NSLog("[Preview] webcamVideoComp.insertTimeRange failed dur=\(webcamUseDuration.seconds): \(error)")
+                throw error
+            }
             if let webcamAudioComp, let webcamAudioTrack {
                 try? webcamAudioComp.insertTimeRange(
                     CMTimeRange(start: .zero, duration: webcamUseDuration),
@@ -148,47 +203,13 @@ enum ClipPreviewBuilder {
             }
         }
 
-        // 5. Pre-decode freeze frames. Skip the entire allocation if there
-        //    are no `.freeze` segments — the common case for an
-        //    uninterrupted recording.
-        var frozenFrames: [Int: CVPixelBuffer] = [:]
-        let freezeIndices = segments.enumerated().compactMap {
-            $0.element.kind == .freeze ? $0.offset : nil
-        }
-        if !freezeIndices.isEmpty {
-            let gen = AVAssetImageGenerator(asset: srcAsset)
-            gen.appliesPreferredTrackTransform = true
-            // Snap to the nearest keyframe — fine for a held frame, and the
-            // reason a 100–800ms decode window is acceptable here. Cap at
-            // 1920×1080 to match the preview composition's renderSize ceiling
-            // so freeze frames don't appear softer than surrounding live frames.
-            gen.requestedTimeToleranceBefore = .positiveInfinity
-            gen.requestedTimeToleranceAfter = .positiveInfinity
-            gen.maximumSize = CGSize(width: 1920, height: 1080)
+        // 5. (No freeze pre-decode anymore — freeze segments are now realized
+        //    as 1-frame source slices stretched to the freeze duration via
+        //    `scaleTimeRange` in the segment loop above. AVPlayer delivers
+        //    them through the normal sourceFrame pipeline, so we don't need
+        //    a per-segment frozenFrames cache.)
 
-            for i in freezeIndices {
-                let priorPlayEnd = sourceTimeAtEndOfPlay(precedingSegment: i, in: segments)
-                let t = CMTime(seconds: priorPlayEnd, preferredTimescale: 600)
-                let cgImage: CGImage
-                do {
-                    let result = try await gen.image(at: t)
-                    cgImage = result.image
-                } catch {
-                    throw ClipPreviewBuilderError.freezeFrameDecodeFailed(srcURL, t, underlying: error)
-                }
-                let buf = try cgImageToBGRAPixelBuffer(cgImage)
-                frozenFrames[i] = buf
-            }
-        }
-
-        // 6. Build the video composition with our custom compositor. The
-        // compositor handles per-frame source selection (live for `.play`,
-        // pre-decoded buffer for `.freeze`) and PiP geometry directly — no
-        // layer instructions, since `customVideoCompositorClass` bypasses
-        // them entirely. Single render path with the export pipeline (see
-        // `CompilationCompositor`), so visual parity is automatic.
-        //
-        // v1 sources are landscape-only (matching
+        // 6. v1 sources are landscape-only (matching
         // `CompilationExporter.renderSize`), so renderSize is the source's
         // raw natural size with no rotation handling.
         let srcNatural = try await srcVideoTrack.load(.naturalSize)
@@ -219,18 +240,109 @@ enum ClipPreviewBuilder {
         let videoComp = AVMutableVideoComposition()
         videoComp.renderSize = renderSize
         videoComp.frameDuration = CMTime(value: 1, timescale: 30)
-        videoComp.customVideoCompositorClass = PreviewCompositor.self
+        // No custom compositor: AVPlayer's playback path on macOS 26 strips
+        // any subclass of AVMutableVideoCompositionInstruction (along with the
+        // `requiredSourceTrackIDs` override carried on it), causing every
+        // source-frame request to return nil → black playback. Built-in
+        // composition with explicit layer instructions sidesteps the strip.
 
+        // Source layer: stretch the source's natural size to the renderSize
+        // (matching the pre-rewrite "non-uniform fit"), then layer the
+        // recorded zoom on top via setTransformRamp so playback replays the
+        // user's pinch/scroll/pan gestures.
+        let baseStretch = CGAffineTransform(
+            scaleX: renderSize.width / max(srcNatural.width, 1),
+            y: renderSize.height / max(srcNatural.height, 1)
+        )
+        // Compose baseStretch with zoom's viewport-space delta. CGAffineTransform's
+        // .concatenating(_) is "self then arg", so this means
+        // "stretch source to renderSize, then apply zoom as a viewport delta."
+        func sourceTransform(zoom: Zoom) -> CGAffineTransform {
+            baseStretch.concatenating(zoom.deltaTransform(viewportSize: renderSize))
+        }
+        let zoomKeyframes: [(time: Double, zoom: Zoom)] = clip.events.compactMap { e in
+            if case let .zoom(z) = e.kind { return (e.recordTime, z) }
+            return nil
+        }
+        let sourceLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVideoComp)
+        // Initial transform: matches `events.zoomAt(recordTime: 0)` semantics —
+        // identity when no zoom keyframes, otherwise the first keyframe's value
+        // (handles the inherit-on-record snapshot at recordTime=0 too).
+        let initialZoom = zoomKeyframes.first?.zoom ?? .identity
+        sourceLayer.setTransform(sourceTransform(zoom: initialZoom), at: .zero)
+        // Ramp between adjacent keyframes. Each pair becomes a linear
+        // CGAffineTransform interpolation over [a.time, b.time]. After the
+        // last keyframe, the transform holds at the last value (no ramp = no
+        // change), matching `zoomAt(...).after-last` behavior.
+        for i in 0 ..< max(0, zoomKeyframes.count - 1) {
+            let a = zoomKeyframes[i]
+            let b = zoomKeyframes[i + 1]
+            let start = CMTime(seconds: a.time, preferredTimescale: 600)
+            let end = CMTime(seconds: b.time, preferredTimescale: 600)
+            // Skip pairs that round to a zero-duration range (sub-tick events
+            // from continuous gestures). Without the guard AVFoundation would
+            // accept the call but the ramp has no effect anyway.
+            guard end > start else { continue }
+            sourceLayer.setTransformRamp(
+                fromStart: sourceTransform(zoom: a.zoom),
+                toEnd: sourceTransform(zoom: b.zoom),
+                timeRange: CMTimeRange(start: start, duration: end - start)
+            )
+        }
+
+        // Webcam PiP layer: scale to 22% of viewport width, preserve cam
+        // aspect, anchor bottom-right with a 2.2% margin. AVMutableVideoCompositionLayerInstruction
+        // transforms work in TOP-LEFT origin (the same as the renderSize
+        // coordinate system), so the PiP's top-left corner sits at
+        // (renderSize.width - margin - pipW, renderSize.height - margin - pipH).
+        let camNatural = try await webcamVideoTrack.load(.naturalSize)
+        let camW = max(abs(camNatural.width), 1)
+        let camH = max(abs(camNatural.height), 1)
+        let pipW = renderSize.width * 0.22
+        let pipH = pipW * camH / camW
+        let margin = renderSize.height * 0.022
+        let webcamScale = CGAffineTransform(scaleX: pipW / camW, y: pipH / camH)
+        let webcamTranslate = CGAffineTransform(
+            translationX: renderSize.width - margin - pipW,
+            y: renderSize.height - margin - pipH
+        )
+        let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
+        webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
+
+        // `addMutableTrack(preferredTrackID:)` doesn't always honor the
+        // preferred ID — if there's a collision or constraint, it generates
+        // a fresh one. Use the ACTUAL assigned trackIDs for both
+        // `requiredSourceTrackIDs` and the layer instruction's source track,
+        // otherwise AVPlayer either fails to load the webcam track or
+        // renders the layer instruction against the wrong track.
+        let actualSourceID = sourceVideoComp.trackID
+        let actualWebcamID = webcamVideoComp.trackID
+        NSLog("[Preview] track IDs: source=\(actualSourceID) webcam=\(actualWebcamID) (preferred was \(sourceTrackID)/\(webcamTrackID))")
+        // requiredSourceTrackIDs is read-only on the mutable base class in
+        // Swift, so we still need PreviewInstruction's getter override to
+        // declare which tracks AVPlayer must deliver. Without it, AVPlayer's
+        // built-in compositor will fail to vend either source or webcam
+        // frames and the entire preview renders black.
         let inst = PreviewInstruction.make(
-            sourceTrackID: sourceTrackID,
-            webcamTrackID: webcamTrackID,
+            sourceTrackID: actualSourceID,
+            webcamTrackID: actualWebcamID,
             compositionStart: .zero,
             clipDuration: clipDuration,
-            segments: segments,
-            frozenFrames: frozenFrames,
-            events: clip.events
+            segments: [],
+            frozenFrames: [:],
+            events: []
         )
+        // AVFoundation layer order: first instruction is on TOP, subsequent
+        // ones are beneath. Webcam (PiP) goes first so it overlays the
+        // full-frame source.
+        inst.layerInstructions = [webcamLayer, sourceLayer]
         videoComp.instructions = [inst]
+
+        let zoomEventCount = clip.events.reduce(into: 0) { acc, e in
+            if case .zoom = e.kind { acc += 1 }
+        }
+        NSLog("[Preview] renderSize=\(renderSize) zoomEvents=\(zoomEventCount) totalEvents=\(clip.events.count)")
+        NSLog("[Preview] build complete; AVPlayerItem ready (built-in compositor)")
 
         let item = AVPlayerItem(asset: comp)
         item.videoComposition = videoComp

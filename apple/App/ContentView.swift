@@ -427,7 +427,7 @@ struct ContentView: View {
         // .previewLoading; the build won't be re-attempted while the failure
         // is recorded.
         if let err = workspace.previewBuildError(for: newID) {
-            previewBuildErrorAlert = err.localizedDescription
+            previewBuildErrorAlert = "\(err)"
             appMode = .scanning
             return
         }
@@ -449,7 +449,7 @@ struct ContentView: View {
                         return false
                     }
                     if let err = self.workspace.previewBuildError(for: newID) {
-                        self.previewBuildErrorAlert = err.localizedDescription
+                        self.previewBuildErrorAlert = "\(err)"
                         self.appMode = .scanning
                         return false
                     }

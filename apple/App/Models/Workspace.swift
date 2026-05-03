@@ -279,6 +279,7 @@ final class Workspace {
             do {
                 try await self.preparePreviewPlayer(for: id)
             } catch {
+                NSLog("[Preview] build failed for clip \(id): \(error)")
                 await MainActor.run { self._previewFailed[id] = error }
             }
             await MainActor.run { _ = self._previewInflight.remove(id) }

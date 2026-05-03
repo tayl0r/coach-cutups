@@ -57,7 +57,21 @@ public final class PreviewCompositor: NSObject, AVVideoCompositing {
 
     public func cancelAllPendingVideoCompositionRequests() {}
 
+    /// Set on the first startRequest of a new compositor instance so we
+    /// emit one breadcrumb confirming the playback path actually reached
+    /// the compositor. Subsequent frames stay quiet.
+    private var didLogFirstRequest = false
+
     public func startRequest(_ request: AVAsynchronousVideoCompositionRequest) {
+        if !didLogFirstRequest {
+            didLogFirstRequest = true
+            let inst = request.videoCompositionInstruction as? PreviewInstruction
+            let evts = inst?.events.count ?? -1
+            let zooms = inst?.events.reduce(into: 0) { acc, e in
+                if case .zoom = e.kind { acc += 1 }
+            } ?? 0
+            NSLog("[PreviewCompositor] first frame ts=\(request.compositionTime.seconds) hasInstSubclass=\(inst != nil) events=\(evts) zoomEvents=\(zooms)")
+        }
         // AVPlayer's playback path on modern macOS sometimes strips the
         // subclass from `videoCompositionInstruction` (the export-session path
         // preserves it; the playback path does not, at least in our testing
