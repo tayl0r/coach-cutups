@@ -109,55 +109,12 @@ final class MPVRenderingNSView: NSView {
     func setCurrentZoom(_ zoom: Zoom) { currentZoom = zoom }
 
     override func magnify(with event: NSEvent) {
-        let cursor = cursorInBounds(event)
-        // event.magnification is a delta (-1...1 typical per gesture step).
-        // Compounding into scale: nextScale = scale * (1 + magnification).
-        let nextScale = currentZoom.scale * (1.0 + event.magnification)
-        let next = currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor)
-        commit(next)
+        commit(ZoomGesture.nextZoom(forMagnify: event, in: self, currentZoom: currentZoom))
     }
 
     override func scrollWheel(with event: NSEvent) {
-        let cursor = cursorInBounds(event)
-        if event.hasPreciseScrollingDeltas {
-            // Trackpad two-finger swipe → pan.
-            // Direction: positive scrollingDeltaY = swipe up = expose more of top
-            // (so the visible center moves toward smaller y in source). The flip
-            // already incorporates the user's natural-scrolling preference; mpv
-            // and Apple's docs both treat scrollingDeltaY as content-direction.
-            guard currentZoom.scale > 1.0 else { return }
-            let viewW = max(1, bounds.width)
-            let viewH = max(1, bounds.height)
-            let dx = -event.scrollingDeltaX / (viewW * currentZoom.scale)
-            let dy = -event.scrollingDeltaY / (viewH * currentZoom.scale)
-            let next = Zoom(
-                scale: currentZoom.scale,
-                panX: currentZoom.panX + dx,
-                panY: currentZoom.panY + dy
-            )
-            commit(next)
-        } else {
-            // Coarse mouse wheel → zoom toward cursor.
-            // Direction: scrollingDeltaY > 0 = wheel scrolled up (away from user)
-            // = zoom IN. This matches Maps, Safari, Final Cut, every macOS app
-            // that supports wheel-to-zoom. macOS's natural-scrolling preference
-            // is already baked into scrollingDeltaY; we don't read
-            // isDirectionInvertedFromDevice separately. (Verified against reviewer
-            // finding 7 in v2 review history.)
-            let step = 0.1
-            let factor = 1.0 + step * (event.scrollingDeltaY > 0 ? 1.0 : -1.0)
-            let nextScale = currentZoom.scale * factor
-            let next = currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor)
-            commit(next)
-        }
-    }
-
-    /// Cursor position normalized to [0,1] in view bounds.
-    private func cursorInBounds(_ event: NSEvent) -> CGPoint {
-        let p = convert(event.locationInWindow, from: nil)
-        let x = bounds.width > 0 ? p.x / bounds.width : 0.5
-        let y = bounds.height > 0 ? (bounds.height - p.y) / bounds.height : 0.5
-        return CGPoint(x: max(0, min(1, x)), y: max(0, min(1, y)))
+        guard let next = ZoomGesture.nextZoom(forScrollWheel: event, in: self, currentZoom: currentZoom) else { return }
+        commit(next)
     }
 
     private func commit(_ zoom: Zoom) {
@@ -293,5 +250,62 @@ struct MPVPlayerView: NSViewRepresentable {
         // internal mirror diverges from Workspace state at clamp boundaries
         // and the next gesture computes from stale state. (Reviewer finding 8.)
         nsView.setCurrentZoom(currentZoom)
+    }
+}
+
+/// Static helpers shared by `MPVRenderingNSView` (scanning-mode source view)
+/// and `DrawingOverlayView` (recording-mode overlay). Both surfaces need to
+/// produce the same Zoom from the same NSEvents so the user's scroll/pinch/
+/// pan gestures behave identically before and after R-press. The recording
+/// drawing overlay sits ON TOP of the MPV view, so without these forwarded
+/// to the overlay, scroll/pinch events die at the overlay (siblings in a
+/// ZStack don't share events).
+@MainActor
+enum ZoomGesture {
+    /// Cursor position normalized to [0,1] with origin at top-left.
+    /// Both call sites have `isFlipped == false`, so we flip Y here.
+    static func cursor(in view: NSView, event: NSEvent) -> CGPoint {
+        let p = view.convert(event.locationInWindow, from: nil)
+        let bw = view.bounds.width
+        let bh = view.bounds.height
+        let x = bw > 0 ? p.x / bw : 0.5
+        let y = bh > 0 ? (bh - p.y) / bh : 0.5
+        return CGPoint(x: max(0, min(1, x)), y: max(0, min(1, y)))
+    }
+
+    /// Compute the next zoom for a scroll-wheel event.
+    /// `hasPreciseScrollingDeltas == true` → trackpad two-finger swipe →
+    /// pan (no-op at scale=1.0, returns nil).
+    /// `false` → coarse mouse wheel → cursor-pivoted zoom.
+    /// Direction matches Maps/Safari/Final Cut: deltaY>0 = away from user
+    /// = zoom in. macOS's natural-scrolling preference is already baked into
+    /// scrollingDeltaY.
+    static func nextZoom(forScrollWheel event: NSEvent, in view: NSView, currentZoom: Zoom) -> Zoom? {
+        if event.hasPreciseScrollingDeltas {
+            guard currentZoom.scale > 1.0 else { return nil }
+            let viewW = max(1, view.bounds.width)
+            let viewH = max(1, view.bounds.height)
+            let dx = -event.scrollingDeltaX / (viewW * currentZoom.scale)
+            let dy = -event.scrollingDeltaY / (viewH * currentZoom.scale)
+            return Zoom(
+                scale: currentZoom.scale,
+                panX: currentZoom.panX + dx,
+                panY: currentZoom.panY + dy
+            )
+        } else {
+            let step = 0.1
+            let factor = 1.0 + step * (event.scrollingDeltaY > 0 ? 1.0 : -1.0)
+            let nextScale = currentZoom.scale * factor
+            return currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor(in: view, event: event))
+        }
+    }
+
+    /// Compute the next zoom for a trackpad pinch event. The 3x sensitivity
+    /// multiplier brings per-event magnification (typical 0.001–0.02) into
+    /// a perceptible scale change comparable to Maps/Photos pinch.
+    static func nextZoom(forMagnify event: NSEvent, in view: NSView, currentZoom: Zoom) -> Zoom {
+        let sensitivity: CGFloat = 3.0
+        let nextScale = currentZoom.scale * (1.0 + event.magnification * sensitivity)
+        return currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor(in: view, event: event))
     }
 }

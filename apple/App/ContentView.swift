@@ -265,14 +265,17 @@ struct ContentView: View {
                     }
                     if appMode == .recording {
                         // Drawing overlay sits between the player and the key
-                        // monitor — clicks/drags here become strokes; everything
-                        // else (keyboard) keeps falling through.
+                        // monitor — clicks/drags here become strokes; scroll/
+                        // pinch are forwarded to currentZoom so the user can
+                        // still zoom and pan the source while recording.
                         DrawingOverlay(
                             autoClearAfterSeconds: autoClearStrokes ? 5.0 : nil,
                             onStrokeFinished: { stroke in
                                 recordingController?.appendStroke(stroke)
                             },
-                            clearAllToken: drawingClearToken
+                            clearAllToken: drawingClearToken,
+                            currentZoom: workspace.currentZoom,
+                            onZoomChange: { newZoom in workspace.currentZoom = newZoom }
                         )
                     }
                     KeyCommandView(

@@ -12,11 +12,19 @@ struct DrawingOverlay: NSViewRepresentable {
     /// `updateNSView` whenever any property changes; we only call
     /// `clearAll()` when this counter actually moved.
     var clearAllToken: Int
+    /// Workspace-canonical zoom state, mirrored into the overlay so its
+    /// scroll/pinch gestures can compute deltas. The overlay sits on top of
+    /// the MPV view during recording, so without this it'd block all zoom/
+    /// pan input.
+    var currentZoom: Zoom
+    var onZoomChange: (Zoom) -> Void
 
     func makeNSView(context: Context) -> DrawingOverlayView {
         let v = DrawingOverlayView(frame: .zero)
         v.autoClearAfterSeconds = autoClearAfterSeconds
         v.onStrokeFinished = onStrokeFinished
+        v.onZoomChange = onZoomChange
+        v.setCurrentZoom(currentZoom)
         context.coordinator.lastClearToken = clearAllToken
         return v
     }
@@ -24,6 +32,8 @@ struct DrawingOverlay: NSViewRepresentable {
     func updateNSView(_ v: DrawingOverlayView, context: Context) {
         v.autoClearAfterSeconds = autoClearAfterSeconds
         v.onStrokeFinished = onStrokeFinished
+        v.onZoomChange = onZoomChange
+        v.setCurrentZoom(currentZoom)
         if context.coordinator.lastClearToken != clearAllToken {
             v.clearAll()
             context.coordinator.lastClearToken = clearAllToken

@@ -16,6 +16,15 @@ final class DrawingOverlayView: NSView {
     var onStrokeFinished: (Stroke) -> Void = { _ in }
     var autoClearAfterSeconds: Double? = 5.0
 
+    /// Forwarded zoom state. The recording overlay covers the MPV view, so
+    /// without these the user can't zoom or pan during recording — events
+    /// don't propagate sideways to the MPV view in AppKit. Updated from the
+    /// SwiftUI representable's `updateNSView` and from local commits during
+    /// continuous gestures.
+    var onZoomChange: ((Zoom) -> Void)?
+    private var currentZoom: Zoom = .identity
+    func setCurrentZoom(_ zoom: Zoom) { currentZoom = zoom }
+
     private struct InProgress {
         var startedAt: TimeInterval
         var points: [StrokePoint]
@@ -137,6 +146,21 @@ final class DrawingOverlayView: NSView {
         for layer in liveLayers.values { layer.removeFromSuperlayer() }
         CATransaction.commit()
         liveLayers.removeAll()
+    }
+
+    override func magnify(with event: NSEvent) {
+        commitZoom(ZoomGesture.nextZoom(forMagnify: event, in: self, currentZoom: currentZoom))
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let next = ZoomGesture.nextZoom(forScrollWheel: event, in: self, currentZoom: currentZoom) else { return }
+        commitZoom(next)
+    }
+
+    private func commitZoom(_ zoom: Zoom) {
+        let clamped = zoom.clamped()
+        currentZoom = clamped
+        onZoomChange?(clamped)
     }
 
     private func pointFromView(_ p: NSPoint, sinceStart strokeT: Double) -> StrokePoint {
