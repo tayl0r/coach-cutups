@@ -914,9 +914,9 @@ disposable UI state — same UX as every other export pref today.
 
 ## Closeout — Phase 11 Plan #6 SHIPPED 2026-05-02
 
-**CI run**: pending green on all 4 jobs (`test (ubuntu-latest)`, `test
-(windows-latest)`, `test (macos-latest)`, `media-tests`); run id and
-final SHA recorded in PROGRESS.txt at CI green.
+**CI run**: green on all 4 jobs (`test (ubuntu-latest)`, `test
+(windows-latest)`, `test (macos-latest)`, `media-tests`); run id
+`25271923384` (closeout commit `bb477b6`).
 
 ### Commits (in shipping order)
 

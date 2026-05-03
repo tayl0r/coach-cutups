@@ -562,7 +562,7 @@ own SHIPPED line + CI run id once green.
         frames byte-for-byte. +316 LOC.
 - [ ] Plan #5: per-frame pipeline rebuild optimization
 - [x] Plan #6: resume failed exports (tag-level resume on PartialFailure)
-      SHIPPED 2026-05-02. CI run pending green on all 4 jobs.
+      SHIPPED 2026-05-02. CI run 25271923384 green on all 4 jobs.
       Phase 10 ships "failure deletes the partial output and returns to
       the form" — no resume. Plan #6 adds tag-level resume: when a batch
       export fails partway through (PartialFailure outcome), the user
