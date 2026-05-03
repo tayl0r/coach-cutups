@@ -147,6 +147,11 @@ public actor CompilationExporter {
                 let segDur = CMTime(seconds: segment.outDuration, preferredTimescale: 600)
                 defer { compositionCursor = compositionCursor + segDur }
                 guard segment.kind == .play else { continue }
+                // Sub-tick (sub-1.67ms) segments — typical of two events fired
+                // within the same gesture frame from a continuous zoom/pinch —
+                // round to 0 CMTime ticks at timescale 600. AVFoundation rejects
+                // empty insertTimeRange with -11800/-12780, so skip the insert.
+                guard segDur > .zero else { continue }
                 let srcRange = CMTimeRange(
                     start: CMTime(seconds: segment.sourceStart, preferredTimescale: 600),
                     duration: segDur
