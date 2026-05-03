@@ -4697,6 +4697,46 @@ mod tests {
         }
     }
 
+    #[test]
+    fn export_command_with_invalid_overwrite_policy_returns_serde_error() {
+        // Code-review fix F12. `#[serde(default = ...)]` only fires when
+        // the field is *absent*; a present-but-unknown variant string
+        // (typo like `"skip"`, future-Plan variant like `"fastResume"`,
+        // legacy harness client sending Phase-10-era nonsense) returns
+        // a `serde_json::Error` rather than panicking or silently
+        // falling back to the default. This test pins that contract so
+        // future contributors know the failure mode users see.
+        //
+        // Matches the upstream serde behavior for
+        // `Resolution`/`Quality`/`Codec` enums — they all fail the same
+        // way on unknown variants. If we ever decide to soften this
+        // (e.g. via `#[serde(other)]` on a fallback variant) this test
+        // will FAIL and force a deliberate update.
+        let json = r#"{
+            "cmd": "export_compilations",
+            "selections": [{"kind": "all_clips"}],
+            "output_folder": "/tmp/exports",
+            "resolution": "r720",
+            "quality": "low",
+            "codec": "h264",
+            "project_name": "InvalidVariant",
+            "filename_template": "{tag} - {project}",
+            "overwrite_policy": "invalidVariant"
+        }"#;
+        let result: Result<Command, _> = serde_json::from_str(json);
+        let err = result.expect_err(
+            "expected unknown overwrite_policy variant to return a serde error, not panic or silently default",
+        );
+        // Upstream serde error message includes the offending variant.
+        // We match loosely (variant name appears) so cosmetic message
+        // tweaks across serde versions don't break the test.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalidVariant") || msg.contains("variant"),
+            "expected serde error to mention the unknown variant; got: {msg}",
+        );
+    }
+
     // ── Phase 11 Plan #6 Task 1 — output_exists_and_intact unit tests ──
     //
     // Helpers below write synthetic mp4-shaped fixtures to disk; the
