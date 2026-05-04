@@ -82,11 +82,11 @@ const AUDIO_RATE: u32 = 48_000;
 const AUDIO_CHANNELS: u32 = 2;
 const AUDIO_BYTES_PER_SAMPLE: usize = 4 * 2; // F32 × 2 channels
 
-// Phase 11 Plan #1 Task 1a (adv-fix #1): cap each AudioSampleQueue at ~4s of
+// Phase 11 Plan #1 (adv-fix #1): cap each AudioSampleQueue at ~4s of
 // decoded audio so a fast `sync=false` source decoder running well above
 // real-time on Apple Silicon hw can't accumulate 50-150 MB of decoded
-// samples before the driver consumes them. Consumer lands in Task 1b.
-#[allow(dead_code)]
+// samples before the driver consumes them. Enforced by
+// `push_into_queue_capped` (drops oldest sample-aligned bytes on overflow).
 const MAX_QUEUED_BYTES: usize = 4 * (AUDIO_RATE as usize) * AUDIO_BYTES_PER_SAMPLE;
 // Source audio appsink internal buffer ceiling. Combined with
 // MAX_QUEUED_BYTES this back-pressures the upstream decoder.
@@ -157,19 +157,20 @@ pub fn export_compilation(
     resolution: Resolution,
     quality: Quality,
     codec: Codec,
-    source_volume: f64, // Phase 11 Plan #1 Task 1a: read+clamp here; mix consumption in Task 1b
-    commentary_volume: f64, // Phase 11 Plan #1 Task 1a: read+clamp here; mix consumption in Task 1b
+    source_volume: f64,
+    commentary_volume: f64,
     compositor: Arc<Compositor>,
     cancel: Arc<AtomicBool>,
     on_progress: Box<dyn Fn(ExportProgress) + Send + Sync>,
 ) -> Result<ExportSummary, ExportError> {
     crate::init().map_err(|e| ExportError::Construction(e.to_string()))?;
 
-    // Defensive clamp; UI also clamps. The actual mix consumption ships in
-    // Phase 11 Plan #1 Task 1b — for now Task 1a only reads + clamps so
-    // signature wiring through bus.rs doesn't go stale.
-    let _source_volume = source_volume.clamp(0.0, 1.0);
-    let _commentary_volume = commentary_volume.clamp(0.0, 1.0);
+    // Defensive clamp; UI also clamps. Phase 11 Plan #1 Task 1b consumes
+    // these in `push_audio_for_window` to mix source + commentary streams.
+    // adv-fix #6: collapse f64 → f32 exactly once at this boundary so the
+    // entire downstream mix chain is f32 without silent precision loss.
+    let source_volume_f32 = source_volume.clamp(0.0, 1.0) as f32;
+    let commentary_volume_f32 = commentary_volume.clamp(0.0, 1.0) as f32;
 
     if inputs.plan.entries.is_empty() {
         return Err(ExportError::Plan("plan has no entries".into()));
@@ -290,6 +291,18 @@ pub fn export_compilation(
         audio_buffer_queues.insert(*clip_id, q);
     }
 
+    // Phase 11 Plan #1 Task 1b: per-source-index audio queue, parallel to
+    // the per-clip commentary queue map above. The source audio appsink is
+    // built dynamically by decodebin's pad-added handler during preroll, so
+    // we read it AFTER `pipeline.set_state(Paused) + state(...)` below has
+    // completed preroll. To keep the ordering simple — and because attach_
+    // audio_sample_queue is idempotent (it just (re)installs callbacks) — we
+    // try here BEFORE preroll: if the cell already holds an AppSink, attach
+    // immediately; otherwise defer to AFTER preroll. The actual attach loop
+    // runs after preroll where every source that surfaced an audio pad is
+    // visible.
+    let mut source_audio_queues: HashMap<usize, Arc<Mutex<AudioSampleQueue>>> = HashMap::new();
+
     // ── Step 7: Set pipeline to PAUSED + wait. All chains preroll. ──
     // Per fix #27: PAUSED is the safe baseline; we transition the active
     // entry's chains to PLAYING below, leave others paused.
@@ -297,6 +310,25 @@ pub fn export_compilation(
         .set_state(gstreamer::State::Paused)
         .map_err(|e| ExportError::StateChange(format!("preroll: {e:?}")))?;
     let (_, _, _) = pipeline.state(gstreamer::ClockTime::from_seconds(10));
+
+    // Phase 11 Plan #1 Task 1b: now that preroll is complete, every source
+    // chain that surfaced an audio pad has its `audio_appsink` cell populated
+    // (per build_source_video_chain's pad-added handler). Attach a sample
+    // queue per source_index for those that have audio. Sources with no
+    // audio track simply have no entry in this map; the mix function
+    // zero-fills their slot.
+    for (idx, chain) in &source_chains {
+        let appsink_opt = chain
+            .audio_appsink
+            .lock()
+            .expect("source audio appsink cell")
+            .clone();
+        if let Some(appsink) = appsink_opt {
+            let q = Arc::new(Mutex::new(AudioSampleQueue::default()));
+            attach_audio_sample_queue(&appsink, q.clone());
+            source_audio_queues.insert(*idx, q);
+        }
+    }
 
     // Move the WHOLE pipeline to PLAYING so the output chain (appsrc →
     // encoder → qtmux → filesink) is in PLAYING — it has no entry-aware
@@ -327,6 +359,9 @@ pub fn export_compilation(
         source_slots: &source_slots,
         webcam_slots: &webcam_slots,
         audio_buffer_queues: &audio_buffer_queues,
+        source_audio_queues: &source_audio_queues,
+        source_volume: source_volume_f32,
+        commentary_volume: commentary_volume_f32,
         video_appsrc: video_appsrc.clone(),
         audio_appsrc: audio_appsrc.clone(),
         frozen_frames_by_entry: &frozen_frames_by_entry,
@@ -560,9 +595,8 @@ struct SourceVideoChain {
     /// returned to the caller; the cell lets the closure publish the
     /// AppSink and the caller read it after `pipeline.state(...)` returns
     /// (i.e. after preroll). Outer `Option` stays `None` when the source
-    /// has no audio track. Plan #1 Task 1b will pull from this in the
-    /// driver loop.
-    #[allow(dead_code)]
+    /// has no audio track. Plan #1 Task 1b reads this after preroll
+    /// completes and attaches a sample queue per source_index.
     pub audio_appsink: Arc<Mutex<Option<gstreamer_app::AppSink>>>,
 }
 
@@ -1299,6 +1333,24 @@ struct AudioSampleQueue {
     bytes: Vec<u8>,
 }
 
+/// adv-fix #1: bound the queue at `MAX_QUEUED_BYTES` (~4s of decoded F32
+/// stereo at 48kHz, ~1.5 MB). Source decoders running well above real-time
+/// on Apple Silicon hw-decode can otherwise pile up 50-150 MB of decoded
+/// samples before the driver consumes them. On overflow we drop OLDEST
+/// bytes (sample-aligned) so the freshest data survives — losing a brief
+/// stale tail past the cap is the right trade for silence.
+fn push_into_queue_capped(queue: &Arc<Mutex<AudioSampleQueue>>, incoming: &[u8]) {
+    let mut q_locked = queue.lock().expect("audio queue lock");
+    q_locked.bytes.extend_from_slice(incoming);
+    if q_locked.bytes.len() > MAX_QUEUED_BYTES {
+        let drop_n = q_locked.bytes.len() - MAX_QUEUED_BYTES;
+        // Sample-align the drop so we never split a stereo F32 sample.
+        let drop_n = drop_n.div_ceil(AUDIO_BYTES_PER_SAMPLE) * AUDIO_BYTES_PER_SAMPLE;
+        let drop_n = drop_n.min(q_locked.bytes.len());
+        q_locked.bytes.drain(..drop_n);
+    }
+}
+
 fn attach_audio_sample_queue(appsink: &AppSink, queue: Arc<Mutex<AudioSampleQueue>>) {
     let queue_preroll = queue.clone();
     appsink.set_callbacks(
@@ -1307,11 +1359,7 @@ fn attach_audio_sample_queue(appsink: &AppSink, queue: Arc<Mutex<AudioSampleQueu
                 if let Ok(sample) = sink.pull_preroll() {
                     if let Some(buffer) = sample.buffer() {
                         if let Ok(map) = buffer.map_readable() {
-                            queue_preroll
-                                .lock()
-                                .expect("audio queue lock")
-                                .bytes
-                                .extend_from_slice(map.as_slice());
+                            push_into_queue_capped(&queue_preroll, map.as_slice());
                         }
                     }
                 }
@@ -1321,11 +1369,7 @@ fn attach_audio_sample_queue(appsink: &AppSink, queue: Arc<Mutex<AudioSampleQueu
                 let sample = sink.pull_sample().map_err(|_| gstreamer::FlowError::Eos)?;
                 if let Some(buffer) = sample.buffer() {
                     if let Ok(map) = buffer.map_readable() {
-                        queue
-                            .lock()
-                            .expect("audio queue lock")
-                            .bytes
-                            .extend_from_slice(map.as_slice());
+                        push_into_queue_capped(&queue, map.as_slice());
                     }
                 }
                 Ok(gstreamer::FlowSuccess::Ok)
@@ -1517,6 +1561,14 @@ struct DriverArgs<'a> {
     source_slots: &'a HashMap<usize, Arc<Mutex<Option<Frame>>>>,
     webcam_slots: &'a HashMap<Uuid, Arc<Mutex<Option<Frame>>>>,
     audio_buffer_queues: &'a HashMap<Uuid, Arc<Mutex<AudioSampleQueue>>>,
+    /// Phase 11 Plan #1 Task 1b: per-source-index audio queues for the
+    /// hand-rolled mix in `push_audio_for_window`. Sources with no audio
+    /// track have no entry; the mix zero-fills.
+    source_audio_queues: &'a HashMap<usize, Arc<Mutex<AudioSampleQueue>>>,
+    /// adv-fix #6: f32 end-to-end through the mix chain. Clamped to
+    /// `[0.0, 1.0]` at `export_compilation`'s entry boundary.
+    source_volume: f32,
+    commentary_volume: f32,
     video_appsrc: AppSrc,
     audio_appsrc: AppSrc,
     frozen_frames_by_entry: &'a HashMap<usize, HashMap<usize, Frame>>,
@@ -1537,6 +1589,9 @@ fn run_driver_loop(args: DriverArgs<'_>) -> Result<(), ExportError> {
         source_slots,
         webcam_slots,
         audio_buffer_queues,
+        source_audio_queues,
+        source_volume,
+        commentary_volume,
         video_appsrc,
         audio_appsrc,
         frozen_frames_by_entry,
@@ -1573,6 +1628,12 @@ fn run_driver_loop(args: DriverArgs<'_>) -> Result<(), ExportError> {
             .get(&entry.clip_id)
             .ok_or_else(|| ExportError::Plan(format!("clip not in map: {}", entry.clip_id)))?;
 
+        // Snapshot the outgoing source_index/clip_id BEFORE the transition
+        // for the unconditional drain below (adv-fix #2). transition_chains
+        // mutates `active_*` to the new values.
+        let prev_source_index = active_source_index;
+        let prev_clip_id = active_clip_id;
+
         // Two-stage entry transition (fix #20):
         //   (a) Pause prev source/webcam chains if they're not also the
         //       new active ones. (b) Seek + play new chains. (c) Reset
@@ -1587,11 +1648,27 @@ fn run_driver_loop(args: DriverArgs<'_>) -> Result<(), ExportError> {
             entry,
         )?;
 
-        // Drain any stale audio bytes from the new active clip's queue —
-        // pre-roll buffers may have accumulated bytes we don't want
-        // counted toward the entry's audio window.
-        if let Some(q) = audio_buffer_queues.get(&entry.clip_id) {
-            q.lock().expect("aq lock").bytes.clear();
+        // adv-fix #2: drain BOTH the source-audio and commentary queues for
+        // the OUTGOING and INCOMING source_index/clip_id, regardless of
+        // whether either changed. Two consecutive entries on the same
+        // source/clip with a Skip segment between them otherwise leave
+        // stale samples covering the OLD record_time window in the queue;
+        // the driver would read them as the NEW entry's first samples.
+        // The seek-flush refills within ~33ms; one frame of silence is
+        // inaudible. (Source-decoder seek policy is flush-on-entry-
+        // boundary, identical to webcam.)
+        for clip_id in prev_clip_id.iter().chain(std::iter::once(&entry.clip_id)) {
+            if let Some(q) = audio_buffer_queues.get(clip_id) {
+                q.lock().expect("aq lock").bytes.clear();
+            }
+        }
+        for src_idx in prev_source_index
+            .iter()
+            .chain(std::iter::once(&clip.source_index))
+        {
+            if let Some(q) = source_audio_queues.get(src_idx) {
+                q.lock().expect("src audio q lock").bytes.clear();
+            }
         }
 
         // Plan #4 Task 3 / Fix #48: pre_decode_all_freeze_frames keeps
@@ -1648,11 +1725,16 @@ fn run_driver_loop(args: DriverArgs<'_>) -> Result<(), ExportError> {
             push_video_frame(&video_appsrc, &composed, pts_ns, FRAME_DURATION_NS)?;
 
             // Audio for this frame's window: pull bytes equal to one frame's
-            // duration worth from the active clip's queue, push to shared
-            // audio appsrc with monotonic audio_pts_ns.
+            // duration worth from the active clip's commentary queue AND
+            // the active source's audio queue, mix sample-wise with the
+            // user-set volumes + soft-clip, push to the shared audio
+            // appsrc with monotonic audio_pts_ns.
             push_audio_for_window(
                 &audio_appsrc,
+                source_audio_queues.get(&clip.source_index),
                 audio_buffer_queues.get(&entry.clip_id),
+                source_volume,
+                commentary_volume,
                 &mut audio_pts_ns,
                 FRAME_DURATION_NS,
             )?;
@@ -1800,9 +1882,55 @@ fn push_video_frame(
     Ok(())
 }
 
+/// Pull `target_bytes` of F32LE stereo bytes from `queue`, drain the queue
+/// of what's read, zero-fill the tail if the queue ran short. Returns a
+/// freshly allocated `Vec<u8>` of exactly `target_bytes`. `target_bytes`
+/// MUST be a multiple of `AUDIO_BYTES_PER_SAMPLE` (8). When `queue` is
+/// `None`, returns an all-zero buffer of the requested length.
+fn drain_aligned_chunk(
+    queue: Option<&Arc<Mutex<AudioSampleQueue>>>,
+    target_bytes: usize,
+) -> Vec<u8> {
+    debug_assert_eq!(
+        target_bytes % AUDIO_BYTES_PER_SAMPLE,
+        0,
+        "target_bytes must be 8-byte aligned (F32LE stereo)"
+    );
+    let mut chunk = vec![0u8; target_bytes];
+    if let Some(q) = queue {
+        let mut q_locked = q.lock().expect("aq lock");
+        let take = q_locked.bytes.len().min(target_bytes);
+        // Sample-align the take so we never split a stereo F32 sample
+        // across two ticks (would cause cumulative drift).
+        let take = (take / AUDIO_BYTES_PER_SAMPLE) * AUDIO_BYTES_PER_SAMPLE;
+        if take > 0 {
+            chunk[..take].copy_from_slice(&q_locked.bytes[..take]);
+            q_locked.bytes.drain(..take);
+        }
+        // Remaining bytes (if any) stay zero (silence padding). Keeps
+        // PTS continuous when the upstream decoder hasn't delivered yet.
+    }
+    chunk
+}
+
+/// Soft-clip per F32 sample using `x / (1.0 + |x|)`. adv-fix #5: MUST be
+/// bit-identical across libm impls (macOS Accelerate vs Linux glibc);
+/// transcendentals like `tanh` are forbidden because their last-ULP
+/// results differ across platforms and would flake any future N-frame
+/// audio parity test. The rational approximation is a simple gentle
+/// soft-knee — v1's effective AVMutableComposition + AAC was a hard clip;
+/// this is gentler at the high end while staying deterministic.
+#[inline]
+fn soft_clip(x: f32) -> f32 {
+    x / (1.0 + x.abs())
+}
+
 fn push_audio_for_window(
     audio_appsrc: &AppSrc,
-    queue: Option<&Arc<Mutex<AudioSampleQueue>>>,
+    source_queue: Option<&Arc<Mutex<AudioSampleQueue>>>,
+    commentary_queue: Option<&Arc<Mutex<AudioSampleQueue>>>,
+    source_volume: f32,
+    commentary_volume: f32,
     audio_pts_ns: &mut u64,
     duration_ns: u64,
 ) -> Result<(), ExportError> {
@@ -1813,28 +1941,51 @@ fn push_audio_for_window(
     let bytes_per_second = (AUDIO_RATE as usize) * AUDIO_BYTES_PER_SAMPLE;
     let target_bytes =
         ((bytes_per_second as u128 * duration_ns as u128) / 1_000_000_000_u128) as usize;
-    // Keep it sample-aligned to AUDIO_BYTES_PER_SAMPLE so the encoder
-    // doesn't see a mid-sample buffer boundary.
+    // adv-fix #6: keep it 8-byte aligned (F32 stereo). The mix loop reads
+    // chunks_exact(4) twice per stereo sample and must never see a partial
+    // sample at the tail.
     let target_bytes = (target_bytes / AUDIO_BYTES_PER_SAMPLE) * AUDIO_BYTES_PER_SAMPLE;
     if target_bytes == 0 {
         return Ok(());
     }
 
-    // Pull from queue; pad with silence if not enough bytes available.
-    let mut chunk = vec![0u8; target_bytes];
-    if let Some(q) = queue {
-        let mut q_locked = q.lock().expect("aq lock");
-        let take = q_locked.bytes.len().min(target_bytes);
-        if take > 0 {
-            chunk[..take].copy_from_slice(&q_locked.bytes[..take]);
-            q_locked.bytes.drain(..take);
-        }
-        // Remaining bytes (if any) stay zero (silence padding). Keeps the
-        // output PTS continuous even when the recording's audio chain
-        // hasn't delivered yet (early-startup grace period).
+    // Pull both streams — zero-filled for missing/short queues. Both
+    // chunks are exactly `target_bytes` long, both 8-byte aligned.
+    let src_chunk = drain_aligned_chunk(source_queue, target_bytes);
+    let cmt_chunk = drain_aligned_chunk(commentary_queue, target_bytes);
+    debug_assert_eq!(src_chunk.len(), target_bytes);
+    debug_assert_eq!(cmt_chunk.len(), target_bytes);
+
+    // Hand-rolled per-sample mix. F32 throughout (adv-fix #6); soft-clip
+    // is the deterministic rational `x / (1+|x|)` (adv-fix #5).
+    //
+    // Volume = 0 case (adv-fix #4): we still mix and push. silence × 0 =
+    // silence, but the resulting buffer is non-empty `target_bytes` of
+    // zero F32s — qtmux's silent-track-rejection path is gated by buffer
+    // PRESENCE, not buffer content. No special branch.
+    let mut mix = vec![0u8; target_bytes];
+    for i in (0..target_bytes).step_by(4) {
+        let s = f32::from_le_bytes([
+            src_chunk[i],
+            src_chunk[i + 1],
+            src_chunk[i + 2],
+            src_chunk[i + 3],
+        ]);
+        let c = f32::from_le_bytes([
+            cmt_chunk[i],
+            cmt_chunk[i + 1],
+            cmt_chunk[i + 2],
+            cmt_chunk[i + 3],
+        ]);
+        let m = soft_clip(s * source_volume + c * commentary_volume);
+        let bytes = m.to_le_bytes();
+        mix[i] = bytes[0];
+        mix[i + 1] = bytes[1];
+        mix[i + 2] = bytes[2];
+        mix[i + 3] = bytes[3];
     }
 
-    let mut buf = gstreamer::Buffer::with_size(chunk.len())
+    let mut buf = gstreamer::Buffer::with_size(mix.len())
         .map_err(|e| ExportError::AppFlow(format!("alloc audio buffer: {e}")))?;
     {
         let buf_mut = buf
@@ -1843,7 +1994,7 @@ fn push_audio_for_window(
         let mut map = buf_mut
             .map_writable()
             .map_err(|e| ExportError::AppFlow(format!("audio buffer map: {e}")))?;
-        map.copy_from_slice(&chunk);
+        map.copy_from_slice(&mix);
         drop(map);
         buf_mut.set_pts(gstreamer::ClockTime::from_nseconds(*audio_pts_ns));
         buf_mut.set_duration(gstreamer::ClockTime::from_nseconds(duration_ns));
