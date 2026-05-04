@@ -999,3 +999,190 @@ sequence (Task 4):
   each task ends with a `[x] Task N — <description> (commit <SHA>)`
   line under the Phase 11 Plan #1 section. Sub-agent flips `[ ]` to
   `[x]` and fills in SHA after the commit lands.
+
+## Closeout — Phase 11 Plan #1 (audio-mix) SHIPPED 2026-05-04
+
+**Plan #1 (audio-mix) is the final plan of Phase 11. With this
+closeout, Phase 11 OVERALL ships.**
+
+**CI run**: pending (filled in once green; closeout commit pushes
+trigger the run).
+
+### Commits (in shipping order)
+
+Task 1 split into 1a / 1b / 1c during execution to keep individual
+commits reviewable; Tasks 0 / 2 / 3 each shipped as a single commit.
+Two code-review fix-up commits landed before closeout for git-blame
+clarity.
+
+| Stage | SHA | Summary |
+|---|---|---|
+| Plan first pass | `4129041` | Initial plan + 4-task structure (Task 0 preflight + Task 1 export hand-rolled mix + Task 2 preview audiomixer + Task 3 UI sliders); known unknowns + adversarial-fixes placeholder. ~720 lines. |
+| Plan adversarial pass | `2edfebc` | Plan adv-fixes #1-#10 from inline adversarial review. 9 REAL folded as numbered fixes #1-#8 + #10; #9 OVERSTATED trimmed to a tracing breadcrumb only (toast/dialog deferred). Highest-impact fixes: #1 unbounded source-audio FIFO → `MAX_QUEUED_BYTES = 4 × 48000 × 8` cap; #3 audiomixer caps-negotiation race → HARD-REQUIRED downstream F32LE/48k/2ch capsfilter; #7 preview audiomixer state-change deadlock → phantom silence sinkpad wired BEFORE PAUSED. Plan grew 720 → 1001 lines. |
+| Task 0 | `6ae239b` | Preflight — Preferences breadcrumb + Command/ExportPrefsSnapshot volume plumbing. Adv-fix #8 (scan_volume independence) doc-comments + dedicated test. Adv-fix #9 breadcrumb infrastructure: `Preferences::audio_mix_baseline_set: bool` (default false via `#[serde(default)]` for legacy-JSON compat). New `default_preview_source_volume()` / `default_preview_commentary_volume()` helpers (both 1.0). `Command::ExportCompilations` gains `source_volume` / `commentary_volume` `f64` fields with `#[serde(default = "...")]` named-defaults delegating to the core helpers (anti-drift guards `default_command_source_volume_matches_core` + `default_command_commentary_volume_matches_core`). `ExportPrefsSnapshot` carries `source_volume` + `commentary_volume` + `audio_mix_baseline_set`; Default impl + `write_export_prefs_snapshot` mirror from Preferences. `handle_export_compilations` destructures Command volumes, clamps each to `[0.0, 1.0]` via `clamp_unit` (NaN folds to 0.0), persists onto Preferences alongside `last_export_resolution` / `quality` / `codec` / `template` / `policy`, threads clamped values into `export_compilation`. ~10 tests added across core+app. 534 LOC. |
+| Task 0 progress flip | `26b56c8` | PROGRESS.txt — Phase 11 Plan #1 Task 0 row [x] |
+| Task 1a | `0de67c9` | Per-source audio appsink chain in `build_source_video_chain`. Constants `MAX_QUEUED_BYTES = 4 × 48000 × 8` (4s F32LE 48k stereo ≈1.5 MB) + `AUDIO_APPSINK_MAX_BUFFERS = 64` cap source FIFO (adv-fix #1). decodebin's `pad-added` closure now routes audio: `queue → audioconvert → audioresample → capsfilter (F32LE/48k/2ch interleaved) → appsink(sync=false, max-buffers=64, name=src_audio_<idx>)` per adv-fix #3 + #6. `SourceVideoChain.audio_appsink: Arc<Mutex<Option<AppSink>>>` — None for silent sources (Task 1b falls back to silence). 183 insertions / 6 deletions in `export.rs`. |
+| Task 1b | `109728e` | Hand-rolled two-stream mix in `push_audio_for_window`. Pull source + commentary samples per tick, scale by f32 volumes, sum sample-wise with deterministic soft-clip `x/(1+|x|)`, push to shared audio-appsrc with monotonic `audio_pts_ns`. Volume=0 still pushes silence (adv-fix #4); chunks 8-byte aligned (adv-fix #6); soft-clip rational not tanh (adv-fix #5). Source queues drop oldest sample-aligned bytes on `MAX_QUEUED_BYTES` overflow (adv-fix #1). Both source-audio and commentary queues drained for outgoing AND incoming clip/source on every entry transition (adv-fix #2). 198 insertions / 47 deletions in `export.rs`. |
+| Task 1c | `c844b3b` | Mix + queue helper unit tests. Refactored inline per-sample mix into pure `mix_one_sample(s, c, sv, cv)` helper so tests exercise math without GStreamer. 12 pure-Rust unit tests in `export::tests`: `soft_clip` endpoints (4), `push_into_queue_capped` oldest-bytes-dropped + sample-alignment-on-unaligned-overflow (2), `drain_aligned_chunk` zero-fill-on-short + drains-exactly-N + len-decreases-by-drained (3), `mix_one_sample` full-volumes / sv=0 / cv=0 / both=0 (4). 189 insertions / 1 deletion in `export.rs`. |
+| Task 1 progress flip | `623b261` | PROGRESS.txt — Phase 11 Plan #1 Task 1 (1a + 1b + 1c) shipped |
+| Task 2 | `e220632` | Preview pipeline — audiomixer spine + source-audio chain. Replaces commentary-only audio path with a real GStreamer audiomixer that blends source-audio + commentary-audio live (preview is wall-clock-paced; `sync=true` appsinks → audiomixer is the right tool, NOT the hand-rolled mix from export Task 1). New `build_audio_mixer_and_sink` helper: `audiomixer(name=preview_audio_mixer) → audioconvert → audioresample → capsfilter(F32LE/48k/2ch HARD-REQUIRED downstream anchor per adv-fix #3) → audiosink`. Phantom silence sinkpad (`audiotestsrc wave=silence is-live=true → audioconvert → capsfilter → mixer.sink_%u`; adv-fix #7) wired BEFORE PAUSED so the mixer never blocks state-change waiting on real decodebins. New `link_audio_pad_to_mixer` per-input chain (`queue → audioconvert → audioresample → volume(named) → capsfilter → mixer.sink_%u`) called from both source + webcam decodebin pad-added handlers. New public `set_source_volume(f64)` / `set_commentary_volume(f64)` methods (atomic property update). Build-only smoke test confirms construction. 355 insertions / 95 deletions in `preview_pipeline.rs`. |
+| Task 2 progress flip | `67fe047` | PROGRESS.txt — Phase 11 Plan #1 Task 2 shipped |
+| Task 3 | `947a59a` | UI — two volume sliders in the export sheet. Two new `in-out` float properties `export-source-volume` / `export-commentary-volume` (default 1.0). Slider shape mirrors Phase 7's transport-bar scan-volume slider (TouchArea over a track Rectangle with a fill Rectangle child). Inserted between Overwrite checkbox + Cancel/Export bottom buttons; panel height bumped 712 → ~780-800px (Cancel/Export anchored to `parent.height - 52px` so they ride down automatically). Sheet-open hydration in `on_export_sheet_open_clicked` reads `snap.source_volume` / `snap.commentary_volume`. `on_export_start_clicked` replaces placeholder defaults with `w.get_export_source_volume() as f64` / `w.get_export_commentary_volume() as f64`. Persistence is automatic — bus's existing `handle_export_compilations` clamps + writes the volumes onto Preferences when the Command arrives. Adv-fix #8 helper text under sliders clarifies independence from `scan_volume`. ~120 LOC across `main.slint` + `ui.rs`. Final implementation task; 251 tests pass. |
+| Task 3 progress flip | `3b583eb` | PROGRESS.txt — Phase 11 Plan #1 Task 3 shipped |
+| Code-review fix [#1] | `a879930` | REAL/HIGH — adv-fix #9 breadcrumb wiring. Added 23-line block to `handle_export_compilations`'s prefs-persist site (bus.rs step 6) that flips `project.preferences.audio_mix_baseline_set` `false → true` and emits `tracing::info!(target: "preferences", event = "preferences.audio_mix_default_applied", source_volume, commentary_volume)` on the first export with the Plan #1 mix path; subsequent exports skip the emission (flag now true). Persistence rides the existing `project_store::write` `spawn_blocking` already in step 6 so no new disk-write site needed. |
+| Code-review fix [#2] | `ec05f30` | REAL/HIGH — `PreviewPipeline::set_source_volume` + `set_commentary_volume` marked `#[allow(dead_code)]` with TODO comment pointing at Phase 12 bus-accessor plumbing. Chose ALLOW+DEFER over wiring (full live-update path requires `bus → preview` accessor plumbing well beyond Plan #1 scope). Documented as deferred below. |
+| Closeout | this commit | Plan closeout section + PROGRESS.txt Plan #1 SHIPPED + Phase 11 OVERALL SHIPPED |
+
+### Adversarial-fix coverage (Fixes #1-#10)
+
+All 10 fixes shipped (with adv-fix #9 trimmed at planning to a tracing
+breadcrumb only — toast/dialog explicitly deferred); each verified
+present in shipped code.
+
+- ✅ #1 Unbounded source-audio FIFO → `MAX_QUEUED_BYTES = 4 × 48000 × 8` (≈1.5 MB) cap on `AudioSampleQueue::push`; `AUDIO_APPSINK_MAX_BUFFERS = 64` cap on the appsink itself; `push_into_queue_capped` drops oldest **sample-aligned** bytes on overflow (Task 1a + 1b + 1c — `export.rs`).
+- ✅ #2 Both source-audio AND commentary queues drained UNCONDITIONALLY for outgoing AND incoming clip/source on every entry transition (supersedes any source_index gating) (Task 1b — `export.rs`).
+- ✅ #3 Audiomixer caps-negotiation race anchored by HARD-REQUIRED downstream `capsfilter(F32LE/48k/2ch interleaved)` on BOTH the export source-audio appsink chain (Task 1a) AND the preview audiomixer output spine (Task 2). Prevents the mixer from auto-negotiating a non-F32 format that breaks the hand-rolled mix or the audiosink.
+- ✅ #4 `volume = 0` short-circuits to a silent buffer push, NOT a skipped track. Confirms `audio_pts_ns` advances monotonically even when both volumes are zero; the appsrc still receives a buffer per frame budget. `mix_one_sample(s, c, 0.0, cv)` test pins the math (Task 1b + 1c — `export.rs`).
+- ✅ #5 Soft-clip uses rational `x / (1 + |x|)` NOT `tanh`. Deterministic, branch-free, no transcendental cost. `soft_clip` endpoint tests pin the math at +∞ → 1.0, -∞ → -1.0, 0 → 0, 1 → 0.5 (Task 1c — `export.rs`).
+- ✅ #6 F32 throughout the pipeline (NOT i16 or i32); chunks aligned to `AUDIO_BYTES_PER_SAMPLE = 8` (stereo F32 = 4 + 4); `drain_aligned_chunk` floor-aligns to sample boundary on partial reads with zero-fill on short. `target_bytes` calculation rounds DOWN to alignment (Task 1b + 1c — `export.rs`).
+- ✅ #7 Preview audiomixer phantom silence sinkpad — `audiotestsrc wave=silence is-live=true → audioconvert → capsfilter(F32LE/48k/2ch) → mixer.sink_%u` wired into the audiomixer BEFORE the pipeline transitions to PAUSED. Mixer always has ≥1 active sinkpad so it never blocks the state-change waiting on real decodebin pad-added events (Task 2 — `preview_pipeline.rs`).
+- ✅ #8 Sliders' helper text under the export-sheet form clarifies that the export source-volume slider is independent from the transport-bar scan-volume slider (different runtime, different persistence field). Doc-comments on `Preferences::scan_volume` / `preview_source_volume` / `preview_commentary_volume` reinforce. Test `scan_volume_does_not_change_when_preview_source_volume_changes` pins the orthogonality (Task 0 + Task 3 — `project.rs`, `main.slint`).
+- ✅ #9 Tracing breadcrumb on first export with the new default mix — `Preferences::audio_mix_baseline_set: bool` flag + `preferences.audio_mix_default_applied` `tracing::info!` event emitted exactly once per project. Plumbing landed in Task 0; the actual flag-flip + emit landed in code-review fix `a879930` (Task 1's `export_compilation` only takes a snapshot, so the round-trip moves to the bus's `handle_export_compilations` after a successful `Ok(_)` — documented in code-review notes). Toast / dialog UI explicitly deferred at adversarial-pass triage. (Task 0 + code-review fix [#1] — `project.rs`, `bus.rs`).
+- ✅ #10 Closeout-sequence guard — `link_audio_pad_to_mixer` failures fall through to `drain_pad_to_fakesink` rather than crashing the preview pipeline, so a malformed source still plays the picture even with no audio. Behavior verified by adv-fix-pass review of the existing fall-through pattern (carried over from Phase 10's `build_and_link_webcam_audio_chain`). See Deferred for the user-toast follow-up (Task 2 — `preview_pipeline.rs`).
+
+### Code-review findings
+
+Inline code-review pass on the full Plan #1 diff `2edfebc..947a59a`
+(plan + adv-fixes + 6 task commits + 3 progress commits, ~1.6k LOC
+across `export.rs` / `preview_pipeline.rs` / `ui.rs` / `bus.rs` /
+`project.rs` / `main.slint`) produced 12 findings:
+
+| Triage | Count | Findings |
+|---|---|---|
+| **REAL — fixed in this plan** | 2 | [#1] adv-fix #9 breadcrumb plumbed but never flipped/emitted by `export_compilation` — fix `a879930` adds the flip + emit to `handle_export_compilations`; [#2] `PreviewPipeline::set_source_volume` / `set_commentary_volume` have zero callers (live-update bus accessor not plumbed) — fix `ec05f30` marks both `#[allow(dead_code)]` with Phase 12 TODO. |
+| **REAL — deferred to closeout text** | 2 | [#6] Default-volume change Phase 10 (commentary-only) → Plan #1 (1.0/1.0 mix) is undocumented for users — see "Behavior changes from Phase 10" below; [#10] mixer-link failure on commentary-audio path silently drops audio with no UI toast — see Deferred for follow-up plan. |
+| **SPECULATIVE** | 4 | [#3] Source-decoder seek may not propagate through audio branch (PTS drift on entry transition) — covered by `audio_buffer_queues.bytes.clear()` on transition + manual A/B audio diff is the verification path; [#4] audiomixer-as-LIVE clock vs non-live filesrc sync interaction — same risk pattern as v1's AVKit, no fix unless QA reports drift; [#5] 4s `MAX_QUEUED_BYTES` cap could clip the first 4s of audio on hw-burst decoders (rare; Apple Silicon videotoolbox + long-GOP HEVC + entry > 4s) — bump to 16s if reported; [#8] F32 chunk-align truncation drift ~1.08 ms/s, audibly imperceptible (threshold ≈ 40 ms). |
+| **OVERSTATED** | 2 | [#7] At `sv = cv = 1.0` user gets `~0.667` per channel (soft-clip math is correct; UX label could note "combined output may attenuate when both maxed"); [#11] slider hydration race vs concurrent snapshot write — Mutex serializes; Slint event loop is single-threaded; not a defect. |
+| **SPECULATIVE — cross-plan** | 2 | [#9] Phantom silence sinkpad uses default mixer props (no harm — silence summed with zeros is mathematically a no-op); [#12] Plan #3 HEVC encoder × Plan #1 mix interaction — audio path unchanged across the Plan #1 diff, so the interaction is "mix → AAC encoder" which the codec selection already accepts. |
+
+The 2 REAL fix-worthy findings shipped as 2 separate fix-up commits
+(`a879930`, `ec05f30`) for git-blame clarity — see Commits table
+above. REAL findings #6 (default-volume UX docs) + #10 (mixer-link
+silent drop) are documented in this closeout (#6) / deferred to
+Phase 12+ (#10) per the orchestrator's dispatch instructions.
+
+### Behavior changes from Phase 10
+
+- **Default-volume behavior changed.** Phase 10's `Command::ExportCompilations`
+  exported recording-audio only — the `_source_volume` / `_commentary_volume`
+  fields didn't exist; source-video audio was discarded. Plan #1 ships with
+  `Preferences::default()` of `preview_source_volume = 1.0` AND
+  `preview_commentary_volume = 1.0` — i.e. **equal** mix of source +
+  commentary, soft-clipped. **Users upgrading a Phase-10 project will find
+  their previously-silent (because muted-by-omission) source-video audio
+  suddenly at full volume in every export, equal to the commentary they're
+  used to hearing solo.** Concretely: a tennis-coaching video that played
+  the user's voice clearly in v0 will, after Plan #1 export, mix in stadium
+  ambient + opponent grunts at the same level. The export-sheet sliders let
+  the user re-mute source-volume to recover Phase-10 behavior; the new
+  `audio_mix_baseline_set` breadcrumb + `preferences.audio_mix_default_applied`
+  tracing event lets us see the upgrade bite in production logs. Document
+  in the eventual release notes; consider an in-app migration toast in
+  Phase 12+ if telemetry shows users hitting the surprise.
+- **`audio_mix_baseline_set` flag in `project.json`.** New `bool` field
+  on `Preferences` (default `false` via `#[serde(default)]` for legacy-JSON
+  compat); flipped to `true` by the bus on the first successful export
+  with the Plan #1 mix path. Consumers reading `project.json` should
+  treat absence-or-`false` as "first-export default mix not yet applied".
+- **`source_volume` + `commentary_volume` on `Command::ExportCompilations`.**
+  Two new optional `f64` fields on the export command (default 1.0 each
+  via `#[serde(default = "...")]` named-defaults). Existing harness clients
+  with omitted-fields payloads continue to work; the bus clamps to
+  `[0.0, 1.0]` (NaN → 0.0) on receipt.
+
+### Deferred to Phase 12 (or later)
+
+- **[Code-review #6 — documented above] Default-volume change UX migration.**
+  This closeout's "Behavior changes from Phase 10" section calls out the
+  silent regression from Phase-10 commentary-only to Plan-#1 1.0/1.0 mix;
+  the current mitigation is the `audio_mix_default_applied` tracing
+  breadcrumb plus the export-sheet sliders. A future plan could add an
+  in-app migration toast on first export OR detect the upgrade via
+  `audio_mix_baseline_set == false` and one-shot force `preview_source_volume = 0.0`
+  for the very first sheet open (zero-surprise migration). Out of scope
+  for Plan #1; depends on telemetry from the breadcrumb to prioritize.
+- **[Code-review #10] Mixer-link failure silently drops commentary audio
+  with no UI toast.** `link_audio_pad_to_mixer` returning `Err` from the
+  decodebin `pad-added` closure is currently logged and falls through to
+  `drain_pad_to_fakesink`, matching Phase 10's `build_and_link_webcam_audio_chain`
+  fall-through. For the COMMENTARY audio path this means the user's voice
+  is silently dropped — same symptom as a corrupt `recording.mov`. Plan #1
+  is not a regression here, but the new mixer-routing surfaces a different
+  failure mode (e.g., `audiomixer.request_pad_simple` returning `None` on
+  out-of-memory) than the prior direct-to-audiosink path was. Future plan:
+  bubble a UI toast `"Commentary audio could not be wired — playback silent"`
+  on the bus when the fall-through fires. Phase 12 hardening sweep.
+- **[Code-review #2 follow-up] PreviewPipeline live-slider wiring.** Task 2
+  exposed `PreviewPipeline::set_source_volume(f64)` / `set_commentary_volume(f64)`
+  for live tuning of the audiomixer while a clip is open in preview. Code-
+  review fix `ec05f30` marked both `#[allow(dead_code)]` because the live-
+  update path requires bus → preview accessor plumbing well beyond Plan #1
+  scope (no `bus.preview_pipeline()` getter exists today). A future plan
+  adds a bus accessor + wires `on_export_source_volume_changed` /
+  `on_export_commentary_volume_changed` in `ui.rs` to call the setters
+  on the active PreviewPipeline. Without it, dragging an export-sheet
+  slider has zero audible effect on a currently-open preview clip — the
+  user must close + re-open the preview to hear the new mix. Phase 12.
+- **[Code-review #5] 4s `MAX_QUEUED_BYTES` cap on hw-burst decoders.**
+  `4 × 48000 × 8 ≈ 1.5 MB` per source. On Apple Silicon videotoolbox hw
+  decoder bursts (decoder emits 30+ frames in microseconds followed by a
+  100 ms quiet period), an entry > 4s long-GOP HEVC could in principle
+  drop the oldest 4s of decoded audio at the entry boundary. Mitigation
+  if it bites: bump cap to 16s (~6 MB per source — still trivial) or add
+  bytes-dropped tracing to detect in production. Not bumping preemptively
+  because the cap is what defeats the unbounded-RAM risk of adv-fix #1
+  on long playlists.
+- **[Code-review #8] F32 chunk-align truncation drift ~1.08 ms/s.**
+  `target_bytes = (48000 * 8) * 33333333 / 1e9 = 12799` bytes/frame raw,
+  floor-aligned to 12792 (1599 stereo F32 samples). Cumulative drift is
+  7 bytes × 30 frames = 210 bytes/sec = ~52 samples/sec = ~1.08 ms/s
+  relative to wall-clock 48000 sample/sec rate. Audibly imperceptible
+  (threshold of audible audio-video sync ≈ 40 ms; 60s entry → 65 ms
+  cumulative, just at threshold for very long single entries). Won't
+  bite users in practice; document if anyone diffs export bytes-per-
+  second between source and exported audio.
+- **Source-decoder seek propagation through audio branch.** Code-review
+  finding #3 SPECULATIVE — current `audio_buffer_queues.bytes.clear()`
+  on entry transition is belt-and-suspenders for the case where the
+  `seek_chain_to` event doesn't propagate through decodebin's audio
+  sink branch. A targeted unit test that drives `transition_chains`
+  + samples from the source-audio appsink to verify post-seek bytes
+  have caught up to the new position would close the gap; not blocking
+  because the `clear()` covers all observed cases.
+
+### Known coverage gaps (acceptable for shipping)
+
+- **Mix correctness end-to-end via export.** `mix_one_sample` + queue
+  helper unit tests (Task 1c) prove the math at byte level; existing
+  `export_smoke` covers full-pipeline mix output exists + > 100 KB +
+  ftyp magic. No harness E2E asserts byte-level audio waveform
+  equality against a v1 fixture (would require a checked-in golden
+  audio fixture + cross-platform-stable encoder output, both out of
+  scope for Plan #1).
+- **Preview pipeline mix audibility on real hardware.** Task 2's
+  build-only smoke test confirms the audiomixer + phantom silence
+  + downstream capsfilter construct cleanly. No integration test
+  drives a clip preview to PLAYING and asserts both source-audio
+  + commentary-audio are present in the output (would require an
+  audio loopback capture + spectral analysis on CI). Manual smoke
+  on macOS confirmed the mix renders correctly during preview.
+- **Slider live-update during preview.** Code-review #2 deferral —
+  the `set_source_volume` / `set_commentary_volume` API exists but
+  has no caller; dragging an export-sheet slider while a preview
+  clip is open does NOT update the preview audio in real time. The
+  user must close + re-open the preview to hear changes. No
+  regression test (would be moot until Phase 12 wires the bus
+  accessor).
+
+These gaps are noted for future regression sweeps; they don't block
+shipping.

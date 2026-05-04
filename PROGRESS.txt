@@ -392,6 +392,8 @@ docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
 
 
 ## Phase 11 — Polish + deferred items from Phase 10 closeout
+SHIPPED 2026-05-04. All 8 plans landed. Plan #3 (audio-mix) was the
+final plan; CI run pending (filled in once green).
 Plans dispatched per `/tmp/phase11-plans/orchestrator-prompt.md` state-
 machine processor; one plan per deferred item. Each plan ships a slug
 under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
@@ -501,11 +503,12 @@ own SHIPPED line + CI run id once green.
         progress fields). Deferred: Windows mfh264enc cold-start
         position-query overlay → Phase 11+.
   - Closeout: <SHA — this commit>
-- [ ] Plan #3: source/commentary audio mix in export + preview
+- [x] Plan #3: source/commentary audio mix in export + preview
+      SHIPPED 2026-05-04. CI run pending (filled in once green).
       Restores v1's source-volume + commentary-volume audio mix in batch
-      export AND clip preview. Phase 10 fix #8 deferred this; current
-      behavior is RECORDING-AUDIO-ONLY. Plan: docs/plans/2026-05-01-rust-
-      rewrite-phase-11-audio-mix.md
+      export AND clip preview. Phase 10 fix #8 deferred this; previous
+      behavior was RECORDING-AUDIO-ONLY. Plan: docs/plans/2026-05-01-
+      rust-rewrite-phase-11-audio-mix.md
   - [x] Task 0: Preflight — Preferences breadcrumb + Command/
         ExportPrefsSnapshot volume plumbing (commit 6ae239b)
         Data-plumbing-only preflight across video-coach-core::project +
@@ -630,7 +633,47 @@ own SHIPPED line + CI run id once green.
         crates/video-coach-app/ui/main.slint +
         crates/video-coach-app/src/ui.rs. ~120 LOC.
         Build/test/clippy/fmt all green.
-  - Closeout: <SHA — pending>
+  - [x] Code-review fix [#1]: adv-fix #9 breadcrumb wiring
+        (commit a879930). REAL/HIGH — added 23-line block in
+        handle_export_compilations's prefs-persist site (bus.rs step 6)
+        that flips project.preferences.audio_mix_baseline_set false→true
+        and emits tracing::info!(target: "preferences",
+        event = "preferences.audio_mix_default_applied", source_volume,
+        commentary_volume) on the FIRST export with the Plan #1 mix path;
+        subsequent exports skip the emission (flag now true). Persistence
+        rides the existing project_store::write spawn_blocking already
+        in step 6 so no new disk-write site needed.
+  - [x] Code-review fix [#2]: dead PreviewPipeline volume setters
+        (commit ec05f30). REAL/HIGH — PreviewPipeline::set_source_volume
+        + set_commentary_volume marked #[allow(dead_code)] with TODO
+        comment pointing at Phase 12 bus-accessor plumbing. Chose
+        ALLOW+DEFER over wiring (full live-update path requires
+        bus → preview accessor plumbing well beyond Plan #1 scope).
+        Documented as deferred in plan closeout.
+  - [x] Closeout: Plan #3 SHIPPED — appended to plan file (this commit);
+        plan adversarial-fix coverage 10/10 (all REAL folded as #1-#8 +
+        #10; #9 OVERSTATED trimmed at planning to a tracing breadcrumb
+        only — toast/dialog deferred). Code-review pass surfaced 12
+        findings (4 REAL, 4 SPECULATIVE, 2 OVERSTATED, 2 SPECULATIVE
+        cross-plan). Two REAL fixed in this plan via fix-up commits
+        a879930 (#1: adv-fix #9 breadcrumb flip + emit) + ec05f30
+        (#2: PreviewPipeline volume-setters #[allow(dead_code)] +
+        Phase 12 TODO). Two REAL deferred to closeout text per dispatch
+        instructions: #6 (Phase 10 → Plan #1 default-volume change from
+        commentary-only to 1.0/1.0 mix is a user-visible behavior change
+        — documented in plan closeout's "Behavior changes from Phase 10"
+        section for the eventual release notes; mitigation is the new
+        audio_mix_default_applied tracing breadcrumb + the export-sheet
+        sliders), #10 (mixer-link failure on commentary path silently
+        falls through to fakesink with no UI toast — Phase 12 hardening
+        sweep). SPECULATIVE #3/#4/#5/#8/#9/#12 + OVERSTATED #7/#11
+        rejected/deferred per triage. Verification battery green:
+        cargo build --workspace --features media; cargo test --workspace
+        --features media; cargo build --workspace; cargo test --workspace;
+        cargo build --workspace --no-default-features; cargo clippy
+        --workspace --all-targets --features media -- -D warnings; cargo
+        clippy --workspace --exclude video-coach-media --all-targets
+        -- -D warnings; cargo fmt --check.
 - [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
       SHIPPED 2026-05-01. CI run 25244914848 green on all 4 jobs.
       Three compositor performance optimizations all in
@@ -1002,11 +1045,13 @@ own SHIPPED line + CI run id once green.
         Guaranteed-quit shape (adv-fix #7). NO #[ignore] — runs
         end-to-end ~18s wall.
 
-## Phase 11 — pending
-Per the design doc:
+## Phase 11 — SHIPPED
+All 8 plans complete (Plans #1-#8 above). Per the design doc:
   Phase 11 Polish, packaging, cross-platform CI green
-Plus the Phase 10 closeout's deferred items: HEVC encoder, real progress
-percentage, source/commentary audio mix in export+preview, freeze-segment
-compose caching, per-frame pipeline rebuild optimization, VBO churn for
-strokes, resume failed exports, drag-reorder tag rows, custom filename
-templates.
+The Phase 10 closeout's deferred items all landed: HEVC encoder (Plan
+#1), real progress percentage (Plan #2), source/commentary audio mix in
+export+preview (Plan #3 — final plan), freeze-segment compose caching +
+per-frame pipeline rebuild optimization + VBO churn for strokes (Plan
+#4 compositor-perf), resume failed exports (Plan #6), drag-reorder tag
+rows + custom filename templates (Plan #7 export-ux-polish), plus
+defensive coverage hardening (Plan #5 + Plan #8).
