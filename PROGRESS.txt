@@ -536,6 +536,43 @@ own SHIPPED line + CI run id once green.
         round-trip, default-is-1.0, baseline-flag round-trip, drift
         guards, snapshot round-trip, legacy-payload defaulting,
         clamp-on-save). 534 LOC inserted; build/test/clippy/fmt green.
+  - [x] Task 1: Export pipeline — source-audio chain + hand-rolled
+        mixer (split into three sub-tasks 1a + 1b + 1c).
+        1a (commit 0de67c9): per-source audio appsink chain in
+        build_source_video_chain. Constants MAX_QUEUED_BYTES (4s F32LE
+        48k stereo ≈1.5 MB) + AUDIO_APPSINK_MAX_BUFFERS=64 cap source
+        FIFO (adv-fix #1). decodebin's pad-added closure now routes
+        audio: queue → audioconvert → audioresample → capsfilter
+        (F32LE/48k/2ch interleaved) → appsink(sync=false,
+        max-buffers=64, name=src_audio_<idx>) per adv-fix #3 (downstream
+        capsfilter normalizes format) + adv-fix #6 (F32 + chunk-aligned).
+        SourceVideoChain.audio_appsink: Arc<Mutex<Option<AppSink>>> —
+        None for silent sources (Task 1b falls back to silence).
+        export_compilation: source_volume/commentary_volume clamped to
+        [0.0, 1.0] at function top. Net 183 insertions/6 deletions in
+        export.rs.
+        1b (commit 109728e): hand-rolled two-stream mix in
+        push_audio_for_window. Pull source + commentary samples per
+        tick, scale by f32 volumes, sum sample-wise with deterministic
+        soft-clip x/(1+|x|), push to shared audio-appsrc with monotonic
+        audio_pts_ns. Volume=0 still pushes silence (adv-fix #4); chunks
+        8-byte aligned (adv-fix #6); soft-clip rational not tanh
+        (adv-fix #5). Source queues drop oldest sample-aligned bytes on
+        MAX_QUEUED_BYTES overflow (adv-fix #1). Both source-audio and
+        commentary queues drained for outgoing AND incoming clip/source
+        on every entry transition (adv-fix #2). Net 198 insertions/47
+        deletions in export.rs.
+        1c (commit c844b3b): mix + queue helper unit tests. Refactored
+        inline per-sample mix into pure mix_one_sample(s, c, sv, cv)
+        helper so tests exercise math without standing up GStreamer.
+        12 pure-Rust unit tests in export::tests: soft_clip endpoints
+        (4), push_into_queue_capped oldest-bytes-dropped +
+        sample-alignment-on-unaligned-overflow (2), drain_aligned_chunk
+        zero-fill-on-short + drains-exactly-N + len-decreases-by-drained
+        (3), mix_one_sample full-volumes/sv=0/cv=0/both=0 (4). No new
+        GStreamer pipeline tests — export_smoke covers full-pipeline mix
+        correctness, helpers cover math. Net 189 insertions/1 deletion
+        in export.rs. Build/test/clippy/fmt all green at 1c.
 - [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
       SHIPPED 2026-05-01. CI run 25244914848 green on all 4 jobs.
       Three compositor performance optimizations all in
