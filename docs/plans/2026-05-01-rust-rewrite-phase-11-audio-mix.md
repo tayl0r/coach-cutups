@@ -1005,8 +1005,8 @@ sequence (Task 4):
 **Plan #1 (audio-mix) is the final plan of Phase 11. With this
 closeout, Phase 11 OVERALL ships.**
 
-**CI run**: pending (filled in once green; closeout commit pushes
-trigger the run).
+**CI run**: 25328918418 green on all 4 jobs (closeout commit
+`eb2e3e7`).
 
 ### Commits (in shipping order)
 

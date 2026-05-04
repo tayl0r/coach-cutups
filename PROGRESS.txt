@@ -393,7 +393,7 @@ docs/plans/2026-05-01-rust-rewrite-phase-10-export-sheet.md
 
 ## Phase 11 — Polish + deferred items from Phase 10 closeout
 SHIPPED 2026-05-04. All 8 plans landed. Plan #3 (audio-mix) was the
-final plan; CI run pending (filled in once green).
+final plan; CI run 25328918418 green on all 4 jobs.
 Plans dispatched per `/tmp/phase11-plans/orchestrator-prompt.md` state-
 machine processor; one plan per deferred item. Each plan ships a slug
 under `docs/plans/2026-05-01-rust-rewrite-phase-11-<slug>.md` with its
@@ -504,7 +504,7 @@ own SHIPPED line + CI run id once green.
         position-query overlay → Phase 11+.
   - Closeout: <SHA — this commit>
 - [x] Plan #3: source/commentary audio mix in export + preview
-      SHIPPED 2026-05-04. CI run pending (filled in once green).
+      SHIPPED 2026-05-04. CI run 25328918418 green on all 4 jobs.
       Restores v1's source-volume + commentary-volume audio mix in batch
       export AND clip preview. Phase 10 fix #8 deferred this; previous
       behavior was RECORDING-AUDIO-ONLY. Plan: docs/plans/2026-05-01-
