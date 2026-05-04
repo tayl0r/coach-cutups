@@ -2844,6 +2844,29 @@ async fn handle_export_compilations(
         // persistence pattern.
         project.preferences.preview_source_volume = source_volume_clamped;
         project.preferences.preview_commentary_volume = commentary_volume_clamped;
+        // Phase 11 Plan #1 code-review fix #1 (adv-fix #9 follow-through):
+        // flip the audio-mix-baseline-set breadcrumb the first time an
+        // export runs with the Plan #1 mix path active, and emit a
+        // one-shot `preferences.audio_mix_default_applied` tracing event
+        // so we can see the Phase-10→Plan-#1 upgrade bite in production
+        // logs. The flag was plumbed through Preferences +
+        // `ExportPrefsSnapshot` by Task 0 but never flipped — finding #1
+        // in the code-review sweep. Subsequent exports skip the
+        // breadcrumb (the flag is now `true`). Doing the flip + emit at
+        // this persist site (rather than after the spawned export task
+        // returns) keeps the durable side-effect on the same disk write
+        // as the volume values themselves; the breadcrumb fires when the
+        // user has affirmatively kicked off an export with the new mix
+        // pipeline, which is what the Phase-10→Plan-#1 telemetry needs.
+        if !project.preferences.audio_mix_baseline_set {
+            tracing::info!(
+                target: "preferences",
+                event = "preferences.audio_mix_default_applied",
+                source_volume = source_volume_clamped,
+                commentary_volume = commentary_volume_clamped,
+            );
+            project.preferences.audio_mix_baseline_set = true;
+        }
         // Phase 11 Plan #3 Task 2 (fix #8): publish to the slot the UI
         // reads on subsequent sheet opens. Done before the spawn-blocking
         // disk write so a slow disk doesn't delay the in-memory snapshot.
