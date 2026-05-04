@@ -602,6 +602,35 @@ own SHIPPED line + CI run id once green.
         spine constructs with named mixer + downstream capsfilter +
         phantom sinkpad. Touched only crates/video-coach-media/src/
         preview_pipeline.rs. 355 insertions/95 deletions.
+  - [x] Task 3: UI — two volume sliders in the export sheet
+        (commit 947a59a — final implementation task; Plan #1
+        implementation complete pending closeout)
+        Adds Source-volume + Commentary-volume sliders to the export
+        sheet's Form view (Slint), bound to two new in-out float
+        properties export-source-volume / export-commentary-volume
+        (default 1.0). Slider shape mirrors Phase 7's transport-bar
+        scan-volume slider (TouchArea over a track Rectangle with a
+        fill Rectangle child). Inserted between Overwrite checkbox and
+        Cancel/Export bottom buttons; panel height bumped 712→~780-
+        800px (Cancel/Export anchored to parent.height - 52px so they
+        ride down automatically). Sheet-open hydration in ui.rs's
+        on_export_sheet_open_clicked extends to read snap.source_volume
+        / snap.commentary_volume from ExportPrefsSnapshot (fields
+        already present from Task 0). on_export_start_clicked replaces
+        the placeholder default_preview_source_volume() /
+        default_preview_commentary_volume() values with
+        w.get_export_source_volume() as f64 /
+        w.get_export_commentary_volume() as f64. Persistence is
+        automatic — the bus's existing handle_export_compilations
+        clamps + writes the volumes onto Preferences when the Command
+        arrives. Adv-fix #8 helper text under the sliders clarifies
+        independence from scan_volume. Optional live preview-side
+        updates via PreviewPipeline::set_source_volume /
+        set_commentary_volume (Task 2 added these). Touched ONLY
+        crates/video-coach-app/ui/main.slint +
+        crates/video-coach-app/src/ui.rs. ~120 LOC.
+        Build/test/clippy/fmt all green.
+  - Closeout: <SHA — pending>
 - [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
       SHIPPED 2026-05-01. CI run 25244914848 green on all 4 jobs.
       Three compositor performance optimizations all in
