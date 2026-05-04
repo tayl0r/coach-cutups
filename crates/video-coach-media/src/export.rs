@@ -48,6 +48,10 @@
 //!
 //! Phase 10 ships RECORDING AUDIO ONLY (fix #8). source_volume +
 //! commentary_volume parameters are accepted for forward-compat but unused.
+//!
+//! Phase 11 Plan #1 Task 1a: source-audio appsinks built per source_index
+//! (queue → audioconvert → audioresample → capsfilter F32LE/48k/2ch →
+//! appsink). Mix logic in Task 1b.
 
 #![allow(clippy::duplicated_attributes)]
 #![cfg(feature = "media")]
@@ -77,6 +81,16 @@ const FRAME_DURATION_NS: u64 = 33_333_333; // 30 fps pinned (fix #17 + #39)
 const AUDIO_RATE: u32 = 48_000;
 const AUDIO_CHANNELS: u32 = 2;
 const AUDIO_BYTES_PER_SAMPLE: usize = 4 * 2; // F32 × 2 channels
+
+// Phase 11 Plan #1 Task 1a (adv-fix #1): cap each AudioSampleQueue at ~4s of
+// decoded audio so a fast `sync=false` source decoder running well above
+// real-time on Apple Silicon hw can't accumulate 50-150 MB of decoded
+// samples before the driver consumes them. Consumer lands in Task 1b.
+#[allow(dead_code)]
+const MAX_QUEUED_BYTES: usize = 4 * (AUDIO_RATE as usize) * AUDIO_BYTES_PER_SAMPLE;
+// Source audio appsink internal buffer ceiling. Combined with
+// MAX_QUEUED_BYTES this back-pressures the upstream decoder.
+const AUDIO_APPSINK_MAX_BUFFERS: u32 = 64;
 
 #[derive(Debug, Error)]
 pub enum ExportError {
@@ -143,13 +157,19 @@ pub fn export_compilation(
     resolution: Resolution,
     quality: Quality,
     codec: Codec,
-    _source_volume: f64,     // fix #8: unused in Phase 10 (recording-only audio)
-    _commentary_volume: f64, // fix #8: unused in Phase 10
+    source_volume: f64, // Phase 11 Plan #1 Task 1a: read+clamp here; mix consumption in Task 1b
+    commentary_volume: f64, // Phase 11 Plan #1 Task 1a: read+clamp here; mix consumption in Task 1b
     compositor: Arc<Compositor>,
     cancel: Arc<AtomicBool>,
     on_progress: Box<dyn Fn(ExportProgress) + Send + Sync>,
 ) -> Result<ExportSummary, ExportError> {
     crate::init().map_err(|e| ExportError::Construction(e.to_string()))?;
+
+    // Defensive clamp; UI also clamps. The actual mix consumption ships in
+    // Phase 11 Plan #1 Task 1b — for now Task 1a only reads + clamps so
+    // signature wiring through bus.rs doesn't go stale.
+    let _source_volume = source_volume.clamp(0.0, 1.0);
+    let _commentary_volume = commentary_volume.clamp(0.0, 1.0);
 
     if inputs.plan.entries.is_empty() {
         return Err(ExportError::Plan("plan has no entries".into()));
@@ -534,6 +554,16 @@ struct SourceVideoChain {
     /// element (filesrc itself doesn't process them meaningfully).
     elements: Vec<gstreamer::Element>,
     video_appsink: AppSink,
+    /// Phase 11 Plan #1 Task 1a: audio sink for the source's decoded audio
+    /// pad. Wrapped in `Arc<Mutex<Option<...>>>` because decodebin's
+    /// `pad-added` is FnMut and fires during preroll AFTER this struct is
+    /// returned to the caller; the cell lets the closure publish the
+    /// AppSink and the caller read it after `pipeline.state(...)` returns
+    /// (i.e. after preroll). Outer `Option` stays `None` when the source
+    /// has no audio track. Plan #1 Task 1b will pull from this in the
+    /// driver loop.
+    #[allow(dead_code)]
+    pub audio_appsink: Arc<Mutex<Option<gstreamer_app::AppSink>>>,
 }
 
 fn build_source_video_chain(
@@ -597,6 +627,16 @@ fn build_source_video_chain(
         .ok_or_else(|| ExportError::Construction(format!("{label}: no queue sink")))?;
     let pipeline_weak = pipeline.downgrade();
     let label_owned = label.to_string();
+
+    // Phase 11 Plan #1 Task 1a: capture cell for the source's audio appsink.
+    // The decodebin pad-added closure is FnMut — it builds the audio chain
+    // when the audio pad surfaces and writes the AppSink back through this
+    // shared cell. After preroll, build_source_video_chain's caller reads
+    // it from `SourceVideoChain::audio_appsink`.
+    let audio_appsink_cell: Arc<Mutex<Option<AppSink>>> = Arc::new(Mutex::new(None));
+    let audio_appsink_cell_for_pad = audio_appsink_cell.clone();
+    let label_owned_pad = label_owned.clone();
+
     decodebin.connect_pad_added(move |_dbin, pad| {
         let Some(caps) = pad.current_caps() else {
             return;
@@ -609,20 +649,152 @@ fn build_source_video_chain(
             if let Err(e) = pad.link(&queue_sink) {
                 tracing::warn!(
                     target: "export.lifecycle",
-                    chain = %label_owned,
+                    chain = %label_owned_pad,
                     error = ?e,
                     "failed to link decoded source video pad",
                 );
             }
             return;
         }
-        // Non-video (audio): drain to fakesink so decodebin doesn't stall.
-        // Source audio is NOT used in Phase 10 (fix #8 — recording audio only).
+        if media.starts_with("audio/x-raw") || media.starts_with("audio/") {
+            // Phase 11 Plan #1 Task 1a: build the source audio chain
+            // dynamically (decodebin doesn't surface caps until prerolled),
+            // mirroring build_webcam_chain's audio path.
+            //   queue → audioconvert → audioresample
+            //     → capsfilter(F32LE,48k,2ch,interleaved)   (adv-fix #3 anchor)
+            //     → appsink(sync=false, max-buffers=AUDIO_APPSINK_MAX_BUFFERS)
+            // Task 1b will pull from the appsink in the driver loop. Until
+            // then nothing reads it — the queue cap (MAX_QUEUED_BYTES, used
+            // by Task 1b) plus AUDIO_APPSINK_MAX_BUFFERS bound the
+            // unconsumed-samples memory.
+            let Some(pipeline) = pipeline_weak.upgrade() else {
+                return;
+            };
+            let queue = match gstreamer::ElementFactory::make("queue")
+                .name(format!("{label_owned_pad}-aqueue"))
+                .build()
+            {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let aconv = match gstreamer::ElementFactory::make("audioconvert").build() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let aresample = match gstreamer::ElementFactory::make("audioresample").build() {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let acaps = match gstreamer::ElementFactory::make("capsfilter")
+                .name(format!("{label_owned_pad}-acaps"))
+                .property(
+                    "caps",
+                    gstreamer::Caps::from_str(&format!(
+                        "audio/x-raw,format=F32LE,channels={AUDIO_CHANNELS},rate={AUDIO_RATE},layout=interleaved"
+                    ))
+                    .unwrap(),
+                )
+                .build()
+            {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let aappsink_elem = match gstreamer::ElementFactory::make("appsink")
+                .name(format!("src_audio_{label_owned_pad}"))
+                .build()
+            {
+                Ok(e) => e,
+                Err(_) => return,
+            };
+            let aappsink = match aappsink_elem.clone().dynamic_cast::<AppSink>() {
+                Ok(a) => a,
+                Err(_) => {
+                    tracing::warn!(
+                        target: "export.lifecycle",
+                        chain = %label_owned_pad,
+                        "src audio appsink downcast failed",
+                    );
+                    return;
+                }
+            };
+            // sync=false: encoder-throttled, no wall-clock pacing (fix #4).
+            aappsink.set_property("sync", false);
+            aappsink.set_property("max-buffers", AUDIO_APPSINK_MAX_BUFFERS);
+            // Pin caps on the appsink itself too, single source of truth
+            // with the upstream capsfilter and the audio-appsrc caps.
+            let pinned_caps = gstreamer::Caps::from_str(&format!(
+                "audio/x-raw,format=F32LE,channels={AUDIO_CHANNELS},rate={AUDIO_RATE},layout=interleaved"
+            ))
+            .ok();
+            if let Some(c) = &pinned_caps {
+                aappsink.set_caps(Some(c));
+            }
+
+            if pipeline
+                .add_many([
+                    &queue,
+                    &aconv,
+                    &aresample,
+                    &acaps,
+                    aappsink.upcast_ref::<gstreamer::Element>(),
+                ])
+                .is_err()
+            {
+                tracing::warn!(target: "export.lifecycle", chain = %label_owned_pad, "src audio chain add failed");
+                return;
+            }
+            if gstreamer::Element::link_many([
+                &queue,
+                &aconv,
+                &aresample,
+                &acaps,
+                aappsink.upcast_ref::<gstreamer::Element>(),
+            ])
+            .is_err()
+            {
+                tracing::warn!(target: "export.lifecycle", chain = %label_owned_pad, "src audio chain link failed");
+                return;
+            }
+            for e in [
+                &queue,
+                &aconv,
+                &aresample,
+                &acaps,
+                aappsink.upcast_ref::<gstreamer::Element>(),
+            ] {
+                if e.sync_state_with_parent().is_err() {
+                    tracing::warn!(target: "export.lifecycle", chain = %label_owned_pad, "src audio elem sync_state failed");
+                }
+            }
+            let queue_sink = match queue.static_pad("sink") {
+                Some(p) => p,
+                None => return,
+            };
+            if let Err(e) = pad.link(&queue_sink) {
+                tracing::warn!(
+                    target: "export.lifecycle",
+                    chain = %label_owned_pad,
+                    error = ?e,
+                    "src audio pad link failed",
+                );
+                return;
+            }
+            // Publish the appsink so the caller can attach a sample queue
+            // in Task 1b. Overwrite is fine if pad-added somehow fires
+            // twice; the latest sink wins (decodebin shouldn't, but
+            // belt-and-suspenders).
+            *audio_appsink_cell_for_pad
+                .lock()
+                .expect("source audio appsink cell") = Some(aappsink);
+            return;
+        }
+        // Anything else (e.g. subtitles): drain to fakesink so decodebin
+        // doesn't stall.
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
         let fakesink = match gstreamer::ElementFactory::make("fakesink")
-            .name(format!("{label_owned}-aux-fakesink"))
+            .name(format!("{label_owned_pad}-aux-fakesink"))
             .property("sync", false)
             .property("async", false)
             .build()
@@ -650,9 +822,14 @@ fn build_source_video_chain(
         appsink.clone().upcast::<gstreamer::Element>(),
     ];
 
+    // The pad-added closure runs during preroll, AFTER this function
+    // returns. Hand the cell to the caller so it can read the published
+    // AppSink (or `None` for soundless sources) once
+    // `pipeline.state(...)` confirms preroll.
     Ok(SourceVideoChain {
         elements,
         video_appsink: appsink,
+        audio_appsink: audio_appsink_cell,
     })
 }
 
