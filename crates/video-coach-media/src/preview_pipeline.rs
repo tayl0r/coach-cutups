@@ -414,6 +414,9 @@ impl PreviewPipeline {
     /// is built lazily inside the source decoder's audio pad-added
     /// handler; if the source file has no audio, the element never
     /// exists and `by_name` returns None).
+    // Plan #1 Task 3 deferred wiring slider callbacks → live preview
+    // volume; defer to Phase 12 — bus accessor plumbing required.
+    #[allow(dead_code)]
     pub fn set_source_volume(&self, value: f64) {
         let v = value.clamp(0.0, 1.0);
         if let Some(volume) = self.pipeline.by_name("preview_source_vol") {
@@ -423,6 +426,9 @@ impl PreviewPipeline {
 
     /// Phase 11 Plan #1 Task 2: live-tune the commentary-side volume
     /// into the preview audiomixer. Same shape as `set_source_volume`.
+    // Plan #1 Task 3 deferred wiring slider callbacks → live preview
+    // volume; defer to Phase 12 — bus accessor plumbing required.
+    #[allow(dead_code)]
     pub fn set_commentary_volume(&self, value: f64) {
         let v = value.clamp(0.0, 1.0);
         if let Some(volume) = self.pipeline.by_name("preview_commentary_vol") {
