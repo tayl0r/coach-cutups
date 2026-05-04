@@ -1925,6 +1925,16 @@ fn soft_clip(x: f32) -> f32 {
     x / (1.0 + x.abs())
 }
 
+/// Per-sample stereo-channel mix used by `push_audio_for_window`. Pure
+/// math (no GStreamer) so unit tests can exercise it directly without
+/// standing up a pipeline. `s` and `c` are the source and commentary
+/// F32 sample values; `sv`/`cv` are the volume scalars (already clamped
+/// to [0.0, 1.0] at the f64→f32 boundary in `export_compilation`).
+#[inline]
+fn mix_one_sample(s: f32, c: f32, sv: f32, cv: f32) -> f32 {
+    soft_clip(s * sv + c * cv)
+}
+
 fn push_audio_for_window(
     audio_appsrc: &AppSrc,
     source_queue: Option<&Arc<Mutex<AudioSampleQueue>>>,
@@ -1977,7 +1987,7 @@ fn push_audio_for_window(
             cmt_chunk[i + 2],
             cmt_chunk[i + 3],
         ]);
-        let m = soft_clip(s * source_volume + c * commentary_volume);
+        let m = mix_one_sample(s, c, source_volume, commentary_volume);
         let bytes = m.to_le_bytes();
         mix[i] = bytes[0];
         mix[i + 1] = bytes[1];
@@ -2146,5 +2156,183 @@ mod tests {
         // floors to 12_799; then aligned to 8-byte boundary = 12_792 bytes.
         assert_eq!(target_bytes, 12_799);
         assert_eq!(aligned, 12_792);
+    }
+
+    // ─── Phase 11 Plan #1 Task 1c: mix + queue helper unit tests ───────────
+
+    /// Helper: build `n` interleaved F32 stereo samples, both channels at
+    /// the same value, encoded little-endian. Length = `n * 8` bytes.
+    fn make_f32_stereo_bytes(value: f32, n_samples: usize) -> Vec<u8> {
+        let mut out = Vec::with_capacity(n_samples * AUDIO_BYTES_PER_SAMPLE);
+        let bytes = value.to_le_bytes();
+        for _ in 0..n_samples {
+            out.extend_from_slice(&bytes); // L
+            out.extend_from_slice(&bytes); // R
+        }
+        out
+    }
+
+    // soft_clip math — `x / (1 + |x|)` is the rational soft-knee adv-fix #5
+    // pinned because tanh's last-ULP differs across libm impls.
+
+    #[test]
+    fn soft_clip_at_2_0_input_yields_2_over_3() {
+        // 2.0 / (1 + 2) = 0.66666...
+        let v = soft_clip(2.0);
+        assert!((v - 2.0_f32 / 3.0).abs() < 1e-6, "soft_clip(2.0) = {v}");
+    }
+
+    #[test]
+    fn soft_clip_at_negative_2_yields_negative_2_over_3() {
+        // -2.0 / (1 + 2) = -0.66666... ; sign preserved
+        let v = soft_clip(-2.0);
+        assert!((v + 2.0_f32 / 3.0).abs() < 1e-6, "soft_clip(-2.0) = {v}");
+    }
+
+    #[test]
+    fn soft_clip_at_zero_returns_zero() {
+        assert_eq!(soft_clip(0.0), 0.0);
+    }
+
+    #[test]
+    fn soft_clip_at_unity_returns_half() {
+        // 1 / (1 + 1) = 0.5 exactly
+        assert_eq!(soft_clip(1.0), 0.5);
+    }
+
+    // push_into_queue_capped — adv-fix #1: bounded at MAX_QUEUED_BYTES,
+    // drops sample-aligned chunks of OLDEST data on overflow.
+
+    #[test]
+    fn push_into_queue_capped_drops_oldest_at_overflow() {
+        let q = Arc::new(Mutex::new(AudioSampleQueue::default()));
+        // Push 1.5 × cap. Use distinguishable byte stamps per chunk so we
+        // can verify the OLDEST half was dropped (not the newest).
+        let chunk_bytes = MAX_QUEUED_BYTES / 2;
+        // Sample-align the chunk size so we don't mis-stamp.
+        let chunk_bytes = (chunk_bytes / AUDIO_BYTES_PER_SAMPLE) * AUDIO_BYTES_PER_SAMPLE;
+        let oldest = vec![0xAA_u8; chunk_bytes];
+        let middle = vec![0xBB_u8; chunk_bytes];
+        let newest = vec![0xCC_u8; chunk_bytes];
+        push_into_queue_capped(&q, &oldest);
+        push_into_queue_capped(&q, &middle);
+        push_into_queue_capped(&q, &newest);
+        let locked = q.lock().unwrap();
+        // After three half-cap pushes (1.5 × cap), queue must be exactly
+        // capped — drop_n was sample-aligned but our chunk size is too,
+        // so the boundary lands cleanly.
+        assert_eq!(
+            locked.bytes.len(),
+            MAX_QUEUED_BYTES,
+            "queue retained != cap"
+        );
+        // Newest 0xCC bytes survive at the tail.
+        assert_eq!(*locked.bytes.last().unwrap(), 0xCC);
+        // 0xAA (oldest) must be entirely gone — first byte should be 0xBB
+        // since we dropped one half-cap (the 0xAA half).
+        assert_eq!(locked.bytes[0], 0xBB);
+        assert!(!locked.bytes.contains(&0xAA), "oldest 0xAA bytes survived");
+    }
+
+    #[test]
+    fn push_into_queue_capped_preserves_sample_alignment_on_drop() {
+        // Force a non-aligned overflow: cap + 3 bytes pushed in one go.
+        // The drop must round UP to the next 8-byte boundary so the
+        // remainder stays sample-aligned (no half-stereo-sample artifact).
+        let q = Arc::new(Mutex::new(AudioSampleQueue::default()));
+        let big = vec![0xEE_u8; MAX_QUEUED_BYTES + 3];
+        push_into_queue_capped(&q, &big);
+        let locked = q.lock().unwrap();
+        // div_ceil(3, 8) = 1, so drop_n = 8 bytes; remaining =
+        // MAX_QUEUED_BYTES + 3 − 8 = MAX_QUEUED_BYTES − 5.
+        assert_eq!(locked.bytes.len(), MAX_QUEUED_BYTES - 5);
+        // And the surviving length must still be sample-aligned modulo
+        // the original push's alignment — we pushed an unaligned size, so
+        // verify the drop produced a result whose front-edge dropped a
+        // full 8-byte sample (i.e. not splitting one).
+        assert_eq!(
+            (MAX_QUEUED_BYTES + 3 - locked.bytes.len()) % AUDIO_BYTES_PER_SAMPLE,
+            0,
+            "drop boundary is not 8-byte aligned"
+        );
+    }
+
+    // drain_aligned_chunk — pulls target_bytes (or all available, sample-
+    // aligned) from the queue, zero-fills tail.
+
+    #[test]
+    fn drain_aligned_chunk_returns_n_bytes_or_less() {
+        // When queue has < N: result still has length N (zero-padded).
+        let q = Arc::new(Mutex::new(AudioSampleQueue::default()));
+        push_into_queue_capped(&q, &make_f32_stereo_bytes(0.25, 4)); // 32 bytes
+        let out = drain_aligned_chunk(Some(&q), 80); // ask for 80
+        assert_eq!(out.len(), 80, "result must always be target_bytes long");
+        // Tail zero-filled past byte 32.
+        assert!(out[32..].iter().all(|&b| b == 0), "tail not zero-filled");
+
+        // When queue has ≥ N: returns exactly N (drains aligned).
+        let q2 = Arc::new(Mutex::new(AudioSampleQueue::default()));
+        push_into_queue_capped(&q2, &make_f32_stereo_bytes(0.25, 20)); // 160 bytes
+        let out2 = drain_aligned_chunk(Some(&q2), 80);
+        assert_eq!(out2.len(), 80);
+        // None of out2 should be the zero-fill marker — all 80 bytes came
+        // from the queue's payload (0.25 little-endian repeating).
+        let payload_bytes = 0.25_f32.to_le_bytes();
+        assert_eq!(&out2[0..4], &payload_bytes);
+    }
+
+    #[test]
+    fn drain_aligned_chunk_consumes_from_queue() {
+        let q = Arc::new(Mutex::new(AudioSampleQueue::default()));
+        push_into_queue_capped(&q, &make_f32_stereo_bytes(0.5, 20)); // 160 bytes
+        let before = q.lock().unwrap().bytes.len();
+        assert_eq!(before, 160);
+        drop(drain_aligned_chunk(Some(&q), 80)); // drains 80
+        let after = q.lock().unwrap().bytes.len();
+        assert_eq!(after, before - 80, "queue not drained by drain amount");
+    }
+
+    // mix_one_sample — pure math used by push_audio_for_window's per-
+    // sample loop. Exercises the volume mix + soft-clip composition.
+
+    #[test]
+    fn mix_at_full_volumes_sums_then_clips() {
+        // s=0.6, c=0.6, sv=cv=1.0 → soft_clip(1.2) = 1.2/(1+1.2) = 0.5454…
+        let m = mix_one_sample(0.6, 0.6, 1.0, 1.0);
+        let expected = 1.2_f32 / 2.2;
+        assert!(
+            (m - expected).abs() < 1e-6,
+            "mix = {m}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn mix_at_zero_source_volume_passes_commentary_through() {
+        // s=0.5, c=0.5, sv=0.0, cv=1.0 → soft_clip(0.5) = 0.5/1.5 = 0.333…
+        let m = mix_one_sample(0.5, 0.5, 0.0, 1.0);
+        let expected = 0.5_f32 / 1.5;
+        assert!(
+            (m - expected).abs() < 1e-6,
+            "mix = {m}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn mix_at_zero_commentary_volume_passes_source_through() {
+        // Symmetric: s=0.5, c=0.5, sv=1.0, cv=0.0 → soft_clip(0.5) = 0.333…
+        let m = mix_one_sample(0.5, 0.5, 1.0, 0.0);
+        let expected = 0.5_f32 / 1.5;
+        assert!(
+            (m - expected).abs() < 1e-6,
+            "mix = {m}, expected {expected}"
+        );
+    }
+
+    #[test]
+    fn mix_at_zero_both_emits_silence() {
+        // sv=cv=0 — for any inputs, mix is 0.0 (silence × 0 = silence).
+        assert_eq!(mix_one_sample(0.5, 0.5, 0.0, 0.0), 0.0);
+        assert_eq!(mix_one_sample(0.99, -0.99, 0.0, 0.0), 0.0);
+        assert_eq!(mix_one_sample(0.0, 0.0, 0.0, 0.0), 0.0);
     }
 }
