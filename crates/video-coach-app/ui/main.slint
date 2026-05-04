@@ -138,6 +138,17 @@ export component MainWindow inherits Window {
     in-out property <bool> export-overwrite-existing: false;
     in-out property <string> export-project-name: "";
 
+    // Phase 11 Plan #1 Task 3: per-export source + commentary volume
+    // sliders. Both are 0..1 floats with default 1.0 (full mix). The
+    // sheet-open hydration in ui.rs reads `ExportPrefsSnapshot.source_volume`
+    // / `commentary_volume` and writes these properties before the sheet
+    // appears; the values are read AT EXPORT CLICK TIME and threaded into
+    // `Command::ExportCompilations.{source,commentary}_volume`. These are
+    // INDEPENDENT of the transport-bar `scan-volume` (which only affects
+    // the live recording session preview, not export rendering).
+    in-out property <float> export-source-volume: 1.0;
+    in-out property <float> export-commentary-volume: 1.0;
+
     // Phase 11 Plan #7 Task 1 (fix #9). Top Repeater renders selected tags
     // in user-chosen order with drag handles; bottom Repeater renders
     // unselected tags alphabetically. `export-tag-rows` is retained as the
@@ -216,6 +227,15 @@ export component MainWindow inherits Window {
     // property write-through — no bus command dispatch. Click value is read
     // at Export-click time, NOT here. Mirrors export-codec-changed in shape.
     callback export-overwrite-existing-changed(bool);
+    // Phase 11 Plan #1 Task 3: per-export volume slider drag/release.
+    // Mirrors `scan-volume-changed` in shape — the Rust handler is a
+    // straight property write-through; the value is read at Export-click
+    // time and threaded into Command::ExportCompilations. NO bus dispatch
+    // here (no live preview-side update wired in this task — the bus's
+    // `handle_export_compilations` persists onto Preferences after the
+    // click, same pattern as overwrite policy / codec / filename).
+    callback export-source-volume-changed(float);
+    callback export-commentary-volume-changed(float);
     // Phase 11 Plan #7 Task 1 (fix #9). Drag-released callback for the
     // top (selected) Repeater. `from-index` is the row index in the
     // top model; `relative-drop-y` is the cursor Y at release minus
@@ -888,7 +908,13 @@ export component MainWindow inherits Window {
                 // fit the new "Overwrite existing files" checkbox row at
                 // y:580-608 between the Filename helper text (ends y:566)
                 // and the Cancel/Export buttons (now at y:660 = 712 - 52).
-                height: 712px;
+                // Phase 11 Plan #1 Task 3: bumped from 712px to 800px to
+                // fit two new volume sliders (Source + Commentary) +
+                // helper text between the Overwrite checkbox (ends y:608)
+                // and the Cancel/Export buttons. Cancel/Export remain
+                // anchored to `parent.height - 52px` so they ride down
+                // with the new height.
+                height: 800px;
                 border-radius: 8px;
                 background: #1f1f1f;
                 border-width: 1px;
@@ -1600,6 +1626,114 @@ export component MainWindow inherits Window {
                                 root.export-overwrite-existing-changed(!root.export-overwrite-existing);
                             }
                         }
+                    }
+
+                    // Phase 11 Plan #1 Task 3: Source + Commentary volume
+                    // sliders (side-by-side). Mirror the transport-bar
+                    // scan-volume slider's exact visual shape: a 6px-tall
+                    // track Rectangle + a fill Rectangle whose width is
+                    // `parent.width * volume` + a TouchArea overlay
+                    // handling drag (`moved` + `pressed`) and release
+                    // (`pointer-event` + left-button-up). The values are
+                    // hydrated on sheet open from ExportPrefsSnapshot and
+                    // read at Export-click time.
+                    Text {
+                        x: 24px;
+                        y: 626px;
+                        width: 240px;
+                        height: 16px;
+                        text: "Source volume";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    src-volume-track := Rectangle {
+                        x: 24px;
+                        y: 652px;
+                        width: 240px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: #2a2a2a;
+
+                        Rectangle {
+                            x: 0; y: 0;
+                            width: parent.width * root.export-source-volume;
+                            height: parent.height;
+                            border-radius: 3px;
+                            background: #888;
+                        }
+
+                        src-volume-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            moved => {
+                                if (self.pressed) {
+                                    root.export-source-volume = max(0, min(1, self.mouse-x / self.width));
+                                    root.export-source-volume-changed(root.export-source-volume);
+                                }
+                            }
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                    root.export-source-volume = max(0, min(1, self.mouse-x / self.width));
+                                    root.export-source-volume-changed(root.export-source-volume);
+                                }
+                            }
+                        }
+                    }
+                    Text {
+                        x: 280px;
+                        y: 626px;
+                        width: 240px;
+                        height: 16px;
+                        text: "Commentary volume";
+                        font-size: 13px;
+                        color: #aaaaaa;
+                    }
+                    com-volume-track := Rectangle {
+                        x: 280px;
+                        y: 652px;
+                        width: 240px;
+                        height: 6px;
+                        border-radius: 3px;
+                        background: #2a2a2a;
+
+                        Rectangle {
+                            x: 0; y: 0;
+                            width: parent.width * root.export-commentary-volume;
+                            height: parent.height;
+                            border-radius: 3px;
+                            background: #888;
+                        }
+
+                        com-volume-area := TouchArea {
+                            width: parent.width;
+                            height: parent.height;
+                            moved => {
+                                if (self.pressed) {
+                                    root.export-commentary-volume = max(0, min(1, self.mouse-x / self.width));
+                                    root.export-commentary-volume-changed(root.export-commentary-volume);
+                                }
+                            }
+                            pointer-event(event) => {
+                                if (event.kind == PointerEventKind.up && event.button == PointerEventButton.left) {
+                                    root.export-commentary-volume = max(0, min(1, self.mouse-x / self.width));
+                                    root.export-commentary-volume-changed(root.export-commentary-volume);
+                                }
+                            }
+                        }
+                    }
+                    // Adv-fix #8: clarify these export volumes are
+                    // INDEPENDENT of the transport-bar scan-volume slider
+                    // (which only affects the live recording-session
+                    // preview audio). A single helper line below both
+                    // sliders satisfies the spec.
+                    Text {
+                        x: 24px;
+                        y: 672px;
+                        width: parent.width - 48px;
+                        height: 16px;
+                        text: "Affects exported videos only. Live-preview transport volume is independent.";
+                        font-size: 11px;
+                        color: #999999;
                     }
 
                     // Cancel + Export bottom buttons.

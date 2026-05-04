@@ -998,6 +998,26 @@ pub fn run(
             w.set_export_overwrite_existing(b);
         }
     });
+    // Phase 11 Plan #1 Task 3: per-export volume sliders. Mirror the
+    // overwrite/codec/template handlers — straight property write-through.
+    // The slider's TouchArea already mutates `export-source-volume` /
+    // `export-commentary-volume` directly inside the .slint (clamp + write
+    // before firing the callback), so this Rust handler is purely for
+    // symmetry / future hooks (e.g. live preview-pipeline updates). The
+    // value is read AT EXPORT CLICK TIME in `on_export_start_clicked`
+    // below.
+    let weak_for_src_vol = window.as_weak();
+    window.on_export_source_volume_changed(move |v: f32| {
+        if let Some(w) = weak_for_src_vol.upgrade() {
+            w.set_export_source_volume(v);
+        }
+    });
+    let weak_for_com_vol = window.as_weak();
+    window.on_export_commentary_volume_changed(move |v: f32| {
+        if let Some(w) = weak_for_com_vol.upgrade() {
+            w.set_export_commentary_volume(v);
+        }
+    });
     // Phase 11 Plan #7 Task 1 (fix #9). Drag-released callback for the
     // top (selected) tag list. Reads the current `selected-export-tag-rows`
     // model + `selected-export-tags` membership list, computes the
@@ -1064,6 +1084,10 @@ pub fn run(
         // snapshot is moved into `export_prefs_to_slint_strings` below.
         // `ExportOverwritePolicy` is `Copy`, so this read is free.
         let overwrite_policy_for_hydration = snap.overwrite_policy;
+        // Phase 11 Plan #1 Task 3: same capture-before-move pattern as the
+        // overwrite policy. The volumes are f64 (Copy) so this is also
+        // free.
+        let snap_volumes = (snap.source_volume, snap.commentary_volume);
         // Phase 11 Plan #7 Task 2 (adv fix #1 + #10). The snapshot now
         // carries `export_filename_template`; the helper returns it as
         // a SharedString in the 4th tuple slot. Apply the
@@ -1092,6 +1116,14 @@ pub fn run(
             overwrite_policy_for_hydration,
             video_coach_core::project::ExportOverwritePolicy::OverwriteAll,
         ));
+        // Phase 11 Plan #1 Task 3: hydrate the Source + Commentary volume
+        // sliders from the persisted snapshot. Same reset-on-instantiation
+        // rationale as the overwrite checkbox above. The Slint property
+        // type is `float` (f32); ExportPrefsSnapshot stores f64 so we cast
+        // — the bus's `handle_export_compilations` already clamps to 0..1
+        // before persisting so the snapshot is always a sensible f64.
+        w.set_export_source_volume(snap_volumes.0 as f32);
+        w.set_export_commentary_volume(snap_volumes.1 as f32);
         // Plan #7 code-review #1. Real partition based on the persisted
         // `selected-export-tags` membership. Tags currently in
         // `selected-export-tags` land in the top (selected) Repeater in
@@ -1228,6 +1260,17 @@ pub fn run(
         } else {
             video_coach_core::project::ExportOverwritePolicy::Resume
         };
+        // Phase 11 Plan #1 Task 3: read the live slider values for
+        // source + commentary export volumes. Same click-time-read pattern
+        // as overwrite_policy above (Slint properties reset on each
+        // component instantiation, so the only durable source of truth is
+        // the click-time read + bus persist on the same dispatch). The
+        // bus's `handle_export_compilations` clamps these to 0..1 before
+        // persisting onto Preferences and threading into
+        // `export_compilation`, so a malformed slider value (out-of-range
+        // or NaN) is still safe.
+        let source_volume = w.get_export_source_volume() as f64;
+        let commentary_volume = w.get_export_commentary_volume() as f64;
         rt_for_start.spawn(async move {
             bus.send(
                 UI_COMMAND_ID.into(),
@@ -1240,19 +1283,8 @@ pub fn run(
                     project_name,
                     filename_template,
                     overwrite_policy,
-                    // Phase 11 Plan #1 Task 0 — preflight only. The
-                    // Command shape now carries the per-export volumes
-                    // but the export-sheet sliders that read user-set
-                    // values land in Task 3. Until then, dispatch the
-                    // Preferences defaults (1.0 / 1.0) so behavior
-                    // matches the prior "read from Preferences" path
-                    // exactly: the bus persists these onto Preferences
-                    // (a no-op when they already match), then threads
-                    // them into export_compilation. Task 3 replaces
-                    // these with the live slider values.
-                    source_volume: video_coach_core::project::default_preview_source_volume(),
-                    commentary_volume: video_coach_core::project::default_preview_commentary_volume(
-                    ),
+                    source_volume,
+                    commentary_volume,
                 },
             )
             .await;
@@ -1835,5 +1867,49 @@ mod tests {
         );
         window.set_project_title("Phase 6 Smoke".into());
         assert_eq!(window.get_project_title().as_str(), "Phase 6 Smoke");
+    }
+
+    // ---------------------------------------------------------------
+    // Phase 11 Plan #1 Task 3 — export-sheet volume slider tests.
+    // ---------------------------------------------------------------
+
+    /// The Slint properties default to 1.0 (full mix) per the .slint
+    /// declaration. This guards against an accidental default-flip during
+    /// future refactors.
+    #[test]
+    fn export_volume_properties_default_to_one() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("MainWindow::new must succeed under testing backend");
+        assert!((window.get_export_source_volume() - 1.0).abs() < 1e-6);
+        assert!((window.get_export_commentary_volume() - 1.0).abs() < 1e-6);
+    }
+
+    /// Round-trip: set both volume properties from Rust (mirrors what the
+    /// sheet-open hydration helper does after reading the snapshot) and
+    /// read them back (mirrors the on_export_start_clicked read).
+    #[test]
+    fn export_volume_properties_round_trip() {
+        i_slint_backend_testing::init_no_event_loop();
+        let window = MainWindow::new().expect("MainWindow::new must succeed under testing backend");
+        // Hydration write — same cast the on_export_sheet_open_clicked
+        // handler performs (snap.source_volume is f64; the property is f32).
+        let snap_src: f64 = 0.3;
+        let snap_com: f64 = 0.7;
+        window.set_export_source_volume(snap_src as f32);
+        window.set_export_commentary_volume(snap_com as f32);
+        // Click-time read — same cast on_export_start_clicked performs.
+        let read_src = window.get_export_source_volume() as f64;
+        let read_com = window.get_export_commentary_volume() as f64;
+        assert!((read_src - snap_src).abs() < 1e-6);
+        assert!((read_com - snap_com).abs() < 1e-6);
+    }
+
+    /// ExportPrefsSnapshot's volume defaults match the .slint property
+    /// defaults so the first sheet-open hydration is a no-op visually.
+    #[test]
+    fn export_prefs_snapshot_volume_defaults_match_slint_defaults() {
+        let snap = crate::bus::ExportPrefsSnapshot::default();
+        assert!((snap.source_volume - 1.0).abs() < 1e-6);
+        assert!((snap.commentary_volume - 1.0).abs() < 1e-6);
     }
 }
