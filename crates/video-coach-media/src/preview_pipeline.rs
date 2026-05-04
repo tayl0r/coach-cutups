@@ -6,13 +6,25 @@
 //! ```text
 //!   filesrc(source)   → decodebin → videoconvert → caps RGBA → appsink ── source_slot
 //!                                                ╲
-//!                                                 → fakesink (audio drained, no source audio in preview)
+//!                                                 → audioconvert → audioresample
+//!                                                       → volume(preview_source_vol)
+//!                                                       → capsfilter(F32LE,48k,2ch)
+//!                                                       → audiomixer.sink_%u
 //!
 //!   filesrc(recording.mov) → decodebin → videoconvert → caps RGBA → appsink ── webcam_slot
 //!                                       ╲
-//!                                        → audioconvert → audioresample → volume(commentary_volume)
-//!                                                                                ↓
-//!                                                                       platform_audio_sink_name()
+//!                                        → audioconvert → audioresample
+//!                                              → volume(preview_commentary_vol)
+//!                                              → capsfilter(F32LE,48k,2ch)
+//!                                              → audiomixer.sink_%u
+//!
+//!   audiotestsrc(silence,is-live) → audioconvert → capsfilter(F32LE,48k,2ch)
+//!                                              → audiomixer.sink_%u   (phantom; adv #7)
+//!
+//!   audiomixer(name=preview_audio_mixer)
+//!       → audioconvert → audioresample
+//!       → capsfilter(F32LE,48k,2ch)               (downstream anchor; adv #3)
+//!       → platform_audio_sink_name()
 //!
 //!                                30 Hz driver thread (NOT source-driven, per fix #17)
 //!                                  - record_time = playhead.compute()
@@ -67,6 +79,16 @@ use video_coach_core::timeline::{playback_segments, source_time_at, PlaybackSegm
 
 const RGBA_CAPS: &str = "video/x-raw,format=RGBA";
 const DRIVER_TICK: Duration = Duration::from_micros(33_333);
+/// Phase 11 Plan #1 Task 2: shared audio caps for the preview audiomixer.
+/// Both source-audio and commentary-audio chains capsfilter to this BEFORE
+/// linking to a mixer sinkpad; an identical capsfilter is wired DOWNSTREAM
+/// of the mixer per adv-fix #3 (HARD REQUIRED). audiomixer negotiates output
+/// caps from the FIRST sinkpad to get caps; without the downstream anchor
+/// pad-added ordering between source/recording (decodebin async) can land
+/// the mixer at the wrong format and the second sinkpad's renegotiation
+/// fails.
+const PREVIEW_AUDIO_CAPS: &str =
+    "audio/x-raw,format=F32LE,rate=48000,channels=2,layout=interleaved";
 
 #[derive(Debug, Error)]
 pub enum PreviewPipelineError {
@@ -184,9 +206,24 @@ impl PreviewPipeline {
             .collect();
 
         // 2. Build the live composition pipeline. Source + webcam decoders
-        //    in one pipeline; both feed RGBA appsinks; webcam adds an
-        //    audio chain via platform sink.
+        //    in one pipeline; both feed RGBA appsinks; both feed a single
+        //    shared audiomixer + audiosink (Phase 11 Plan #1 Task 2).
+        //
+        //    Construction order matters: the audiomixer + downstream sink
+        //    + phantom silence sinkpad MUST be wired BEFORE per-input
+        //    decodebins start firing pad-added events. Two reasons:
+        //    (a) the per-input pad-added handlers request_pad("sink_%u")
+        //        on the named mixer; the mixer must already exist in the
+        //        pipeline.
+        //    (b) adv-fix #7: audiomixer needs ≥1 sinkpad to transition to
+        //        PAUSED. If both decodebins are still probing and neither
+        //        has fired pad-added when set_state(Paused) runs, a
+        //        zero-pad mixer blocks PAUSED indefinitely and the
+        //        downstream audiosink never prerolls. The phantom silence
+        //        sinkpad guarantees ≥1 pad through PAUSED. Same trick
+        //        playbin3's internal mixer uses.
         let pipeline = gstreamer::Pipeline::new();
+        build_audio_mixer_and_sink(&pipeline)?;
         let source_appsink = build_video_input_chain(&pipeline, source_path, "src")?;
         let webcam_appsink = build_webcam_input_chain_with_audio(&pipeline, recording_path, "cam")?;
 
@@ -369,6 +406,30 @@ impl PreviewPipeline {
         Ok(())
     }
 
+    /// Phase 11 Plan #1 Task 2: live-tune the source-side volume into
+    /// the preview audiomixer. Looks up the named volume element and
+    /// updates its `volume` property atomically — no pipeline restart,
+    /// no glitch (verified pattern in `source_player.rs::set_volume`).
+    /// No-op if the source has no audio track (the named volume element
+    /// is built lazily inside the source decoder's audio pad-added
+    /// handler; if the source file has no audio, the element never
+    /// exists and `by_name` returns None).
+    pub fn set_source_volume(&self, value: f64) {
+        let v = value.clamp(0.0, 1.0);
+        if let Some(volume) = self.pipeline.by_name("preview_source_vol") {
+            volume.set_property("volume", v);
+        }
+    }
+
+    /// Phase 11 Plan #1 Task 2: live-tune the commentary-side volume
+    /// into the preview audiomixer. Same shape as `set_source_volume`.
+    pub fn set_commentary_volume(&self, value: f64) {
+        let v = value.clamp(0.0, 1.0);
+        if let Some(volume) = self.pipeline.by_name("preview_commentary_vol") {
+            volume.set_property("volume", v);
+        }
+    }
+
     /// Same shape as `SourcePlayer::snapshot()` so the bus's position-poll
     /// task is reusable verbatim (Task 3 picks this up).
     pub fn snapshot(&self) -> PlayerSnapshot {
@@ -484,11 +545,191 @@ fn segment_index_at(segments: &[PlaybackSegment], record_time: f64) -> usize {
     segments.len().saturating_sub(1)
 }
 
+/// Phase 11 Plan #1 Task 2: build the shared audio output spine of the
+/// preview pipeline. Layout:
+///
+/// ```text
+///   audiotestsrc(silence,is-live)         (phantom silence sinkpad — adv #7)
+///       → audioconvert
+///       → capsfilter(F32LE,48k,2ch)
+///       → audiomixer(name=preview_audio_mixer).sink_%u
+///   <per-input volume chains>
+///       → mixer.sink_%u   (added later by pad-added handlers)
+///   audiomixer
+///       → audioconvert
+///       → audioresample
+///       → capsfilter(F32LE,48k,2ch)        (adv #3 HARD REQUIRED)
+///       → audiosink (osxaudiosink/wasapisink/pulsesink, or fakesink in CI)
+/// ```
+///
+/// Wired BEFORE the per-input decodebins start firing pad-added events
+/// so (a) the named mixer exists when the audio handlers request_pad
+/// on it and (b) the mixer has ≥1 sinkpad through PAUSED (adv-fix #7).
+fn build_audio_mixer_and_sink(pipeline: &gstreamer::Pipeline) -> Result<(), PreviewPipelineError> {
+    let audiomixer = gstreamer::ElementFactory::make("audiomixer")
+        .name("preview_audio_mixer")
+        .build()
+        .map_err(|_| PreviewPipelineError::MissingElement("audiomixer".into()))?;
+    // Downstream chain — adv-fix #3: capsfilter pinning F32LE/48k/2ch
+    // AFTER the mixer is non-negotiable. Without it, pad-added ordering
+    // races can land the mixer at the wrong output caps and the second
+    // real sinkpad's renegotiation fails.
+    let post_convert = make_or("audioconvert")?;
+    let post_resample = make_or("audioresample")?;
+    let post_capsfilter = gstreamer::ElementFactory::make("capsfilter")
+        .name("preview_audio_post_caps")
+        .property(
+            "caps",
+            gstreamer::Caps::from_str(PREVIEW_AUDIO_CAPS).unwrap(),
+        )
+        .build()
+        .map_err(|_| PreviewPipelineError::MissingElement("capsfilter".into()))?;
+    let audiosink = if platform_audio_sink_name() == "fakesink" {
+        // Honor VIDEO_COACH_NO_AUDIO=1 (CI / headless tests). Real fakesinks
+        // need sync=true so they don't fast-drain past real-time, mirroring
+        // `source_player.rs`'s pattern.
+        gstreamer::ElementFactory::make("fakesink")
+            .property("sync", true)
+            .build()
+            .map_err(|_| PreviewPipelineError::MissingElement("fakesink".into()))?
+    } else {
+        make_or(platform_audio_sink_name())?
+    };
+    pipeline
+        .add_many([
+            &audiomixer,
+            &post_convert,
+            &post_resample,
+            &post_capsfilter,
+            &audiosink,
+        ])
+        .map_err(|e| PreviewPipelineError::Construction(format!("add audiomixer chain: {e}")))?;
+    gstreamer::Element::link_many([
+        &audiomixer,
+        &post_convert,
+        &post_resample,
+        &post_capsfilter,
+        &audiosink,
+    ])
+    .map_err(|e| PreviewPipelineError::Construction(format!("link audiomixer chain: {e}")))?;
+
+    // Phantom silence sinkpad (adv-fix #7). Guarantees the mixer has ≥1
+    // sinkpad when the pipeline transitions to PAUSED, even if both
+    // decodebins delay pad-added. Same trick playbin3's internal mixer
+    // uses. volume=0 is implicit via wave=silence; we don't add a `volume`
+    // element here because a silence-source already emits zeros.
+    let silence = gstreamer::ElementFactory::make("audiotestsrc")
+        .name("preview_audio_phantom_silence")
+        .property_from_str("wave", "silence")
+        .property("is-live", true)
+        .build()
+        .map_err(|_| PreviewPipelineError::MissingElement("audiotestsrc".into()))?;
+    let silence_convert = make_or("audioconvert")?;
+    let silence_caps = gstreamer::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gstreamer::Caps::from_str(PREVIEW_AUDIO_CAPS).unwrap(),
+        )
+        .build()
+        .map_err(|_| PreviewPipelineError::MissingElement("capsfilter".into()))?;
+    pipeline
+        .add_many([&silence, &silence_convert, &silence_caps])
+        .map_err(|e| PreviewPipelineError::Construction(format!("add phantom silence: {e}")))?;
+    gstreamer::Element::link_many([&silence, &silence_convert, &silence_caps])
+        .map_err(|e| PreviewPipelineError::Construction(format!("link phantom silence: {e}")))?;
+    let mixer_pad = audiomixer.request_pad_simple("sink_%u").ok_or_else(|| {
+        PreviewPipelineError::Construction("audiomixer phantom sink_%u request failed".into())
+    })?;
+    let silence_src = silence_caps.static_pad("src").ok_or_else(|| {
+        PreviewPipelineError::Construction("phantom silence capsfilter has no src pad".into())
+    })?;
+    silence_src.link(&mixer_pad).map_err(|e| {
+        PreviewPipelineError::Construction(format!("link phantom silence → mixer: {e:?}"))
+    })?;
+
+    Ok(())
+}
+
+/// Phase 11 Plan #1 Task 2: link a freshly-arrived audio pad (from one of
+/// the source/webcam decodebins) into the shared `preview_audio_mixer` via
+/// `queue → audioconvert → audioresample → volume(name=`volume_name`) →
+/// capsfilter(F32LE,48k,2ch) → mixer.sink_%u`.
+///
+/// The named volume element is the live-tune handle: `set_source_volume`
+/// / `set_commentary_volume` look it up by name. Placement matters
+/// (per Plan task 2 note 10): AFTER audioconvert+audioresample, BEFORE
+/// the capsfilter, so volume scales F32 (clean math) and every sinkpad
+/// presents identical caps to the mixer.
+fn link_audio_pad_to_mixer(
+    pipeline: &gstreamer::Pipeline,
+    src_pad: &gstreamer::Pad,
+    volume_name: &str,
+    initial_volume: f64,
+) -> Result<(), PreviewPipelineError> {
+    let mixer = pipeline.by_name("preview_audio_mixer").ok_or_else(|| {
+        PreviewPipelineError::Construction("preview_audio_mixer not found".into())
+    })?;
+
+    let queue = make_or("queue")?;
+    let convert = make_or("audioconvert")?;
+    let resample = make_or("audioresample")?;
+    let volume = gstreamer::ElementFactory::make("volume")
+        .name(volume_name)
+        .property("volume", initial_volume.clamp(0.0, 1.0))
+        .build()
+        .map_err(|_| PreviewPipelineError::MissingElement("volume".into()))?;
+    let caps = gstreamer::ElementFactory::make("capsfilter")
+        .property(
+            "caps",
+            gstreamer::Caps::from_str(PREVIEW_AUDIO_CAPS).unwrap(),
+        )
+        .build()
+        .map_err(|_| PreviewPipelineError::MissingElement("capsfilter".into()))?;
+
+    pipeline
+        .add_many([&queue, &convert, &resample, &volume, &caps])
+        .map_err(|e| PreviewPipelineError::Construction(format!("add audio chain: {e}")))?;
+    gstreamer::Element::link_many([&queue, &convert, &resample, &volume, &caps])
+        .map_err(|e| PreviewPipelineError::Construction(format!("link audio chain: {e}")))?;
+
+    // Sync state with parent BEFORE pad linking so the new elements come
+    // up to whatever state the pipeline is currently in (PAUSED during
+    // preroll, PLAYING after play() flipped state).
+    for e in [&queue, &convert, &resample, &volume, &caps] {
+        e.sync_state_with_parent()
+            .map_err(|e| PreviewPipelineError::Construction(format!("sync state: {e}")))?;
+    }
+
+    // Request a fresh sinkpad on the mixer and link the chain's tail to
+    // it. The mixer's request-pad ordering doesn't matter — we look up
+    // volume elements by name, not by mixer pad index.
+    let mixer_pad = mixer.request_pad_simple("sink_%u").ok_or_else(|| {
+        PreviewPipelineError::Construction("audiomixer sink_%u request failed".into())
+    })?;
+    let caps_src = caps
+        .static_pad("src")
+        .ok_or_else(|| PreviewPipelineError::Construction("audio capsfilter has no src".into()))?;
+    caps_src
+        .link(&mixer_pad)
+        .map_err(|e| PreviewPipelineError::Construction(format!("link → mixer: {e:?}")))?;
+
+    let queue_sink = queue
+        .static_pad("sink")
+        .ok_or_else(|| PreviewPipelineError::Construction("audio queue has no sink pad".into()))?;
+    src_pad
+        .link(&queue_sink)
+        .map_err(|e| PreviewPipelineError::Construction(format!("link decode pad: {e:?}")))?;
+
+    Ok(())
+}
+
 /// Build `filesrc → decodebin → videoconvert → caps RGBA → appsink` and
-/// route any non-video pad to a fakesink (so audio in the source file
-/// doesn't deadlock decodebin's multiqueue). Element names prefixed with
-/// `label` so two chains in the same pipeline don't collide; the filesrc's
-/// name is `{label}-filesrc` so `seek_source_named` can target it.
+/// route the source's audio pad into the shared `preview_audio_mixer`
+/// via the source-volume element (Phase 11 Plan #1 Task 2). Non-audio,
+/// non-video pads (subtitles, data) drain to fakesink so decodebin's
+/// multiqueue doesn't stall. Element names prefixed with `label` so two
+/// chains in the same pipeline don't collide; the filesrc's name is
+/// `{label}-filesrc` so `seek_source_named` can target it.
 fn build_video_input_chain(
     pipeline: &gstreamer::Pipeline,
     path: &Path,
@@ -574,31 +815,60 @@ fn build_video_input_chain(
             }
             return;
         }
-        // Non-video (typically audio) — fakesink so decodebin doesn't stall.
         let Some(pipeline) = pipeline_weak.upgrade() else {
             return;
         };
-        let fakesink = match gstreamer::ElementFactory::make("fakesink")
-            .name(format!("{label_owned}-aux-fakesink"))
-            .property("sync", false)
-            .property("async", false)
-            .build()
-        {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        if pipeline.add(&fakesink).is_err() {
+        if media.starts_with("audio/") {
+            // Phase 11 Plan #1 Task 2: route the source's audio into the
+            // shared audiomixer via the named source-volume element. If
+            // wiring fails the audio side is silently dropped (fall back
+            // to fakesink-equivalent behavior so decodebin doesn't
+            // stall) — log loudly so missing source audio is debuggable.
+            if let Err(e) = link_audio_pad_to_mixer(
+                &pipeline,
+                pad,
+                "preview_source_vol",
+                /* initial_volume */ 1.0,
+            ) {
+                tracing::warn!(
+                    target: "clip_preview.lifecycle",
+                    chain = %label_owned,
+                    error = %e,
+                    "failed to wire source audio into preview mixer (source audio will be silent)",
+                );
+                drain_pad_to_fakesink(&pipeline, pad, &label_owned);
+            }
             return;
         }
-        if fakesink.sync_state_with_parent().is_err() {
-            return;
-        }
-        if let Some(sink_pad) = fakesink.static_pad("sink") {
-            let _ = pad.link(&sink_pad);
-        }
+        // Anything else (subtitles, data) — fakesink so decodebin doesn't stall.
+        drain_pad_to_fakesink(&pipeline, pad, &label_owned);
     });
 
     Ok(appsink)
+}
+
+/// Helper: drain an unhandled decodebin pad to a fresh fakesink. Used for
+/// non-audio, non-video pads (subtitles, data) and as a fallback when
+/// audio mixer wiring fails.
+fn drain_pad_to_fakesink(pipeline: &gstreamer::Pipeline, pad: &gstreamer::Pad, label: &str) {
+    let fakesink = match gstreamer::ElementFactory::make("fakesink")
+        .name(format!("{label}-aux-fakesink"))
+        .property("sync", false)
+        .property("async", false)
+        .build()
+    {
+        Ok(f) => f,
+        Err(_) => return,
+    };
+    if pipeline.add(&fakesink).is_err() {
+        return;
+    }
+    if fakesink.sync_state_with_parent().is_err() {
+        return;
+    }
+    if let Some(sink_pad) = fakesink.static_pad("sink") {
+        let _ = pad.link(&sink_pad);
+    }
 }
 
 /// Same as `build_video_input_chain` but routes the decoded audio pad
@@ -693,87 +963,33 @@ fn build_webcam_input_chain_with_audio(
             }
             return;
         }
+        let Some(pipeline) = pipeline_weak.upgrade() else {
+            return;
+        };
         if media.starts_with("audio/") {
-            let Some(pipeline) = pipeline_weak.upgrade() else {
-                return;
-            };
-            if let Err(e) = build_and_link_webcam_audio_chain(&pipeline, pad) {
+            // Phase 11 Plan #1 Task 2: route commentary audio into the
+            // shared audiomixer via the named commentary-volume element.
+            if let Err(e) = link_audio_pad_to_mixer(
+                &pipeline,
+                pad,
+                "preview_commentary_vol",
+                /* initial_volume */ 1.0,
+            ) {
                 tracing::warn!(
                     target: "clip_preview.lifecycle",
                     chain = %label_owned,
                     error = %e,
-                    "failed to wire webcam audio chain (audio will be silent)",
+                    "failed to wire commentary audio into preview mixer (audio will be silent)",
                 );
+                drain_pad_to_fakesink(&pipeline, pad, &label_owned);
             }
             return;
         }
         // Anything else: drain to fakesink.
-        let Some(pipeline) = pipeline_weak.upgrade() else {
-            return;
-        };
-        let fakesink = match gstreamer::ElementFactory::make("fakesink")
-            .name(format!("{label_owned}-aux-fakesink"))
-            .property("sync", false)
-            .property("async", false)
-            .build()
-        {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        if pipeline.add(&fakesink).is_err() {
-            return;
-        }
-        if fakesink.sync_state_with_parent().is_err() {
-            return;
-        }
-        if let Some(sink_pad) = fakesink.static_pad("sink") {
-            let _ = pad.link(&sink_pad);
-        }
+        drain_pad_to_fakesink(&pipeline, pad, &label_owned);
     });
 
     Ok(appsink)
-}
-
-fn build_and_link_webcam_audio_chain(
-    pipeline: &gstreamer::Pipeline,
-    src_pad: &gstreamer::Pad,
-) -> Result<(), PreviewPipelineError> {
-    let queue = make_or("queue")?;
-    let convert = make_or("audioconvert")?;
-    let resample = make_or("audioresample")?;
-    let volume = gstreamer::ElementFactory::make("volume")
-        .name("commentary_volume")
-        .property("volume", 1.0_f64)
-        .build()
-        .map_err(|_| PreviewPipelineError::MissingElement("volume".into()))?;
-    let audiosink = if platform_audio_sink_name() == "fakesink" {
-        // Honor VIDEO_COACH_NO_AUDIO=1 (CI / headless tests). Real fakesinks
-        // need sync=true so they don't fast-drain past real-time, mirroring
-        // `source_player.rs`'s pattern.
-        gstreamer::ElementFactory::make("fakesink")
-            .property("sync", true)
-            .build()
-            .map_err(|_| PreviewPipelineError::MissingElement("fakesink".into()))?
-    } else {
-        make_or(platform_audio_sink_name())?
-    };
-
-    pipeline
-        .add_many([&queue, &convert, &resample, &volume, &audiosink])
-        .map_err(|e| PreviewPipelineError::Construction(format!("add audio chain: {e}")))?;
-    gstreamer::Element::link_many([&queue, &convert, &resample, &volume, &audiosink])
-        .map_err(|e| PreviewPipelineError::Construction(format!("link audio chain: {e}")))?;
-    for e in [&queue, &convert, &resample, &volume, &audiosink] {
-        e.sync_state_with_parent()
-            .map_err(|e| PreviewPipelineError::Construction(format!("sync state: {e}")))?;
-    }
-    let queue_sink = queue
-        .static_pad("sink")
-        .ok_or_else(|| PreviewPipelineError::Construction("audio queue has no sink pad".into()))?;
-    src_pad
-        .link(&queue_sink)
-        .map_err(|e| PreviewPipelineError::Construction(format!("link audio pad: {e:?}")))?;
-    Ok(())
 }
 
 /// Same env-var override + per-platform default name as `source_player.rs`.
@@ -1232,5 +1448,49 @@ mod tests {
         assert_eq!(segment_index_at(&segs, 9.99), 2);
         // Past the end clamps to the last segment.
         assert_eq!(segment_index_at(&segs, 100.0), 2);
+    }
+
+    /// Phase 11 Plan #1 Task 2: build-only smoke test for the preview
+    /// audiomixer spine. Confirms `build_audio_mixer_and_sink` constructs
+    /// without panic and the named mixer + downstream capsfilter land
+    /// in the pipeline. End-to-end audio is exercised by manual play in
+    /// dev (preview audio is hard to assert programmatically).
+    #[test]
+    fn preview_pipeline_audiomixer_constructs_without_panic() {
+        // Force fakesink — no audio daemon required for this test.
+        std::env::set_var("VIDEO_COACH_NO_AUDIO", "1");
+        crate::init().expect("gstreamer init");
+
+        let pipeline = gstreamer::Pipeline::new();
+        build_audio_mixer_and_sink(&pipeline).expect("audiomixer spine builds");
+
+        // Mixer present and named.
+        let mixer = pipeline
+            .by_name("preview_audio_mixer")
+            .expect("preview_audio_mixer in pipeline");
+        // Downstream capsfilter present (adv-fix #3 anchor).
+        let post_caps = pipeline
+            .by_name("preview_audio_post_caps")
+            .expect("preview_audio_post_caps in pipeline");
+        // Phantom silence src present (adv-fix #7 phantom sinkpad).
+        let phantom = pipeline
+            .by_name("preview_audio_phantom_silence")
+            .expect("preview_audio_phantom_silence in pipeline");
+
+        // Mixer has at least the phantom sinkpad already requested.
+        let phantom_count = mixer.sink_pads().len();
+        assert!(
+            phantom_count >= 1,
+            "audiomixer should have ≥1 sinkpad (phantom silence) immediately after construction; got {phantom_count}",
+        );
+
+        // Bind variables to silence unused warnings without dropping
+        // their pipeline membership.
+        let _ = (post_caps, phantom);
+
+        // Tear down cleanly (no PAUSED transition — this is a build-only
+        // smoke; real pipelines exercise PAUSED via the PreviewPipeline
+        // `open()` path which is covered by the integration smokes).
+        let _ = pipeline.set_state(gstreamer::State::Null);
     }
 }
