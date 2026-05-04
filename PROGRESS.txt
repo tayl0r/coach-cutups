@@ -573,6 +573,35 @@ own SHIPPED line + CI run id once green.
         GStreamer pipeline tests — export_smoke covers full-pipeline mix
         correctness, helpers cover math. Net 189 insertions/1 deletion
         in export.rs. Build/test/clippy/fmt all green at 1c.
+  - [x] Task 2: Preview pipeline — audiomixer spine + source-audio chain
+        (commit e220632)
+        Replaces the preview's commentary-only audio path with a real
+        GStreamer audiomixer that blends source-audio + commentary-audio
+        live (preview is wall-clock-paced; sync=true appsinks → audiomixer
+        is the right tool, NOT the hand-rolled mix from export Task 1).
+        New build_audio_mixer_and_sink helper wires the shared output:
+        audiomixer(name=preview_audio_mixer) → audioconvert →
+        audioresample → capsfilter(F32LE/48k/2ch; adv-fix #3 HARD-REQUIRED
+        downstream anchor so mixer never negotiates a different format)
+        → audiosink. Phantom silence sinkpad (audiotestsrc wave=silence
+        is-live=true → audioconvert → capsfilter → mixer.sink_%u;
+        adv-fix #7) wired BEFORE PAUSED so the mixer never blocks
+        state-change waiting on real decodebins. New
+        link_audio_pad_to_mixer helper builds the per-input chain
+        (queue → audioconvert → audioresample → volume(named) →
+        capsfilter → mixer.sink_%u) called from both source + webcam
+        decodebin pad-added handlers. volume placed after audioconvert
+        keeps scaling on F32 (clean math) + presents identical caps to
+        the mixer. Source decodebin: audio/* routes into the mixer via
+        preview_source_vol (was: fakesink). Webcam decodebin: audio/*
+        routes into the mixer via preview_commentary_vol (was: direct
+        to audiosink). New public set_source_volume(f64) /
+        set_commentary_volume(f64) methods look up the named volume
+        elements + update properties atomically (same pattern as
+        SourcePlayer::set_volume). Build-only smoke test confirms the
+        spine constructs with named mixer + downstream capsfilter +
+        phantom sinkpad. Touched only crates/video-coach-media/src/
+        preview_pipeline.rs. 355 insertions/95 deletions.
 - [x] Plan #4: compositor-perf (freeze-segment cache + pipeline cache + VBO pool)
       SHIPPED 2026-05-01. CI run 25244914848 green on all 4 jobs.
       Three compositor performance optimizations all in
