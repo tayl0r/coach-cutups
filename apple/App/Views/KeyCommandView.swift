@@ -80,6 +80,13 @@ final class KeyCatchingView: NSView {
     var currentZoomScale: Double = 1.0
     var onZoomLevel: (Double, CGPoint) -> Void = { _, _ in }
 
+    private func isPreviewMode() -> Bool {
+        switch appMode {
+        case .previewClip, .previewLoading: return true
+        default: return false
+        }
+    }
+
     private var monitor: Any?
 
     /// Mouse events fall through to the AVPlayerView underneath so the transport controls
@@ -93,11 +100,19 @@ final class KeyCatchingView: NSView {
         guard window != nil else { return }
         monitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard let self, let window = self.window, window.isKeyWindow else { return event }
-            // If a text editor (TextField field editor or TextEditor) currently has
-            // focus, let the keystroke through. Otherwise typing "space", "a", "d"
-            // into a name/tag/notes field would silently trigger video transport
-            // commands instead of inserting characters.
-            if window.firstResponder is NSText { return event }
+            let textIsFocused = window.firstResponder is NSText
+            // Most shortcuts must defer to a focused text field — typing
+            // "space", "a", "d" into a name/tag/notes field shouldn't fire
+            // transport commands. Esc is the exception while previewing a
+            // clip: if focus has wandered into the inspector, the user
+            // still expects Esc to bail back to the source. Field-edit
+            // commits happen on focus-loss (and on Enter for the name
+            // field) so nothing in-flight is dropped — the focus change
+            // induced by Esc still flows through ClipInspector's
+            // onChange(of: focusedField) path.
+            if textIsFocused && !(event.keyCode == KeyCode.escape && self.isPreviewMode()) {
+                return event
+            }
 
             // While the recording is being prepared (waiting for the first
             // sample buffer), ignore every shortcut. Recording any event in
