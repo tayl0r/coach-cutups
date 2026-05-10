@@ -178,7 +178,7 @@ final class Workspace {
         self.project = p
         // Undo state is in-memory only — never carries across app launches
         // or project switches. Shred any leftover trash from a prior session.
-        lastDeletedClip = nil
+        history.clearAll()
         shredTrashDirectory()
         try await rebuildSourcePlayer()
         UserDefaults.standard.set(folder.path(percentEncoded: false), forKey: "VideoCoach.lastProjectFolder")
@@ -448,109 +448,157 @@ final class Workspace {
         _previewFailed.removeValue(forKey: id)
     }
 
-    /// In-memory record of the most-recently-deleted clip, available for
-    /// `undoLastDelete()`. Cleared by another delete (which trashes the new
-    /// clip and shreds the previous trash file) or by a successful undo.
-    /// Not persisted — quitting the app loses the undo. Each new project
-    /// open also clears this and shreds the trash directory.
-    private(set) var lastDeletedClip: DeletedClip?
+    /// Per-project undo/redo machinery. Pure-data; lives in
+    /// `VideoCoachCore` so the package's existing test target can cover
+    /// the stack semantics without dragging in MPVKit. Application of
+    /// each `UndoAction` (mutating `project.clips`, invalidating the
+    /// preview cache, moving recording files in / out of `.trash`) is
+    /// owned by this class — the controller is a passive bookkeeper.
+    private var history = UndoController()
 
-    /// Snapshot of a deleted clip plus the on-disk path of its recording in
-    /// the project's trash directory. The recording file itself was *moved*,
-    /// not copied, so undelete restores it without round-tripping data
-    /// through RAM (safer for the 30-70MB .mov files we deal with).
-    struct DeletedClip: Sendable {
-        let clip: Clip
-        let trashedRecordingURL: URL
-    }
+    /// Forwarded from the controller so callers (the `undo` / `redo`
+    /// menu handlers, in particular) don't need to know the controller
+    /// exists.
+    var canUndo: Bool { history.canUndo }
+    var canRedo: Bool { history.canRedo }
 
-    /// Removes a clip from the project: drops the in-memory entry, MOVES the
-    /// underlying `clip-<uuid>.mov` recording to `recordings/.trash/`,
-    /// invalidates the preview cache, and persists. The trashed recording
-    /// stays on disk until either (a) another clip is deleted (the older
-    /// trash entry gets shredded then), or (b) the project is reopened (all
-    /// trash gets shredded). The clip's `sortIndex` gap is left as-is —
-    /// `reorderClips(from:to:)` re-numbers on next reorder, and the sidebar
-    /// sorts by `sortIndex`-ascending so a gap is invisible.
+    /// Removes a clip from the project: drops the in-memory entry, MOVES
+    /// the underlying recording into `recordings/.trash/`, invalidates the
+    /// preview cache, and persists. Pushes a `.deleteClip` action onto
+    /// the undo stack via `history.pushDelete(_:)`, which evicts any
+    /// prior `.deleteClip` from either stack (returning the evicted
+    /// `DeletedClip` so we can shred its trash file). The clip's
+    /// `sortIndex` gap is left as-is — `reorderClips(from:to:)` re-numbers
+    /// on next reorder, and the sidebar sorts by `sortIndex`-ascending
+    /// so a gap is invisible.
     func deleteClip(id: Clip.ID) throws {
         guard let idx = project.clips.firstIndex(where: { $0.id == id }) else { return }
         let clip = project.clips[idx]
         invalidatePreviewCache(for: id)
 
-        // Shred the previous trash entry — the user already moved past it
-        // when they invoked another delete.
-        if let prior = lastDeletedClip {
-            try? FileManager.default.removeItem(at: prior.trashedRecordingURL)
-            lastDeletedClip = nil
+        guard let folder else {
+            // No folder open ⇒ no trash dir ⇒ no recoverable delete.
+            // Drop the clip metadata and bail. (In practice the menu
+            // gates on having a project, so this is defensive.)
+            project.clips.remove(at: idx)
+            try saveProject()
+            return
         }
 
-        if let folder {
-            let recordingsDir = ProjectStore.recordingsDir(in: folder)
-            let recordingURL = recordingsDir.appendingPathComponent(clip.recordingFilename)
-            let trashDir = recordingsDir.appendingPathComponent(".trash")
-            try? FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
-            let trashedURL = trashDir.appendingPathComponent(clip.recordingFilename)
-            // Move the .mov into trash so undelete can put it back without
-            // double-buffering it through RAM. If the source recording is
-            // already gone (e.g., partial cleanup from a past session), we
-            // still record the deletion — the metadata is undoable even if
-            // the recording isn't.
-            if FileManager.default.fileExists(atPath: recordingURL.path) {
-                try? FileManager.default.removeItem(at: trashedURL)   // any stale leftover
-                try FileManager.default.moveItem(at: recordingURL, to: trashedURL)
-                lastDeletedClip = DeletedClip(clip: clip, trashedRecordingURL: trashedURL)
-            } else {
-                // No file to trash — record the metadata so undelete can at
-                // least restore the project entry. The file URL points at
-                // a non-existent path; undelete tolerates that.
-                lastDeletedClip = DeletedClip(clip: clip, trashedRecordingURL: trashedURL)
-            }
+        let recordingsDir = ProjectStore.recordingsDir(in: folder)
+        let recordingURL = recordingsDir.appendingPathComponent(clip.recordingFilename)
+        let trashDir = recordingsDir.appendingPathComponent(".trash")
+        try? FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        let trashedURL = trashDir.appendingPathComponent(clip.recordingFilename)
+        if FileManager.default.fileExists(atPath: recordingURL.path) {
+            try? FileManager.default.removeItem(at: trashedURL)
+            try FileManager.default.moveItem(at: recordingURL, to: trashedURL)
         }
+        let stash = DeletedClip(clip: clip, trashedRecordingURL: trashedURL)
 
         project.clips.remove(at: idx)
         try saveProject()
+
+        // Push onto the controller; if it returns an evicted prior
+        // delete, shred that trash file (the controller doesn't do IO).
+        if let evicted = history.pushDelete(stash) {
+            try? FileManager.default.removeItem(at: evicted.trashedRecordingURL)
+        }
     }
 
-    /// Restores the most-recently-deleted clip: re-inserts the metadata into
-    /// `project.clips` (preserving its original `sortIndex`) and moves the
-    /// recording back from `recordings/.trash/`. Returns the restored clip's
-    /// id so callers can re-select it; returns nil if there's nothing to
-    /// undo.
+    /// Inspector calls this on every field's focus-loss when the
+    /// snapshot taken at focus-gain differs from the current clip. Skip
+    /// when before == after so an unchanged focus session doesn't pollute
+    /// the stack. Any redo branch is dropped.
+    func commitClipEdit(id: Clip.ID, before: Clip, after: Clip) {
+        guard before != after else { return }
+        history.pushEdit(.editClip(id: id, before: before, after: after))
+    }
+
+    /// Pop one action from the undo stack and apply its inverse. Quietly
+    /// no-ops when the stack is empty so menu wiring doesn't have to
+    /// gate the call. Returns the action that was applied so the caller
+    /// (ContentView) can adjust selection — it doesn't see the
+    /// controller directly. Save errors during the inverse are
+    /// swallowed (project file may be on a read-only volume mid-flight);
+    /// the in-memory state is what the user sees and is what counts for
+    /// undo correctness.
     @discardableResult
-    func undoLastDelete() throws -> Clip.ID? {
-        guard let stash = lastDeletedClip else { return nil }
-        // If a clip with the same id has somehow re-appeared (shouldn't
-        // happen, but be defensive), bail rather than create a duplicate.
-        if project.clips.contains(where: { $0.id == stash.clip.id }) {
-            lastDeletedClip = nil
-            return nil
-        }
+    func undo() -> UndoAction? {
+        guard let action = history.popForUndo() else { return nil }
+        applyInverse(of: action)
+        return action
+    }
 
-        // Restore the recording first so the clip's referenced file exists
-        // before we re-add the metadata. If the trash file is missing
-        // (someone deleted it externally), we still restore the metadata —
-        // user gets back the clip entry minus playable media.
-        if let folder, FileManager.default.fileExists(atPath: stash.trashedRecordingURL.path) {
-            let recordingsDir = ProjectStore.recordingsDir(in: folder)
-            let target = recordingsDir.appendingPathComponent(stash.clip.recordingFilename)
-            try? FileManager.default.removeItem(at: target)   // shouldn't exist, defensive
-            try FileManager.default.moveItem(at: stash.trashedRecordingURL, to: target)
-        }
+    /// Symmetric to `undo()`. Pops one action from the redo stack and
+    /// applies it forward. Returns the applied action.
+    @discardableResult
+    func redo() -> UndoAction? {
+        guard let action = history.popForRedo() else { return nil }
+        applyForward(of: action)
+        return action
+    }
 
-        // Insert at the position that puts the clip back in its original
-        // sortIndex slot. Other clips' sortIndexes were never re-numbered,
-        // so the gap is still there.
-        let insertAt = project.clips.firstIndex(where: { $0.sortIndex > stash.clip.sortIndex })
-            ?? project.clips.endIndex
-        project.clips.insert(stash.clip, at: insertAt)
-        lastDeletedClip = nil
-        try saveProject()
-        return stash.clip.id
+    private func applyInverse(of action: UndoAction) {
+        switch action {
+        case let .editClip(id, before, _):
+            if let i = project.clips.firstIndex(where: { $0.id == id }) {
+                project.clips[i] = before
+                invalidatePreviewCache(for: id)
+                try? saveProject()
+            }
+        case let .deleteClip(stash):
+            // Move .mov out of trash and re-insert the clip at its
+            // original sortIndex slot. Tolerate a missing trash file
+            // (someone may have cleaned it externally) — metadata still
+            // restores. Re-selection of the restored clip is done by
+            // the menu handler in ContentView, not here.
+            if let folder, FileManager.default.fileExists(atPath: stash.trashedRecordingURL.path) {
+                let recordingsDir = ProjectStore.recordingsDir(in: folder)
+                let target = recordingsDir.appendingPathComponent(stash.clip.recordingFilename)
+                try? FileManager.default.removeItem(at: target)
+                try? FileManager.default.moveItem(at: stash.trashedRecordingURL, to: target)
+            }
+            let insertAt = project.clips.firstIndex(where: { $0.sortIndex > stash.clip.sortIndex })
+                ?? project.clips.endIndex
+            project.clips.insert(stash.clip, at: insertAt)
+            try? saveProject()
+        }
+    }
+
+    private func applyForward(of action: UndoAction) {
+        switch action {
+        case let .editClip(id, _, after):
+            if let i = project.clips.firstIndex(where: { $0.id == id }) {
+                project.clips[i] = after
+                invalidatePreviewCache(for: id)
+                try? saveProject()
+            }
+        case let .deleteClip(stash):
+            // Re-apply the delete: remove from project, move .mov back
+            // into trash. The action's `trashedRecordingURL` points at
+            // the same path we'll re-occupy.
+            if let i = project.clips.firstIndex(where: { $0.id == stash.clip.id }) {
+                invalidatePreviewCache(for: stash.clip.id)
+                project.clips.remove(at: i)
+            }
+            if let folder {
+                let recordingsDir = ProjectStore.recordingsDir(in: folder)
+                let recordingURL = recordingsDir.appendingPathComponent(stash.clip.recordingFilename)
+                let trashDir = recordingsDir.appendingPathComponent(".trash")
+                try? FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+                if FileManager.default.fileExists(atPath: recordingURL.path) {
+                    try? FileManager.default.removeItem(at: stash.trashedRecordingURL)
+                    try? FileManager.default.moveItem(at: recordingURL, to: stash.trashedRecordingURL)
+                }
+            }
+            try? saveProject()
+        }
     }
 
     /// Wipes the project's trash directory. Called on every `openProject` so
     /// undo state never survives across launches (per design — the in-memory
-    /// `lastDeletedClip` is also reset by re-instantiating the Workspace).
+    /// `history` controller is also cleared in `openProject`).
     private func shredTrashDirectory() {
         guard let folder else { return }
         let trashDir = ProjectStore.recordingsDir(in: folder).appendingPathComponent(".trash")

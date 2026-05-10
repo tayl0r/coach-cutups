@@ -129,9 +129,10 @@ struct ContentView: View {
             // when no clip is selected or we're recording, so the menu item
             // (and its Cmd+Delete shortcut) auto-disable in those states.
             .focusedValue(\.deleteSelectedClip, deleteSelectedClipHandler)
-            // Undo delete is gated on Workspace.lastDeletedClip — also nil
-            // when nothing has been deleted, or while recording.
-            .focusedValue(\.undoLastDelete, undoLastDeleteHandler)
+            // Undo / redo are gated on Workspace.canUndo / canRedo — both
+            // nil while recording so the menu items auto-disable.
+            .focusedValue(\.undoAction, undoHandler)
+            .focusedValue(\.redoAction, redoHandler)
             // No `.task { capture.configure() }` here on purpose: opening the
             // capture session at launch turns on the camera/mic indicator
             // light and triggers the OS permission prompt before the user
@@ -725,20 +726,43 @@ struct ContentView: View {
         return { requestDeleteClip(id) }
     }
 
-    /// Computed handler for Clip ▸ Undo Delete Clip (⌘Z). nil when there's
-    /// nothing to undo OR while recording — the menu item disables itself
-    /// in either case. On success, re-selects the restored clip so the user
-    /// sees what came back.
-    private var undoLastDeleteHandler: (() -> Void)? {
-        guard workspace.lastDeletedClip != nil else { return nil }
+    /// Handler published to the Clip ▸ Undo (⌘Z) menu. nil when the undo
+    /// stack is empty OR while recording — the menu item disables itself
+    /// in either case. ALWAYS selects the affected clip after undoing —
+    /// without this, an undo of an edit on a non-selected clip is silent
+    /// (model reverts but the user sees nothing change) and the user
+    /// can't tell whether Cmd+Z actually did anything.
+    private var undoHandler: (() -> Void)? {
+        guard workspace.canUndo else { return nil }
         if appMode == .recording || appMode == .recordingStarting { return nil }
         return {
-            do {
-                if let restored = try workspace.undoLastDelete() {
-                    selectedClipID = restored
+            guard let undone = workspace.undo() else { return }
+            switch undone {
+            case let .editClip(id, _, _):
+                selectedClipID = id
+            case let .deleteClip(stash):
+                selectedClipID = stash.clip.id
+            }
+        }
+    }
+
+    /// Handler published to the Clip ▸ Redo (⇧⌘Z) menu. Same gating
+    /// rules as undo. For an `.editClip` redo, selects the affected
+    /// clip (mirrors undo). For a `.deleteClip` redo, clears selection
+    /// if the deleted clip was selected — same behavior as a fresh
+    /// delete in `requestDeleteClip`.
+    private var redoHandler: (() -> Void)? {
+        guard workspace.canRedo else { return nil }
+        if appMode == .recording || appMode == .recordingStarting { return nil }
+        return {
+            guard let redone = workspace.redo() else { return }
+            switch redone {
+            case let .editClip(id, _, _):
+                selectedClipID = id
+            case let .deleteClip(stash):
+                if selectedClipID == stash.clip.id {
+                    selectedClipID = nil
                 }
-            } catch {
-                recordingError = "Couldn't undo delete: \(error.localizedDescription)"
             }
         }
     }

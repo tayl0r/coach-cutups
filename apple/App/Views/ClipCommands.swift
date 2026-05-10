@@ -9,7 +9,11 @@ private struct DeleteSelectedClipKey: FocusedValueKey {
     typealias Value = () -> Void
 }
 
-private struct UndoLastDeleteKey: FocusedValueKey {
+private struct UndoActionKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
+private struct RedoActionKey: FocusedValueKey {
     typealias Value = () -> Void
 }
 
@@ -18,9 +22,13 @@ extension FocusedValues {
         get { self[DeleteSelectedClipKey.self] }
         set { self[DeleteSelectedClipKey.self] = newValue }
     }
-    var undoLastDelete: (() -> Void)? {
-        get { self[UndoLastDeleteKey.self] }
-        set { self[UndoLastDeleteKey.self] = newValue }
+    var undoAction: (() -> Void)? {
+        get { self[UndoActionKey.self] }
+        set { self[UndoActionKey.self] = newValue }
+    }
+    var redoAction: (() -> Void)? {
+        get { self[RedoActionKey.self] }
+        set { self[RedoActionKey.self] = newValue }
     }
 }
 
@@ -29,19 +37,29 @@ extension FocusedValues {
 /// Room to grow: Rename Clip, Reveal Recording in Finder, Duplicate, etc.
 struct ClipCommands: Commands {
     @FocusedValue(\.deleteSelectedClip) private var deleteHandler
-    @FocusedValue(\.undoLastDelete) private var undoDeleteHandler
+    @FocusedValue(\.undoAction) private var undoHandler
+    @FocusedValue(\.redoAction) private var redoHandler
 
     var body: some Commands {
         CommandMenu("Clip") {
             // No "…" — the action is one-shot now (no confirm) but
-            // recoverable via Undo Delete Clip below.
+            // recoverable via Undo below.
             Button("Delete Clip") { deleteHandler?() }
                 .keyboardShortcut(.delete, modifiers: .command)
                 .disabled(deleteHandler == nil)
 
-            Button("Undo Delete Clip") { undoDeleteHandler?() }
+            Divider()
+
+            // Whole-project undo: covers the most recent clip edit
+            // (tags / name / notes) OR the most recent delete, whichever
+            // was last. Disabled while recording.
+            Button("Undo") { undoHandler?() }
                 .keyboardShortcut("z", modifiers: .command)
-                .disabled(undoDeleteHandler == nil)
+                .disabled(undoHandler == nil)
+
+            Button("Redo") { redoHandler?() }
+                .keyboardShortcut("z", modifiers: [.command, .shift])
+                .disabled(redoHandler == nil)
         }
     }
 }
