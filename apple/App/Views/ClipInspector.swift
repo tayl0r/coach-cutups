@@ -73,6 +73,20 @@ private struct EditorView: View {
     @Binding var clip: Clip
     let suggestions: Set<String>
 
+    @FocusState private var nameFocused: Bool
+    @FocusState private var notesFocused: Bool
+
+    /// Per-field snapshots taken on focus-gain. Each field commits its
+    /// own undo step on focus-loss. Per-spec ("each blur/Enter on a
+    /// field is one step"), so tabbing name → tags → notes produces
+    /// up to three undo steps. No union/coalescing here — it would
+    /// require coordinating two different focus-tracking primitives
+    /// (@FocusState for name+notes, callback for TagField) and the
+    /// interleave order between them isn't guaranteed by SwiftUI.
+    @State private var nameSnapshot: Clip?
+    @State private var tagsSnapshot: Clip?
+    @State private var notesSnapshot: Clip?
+
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("Clip").font(.headline)
@@ -81,6 +95,10 @@ private struct EditorView: View {
                 Text("Name").font(.caption).foregroundStyle(.secondary)
                 TextField("Clip name", text: $clip.name)
                     .textFieldStyle(.roundedBorder)
+                    .focused($nameFocused)
+                    .onChange(of: nameFocused) { _, focused in
+                        handleFocusChange(focused: focused, snapshot: $nameSnapshot)
+                    }
                     .onSubmit { try? workspace.saveProject() }
             }
 
@@ -89,7 +107,10 @@ private struct EditorView: View {
                 TagField(
                     tags: $clip.tags,
                     suggestions: suggestions,
-                    onCommit: { try? workspace.saveProject() }
+                    onCommit: { try? workspace.saveProject() },
+                    onFocusChange: { focused in
+                        handleFocusChange(focused: focused, snapshot: $tagsSnapshot)
+                    }
                 )
             }
 
@@ -102,13 +123,54 @@ private struct EditorView: View {
                         RoundedRectangle(cornerRadius: 4)
                             .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                     )
-                    // TextEditor has no `.onSubmit` (Return inserts a newline),
-                    // so we persist on focus loss via .onChange + a save call.
-                    // Cheap: ProjectStore writes a small JSON blob.
-                    .onChange(of: clip.notes) { _, _ in try? workspace.saveProject() }
+                    .focused($notesFocused)
+                    .onChange(of: notesFocused) { _, focused in
+                        handleFocusChange(focused: focused, snapshot: $notesSnapshot)
+                    }
             }
 
             Spacer()
         }
+        // Safety net: if the EditorView is torn down (selection change,
+        // Esc-to-source) while a field still holds an in-flight snapshot,
+        // SwiftUI does NOT guarantee the field's focus-loss onChange
+        // fires. Flush any remaining snapshots here so the user's edit
+        // gets one undo step rather than vanishing. The bound clip is
+        // already up-to-date because TextField/TextEditor write through
+        // their bindings on every keystroke and TagField commits in its
+        // own .onDisappear.
+        .onDisappear {
+            flush(&nameSnapshot)
+            flush(&tagsSnapshot)
+            flush(&notesSnapshot)
+        }
+    }
+
+    /// Called on every focus transition for one field. On focus-gain,
+    /// snapshot the clip; on focus-loss, push one commitClipEdit if the
+    /// clip changed and clear the snapshot.
+    private func handleFocusChange(focused: Bool, snapshot: Binding<Clip?>) {
+        if focused {
+            snapshot.wrappedValue = clip
+        } else {
+            flush(snapshot.wrappedValue.map { $0 }, clear: { snapshot.wrappedValue = nil })
+        }
+    }
+
+    /// Two-arity flush (used by handleFocusChange — snapshot is held in
+    /// a Binding, can't be inout-passed).
+    private func flush(_ before: Clip?, clear: () -> Void) {
+        guard let before, before != clip else { clear(); return }
+        workspace.commitClipEdit(id: clip.id, before: before, after: clip)
+        try? workspace.saveProject()
+        clear()
+    }
+
+    /// One-arity flush over an inout snapshot (used by .onDisappear).
+    private func flush(_ snapshot: inout Clip?) {
+        guard let before = snapshot, before != clip else { snapshot = nil; return }
+        workspace.commitClipEdit(id: clip.id, before: before, after: clip)
+        try? workspace.saveProject()
+        snapshot = nil
     }
 }

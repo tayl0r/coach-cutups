@@ -11,6 +11,10 @@ struct TagField: View {
     /// `Set(workspace.project.clips.flatMap(\.tags))`.
     let suggestions: Set<String>
     let onCommit: () -> Void
+    /// Fires whenever the internal TextField gains or loses focus.
+    /// Used by the inspector to snapshot/commit clip edits for the undo
+    /// stack. Default no-op so other call sites don't have to care.
+    var onFocusChange: (Bool) -> Void = { _ in }
 
     @State private var text: String = ""
     @State private var didInitialize = false
@@ -62,6 +66,7 @@ struct TagField: View {
                     highlightedIndex = nil
                     popoverManuallyDismissed = false
                 }
+                onFocusChange(focused)
             }
             .onChange(of: text) { _, _ in
                 // Typing invalidates any prior highlight + un-dismisses an
