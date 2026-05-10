@@ -121,10 +121,15 @@ combined. Matches the existing trash-of-one constraint; eviction
   today's `lastDeletedClip = nil`). Trash shred stays as-is.
 - During recording (`appMode == .recording` or `.recordingStarting`)
   the menu handlers are nil — Cmd+Z and Shift+Cmd+Z auto-disable.
-- Selection: undoing a `.deleteClip` re-selects the restored clip
-  (existing behavior). Undoing an `.editClip` does NOT change
-  selection — the user may have moved on to a different clip in the
-  interim, and yanking selection back would be jarring.
+- Selection: undo / redo always selects the affected clip. For
+  `.deleteClip` undo this matches the existing restore-then-select
+  behavior. For `.editClip` undo we also select — without this, an
+  undo on a clip that isn't currently selected is silent (the model
+  reverts but nothing visibly changes), and the user has no feedback
+  to tell whether Cmd+Z did anything. The cost — being teleported to
+  the affected clip — is preferable to invisible state changes.
+  Redoing a `.deleteClip` clears selection if the deleted clip was
+  selected (matches the fresh-delete behavior).
 
 ## Inspector changes (`ClipInspector.swift`)
 

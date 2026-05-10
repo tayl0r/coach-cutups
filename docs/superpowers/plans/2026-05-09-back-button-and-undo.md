@@ -685,34 +685,47 @@ Replace with:
 ```swift
     /// Handler published to the Clip ▸ Undo (⌘Z) menu. nil when the undo
     /// stack is empty OR while recording — the menu item disables itself
-    /// in either case. When the popped action is `.deleteClip`, re-selects
-    /// the restored clip so the user sees what came back; for `.editClip`
-    /// we leave selection alone (the user may have moved on to a different
-    /// clip in the interim).
+    /// in either case. ALWAYS selects the affected clip after undoing —
+    /// without this, an undo of an edit on a non-selected clip is silent
+    /// (model reverts but the user sees nothing change) and the user
+    /// can't tell whether Cmd+Z actually did anything.
     private var undoHandler: (() -> Void)? {
         guard workspace.canUndo else { return nil }
         if appMode == .recording || appMode == .recordingStarting { return nil }
         return {
             let top = workspace.undoStack.last
             workspace.undo()
-            if case let .deleteClip(stash) = top {
+            switch top {
+            case let .editClip(id, _, _):
+                selectedClipID = id
+            case let .deleteClip(stash):
                 selectedClipID = stash.clip.id
+            case nil:
+                break
             }
         }
     }
 
     /// Handler published to the Clip ▸ Redo (⇧⌘Z) menu. Same gating
-    /// rules as undo. When the redo'd action is `.deleteClip`, clears
-    /// selection if the deleted clip was selected, mirroring how a
-    /// fresh delete behaves in `requestDeleteClip`.
+    /// rules as undo. For an `.editClip` redo, selects the affected
+    /// clip (mirrors undo). For a `.deleteClip` redo, clears selection
+    /// if the deleted clip was selected — same behavior as a fresh
+    /// delete in `requestDeleteClip`.
     private var redoHandler: (() -> Void)? {
         guard workspace.canRedo else { return nil }
         if appMode == .recording || appMode == .recordingStarting { return nil }
         return {
             let top = workspace.redoStack.last
             workspace.redo()
-            if case let .deleteClip(stash) = top, selectedClipID == stash.clip.id {
-                selectedClipID = nil
+            switch top {
+            case let .editClip(id, _, _):
+                selectedClipID = id
+            case let .deleteClip(stash):
+                if selectedClipID == stash.clip.id {
+                    selectedClipID = nil
+                }
+            case nil:
+                break
             }
         }
     }
