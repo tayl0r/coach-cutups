@@ -637,7 +637,7 @@ Replace with:
         shredTrashDirectory()
 ```
 
-`ContentView.swift` will still reference `lastDeletedClip` and `undoLastDelete` at this point — that's expected; Task 6 migrates those call sites and the project compiles again. Don't try to build between Tasks 3 and 6 yet — they're a coupled rewrite. (Tests in Task 4 / 5 below don't go through the app target's `ContentView`, so we can verify the model without compiling the UI code path. Actually, AppTests does compile the whole app target — see Step 4.)
+After Step 3, `ContentView.swift` and `ClipCommands.swift` still reference `lastDeletedClip` / `undoLastDelete` — the build is broken until Step 4 migrates them. Step 4 lands in the same task and the same commit so the build is green again before the test run in Step 5.
 
 - [ ] **Step 4: Migrate `ContentView`'s call sites in the same edit (so the target builds)**
 
@@ -908,7 +908,7 @@ Replace with:
 
 That preserves the existing commit-on-blur behavior and adds an outbound notification on every focus transition.
 
-- [ ] **Step 2: Replace `EditorView` body with focus-tracked version**
+- [ ] **Step 2: Replace `EditorView` body with per-field focus tracking**
 
 In `apple/App/Views/ClipInspector.swift`, replace the entire `private struct EditorView` (lines 71–115) with:
 
@@ -918,21 +918,19 @@ private struct EditorView: View {
     @Binding var clip: Clip
     let suggestions: Set<String>
 
-    /// Tracks which non-tag field has keyboard focus. nil = nothing
-    /// focused (or tags are focused — those are tracked separately via
-    /// TagField's onFocusChange callback because TagField owns an
-    /// internal @FocusState that the outer .focused(...) modifier
-    /// doesn't reach).
-    @FocusState private var focusedField: Field?
-    /// Whether TagField currently has focus, surfaced via its
-    /// onFocusChange callback. Single source of truth for tag focus.
-    @State private var tagsFocused: Bool = false
-    /// Snapshot of the clip taken when ANY field (name / tags / notes)
-    /// gained focus. Cleared on focus-loss after pushing one
-    /// commitClipEdit. nil = no field is currently being edited.
-    @State private var snapshotAtFocus: Clip?
+    @FocusState private var nameFocused: Bool
+    @FocusState private var notesFocused: Bool
 
-    private enum Field: Hashable { case name, notes }
+    /// Per-field snapshots taken on focus-gain. Each field commits its
+    /// own undo step on focus-loss. Per-spec ("each blur/Enter on a
+    /// field is one step"), so tabbing name → tags → notes produces
+    /// up to three undo steps. No union/coalescing here — it would
+    /// require coordinating two different focus-tracking primitives
+    /// (@FocusState for name+notes, callback for TagField) and the
+    /// interleave order between them isn't guaranteed by SwiftUI.
+    @State private var nameSnapshot: Clip?
+    @State private var tagsSnapshot: Clip?
+    @State private var notesSnapshot: Clip?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -942,7 +940,10 @@ private struct EditorView: View {
                 Text("Name").font(.caption).foregroundStyle(.secondary)
                 TextField("Clip name", text: $clip.name)
                     .textFieldStyle(.roundedBorder)
-                    .focused($focusedField, equals: .name)
+                    .focused($nameFocused)
+                    .onChange(of: nameFocused) { _, focused in
+                        handleFocusChange(focused: focused, snapshot: $nameSnapshot)
+                    }
                     .onSubmit { try? workspace.saveProject() }
             }
 
@@ -952,7 +953,9 @@ private struct EditorView: View {
                     tags: $clip.tags,
                     suggestions: suggestions,
                     onCommit: { try? workspace.saveProject() },
-                    onFocusChange: { focused in tagsFocused = focused }
+                    onFocusChange: { focused in
+                        handleFocusChange(focused: focused, snapshot: $tagsSnapshot)
+                    }
                 )
             }
 
@@ -965,47 +968,63 @@ private struct EditorView: View {
                         RoundedRectangle(cornerRadius: 4)
                             .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
                     )
-                    .focused($focusedField, equals: .notes)
+                    .focused($notesFocused)
+                    .onChange(of: notesFocused) { _, focused in
+                        handleFocusChange(focused: focused, snapshot: $notesSnapshot)
+                    }
             }
 
             Spacer()
         }
-        .onChange(of: anyFieldFocused) { oldValue, newValue in
-            // Focus-gain (no field → some field): snapshot the clip so
-            // we can compute a single before/after for the editing
-            // session.
-            if !oldValue, newValue {
-                snapshotAtFocus = clip
-                return
-            }
-            // Focus-loss (some field → no field): commit one undo step
-            // covering the whole session. Notes save also lands here
-            // (replaces the old per-keystroke .onChange(clip.notes)
-            // write — same end state, far less I/O).
-            if oldValue, !newValue, let before = snapshotAtFocus {
-                if before != clip {
-                    workspace.commitClipEdit(id: clip.id, before: before, after: clip)
-                    try? workspace.saveProject()
-                }
-                snapshotAtFocus = nil
-            }
+        // Safety net: if the EditorView is torn down (selection change,
+        // Esc-to-source) while a field still holds an in-flight snapshot,
+        // SwiftUI does NOT guarantee the field's focus-loss onChange
+        // fires. Flush any remaining snapshots here so the user's edit
+        // gets one undo step rather than vanishing. The bound clip is
+        // already up-to-date because TextField/TextEditor write through
+        // their bindings on every keystroke and TagField commits in its
+        // own .onDisappear.
+        .onDisappear {
+            flush(&nameSnapshot)
+            flush(&tagsSnapshot)
+            flush(&notesSnapshot)
         }
     }
 
-    /// True when ANY of the three fields has keyboard focus. Computed so
-    /// onChange fires on the union transition (no field → some field
-    /// and back), not on intermediate hops between fields. That way
-    /// tabbing from name → tags → notes is one editing session, not
-    /// three.
-    private var anyFieldFocused: Bool {
-        focusedField != nil || tagsFocused
+    /// Called on every focus transition for one field. On focus-gain,
+    /// snapshot the clip; on focus-loss, push one commitClipEdit if the
+    /// clip changed and clear the snapshot.
+    private func handleFocusChange(focused: Bool, snapshot: Binding<Clip?>) {
+        if focused {
+            snapshot.wrappedValue = clip
+        } else {
+            flush(snapshot.wrappedValue.map { $0 }, clear: { snapshot.wrappedValue = nil })
+        }
+    }
+
+    /// Two-arity flush (used by handleFocusChange — snapshot is held in
+    /// a Binding, can't be inout-passed).
+    private func flush(_ before: Clip?, clear: () -> Void) {
+        guard let before, before != clip else { clear(); return }
+        workspace.commitClipEdit(id: clip.id, before: before, after: clip)
+        try? workspace.saveProject()
+        clear()
+    }
+
+    /// One-arity flush over an inout snapshot (used by .onDisappear).
+    private func flush(_ snapshot: inout Clip?) {
+        guard let before = snapshot, before != clip else { snapshot = nil; return }
+        workspace.commitClipEdit(id: clip.id, before: before, after: clip)
+        try? workspace.saveProject()
+        snapshot = nil
     }
 }
 ```
 
-Subtle correctness notes:
-1. `TagField`'s `onCommit` still calls `saveProject()` on Enter so that committing without ever losing focus (e.g., user types tags, presses Enter, then quits the app) still persists. The focus-loss path then no-ops because `commitClipEdit` early-returns when `before == after`.
-2. Field-to-field transitions (e.g., user clicks from name into tags) briefly toggle `anyFieldFocused` — `focusedField` becomes nil for one runloop tick before TagField reports `tagsFocused = true`. SwiftUI's `onChange(of:)` coalesces same-value writes, but the order of focus-out/focus-in is not guaranteed. If this turns out to flicker (testable: tab through fields, check `Workspace.undoStack.count`), wrap the snapshot reset in a one-runloop debounce. Verify in Step 3 manual smoke and only add the debounce if needed — YAGNI otherwise.
+Notes on the design:
+1. Three independent snapshots, one per field. Each field handles its own focus-gain/focus-loss without depending on the others. Eliminates the inter-field tab interleave race that a union-tracking approach would have.
+2. `TagField`'s `onCommit` still calls `saveProject()` on Enter so partial-edit data is durable across app exit. The focus-loss path then no-ops because `commitClipEdit` early-returns on `before == after`.
+3. The `.onDisappear` flush is the backstop for view-teardown paths SwiftUI does not guarantee fire `onChange(of:focused)`: selecting a different clip (the parent `ClipInspector` applies `.id(id)` to force teardown) and Esc-to-source (ContentView clears `selectedClipID`, removing the inspector entirely).
 
 - [ ] **Step 3: Build and smoke-test the field-edit flow**
 
@@ -1018,6 +1037,8 @@ Manual smoke test:
 - Press Cmd+Z — the tag disappears.
 - Press Shift+Cmd+Z — the tag comes back.
 - Repeat with Name and Notes.
+- Tab from name → tags → notes, making one change in each. Click outside. Press Cmd+Z three times — each undo reverts one field at a time. (Per-spec: one blur = one step.)
+- Edit tags, then press Esc (instead of clicking out) — preview closes. Re-select the clip — tag change is present, Cmd+Z undoes it (the `.onDisappear` flush did its job).
 
 If any field doesn't push an undo step, the engineer should re-check the `@FocusState` wiring (for name / notes) and the `onFocusChange` callback wiring (for tags).
 
