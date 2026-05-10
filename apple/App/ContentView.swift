@@ -154,6 +154,13 @@ struct ContentView: View {
         return "\(BuildInfo.commit) · \(BuildInfo.builtAt)"
     }
 
+    private var isPreviewMode: Bool {
+        switch appMode {
+        case .previewClip, .previewLoading: return true
+        default: return false
+        }
+    }
+
     // MARK: - Device handling
 
     /// Called when a project just finished opening (or was switched). Seeds
@@ -362,6 +369,22 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
         }
         .toolbar {
+            // Top-left BACK affordance: shown only while previewing a
+            // clip, mirrors the Esc shortcut and the existing Source
+            // button in TransportBar. Hidden (not just disabled) outside
+            // preview modes so it doesn't visually clutter the toolbar
+            // during scanning/recording.
+            ToolbarItem(placement: .navigation) {
+                if isPreviewMode {
+                    Button(action: handleClosePreview) {
+                        Label("Source", systemImage: "chevron.left")
+                            .labelStyle(.titleAndIcon)
+                            .font(.headline)
+                    }
+                    .controlSize(.large)
+                    .help("Return to source video (Esc)")
+                }
+            }
             // Centered always-on cluster: zoom level + drawing controls.
             // The drawing controls used to live in a `drawingToolbar`
             // mounted below the player area only during recording, but
@@ -381,6 +404,15 @@ struct ContentView: View {
                     }
                     .disabled(appMode != .recording)
                 }
+            }
+            // Right side: app-name label, then Export. The window's
+            // navigationTitle still drives the macOS window chrome — this
+            // toolbar label is a redundant in-pane affordance the user
+            // asked for.
+            ToolbarItem(placement: .primaryAction) {
+                Text("Coach Cutups")
+                    .font(.headline)
+                    .foregroundStyle(.secondary)
             }
             ToolbarItem(placement: .primaryAction) {
                 Button {
