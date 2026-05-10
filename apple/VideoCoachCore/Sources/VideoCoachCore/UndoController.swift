@@ -61,7 +61,17 @@ public struct UndoController {
     /// carries extra eviction semantics tied to the on-disk trash
     /// invariant.
     public mutating func pushEdit(_ action: UndoAction) {
-        fatalError("Implement in Task 2")
+        // Reject delete here so the eviction-aware `pushDelete` is the
+        // only way a `.deleteClip` enters the stacks. A misuse caught
+        // at runtime is better than silently bypassing eviction.
+        if case .deleteClip = action {
+            preconditionFailure("Use pushDelete(_:) for .deleteClip actions")
+        }
+        undoStack.append(action)
+        if undoStack.count > Self.stackCap {
+            undoStack.removeFirst(undoStack.count - Self.stackCap)
+        }
+        redoStack.removeAll()
     }
 
     /// Push a delete onto the undo stack. Returns any prior delete
@@ -69,26 +79,51 @@ public struct UndoController {
     /// (the controller doesn't do file I/O). Trims to cap; clears
     /// redo.
     public mutating func pushDelete(_ stash: DeletedClip) -> DeletedClip? {
-        fatalError("Implement in Task 2")
+        let evicted = evictPriorDelete()
+        undoStack.append(.deleteClip(stash))
+        if undoStack.count > Self.stackCap {
+            undoStack.removeFirst(undoStack.count - Self.stackCap)
+        }
+        redoStack.removeAll()
+        return evicted
     }
 
     /// Pop top of `undoStack`, push it onto `redoStack`, and return
     /// the popped action so the caller can apply its inverse. Returns
     /// nil when the stack is empty.
     public mutating func popForUndo() -> UndoAction? {
-        fatalError("Implement in Task 2")
+        guard let action = undoStack.popLast() else { return nil }
+        redoStack.append(action)
+        return action
     }
 
     /// Pop top of `redoStack`, push it onto `undoStack`, and return
     /// the popped action so the caller can apply it forward. Returns
     /// nil when the stack is empty.
     public mutating func popForRedo() -> UndoAction? {
-        fatalError("Implement in Task 2")
+        guard let action = redoStack.popLast() else { return nil }
+        undoStack.append(action)
+        return action
     }
 
     /// Drop everything. Called by `Workspace.openProject(...)` so undo
     /// state never carries across project switches.
     public mutating func clearAll() {
-        fatalError("Implement in Task 2")
+        undoStack.removeAll()
+        redoStack.removeAll()
+    }
+
+    /// Walks both stacks (undo first, redo as fallback) for an existing
+    /// `.deleteClip`, removes it, and returns the carried `DeletedClip`.
+    /// Returns nil when there's nothing to evict. Caller is responsible
+    /// for shredding the trashed file if a `DeletedClip` is returned.
+    private mutating func evictPriorDelete() -> DeletedClip? {
+        if let i = undoStack.lastIndex(where: { if case .deleteClip = $0 { return true } else { return false } }) {
+            if case let .deleteClip(d) = undoStack.remove(at: i) { return d }
+        }
+        if let i = redoStack.lastIndex(where: { if case .deleteClip = $0 { return true } else { return false } }) {
+            if case let .deleteClip(d) = redoStack.remove(at: i) { return d }
+        }
+        return nil
     }
 }
