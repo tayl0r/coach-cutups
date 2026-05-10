@@ -448,6 +448,33 @@ final class Workspace {
         _previewFailed.removeValue(forKey: id)
     }
 
+    /// One step on the unified undo stack. `editClip` covers tag/name/notes
+    /// commits made in the inspector — `before`/`after` are full Clip
+    /// snapshots (small structs, copy is cheap) so undo is just a slot
+    /// swap. `deleteClip` carries the same `DeletedClip` value the trash
+    /// directory tracks; at most one of these may exist across both stacks
+    /// combined, matching the on-disk invariant that we only keep one
+    /// trashed `.mov` at a time.
+    enum UndoAction {
+        case editClip(id: Clip.ID, before: Clip, after: Clip)
+        case deleteClip(DeletedClip)
+    }
+
+    /// Per-project undo and redo histories. Newest entry at the end of
+    /// each array. Cleared on `openProject(...)` and never persisted —
+    /// quitting the app, switching projects, or relaunching loses the
+    /// stacks (matches the existing trash-shred behavior).
+    private(set) var undoStack: [UndoAction] = []
+    private(set) var redoStack: [UndoAction] = []
+
+    /// Cap on `undoStack` length. Drops from the front (oldest) when a new
+    /// push would exceed it. The redo stack inherits its bound implicitly:
+    /// it can only ever hold what was previously on `undoStack`.
+    static let undoStackCap = 100
+
+    var canUndo: Bool { !undoStack.isEmpty }
+    var canRedo: Bool { !redoStack.isEmpty }
+
     /// In-memory record of the most-recently-deleted clip, available for
     /// `undoLastDelete()`. Cleared by another delete (which trashes the new
     /// clip and shreds the previous trash file) or by a successful undo.
