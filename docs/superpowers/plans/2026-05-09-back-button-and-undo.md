@@ -753,15 +753,12 @@ Replace with:
         guard workspace.canUndo else { return nil }
         if appMode == .recording || appMode == .recordingStarting { return nil }
         return {
-            let top = workspace.undoStack.last
-            workspace.undo()
-            switch top {
+            guard let undone = workspace.undo() else { return }
+            switch undone {
             case let .editClip(id, _, _):
                 selectedClipID = id
             case let .deleteClip(stash):
                 selectedClipID = stash.clip.id
-            case nil:
-                break
             }
         }
     }
@@ -775,17 +772,14 @@ Replace with:
         guard workspace.canRedo else { return nil }
         if appMode == .recording || appMode == .recordingStarting { return nil }
         return {
-            let top = workspace.redoStack.last
-            workspace.redo()
-            switch top {
+            guard let redone = workspace.redo() else { return }
+            switch redone {
             case let .editClip(id, _, _):
                 selectedClipID = id
             case let .deleteClip(stash):
                 if selectedClipID == stash.clip.id {
                     selectedClipID = nil
                 }
-            case nil:
-                break
             }
         }
     }
