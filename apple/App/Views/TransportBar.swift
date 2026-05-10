@@ -197,7 +197,15 @@ struct ScanningTransport: View {
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
         panel.allowsMultipleSelection = false
         if panel.runModal() == .OK, let url = panel.url {
-            Task { try? await workspace.addSourceVideo(url: url) }
+            Task {
+                do {
+                    try await workspace.addSourceVideo(url: url)
+                } catch {
+                    await MainActor.run {
+                        openProjectError = "Couldn't add source: \(error.localizedDescription)"
+                    }
+                }
+            }
         }
     }
 }

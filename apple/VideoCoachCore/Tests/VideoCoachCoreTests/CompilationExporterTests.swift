@@ -60,7 +60,7 @@ final class CompilationExporterTests: XCTestCase {
             startSourceSeconds: 0,
             recordingDuration: 2.0,
             recordingFilename: webcamURL.lastPathComponent,
-            events: [CommentaryEvent(recordTime: 0, kind: .play)],
+            events: [CommentaryEvent(recordTime: 0, kind: .play(sourceTime: 0))],
             sortIndex: 0
         )
         var project = Project(name: "exporter-smoke")
@@ -153,14 +153,14 @@ final class CompilationExporterTests: XCTestCase {
             name: "first", tags: ["test"],
             sourceIndex: 0, startSourceSeconds: 0,
             recordingDuration: 2.0, recordingFilename: webcam0URL.lastPathComponent,
-            events: [CommentaryEvent(recordTime: 0, kind: .play)],
+            events: [CommentaryEvent(recordTime: 0, kind: .play(sourceTime: 0))],
             sortIndex: 0
         )
         let clip1 = Clip(
             name: "second", tags: ["test"],
             sourceIndex: 0, startSourceSeconds: 5.0,
             recordingDuration: 2.5, recordingFilename: webcam1URL.lastPathComponent,
-            events: [CommentaryEvent(recordTime: 0, kind: .play)],
+            events: [CommentaryEvent(recordTime: 0, kind: .play(sourceTime: 0))],
             sortIndex: 1
         )
         var project = Project(name: "multi-clip-smoke")

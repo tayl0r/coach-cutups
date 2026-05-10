@@ -13,6 +13,18 @@ struct KeyCommandView: NSViewRepresentable {
     /// Invoked for ⌘0. Wired to reset the workspace zoom transform back to
     /// identity so the player frame fills the viewport without translation.
     let onResetZoom: () -> Void
+    /// Current zoom scale, fed in so plain `2` / `3` (zoom out / in by
+    /// 0.25×) can compute their absolute target without the view holding
+    /// stale state.
+    let currentZoomScale: Double
+    /// Invoked for plain `1` (target scale 1.0×, cursor ignored), `2`
+    /// (current − 0.25×, cursor-pivoted), and `3` (current + 0.25×,
+    /// cursor-pivoted). First param is the absolute target scale; second
+    /// is the cursor position in [0,1]² normalized to the source player
+    /// view, origin top-left, clamped — so a press while the cursor is in
+    /// the black surround zooms toward the nearest player edge rather than
+    /// producing an out-of-range pivot.
+    let onZoomLevel: (Double, CGPoint) -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
@@ -30,6 +42,8 @@ struct KeyCommandView: NSViewRepresentable {
         v.onToggleRecord = onToggleRecord
         v.onClosePreview = onClosePreview
         v.onResetZoom = onResetZoom
+        v.currentZoomScale = currentZoomScale
+        v.onZoomLevel = onZoomLevel
     }
 }
 
@@ -46,7 +60,15 @@ private enum KeyCode {
     static let space: UInt16 = 0x31      // kVK_Space
     static let escape: UInt16 = 0x35     // kVK_Escape
     static let zero: UInt16 = 0x1D       // kVK_ANSI_0
+    static let one: UInt16 = 0x12        // kVK_ANSI_1 — reset zoom to 1×
+    static let two: UInt16 = 0x13        // kVK_ANSI_2 — zoom out by step
+    static let three: UInt16 = 0x14      // kVK_ANSI_3 — zoom in by step
 }
+
+/// Per-press zoom step for keys 2 / 3. 0.25× lands evenly on the existing
+/// snap notches (1.0, 1.25, 1.5, 2.0…) so a sequence of presses tracks the
+/// notch ladder predictably.
+private let zoomKeyStep: Double = 0.25
 
 final class KeyCatchingView: NSView {
     var appMode: AppMode = .scanning
@@ -55,6 +77,8 @@ final class KeyCatchingView: NSView {
     var onToggleRecord: () -> Void = {}
     var onClosePreview: () -> Void = {}
     var onResetZoom: () -> Void = {}
+    var currentZoomScale: Double = 1.0
+    var onZoomLevel: (Double, CGPoint) -> Void = { _, _ in }
 
     private var monitor: Any?
 
@@ -124,6 +148,29 @@ final class KeyCatchingView: NSView {
                     return nil
                 }
                 return event
+            case KeyCode.one, KeyCode.two, KeyCode.three:
+                // Plain `1` / `2` / `3` set or step the source zoom. Only
+                // active in source-visible modes; preview modes have no MPV
+                // view to pivot against, so the keystrokes fall through
+                // (AppKit's default beep is fine — the user shouldn't be
+                // attempting source-zoom shortcuts mid-preview).
+                let modSignificant: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
+                guard event.modifierFlags.intersection(modSignificant).isEmpty else { return event }
+                switch self.appMode {
+                case .scanning, .recording:
+                    let target: Double
+                    switch event.keyCode {
+                    case KeyCode.one:   target = 1.0
+                    case KeyCode.two:   target = self.currentZoomScale - zoomKeyStep
+                    case KeyCode.three: target = self.currentZoomScale + zoomKeyStep
+                    default:            return event
+                    }
+                    let cursor = self.cursorInPlayerView() ?? CGPoint(x: 0.5, y: 0.5)
+                    self.onZoomLevel(target, cursor)
+                    return nil
+                default:
+                    return event
+                }
             default: return event
             }
         }
@@ -131,5 +178,32 @@ final class KeyCatchingView: NSView {
 
     deinit {
         if let monitor { NSEvent.removeMonitor(monitor) }
+    }
+
+    /// Cursor position in the source player view, normalized to [0,1]² with
+    /// origin at top-left, clamped. Returns nil when the MPV view isn't in
+    /// the hierarchy (e.g. the user pressed a zoom key in a preview mode
+    /// the switch above didn't already gate out — defensive). Mirrors
+    /// `ZoomGesture.cursor(in:event:)`'s normalization so a cursor-pivoted
+    /// hotkey lands on the same source point a scroll-wheel zoom would.
+    private func cursorInPlayerView() -> CGPoint? {
+        guard let window, let target = Self.findMPVView(in: window.contentView) else { return nil }
+        let mouseInWindow = window.mouseLocationOutsideOfEventStream
+        let p = target.convert(mouseInWindow, from: nil)
+        let bw = target.bounds.width
+        let bh = target.bounds.height
+        guard bw > 0, bh > 0 else { return nil }
+        let nx = p.x / bw
+        let ny = (target.isFlipped ? p.y : (bh - p.y)) / bh
+        return CGPoint(x: max(0, min(1, nx)), y: max(0, min(1, ny)))
+    }
+
+    private static func findMPVView(in view: NSView?) -> MPVRenderingNSView? {
+        guard let view else { return nil }
+        if let mpv = view as? MPVRenderingNSView { return mpv }
+        for sub in view.subviews {
+            if let mpv = findMPVView(in: sub) { return mpv }
+        }
+        return nil
     }
 }

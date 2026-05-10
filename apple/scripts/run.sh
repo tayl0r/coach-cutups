@@ -2,7 +2,11 @@
 # Build the Coach Cutups app and launch the freshly-built binary,
 # replacing any running instance. Run from the repo root or anywhere —
 # the script cd's to the project directory itself.
+#
+# Usage: run.sh [CONFIG]   # CONFIG defaults to Debug; pass Release for prod.
 set -euo pipefail
+
+CONFIG="${1:-Debug}"
 
 cd "$(dirname "$0")/.."
 
@@ -40,11 +44,11 @@ enum BuildInfo {
 }
 EOF
 
-echo "==> building"
+echo "==> building ($CONFIG)"
 xcodebuild \
   -project VideoCoach.xcodeproj \
   -scheme VideoCoach \
-  -configuration Debug \
+  -configuration "$CONFIG" \
   build \
   | grep -E "error:|warning:|\*\* BUILD" || true
 
@@ -58,7 +62,7 @@ git checkout HEAD -- App/BuildInfo.swift 2>/dev/null || true
 APP=$(xcodebuild \
   -project VideoCoach.xcodeproj \
   -scheme VideoCoach \
-  -configuration Debug \
+  -configuration "$CONFIG" \
   -showBuildSettings 2>/dev/null \
   | awk -F' = ' '/^[[:space:]]+BUILT_PRODUCTS_DIR =/ {print $2; exit}')/VideoCoach.app
 

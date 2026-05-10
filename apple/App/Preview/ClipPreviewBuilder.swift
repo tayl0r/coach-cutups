@@ -161,7 +161,20 @@ enum ClipPreviewBuilder {
                 // composite request, so the compositor can render it without
                 // needing the PreviewInstruction's pre-decoded frozenFrames
                 // (which the playback path can't reach).
-                let frameRange = CMTimeRange(start: srcStart, duration: freezeSlice)
+                //
+                // Bias the slice's start ONE TICK past `srcStart` (1.67ms at
+                // timescale 600 — ~5% of a 30fps frame, far less on faster
+                // sources). When mpv reports `time-pos` exactly on a source
+                // frame's PTS boundary, AVMutableComposition's
+                // `insertTimeRange` empirically picks the sample whose PTS
+                // is STRICTLY less than the slice start, delivering the
+                // frame BEFORE the user-visible one. The strokes overlay
+                // then appears on a frame one motion-step behind where the
+                // user drew. Shifting by one tick lands the slice safely
+                // inside the visible frame's PTS interval (the next frame
+                // boundary is always ≥ 8ms away — half-frame at 60 fps).
+                let freezeStart = srcStart + CMTime(value: 1, timescale: 600)
+                let frameRange = CMTimeRange(start: freezeStart, duration: freezeSlice)
                 do {
                     try sourceVideoComp.insertTimeRange(frameRange, of: srcVideoTrack, at: compCursor)
                 } catch {
@@ -265,29 +278,29 @@ enum ClipPreviewBuilder {
             return nil
         }
         let sourceLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: sourceVideoComp)
-        // Initial transform: matches `events.zoomAt(recordTime: 0)` semantics —
-        // identity when no zoom keyframes, otherwise the first keyframe's value
-        // (handles the inherit-on-record snapshot at recordTime=0 too).
-        let initialZoom = zoomKeyframes.first?.zoom ?? .identity
-        sourceLayer.setTransform(sourceTransform(zoom: initialZoom), at: .zero)
-        // Ramp between adjacent keyframes. Each pair becomes a linear
-        // CGAffineTransform interpolation over [a.time, b.time]. After the
-        // last keyframe, the transform holds at the last value (no ramp = no
-        // change), matching `zoomAt(...).after-last` behavior.
-        for i in 0 ..< max(0, zoomKeyframes.count - 1) {
-            let a = zoomKeyframes[i]
-            let b = zoomKeyframes[i + 1]
-            let start = CMTime(seconds: a.time, preferredTimescale: 600)
-            let end = CMTime(seconds: b.time, preferredTimescale: 600)
-            // Skip pairs that round to a zero-duration range (sub-tick events
-            // from continuous gestures). Without the guard AVFoundation would
-            // accept the call but the ramp has no effect anyway.
-            guard end > start else { continue }
-            sourceLayer.setTransformRamp(
-                fromStart: sourceTransform(zoom: a.zoom),
-                toEnd: sourceTransform(zoom: b.zoom),
-                timeRange: CMTimeRange(start: start, duration: end - start)
-            )
+        // Stepwise per-keyframe setTransform (no setTransformRamp). AVPlayer's
+        // built-in compositor on macOS 26 silently ignores setTransformRamp
+        // calls on a layer instruction even though AVAssetExportSession
+        // honors them — verified empirically by `LayerInstructionZoomTests`,
+        // which passes via export with ramps but the live preview shows the
+        // source un-zoomed. setTransform is honored on both paths, and
+        // recording captures zoom at 60+ Hz during continuous gestures so
+        // the stepwise transform changes on every preview frame and the
+        // user perceives a smooth interpolation.
+        if zoomKeyframes.isEmpty {
+            sourceLayer.setTransform(sourceTransform(zoom: .identity), at: .zero)
+        } else {
+            var lastTime = CMTime(value: -1, timescale: 600)
+            for kf in zoomKeyframes {
+                let t = CMTime(seconds: kf.time, preferredTimescale: 600)
+                // setTransform requires strictly increasing times; sub-tick
+                // events from continuous gestures collapse to the same tick
+                // at timescale 600 — keep the last one (closest to its
+                // intended record-time) and drop the earlier dup.
+                guard t > lastTime else { continue }
+                sourceLayer.setTransform(sourceTransform(zoom: kf.zoom), at: t)
+                lastTime = t
+            }
         }
 
         // Webcam PiP layer: scale to 22% of viewport width, preserve cam

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVFoundation
+import QuartzCore
 import VideoCoachCore
 
 struct ContentView: View {
@@ -240,93 +241,105 @@ struct ContentView: View {
         } content: {
             VStack(spacing: 0) {
                 ZStack {
-                    switch appMode {
-                    case .scanning, .recordingStarting, .recording:
-                        MPVPlayerView(
-                            player: workspace.sourcePlayer,
-                            currentZoom: workspace.currentZoom,
-                            onZoomChange: { newZoom in workspace.currentZoom = newZoom }
-                        )
-                    case .previewLoading:
-                        Color.black
-                    case .previewClip(let id):
-                        PreviewPlayerSurface(player: workspace.previewPlayer(for: id))
-                    }
-                    // Mode C overlays — only mounted when previewing so the
-                    // periodic time observer in StrokeReplayLayer doesn't run
-                    // during scanning/recording.
-                    if case .previewClip(let id) = appMode,
-                       let player = workspace.previewPlayer(for: id),
-                       let clip = workspace.project.clips.first(where: { $0.id == id }) {
-                        StrokeReplayOverlay(player: player, clip: clip, replayFrozen: coarseSeekInFlight)
-                            .allowsHitTesting(false)
-                        previewTextBar(for: clip)
-                            .allowsHitTesting(false)
-                    }
-                    if appMode == .recording {
-                        // Drawing overlay sits between the player and the key
-                        // monitor — clicks/drags here become strokes; scroll/
-                        // pinch are forwarded to currentZoom so the user can
-                        // still zoom and pan the source while recording.
-                        DrawingOverlay(
-                            autoClearAfterSeconds: autoClearStrokes ? 5.0 : nil,
-                            onStrokeFinished: { stroke in
-                                recordingController?.appendStroke(stroke)
-                            },
-                            clearAllToken: drawingClearToken,
-                            currentZoom: workspace.currentZoom,
-                            onZoomChange: { newZoom in workspace.currentZoom = newZoom }
-                        )
-                    }
-                    // Zoom level + snap-track indicator. Auto-hides at identity
-                    // (handled inside the view), so it only appears once the
-                    // user has zoomed in. Pinned to the top-right of the
-                    // player area so it doesn't compete with the bottom PiP.
-                    VStack {
-                        HStack {
-                            Spacer()
-                            ZoomIndicator(zoom: workspace.currentZoom)
-                                .padding(.top, 12)
-                                .padding(.trailing, 12)
+                    // Black surround for any chrome between the
+                    // aspect-locked player and the outer frame.
+                    Color.black
+
+                    // Aspect-locked player area. The mpv view (recording)
+                    // and AVPlayer view (preview) both render at source
+                    // aspect; locking the SwiftUI frame to the same aspect
+                    // means there's no letterbox math to do — recording
+                    // and playback render pixel-identical at every zoom.
+                    // Aspect comes from `workspace.sourceAspect`; falls
+                    // back to 16:9 during the brief async load between
+                    // project open and track-naturalSize resolution.
+                    ZStack {
+                        switch appMode {
+                        case .scanning, .recordingStarting, .recording:
+                            MPVPlayerView(
+                                player: workspace.sourcePlayer,
+                                currentZoom: workspace.currentZoom,
+                                onZoomChange: { newZoom in workspace.currentZoom = newZoom }
+                            )
+                        case .previewLoading:
+                            Color.black
+                        case .previewClip(let id):
+                            PreviewPlayerSurface(player: workspace.previewPlayer(for: id))
                         }
-                        Spacer()
+                        // Mode C overlays — only mounted when previewing so the
+                        // periodic time observer in StrokeReplayLayer doesn't run
+                        // during scanning/recording.
+                        if case .previewClip(let id) = appMode,
+                           let player = workspace.previewPlayer(for: id),
+                           let clip = workspace.project.clips.first(where: { $0.id == id }) {
+                            StrokeReplayOverlay(player: player, clip: clip, replayFrozen: coarseSeekInFlight)
+                                .allowsHitTesting(false)
+                            previewTextBar(for: clip)
+                                .allowsHitTesting(false)
+                        }
+                        if appMode == .recording {
+                            // Drawing overlay sits between the player and the key
+                            // monitor — clicks/drags here become strokes; scroll/
+                            // pinch are forwarded to currentZoom so the user can
+                            // still zoom and pan the source while recording.
+                            DrawingOverlay(
+                                autoClearAfterSeconds: autoClearStrokes ? 5.0 : nil,
+                                onStrokeFinished: { stroke in
+                                    recordingController?.appendStroke(stroke)
+                                },
+                                clearAllToken: drawingClearToken,
+                                currentZoom: workspace.currentZoom,
+                                onZoomChange: { newZoom in workspace.currentZoom = newZoom }
+                            )
+                        }
+                        if case .previewLoading = appMode {
+                            // Cover the player surface while we wait for the preview
+                            // cache to populate. Without this the user briefly sees
+                            // whatever frame the previous player was paused on.
+                            Color.black.opacity(0.5)
+                            ProgressView("Preparing preview…")
+                                .controlSize(.regular)
+                                .tint(.white)
+                                .foregroundStyle(.white)
+                        }
+                        // Brief red flash to confirm "recording started." Token
+                        // increments on each successful start; the modifier
+                        // animates 0 → 0.45 → 0 over ~400ms then idles.
+                        RecordingStartFlash(trigger: recordingFlashToken)
+                            .allowsHitTesting(false)
                     }
-                    .allowsHitTesting(false)
+                    .aspectRatio(workspace.sourceAspect ?? 16.0/9.0, contentMode: .fit)
+
+                    // Zoom indicator moved to top toolbar (.principal slot).
+                    // Drawing controls (auto-clear / clear all) moved there
+                    // too so the player area's height stays constant when
+                    // entering recording — having a bottom drawingToolbar
+                    // appear/disappear was rescaling the source video which
+                    // made it harder to land precise drawing strokes.
                     KeyCommandView(
                         appMode: appMode,
                         onSkip: handleSkip,
                         onTogglePlay: handleTogglePlay,
                         onToggleRecord: handleToggleRecord,
                         onClosePreview: handleClosePreview,
-                        onResetZoom: { workspace.currentZoom = .identity }
+                        onResetZoom: { workspace.currentZoom = .identity },
+                        currentZoomScale: workspace.currentZoom.scale,
+                        onZoomLevel: { newScale, cursor in
+                            // Cursor-pivoted absolute zoom — `zoomedToCursor`
+                            // collapses to .identity for newScale ≤ 1, so key
+                            // 1's reset doesn't need a separate path.
+                            let next = workspace.currentZoom
+                                .zoomedToCursor(newScale: newScale, cursor: cursor)
+                            workspace.setCurrentZoomImmediate(next)
+                        }
                     )
-                    if case .previewLoading = appMode {
-                        // Cover the player surface while we wait for the preview
-                        // cache to populate. Without this the user briefly sees
-                        // whatever frame the previous player was paused on.
-                        Color.black.opacity(0.5)
-                        ProgressView("Preparing preview…")
-                            .controlSize(.regular)
-                            .tint(.white)
-                            .foregroundStyle(.white)
-                    }
                     // Empty / error states cover the player area when there's
                     // nothing meaningful to show. They sit ON TOP of preview
                     // overlays intentionally — if a source goes missing
                     // mid-session, the relink banner trumps the playhead.
                     playerEmptyStateOverlay
-                    // Brief red flash to confirm "recording started." Token
-                    // increments on each successful start; the modifier
-                    // animates 0 → 0.45 → 0 over ~400ms then idles.
-                    RecordingStartFlash(trigger: recordingFlashToken)
-                        .allowsHitTesting(false)
                 }
                 .frame(minWidth: 640, minHeight: 360)
-
-                if appMode == .recording {
-                    Divider()
-                    drawingToolbar
-                }
 
                 Divider()
 
@@ -348,6 +361,26 @@ struct ContentView: View {
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
         }
         .toolbar {
+            // Centered always-on cluster: zoom level + drawing controls.
+            // The drawing controls used to live in a `drawingToolbar`
+            // mounted below the player area only during recording, but
+            // mounting/unmounting it changed the player's height which
+            // shifted the on-screen layout right when the user wanted to
+            // start drawing precisely. Pinning them to the toolbar keeps
+            // the player's frame constant across mode switches.
+            ToolbarItem(placement: .principal) {
+                HStack(spacing: 16) {
+                    ZoomIndicator(zoom: workspace.currentZoom)
+                    Toggle("Auto-clear (5s)", isOn: $autoClearStrokes)
+                        .toggleStyle(.checkbox)
+                        .disabled(appMode != .recording)
+                    Button("Clear All") {
+                        drawingClearToken &+= 1
+                        recordingController?.appendClearAll()
+                    }
+                    .disabled(appMode != .recording)
+                }
+            }
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     showExportSheet = true
@@ -404,20 +437,6 @@ struct ContentView: View {
         if !trimmedName.isEmpty { parts.append(trimmedName) }
         if !clip.tags.isEmpty { parts.append(clip.tags.joined(separator: ", ")) }
         return parts.joined(separator: " | ")
-    }
-
-    private var drawingToolbar: some View {
-        HStack(spacing: 12) {
-            Toggle("Auto-clear (5s)", isOn: $autoClearStrokes)
-                .toggleStyle(.checkbox)
-            Button("Clear All") {
-                drawingClearToken &+= 1
-                recordingController?.appendClearAll()
-            }
-            Spacer()
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
     }
 
     // MARK: - Mode transitions
@@ -604,11 +623,38 @@ struct ContentView: View {
         case .scanning, .recordingStarting, .recording:
             guard let player = workspace.sourcePlayer else { return }
             let wasPlaying = !player.isPaused
+            // Capture BOTH the keystroke host-time AND mpv's current source
+            // playhead BEFORE calling player.pause/play.
+            //   * host-time before mpv: `mpv_set_property("pause")` can
+            //     block for tens to hundreds of ms while mpv processes the
+            //     flag; reading `now` after that block lands the event late
+            //     and playback's pause arrives that long after the user
+            //     pressed space.
+            //   * source-time anchor: mpv may have play/pause latency or
+            //     frame-boundary rounding that makes the segment-builder's
+            //     1×-wall-clock cursor drift from where the user actually
+            //     saw the source freeze. Pinning the captured `timePos` on
+            //     the event lets the segment-builder anchor the freeze
+            //     frame to the exact mpv state at the keystroke.
+            //
+            // Use `currentSourceTimeSync()` (a synchronous
+            // `mpv_get_property("time-pos", ...)` call) rather than
+            // `player.timePos` (the @Observable cache populated by mpv
+            // property-change events): the cache lags the actual
+            // playback head by up to one frame because property events
+            // hop through `DispatchQueue.main.async` before reaching
+            // Swift, and on a fast-moving source that lag is visible —
+            // the user pauses on the soccer ball at frame N+1 but the
+            // recorded freeze shows frame N, so any drawing made on top
+            // of the paused frame doesn't line up with the ball on
+            // playback.
+            let keystrokeHostTime = CACurrentMediaTime()
+            let sourceTime = player.currentSourceTimeSync()
             wasPlaying ? player.pause() : player.play()
             if appMode == .recording {
                 wasPlaying
-                    ? recordingController?.appendPause()
-                    : recordingController?.appendPlay()
+                    ? recordingController?.appendPause(atHostTime: keystrokeHostTime, sourceTime: sourceTime)
+                    : recordingController?.appendPlay(atHostTime: keystrokeHostTime, sourceTime: sourceTime)
             }
         case .previewClip(let id):
             guard let player = workspace.previewPlayer(for: id) else { return }
@@ -720,14 +766,19 @@ struct ContentView: View {
         let filename = "clip-\(clipID).mov"
         let url = recordingsDir.appendingPathComponent(filename)
 
-        // Capture source-time anchor synchronously at R-press. Pause doesn't
-        // move the playhead, so the cached (@Observable) values reflect the
-        // on-screen frame.
+        // Capture source-time anchor synchronously at R-press via
+        // `currentSourceTimeSync()` — the cached `timePos` can still
+        // lag mpv's actual state right after a recent pause (the
+        // property-change → DispatchQueue.main.async hop can leave the
+        // cache one update behind), and we'd rather the clip's
+        // `startSourceSeconds` reflect the exact frame on screen than
+        // a value from a few frames ago.
+        let initialSourceSeconds = player.currentSourceTimeSync()
         pendingRecording = PendingRecording(
             clipID: clipID,
             filename: filename,
             sourceIndex: player.playlistPos,
-            startSourceSeconds: player.timePos
+            startSourceSeconds: initialSourceSeconds
         )
 
         let preferredCameraID = deviceCatalog.selectedCameraID
@@ -758,9 +809,21 @@ struct ContentView: View {
                     // Source was paused on R-press and KeyCommandView blocks
                     // space during .recordingStarting, so the source is
                     // guaranteed paused at t0. Anchor the event log with
-                    // .pause so PlaybackTimeline reconstructs a leading
-                    // .freeze segment (rather than its rate=1.0 default).
-                    controller.appendPause()
+                    // .pause AT recordTime=0 (not `now`) — the async hop
+                    // between capture.startRecording and MainActor.run can
+                    // land at `now > 0`, which would emit a phantom
+                    // leading .play segment of `now` seconds at the start
+                    // of the clip (the source was actually frozen during
+                    // that window).
+                    // Reuse the sync-fetched startSourceSeconds rather
+                    // than re-reading `player.timePos` here. By the time
+                    // this MainActor.run closure runs, mpv has had several
+                    // dispatch hops to update its state — but we want the
+                    // initial pause anchor to match the clip's
+                    // startSourceSeconds exactly so the freeze frame at
+                    // recordTime=0 is the same source-time the clip is
+                    // semantically anchored to.
+                    controller.appendInitialPause(sourceTime: initialSourceSeconds)
                     self.recordingController = controller
                     workspace.recordingController = controller
                     self.appMode = .recording
@@ -946,7 +1009,15 @@ struct ContentView: View {
         panel.allowedContentTypes = [.movie, .mpeg4Movie, .quickTimeMovie]
         panel.allowsMultipleSelection = false
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        Task { try? await workspace.addSourceVideo(url: url) }
+        Task {
+            do {
+                try await workspace.addSourceVideo(url: url)
+            } catch {
+                await MainActor.run {
+                    openProjectError = "Couldn't add source: \(error.localizedDescription)"
+                }
+            }
+        }
     }
 
     private func relinkSourcePanel(at index: Int) {

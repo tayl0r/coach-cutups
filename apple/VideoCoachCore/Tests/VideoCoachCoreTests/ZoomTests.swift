@@ -101,4 +101,36 @@ final class ZoomTests: XCTestCase {
         XCTAssertEqual(origin.x, -500, accuracy: 1e-9)
         XCTAssertEqual(origin.y, -250, accuracy: 1e-9)
     }
+
+    /// `deltaTransform` is the visual inverse of `sourcePoint(atViewPosition:)`:
+    /// the source point that `sourcePoint` says is shown at viewport position v
+    /// must map *to* viewport position v under deltaTransform. With a non-zero
+    /// pan this catches a regression where the pan magnitude is missing a
+    /// factor of `scale` (which made the visible region drift toward the
+    /// source center as the user panned).
+    func test_deltaTransform_with_pan_matches_sourcePoint() {
+        let vpSize = CGSize(width: 1280, height: 720)
+        let z = Zoom(scale: 2, panX: 0.25, panY: -0.1)
+        let t = z.deltaTransform(viewportSize: vpSize)
+        let probes: [CGPoint] = [
+            CGPoint(x: 0.5, y: 0.5),
+            CGPoint(x: 0.25, y: 0.25),
+            CGPoint(x: 0.75, y: 0.75),
+        ]
+        for probe in probes {
+            let expectedSourceNorm = z.sourcePoint(atViewPosition: probe)
+            // sourcePoint returns normalized; convert to source pixels (the
+            // input space deltaTransform expects when source size == viewport).
+            let srcPx = CGPoint(
+                x: expectedSourceNorm.x * vpSize.width,
+                y: expectedSourceNorm.y * vpSize.height
+            )
+            let mapped = srcPx.applying(t)
+            // The roundtrip should land at viewport pixels (probe * vpSize).
+            XCTAssertEqual(mapped.x, probe.x * vpSize.width, accuracy: 1e-6,
+                "deltaTransform should map sourcePoint(\(probe)) → viewport(\(probe))")
+            XCTAssertEqual(mapped.y, probe.y * vpSize.height, accuracy: 1e-6,
+                "deltaTransform should map sourcePoint(\(probe)) → viewport(\(probe))")
+        }
+    }
 }

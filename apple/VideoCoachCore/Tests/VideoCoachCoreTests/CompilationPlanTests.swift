@@ -139,8 +139,11 @@ final class CompilationPlanTests: XCTestCase {
         let segs = plan.entries[0].segments
         let expected = clip.playbackSegments(sourceDuration: 1000)
         XCTAssertEqual(segs, expected)
-        // Sanity-check: the post-skip segment is clamped at the supplied source duration.
-        XCTAssertEqual(segs[1].sourceStart, 1000, accuracy: 1e-9)
+        // Sanity-check: post-skip "play" tail past source EOF is realized
+        // as a freeze on the last source frame, not a `.play` whose read
+        // range would fall past the asset bounds.
+        XCTAssertEqual(segs[1].kind, .freeze)
+        XCTAssertLessThan(segs[1].sourceStart, 1000)
     }
 
     func test_compilationPlan_recordingDuration_perEntryMatchesClip() {

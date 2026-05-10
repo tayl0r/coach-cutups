@@ -29,11 +29,21 @@ public struct SkipDecision: Equatable, Sendable {
 
 /// Coalesces rapid FF/RW skip presses into a small number of player seeks.
 ///
-/// During a burst we issue at most one keyframe-tolerant ("coarse") seek
-/// in flight at a time and accumulate the user's intended target. Once
+/// The first press of any sequence issues an exact-frame seek directly —
+/// no coarse-then-refine for single keypresses, since on long-GOP HEVC the
+/// "coarse" landing visibly snaps to the keyframe before the target (e.g.
+/// +2s for a +3s skip) and the burst-end debounce then jumps the rest of
+/// the way, producing a perceived double-seek for one keypress.
+///
+/// Follow-up presses inside the same burst accumulate the user's intended
+/// target. When the leading exact lands while a follow-up target has piled
+/// up, the coordinator switches into burst mode: a keyframe-tolerant
+/// ("coarse") seek to the latest target with a refreshed debounce. Once
 /// the user stops pressing for `burstWindowSeconds`, an exact-frame seek
-/// is issued to settle on the precise frame. This is a pure-logic state
-/// machine; the caller wires it to the actual player and timers.
+/// settles on the precise frame.
+///
+/// This is a pure-logic state machine; the caller wires it to the actual
+/// player and timers.
 @MainActor
 public final class SkipCoordinator {
     private let burstWindow: Double
@@ -59,25 +69,36 @@ public final class SkipCoordinator {
         target = t
         exactPending = false
         if flying == nil {
+            // Leading press: issue exact directly so a single keypress
+            // produces one frame-precise jump. `target` stays set so a
+            // follow-up press during this seek's flight uses it as the
+            // base; if no follow-up arrives, `seekCompleted` clears it.
+            // No debounce — there's nothing left to settle to.
             flying = t
-            flyingExact = false
-            return SkipDecision(seek: .init(targetSeconds: t, exact: false),
-                                armDebounceSeconds: burstWindow)
+            flyingExact = true
+            return SkipDecision(seek: .init(targetSeconds: t, exact: true))
         }
+        // Follow-up press during flight: accumulate target only and
+        // (re)arm the burst-end debounce. The actual coarse seek is
+        // issued by `seekCompleted` once the leading exact lands.
         return SkipDecision(armDebounceSeconds: burstWindow)
     }
 
     /// Notify the coordinator that the in-flight seek has completed.
     ///
     /// Branches, in order:
-    /// (a) `exactPending` is cleared unconditionally on entry; if a `target`
-    ///     remains, an exact-frame seek is issued to settle on it (the burst
-    ///     ended while this seek was in flight).
-    /// (b) If the completed seek landed exact, clear `target` and no-op.
-    /// (c) If `target` advanced past the landed coarse position during flight,
-    ///     refire coarse to the latest `target`.
-    /// (d) Otherwise no-op (landed coarse on the user's current target; the
-    ///     pending burst-end debounce will issue the exact settle).
+    /// (a) If `exactPending` was set (the burst-end debounce fired during
+    ///     this seek's flight), issue an exact settle to `target` if any.
+    /// (b) Leading exact landed and a follow-up press piled up a new target
+    ///     during flight: switch into burst mode — fire a coarse seek to
+    ///     the new target and arm the burst-end debounce. (For a true
+    ///     single press, `target == landedTarget` here, so this collapses
+    ///     to the next branch and no follow-up seek is issued.)
+    /// (c) Leading exact landed with no pending target: clear and no-op.
+    /// (d) Coarse landed and `target` advanced past the landed position
+    ///     during flight: refire coarse to the latest `target`. (No debounce
+    ///     re-arm needed — the press that advanced `target` armed it.)
+    /// (e) Otherwise no-op.
     public func seekCompleted(nowMonotonicSeconds: TimeInterval) -> SkipDecision {
         let landedTarget = flying
         let landedExact = flyingExact
@@ -91,7 +112,15 @@ public final class SkipCoordinator {
             }
             return .none
         }
-        if landedExact { target = nil; return .none }
+        if landedExact {
+            if let tgt = target, tgt != landedTarget {
+                flying = tgt; flyingExact = false
+                return SkipDecision(seek: .init(targetSeconds: tgt, exact: false),
+                                    armDebounceSeconds: burstWindow)
+            }
+            target = nil
+            return .none
+        }
         if let tgt = target, tgt != landedTarget {
             flying = tgt; flyingExact = false
             return SkipDecision(seek: .init(targetSeconds: tgt, exact: false))

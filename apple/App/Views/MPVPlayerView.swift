@@ -274,14 +274,33 @@ enum ZoomGesture {
     }
 
     /// Compute the next zoom for a scroll-wheel event.
-    /// `hasPreciseScrollingDeltas == true` → trackpad two-finger swipe →
-    /// pan (no-op at scale=1.0, returns nil).
-    /// `false` → coarse mouse wheel → cursor-pivoted zoom.
-    /// Direction matches Maps/Safari/Final Cut: deltaY>0 = away from user
-    /// = zoom in. macOS's natural-scrolling preference is already baked into
-    /// scrollingDeltaY.
+    ///
+    /// `hasPreciseScrollingDeltas == true` → trackpad two-finger swipe.
+    /// Modifier state is checked PER EVENT (not latched at gesture start),
+    /// so pressing or releasing Cmd partway through a swipe flips
+    /// pan↔zoom live — that's why `cf705f9` (latched at gesture start)
+    /// was reverted as `f3eaf03`.
+    ///   * `.command` held → cursor-pivoted zoom (`scrollingDeltaY` →
+    ///     scale multiplier).
+    ///   * `.command` released → pan (no-op at scale=1.0, returns nil).
+    ///
+    /// `hasPreciseScrollingDeltas == false` → coarse mouse wheel →
+    /// cursor-pivoted zoom regardless of modifiers.
+    ///
+    /// Direction matches Maps/Safari/Final Cut: deltaY>0 = swipe away
+    /// from user = zoom in. macOS's natural-scrolling preference is
+    /// already baked into `scrollingDeltaY`.
     static func nextZoom(forScrollWheel event: NSEvent, in view: NSView, currentZoom: Zoom) -> Zoom? {
         if event.hasPreciseScrollingDeltas {
+            if event.modifierFlags.contains(.command) {
+                // Trackpad zoom. `/300` chosen empirically as a reasonable
+                // starting feel — comparable per-event scale change to a
+                // mouse-wheel notch (~10% per ~30px of swipe). Tune as
+                // needed.
+                let nextScale = currentZoom.scale * (1.0 + event.scrollingDeltaY / 300.0)
+                return currentZoom.zoomedToCursor(newScale: nextScale, cursor: cursor(in: view, event: event))
+            }
+            // Trackpad pan. No-op at scale=1.0 (nothing to pan).
             guard currentZoom.scale > 1.0 else { return nil }
             let viewW = max(1, view.bounds.width)
             let viewH = max(1, view.bounds.height)

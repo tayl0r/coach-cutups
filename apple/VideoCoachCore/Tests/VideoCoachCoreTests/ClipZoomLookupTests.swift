@@ -68,9 +68,9 @@ final class ClipZoomLookupTests: XCTestCase {
             name: "x", sourceIndex: 0, startSourceSeconds: 0,
             recordingDuration: 10, recordingFilename: "x.mov",
             events: [
-                CommentaryEvent(recordTime: 0.5, kind: .play),
+                CommentaryEvent(recordTime: 0.5, kind: .play(sourceTime: 0)),
                 CommentaryEvent(recordTime: 1.0, kind: .zoom(z)),
-                CommentaryEvent(recordTime: 1.5, kind: .pause),
+                CommentaryEvent(recordTime: 1.5, kind: .pause(sourceTime: 1)),
             ],
             sortIndex: 0
         )

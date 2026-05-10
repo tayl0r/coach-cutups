@@ -29,8 +29,6 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
     ]
 
     private var renderContext: AVVideoCompositionRenderContext?
-    private var lastSourceFrame: CVPixelBuffer?
-    private var lastClipIndex: Int = -1
 
     /// Shared CIContext for `CVPixelBuffer → CGImage` conversions in
     /// ``makeCGImage(_:)``. Allocated once per compositor instance (one
@@ -64,24 +62,18 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         // gracefully: when the cast misses, fall back to a "no per-clip
         // context" path that still emits a frame so the export completes.
         let inst = request.videoCompositionInstruction as? CompilationInstruction
-
-        if let inst {
-            // Reset cached source frame at every clip boundary so a leading
-            // .freeze in clip N never displays clip N-1's last source frame.
-            if inst.clipIndex != lastClipIndex {
-                lastClipIndex = inst.clipIndex
-                lastSourceFrame = nil
-            }
-        }
-
         let recordTime = inst.map { (request.compositionTime - $0.clipCompositionStart).seconds } ?? 0
-        let isFreeze = inst.map { currentSegmentIsFreeze(inst: $0, recordTime: recordTime) } ?? false
 
-        // 1. Base buffer: live source for .play, cached for .freeze, cached
-        //    fallback if the live pull returned nil. When the subclass is
-        //    stripped, we don't know the source track ID — try the
-        //    instruction's `requiredSourceTrackIDs` (set on the parent class)
-        //    in declaration order; the first one is by convention the source.
+        // 1. Base buffer: live source frame from the composition track. The
+        //    exporter inserts content for both `.play` AND `.freeze` segments
+        //    (freezes are stretched 1-tick slices via `scaleTimeRange`), so
+        //    `request.sourceFrame(byTrackID:)` returns a real frame at every
+        //    compositionTime — no per-clip cache fallback needed. When the
+        //    instruction subclass is stripped (macOS 26 has been seen to do
+        //    this), we don't know the source track ID directly; fall back to
+        //    the instruction's `requiredSourceTrackIDs` (set on the parent
+        //    class) in declaration order, which by convention puts source
+        //    first.
         let sourceTrackID: CMPersistentTrackID
         if let inst {
             sourceTrackID = inst.sourceTrackID
@@ -92,15 +84,7 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
             sourceTrackID = kCMPersistentTrackID_Invalid
         }
 
-        var base: CVPixelBuffer?
-        if isFreeze {
-            base = lastSourceFrame
-        } else if let sf = request.sourceFrame(byTrackID: sourceTrackID) {
-            lastSourceFrame = sf
-            base = sf
-        } else {
-            base = lastSourceFrame
-        }
+        let base: CVPixelBuffer? = request.sourceFrame(byTrackID: sourceTrackID)
 
         // 2. Output buffer + CG context (flip Y to top-left origin).
         guard let out = renderContext?.newPixelBuffer() else {
@@ -209,22 +193,6 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
     }
 
     // MARK: - Helpers
-
-    /// Walks `inst.segments` summing `outDuration`; returns true when the
-    /// segment containing `recordTime` is `.freeze`. Returns false if
-    /// `recordTime` falls outside the walked range (defensive — the
-    /// instruction should cover the clip's full output range).
-    private func currentSegmentIsFreeze(inst: CompilationInstruction, recordTime: Double) -> Bool {
-        var cursor = 0.0
-        for seg in inst.segments {
-            let next = cursor + seg.outDuration
-            if recordTime < next {
-                return seg.kind == .freeze
-            }
-            cursor = next
-        }
-        return false
-    }
 
     private func drawStroke(_ vs: VisibleStroke, into cg: CGContext, size: CGSize) {
         guard vs.drawnPointCount > 0 else { return }

@@ -24,7 +24,7 @@ final class ProjectTests: XCTestCase {
             name: "play 1", notes: "first one", tags: ["attacking-chance"],
             sourceIndex: 0, startSourceSeconds: 12.0, recordingDuration: 4.5,
             recordingFilename: "clip-A.mov",
-            events: [.init(recordTime: 0, kind: .play)],
+            events: [.init(recordTime: 0, kind: .play(sourceTime: 0))],
             sortIndex: 0
         ))
         let data = try JSONEncoder().encode(p)

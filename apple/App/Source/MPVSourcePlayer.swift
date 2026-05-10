@@ -430,6 +430,26 @@ public final class MPVSourcePlayer {
         if isPaused { play() } else { pause() }
     }
 
+    /// Synchronously fetch mpv's current `time-pos` property, bypassing
+    /// the property-observer-event cache (`self.timePos`). The cache is
+    /// updated only when mpv emits a property-change event AND that event
+    /// has been dispatched to the main actor — both contribute up to a
+    /// frame of staleness. For features that need the freshest possible
+    /// playback-time value (capturing the source-frame the user paused
+    /// on, so the recorded freeze matches what was on screen at keystroke
+    /// time), call this instead of reading `timePos`.
+    ///
+    /// Returns `timePos` (the cached value) when no mpv handle is
+    /// attached — the fallback matches the legacy code path so callers
+    /// don't have to special-case the detached state.
+    public func currentSourceTimeSync() -> Double {
+        guard let h = handle else { return timePos }
+        var v: Double = 0
+        let rc = mpv_get_property(h, "time-pos", MPV_FORMAT_DOUBLE, &v)
+        guard rc >= 0, v.isFinite else { return timePos }
+        return v
+    }
+
     public func setVolume(_ v: Double) {
         volume = v
         guard let h = handle else { return }
@@ -459,14 +479,15 @@ public final class MPVSourcePlayer {
         // positive = visible center on RIGHT." Opposite signs → negate.
         var px = -zoom.panX
         var py = -zoom.panY
-        // panscan=0 at identity preserves source aspect (letterbox if needed);
-        // panscan=1 once zoomed scales the source to cover the viewport so the
-        // pan-clamp guarantees no black is exposed.
-        var panscan: Double = zoom.scale > 1.0 ? 1.0 : 0.0
+        // panscan stays at 0 (letterbox-fit, preserves source aspect). The
+        // SwiftUI player viewport is aspect-locked to the source, so there
+        // are no black bars to expose at any zoom — and keeping panscan=0
+        // means mpv's framing matches AVPlayer's letterbox-into-renderSize
+        // playback math exactly, so what the user records is what they see
+        // on playback.
         mpv_set_property(h, "video-zoom",  MPV_FORMAT_DOUBLE, &mpvZoom)
         mpv_set_property(h, "video-pan-x", MPV_FORMAT_DOUBLE, &px)
         mpv_set_property(h, "video-pan-y", MPV_FORMAT_DOUBLE, &py)
-        mpv_set_property(h, "panscan",     MPV_FORMAT_DOUBLE, &panscan)
     }
 
     private func runCommandSync(_ args: [String]) {

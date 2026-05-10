@@ -86,17 +86,23 @@ public extension Zoom {
     /// Zoom-and-pan delta in viewport pixel coordinates, to be applied
     /// AFTER any existing layout transform. At identity returns the
     /// identity transform (no behavior change for existing compositors).
-    /// At scale=2, panX=0.1: scale up by 2 around the viewport center,
-    /// then translate by 0.1 of viewport width.
+    ///
+    /// Visual inverse of `sourcePoint(atViewPosition:)`: the source point
+    /// at viewport-center is `(0.5 + panX, 0.5 + panY)` (in normalized
+    /// coords), and `scale` is the viewport-pixel-per-source-pixel ratio.
+    /// Forward map: viewport = scale·source + (cx − scale·(0.5+pan)·W, cy − scale·(0.5+pan)·H).
     func deltaTransform(viewportSize: CGSize) -> CGAffineTransform {
         guard scale != 1.0 || panX != 0 || panY != 0 else { return .identity }
         let cx = viewportSize.width / 2
         let cy = viewportSize.height / 2
-        let tx = -panX * viewportSize.width
-        let ty = -panY * viewportSize.height
+        // Build as: translate(-(0.5+pan)·viewport)  →  scale  →  translate(center).
+        // The `scaledBy` chain pre-multiplies the new op, so this matches the
+        // intended semantics: shift the desired-center-source-point to origin,
+        // scale around origin, shift origin back to viewport center.
         return CGAffineTransform.identity
-            .translatedBy(x: cx + tx, y: cy + ty)
+            .translatedBy(x: cx, y: cy)
             .scaledBy(x: scale, y: scale)
-            .translatedBy(x: -cx, y: -cy)
+            .translatedBy(x: -(0.5 + panX) * viewportSize.width,
+                          y: -(0.5 + panY) * viewportSize.height)
     }
 }

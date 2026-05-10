@@ -2,6 +2,7 @@ import Foundation
 import VideoCoachCore
 import AVFoundation
 import Observation
+import QuartzCore   // CACurrentMediaTime for setCurrentZoom throttle
 
 enum WorkspaceError: Error {
     case noVideoTrack(URL)
@@ -10,6 +11,33 @@ enum WorkspaceError: Error {
     /// reference it. The UI should disable the unload affordance with a
     /// tooltip explaining; this case is the defensive fallback.
     case sourceHasClipsReferencingIt(count: Int)
+    /// New source's aspect ratio doesn't match the project's existing
+    /// aspect. v1 is single-aspect-per-project so the player can lock its
+    /// viewport to source aspect — recording and playback then render
+    /// pixel-identical without a letterbox/cover-fit toggle.
+    /// TODO(multi-aspect): support a project that mixes aspects by
+    /// rebuilding the player viewport per active source.
+    case aspectMismatch(existing: Double, attempted: Double, displayName: String)
+}
+
+extension WorkspaceError: LocalizedError {
+    var errorDescription: String? {
+        switch self {
+        case .noVideoTrack(let url):
+            return "“\(url.lastPathComponent)” has no video track."
+        case .bookmarkResolutionFailed(let name):
+            return "Couldn't resolve “\(name)”."
+        case .sourceHasClipsReferencingIt(let count):
+            return "\(count) clip\(count == 1 ? "" : "s") still reference this source."
+        case .aspectMismatch(let existing, let attempted, let name):
+            return String(
+                format: "“%@” has aspect %.3f but the project's existing source aspect is %.3f. " +
+                "Multi-aspect projects aren't supported yet — remove all clips and the existing " +
+                "source first to switch the project to a different aspect.",
+                name, attempted, existing
+            )
+        }
+    }
 }
 
 @Observable
@@ -30,6 +58,18 @@ final class Workspace {
     /// would no longer line up with the concat.
     var missingSourceIndices: Set<Int> = []
 
+    /// Display aspect (width / height) of the project's first resolved
+    /// source video, rotation-corrected. The player area locks to this so
+    /// the mpv view (recording) and AVPlayer view (playback) always render
+    /// at source aspect — no letterbox math, no `panscan` cover-fit toggle,
+    /// no recording-vs-playback divergence at zoom > 1.
+    /// In-memory only; never persisted. Repopulated on every
+    /// `rebuildSourcePlayer` and on `relinkSource`. nil while no project is
+    /// open, while loading, or when every source is missing.
+    /// TODO(multi-aspect): expose per-source aspect once we let projects
+    /// mix aspects.
+    var sourceAspect: Double?
+
     /// Live zoom/pan state for the source-playback view. Ephemeral —
     /// not persisted to the project. Reset to identity on workspace switch
     /// (which happens by Workspace re-init in openProject).
@@ -45,15 +85,55 @@ final class Workspace {
     /// targeted invalidation — only views that actually read the property
     /// re-render.
     private var _currentZoom: Zoom = .identity
+    /// Host-clock time (`CACurrentMediaTime()`) of the last commit through
+    /// `setCurrentZoom(_:)`. Used to throttle gesture-driven updates to
+    /// ~20Hz so the live mpv view and the recorded event log see the
+    /// SAME stream of zoom values — without that match, a user who pans
+    /// while drawing on a moving subject sees the ball follow the smooth
+    /// 60Hz mpv output during recording but stepwise-throttled keyframes
+    /// during replay, which puts the recorded drawing offset from the
+    /// ball by the unmatched-pan delta. Throttling at this single point
+    /// (rather than only on the recording side) keeps live and replay
+    /// in lockstep.
+    @ObservationIgnored
+    private var _lastZoomCommitHostTime: Double = -.infinity
 
     var currentZoom: Zoom {
         get { _currentZoom }
         set { setCurrentZoom(newValue) }
     }
 
+    /// Throttle interval for `setCurrentZoom` commits — see
+    /// `_lastZoomCommitHostTime`. 50ms = 20Hz; AppKit gesture events fire
+    /// at ~60Hz so this drops about 2 of every 3 calls on a continuous
+    /// gesture. Visually 20Hz is borderline noticeable but the
+    /// alternative (no throttle = full 60Hz) doubles the recorded
+    /// keyframe count and the alternative (recording-side-only throttle)
+    /// puts live and replay out of sync.
+    private static let zoomThrottleSeconds: Double = 0.05
+
     func setCurrentZoom(_ zoom: Zoom) {
         let clamped = zoom.clamped()
         guard clamped != _currentZoom else { return }
+        let now = CACurrentMediaTime()
+        if now - _lastZoomCommitHostTime < Self.zoomThrottleSeconds { return }
+        _lastZoomCommitHostTime = now
+        self._currentZoom = clamped
+        sourcePlayer?.setZoom(clamped)
+        recordingController?.appendZoom(clamped)
+    }
+
+    /// Apply a zoom from a discrete one-shot intent (hotkey, menu command,
+    /// programmatic reset) — bypasses the gesture throttle. The throttle on
+    /// `setCurrentZoom` exists to drop ~⅔ of the 60Hz gesture stream so live
+    /// playback and recorded keyframes stay in lockstep at ~20Hz; a single
+    /// keypress isn't a stream, and silently dropping it (e.g. user mashes
+    /// `1` then `4` inside 50ms) would leave the user stuck on whichever
+    /// level happened to land first.
+    func setCurrentZoomImmediate(_ zoom: Zoom) {
+        let clamped = zoom.clamped()
+        guard clamped != _currentZoom else { return }
+        _lastZoomCommitHostTime = CACurrentMediaTime()
         self._currentZoom = clamped
         sourcePlayer?.setZoom(clamped)
         recordingController?.appendZoom(clamped)
@@ -110,9 +190,18 @@ final class Workspace {
     }
 
     func addSourceVideo(url: URL) async throws {
-        let bookmark = try url.bookmarkData(options: [])  // plain — we're unsandboxed
         let asset = AVURLAsset(url: url)
-        let duration = try await asset.load(.duration)
+        async let durationLoad = asset.load(.duration)
+        let newAspect = try await Self.displayAspect(of: asset)
+        if let existing = sourceAspect, !Self.aspectsMatch(existing, newAspect) {
+            throw WorkspaceError.aspectMismatch(
+                existing: existing,
+                attempted: newAspect,
+                displayName: url.lastPathComponent
+            )
+        }
+        let duration = try await durationLoad
+        let bookmark = try url.bookmarkData(options: [])  // plain — we're unsandboxed
         project.sourceVideos.append(.init(
             bookmark: bookmark,
             displayName: url.lastPathComponent,
@@ -150,6 +239,7 @@ final class Workspace {
         // the player handle alive (D2) so a Relink doesn't repay init cost.
         guard !project.sourceVideos.isEmpty, missing.isEmpty else {
             sourcePlayer?.setPlaylist([])
+            sourceAspect = nil
             return
         }
 
@@ -158,6 +248,48 @@ final class Workspace {
         }
         sourcePlayer?.setPlaylist(resolved.map { $0.url.path(percentEncoded: false) })
         sourcePlayer?.setVolume(project.preferences.scanVolume)
+
+        // Resolve aspect from the first source's video track. Async, but the
+        // SwiftUI player ZStack stays gated behind `playerEmptyStateOverlay`
+        // until this lands so the user never sees a non-source-aspect frame.
+        // Off-main: doesn't block rebuildSourcePlayer's caller.
+        if let first = resolved.first {
+            let url = first.url
+            Task { [weak self] in
+                let aspect = try? await Self.displayAspect(of: AVURLAsset(url: url))
+                await MainActor.run {
+                    guard let self else { return }
+                    self.sourceAspect = aspect
+                }
+            }
+        }
+    }
+
+    /// Display aspect (width / height) of `asset`'s first video track,
+    /// corrected for any `preferredTransform` rotation. Throws if the asset
+    /// has no video track. Used as the gate value for new-source aspect
+    /// matching and as the lock value for the player viewport.
+    static func displayAspect(of asset: AVAsset) async throws -> Double {
+        let track = try await asset.primaryVideoTrack()
+        async let naturalSize = track.load(.naturalSize)
+        async let transform = track.load(.preferredTransform)
+        let size = try await naturalSize
+        let t = try await transform
+        let displayed = size.applying(t)
+        let w = abs(displayed.width)
+        let h = abs(displayed.height)
+        guard h > 0 else { return 0 }
+        return w / h
+    }
+
+    /// Aspects compare equal if they're within 0.5%. `naturalSize` from
+    /// AVFoundation is exact for most professional sources (1920/1080,
+    /// 3840/2160) but phone-recorded clips occasionally land off-by-a-pixel
+    /// (e.g. 1920/1078) which is the same intended aspect. 0.5% covers that
+    /// without admitting genuinely different aspects.
+    static func aspectsMatch(_ a: Double, _ b: Double) -> Bool {
+        guard a > 0, b > 0 else { return false }
+        return abs(a - b) / max(a, b) < 0.005
     }
 
     /// Number of clips whose `sourceIndex` points at the given source. The
@@ -220,9 +352,22 @@ final class Workspace {
     /// passing the user-picked URL.
     func relinkSource(at index: Int, to url: URL) async throws {
         guard project.sourceVideos.indices.contains(index) else { return }
-        let bookmark = try url.bookmarkData(options: [])
         let asset = AVURLAsset(url: url)
-        let duration = try await asset.load(.duration)
+        async let durationLoad = asset.load(.duration)
+        let newAspect = try await Self.displayAspect(of: asset)
+        // If any *other* source is currently resolved, its aspect is the
+        // project-level lock — the relinked file must match. (When the
+        // project has only this one source, we let the relink set the new
+        // aspect freely; it's the same as a fresh add.)
+        if let existing = sourceAspect, !Self.aspectsMatch(existing, newAspect) {
+            throw WorkspaceError.aspectMismatch(
+                existing: existing,
+                attempted: newAspect,
+                displayName: url.lastPathComponent
+            )
+        }
+        let duration = try await durationLoad
+        let bookmark = try url.bookmarkData(options: [])
         project.sourceVideos[index] = .init(
             bookmark: bookmark,
             displayName: url.lastPathComponent,

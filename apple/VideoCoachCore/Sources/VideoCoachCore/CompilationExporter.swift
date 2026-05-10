@@ -50,6 +50,32 @@ public enum CompilationExportError: Error, CustomStringConvertible, LocalizedErr
 public actor CompilationExporter {
     public init() {}
 
+    /// Slim a clip's event list down to what `CompilationCompositor`
+    /// actually consumes inside `startRequest(_:)`:
+    ///
+    /// - `.stroke` and `.clearAll`: walked by `visibleStrokes(in:atRecordTime:)`
+    ///   to redraw active strokes on each output frame.
+    /// - `.zoom`: walked by `events.zoomAt(recordTime:)` to compute the
+    ///   per-frame delta transform applied to the source frame.
+    ///
+    /// `.play`/`.pause`/`.skip` are dropped — the compositor doesn't
+    /// replay them; segment-driven freeze logic in `playbackSegments`
+    /// already collapsed them into `.play` vs `.freeze` segment kinds.
+    ///
+    /// Pulled out of the inline filter at the call site so it has a
+    /// dedicated unit test (`CompilationExporterEventFilterTests`).
+    /// Until 2026-05-05 this filter omitted `.zoom`, which silently
+    /// dropped all zoom keyframes from exports — the user's zoom showed
+    /// up in preview but exported videos always rendered at identity.
+    public static func compositorEvents(from events: [CommentaryEvent]) -> [CommentaryEvent] {
+        events.filter { event in
+            switch event.kind {
+            case .stroke, .clearAll, .zoom: return true
+            case .play, .pause, .skip, .unknown: return false
+            }
+        }
+    }
+
     /// Run an export to completion. Throws ``CompilationExportError`` on any
     /// failure. The output `.mp4` lives at `outputURL` — caller decides the
     /// path (which is also the file the AVAssetExportSession writes to).
@@ -138,28 +164,60 @@ public actor CompilationExporter {
             let sourceVideoSrc = try await sourceAsset.primaryVideoTrack()
             let sourceAudioSrc = try await sourceAsset.optionalAudioTrack()
 
-            // Walk the entry's segments. For each `.play` segment, insert the
-            // matching slice of source video (and audio if present) at the
-            // segment's output offset. Skip `.freeze` segments — the
-            // compositor renders those from cache.
+            // Walk the entry's segments. For BOTH `.play` and `.freeze` we
+            // insert source content into the composition track — `.play`
+            // gets the matching duration of source video; `.freeze` gets a
+            // 1-tick slice of the held source frame stretched via
+            // `scaleTimeRange` to the freeze's outDuration. Without the
+            // freeze inserts, the source track had holes during freeze
+            // regions and the compositor relied on a `lastSourceFrame`
+            // cache — which starts nil at every clip boundary, so any
+            // clip that began with a freeze (virtually every recording,
+            // since `appendInitialPause` always lands at recordTime=0)
+            // exported as BLACK at the start until a `.play` segment
+            // populated the cache.
+            //
+            // Source AUDIO is inserted only for `.play` — during a freeze
+            // the user paused the source so playback should be silent.
             let entryStart = compositionCursor
+            let freezeSlice = CMTime(value: 1, timescale: 600)
             for segment in entry.segments {
                 let segDur = CMTime(seconds: segment.outDuration, preferredTimescale: 600)
                 defer { compositionCursor = compositionCursor + segDur }
-                guard segment.kind == .play else { continue }
                 // Sub-tick (sub-1.67ms) segments — typical of two events fired
                 // within the same gesture frame from a continuous zoom/pinch —
                 // round to 0 CMTime ticks at timescale 600. AVFoundation rejects
                 // empty insertTimeRange with -11800/-12780, so skip the insert.
                 guard segDur > .zero else { continue }
-                let srcRange = CMTimeRange(
-                    start: CMTime(seconds: segment.sourceStart, preferredTimescale: 600),
-                    duration: segDur
-                )
-                try sourceVideoTrack.insertTimeRange(srcRange, of: sourceVideoSrc, at: compositionCursor)
-                if let sourceAudioSrc {
-                    try sourceAudioTrack.insertTimeRange(srcRange, of: sourceAudioSrc, at: compositionCursor)
-                    hasSourceAudioInsert = true
+                let srcStart = CMTime(seconds: segment.sourceStart, preferredTimescale: 600)
+                switch segment.kind {
+                case .play:
+                    let srcRange = CMTimeRange(start: srcStart, duration: segDur)
+                    try sourceVideoTrack.insertTimeRange(srcRange, of: sourceVideoSrc, at: compositionCursor)
+                    if let sourceAudioSrc {
+                        try sourceAudioTrack.insertTimeRange(srcRange, of: sourceAudioSrc, at: compositionCursor)
+                        hasSourceAudioInsert = true
+                    }
+                case .freeze:
+                    // Bias the slice's start ONE TICK past `srcStart`
+                    // (1.67ms at timescale 600). AVMutableComposition's
+                    // `insertTimeRange` empirically picks the source sample
+                    // whose PTS is STRICTLY less than the slice start, so a
+                    // slice that begins exactly on (or a few µs below) the
+                    // user-visible frame's PTS delivers the frame BEFORE
+                    // it. Drawings on the freeze then appear one
+                    // motion-step behind the ball in both preview and
+                    // export. Shifting by one tick lands the slice safely
+                    // inside the visible frame's PTS interval. Mirror in
+                    // `ClipPreviewBuilder` and the test renderer in
+                    // `ClipPlaybackAccuracyTests`.
+                    let freezeStart = srcStart + CMTime(value: 1, timescale: 600)
+                    let frameRange = CMTimeRange(start: freezeStart, duration: freezeSlice)
+                    try sourceVideoTrack.insertTimeRange(frameRange, of: sourceVideoSrc, at: compositionCursor)
+                    sourceVideoTrack.scaleTimeRange(
+                        CMTimeRange(start: compositionCursor, duration: freezeSlice),
+                        toDuration: segDur
+                    )
                 }
             }
             let entryDuration = compositionCursor - entryStart
@@ -243,16 +301,7 @@ public actor CompilationExporter {
                 if case .stroke(let s) = event.kind { return s }
                 return nil
             }
-            // Slim event list: only `.stroke` and `.clearAll` — what the
-            // compositor's visibleStrokes(in:atRecordTime:) helper needs.
-            // Drop `.play`/`.pause`/`.skip` (the compositor doesn't replay
-            // those — segment-driven freeze logic handles them).
-            let drawingEvents: [CommentaryEvent] = clip.events.filter { event in
-                switch event.kind {
-                case .stroke, .clearAll: return true
-                case .play, .pause, .skip, .zoom, .unknown: return false
-                }
-            }
+            let drawingEvents = Self.compositorEvents(from: clip.events)
             // Bottom-bar info: `<n> / <total> | <name> | tag1, tag2, tag3`.
             // Empty segments collapse — a clip with no tags just shows
             // `<n> / <total> | <name>`; a name-less + tag-less clip just
