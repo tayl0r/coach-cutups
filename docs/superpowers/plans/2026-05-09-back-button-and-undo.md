@@ -10,532 +10,476 @@
 
 **Build/test commands:**
 - Build & launch (after every Swift edit): `apple/scripts/run.sh`
-- Unit tests: `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:AppTests`
+- App-target tests (RecordingZoomCaptureTests etc.): `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:VideoCoachTests`
+- Core package tests (UndoControllerTests + others): `cd apple/VideoCoachCore && swift test`
 
 ---
 
 ## File Structure
 
 **Create:**
-- `apple/Tests/AppTests/UndoStackTests.swift` — XCTest cases for `Workspace.commitClipEdit`, `undo()`, `redo()`, and the delete-eviction invariant.
+- `apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift` — pure-Swift undo machinery: `DeletedClip`, `UndoAction`, `UndoController` struct with stacks + push/pop/cap/eviction.
+- `apple/VideoCoachCore/Tests/VideoCoachCoreTests/UndoControllerTests.swift` — XCTest cases for the controller, runs in the existing hermetic VideoCoachCore test target (no MPVKit dependency).
 
 **Modify:**
-- `apple/App/Models/Workspace.swift` — add `UndoAction`, `undoStack`, `redoStack`, `commitClipEdit`, `undo`, `redo`, `canUndo`, `canRedo`. Remove `lastDeletedClip` and `undoLastDelete()`. Update `deleteClip` and `openProject`.
-- `apple/App/Views/ClipInspector.swift` — `EditorView` adds `@FocusState`, snapshot-on-focus, commit-on-focus-loss for name / tags / notes. Drop per-keystroke notes save.
+- `apple/App/Models/Workspace.swift` — replace `lastDeletedClip` + `undoLastDelete()` + the local `struct DeletedClip` with a `private var history = UndoController()`. Add `commitClipEdit`, `undo()`, `redo()`, forwarding `canUndo`/`canRedo`. Update `deleteClip` to use `history.pushDelete` and shred the evicted trash file. Update `openProject` to call `history.clearAll()`.
+- `apple/App/Views/TagField.swift` — add `onFocusChange: (Bool) -> Void` callback so the inspector can observe tag-field focus transitions (TagField's internal `@FocusState` isn't reachable from outside).
+- `apple/App/Views/ClipInspector.swift` — `EditorView` adds per-field `@FocusState` for name/notes plus a `tagsSnapshot` driven by TagField's callback, with snapshot-on-focus / commit-on-focus-loss and a `.onDisappear` flush. Drop per-keystroke notes save.
 - `apple/App/Views/KeyCommandView.swift` — in `.previewClip` / `.previewLoading`, Esc bypasses the `firstResponder is NSText` guard.
 - `apple/App/Views/ClipCommands.swift` — replace the `undoLastDelete` `FocusedValueKey` with `undoAction` + `redoAction`. Replace "Undo Delete Clip" with "Undo" + "Redo".
 - `apple/App/ContentView.swift` — replace `undoLastDeleteHandler` with `undoHandler` + `redoHandler` published via `@FocusedValue`. Restructure toolbar: `.navigation` BACK button (only in preview), `.principal` keeps zoom + drawing controls, `.primaryAction` adds title before Export.
 
 ---
 
-## Task 1: Add `UndoAction` and empty stacks to Workspace
+## Task 1: Create `UndoController` skeleton in `VideoCoachCore`
+
+The undo state and stack management lives in the package (independently testable, no MPVKit cascade). `Workspace` will adopt it in Task 3. Today's `Workspace.DeletedClip` moves here too so the action's payload type is in the same module.
 
 **Files:**
-- Modify: `apple/App/Models/Workspace.swift`
+- Create: `apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift`
 
-- [ ] **Step 1: Add the type declaration and stack properties**
+- [ ] **Step 1: Create the file with type declarations and method stubs**
 
-Just under `struct DeletedClip` (around line 462–465), add the new enum and stacks. Don't wire any push paths yet — that's Tasks 2 and 3. We add this first so the test file in Task 2 can reference the type.
-
-Find this block:
+Write `apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift`:
 
 ```swift
-    /// In-memory record of the most-recently-deleted clip, available for
-    /// `undoLastDelete()`. Cleared by another delete (which trashes the new
-    /// clip and shreds the previous trash file) or by a successful undo.
-    /// Not persisted — quitting the app loses the undo. Each new project
-    /// open also clears this and shreds the trash directory.
-    private(set) var lastDeletedClip: DeletedClip?
-```
+import Foundation
 
-Replace with:
+/// In-memory record of a deleted clip plus the on-disk path of its
+/// recording in the project's trash directory. The recording file is
+/// MOVED, not copied, so undelete restores it without round-tripping
+/// data through RAM (safer for the 30–70MB .mov files we deal with).
+///
+/// Lives in `VideoCoachCore` rather than the app target because it's
+/// the payload of `UndoAction.deleteClip` and the controller — which
+/// owns the stack — must be able to construct and inspect these.
+public struct DeletedClip: Sendable {
+    public let clip: Clip
+    public let trashedRecordingURL: URL
 
-```swift
-    /// One step on the unified undo stack. `editClip` covers tag/name/notes
-    /// commits made in the inspector — `before`/`after` are full Clip
-    /// snapshots (small structs, copy is cheap) so undo is just a slot
-    /// swap. `deleteClip` carries the same `DeletedClip` value the trash
-    /// directory tracks; at most one of these may exist across both stacks
-    /// combined, matching the on-disk invariant that we only keep one
-    /// trashed `.mov` at a time.
-    enum UndoAction {
-        case editClip(id: Clip.ID, before: Clip, after: Clip)
-        case deleteClip(DeletedClip)
+    public init(clip: Clip, trashedRecordingURL: URL) {
+        self.clip = clip
+        self.trashedRecordingURL = trashedRecordingURL
+    }
+}
+
+/// One step on the unified undo stack. `editClip` covers tag/name/notes
+/// commits made in the inspector — `before`/`after` are full `Clip`
+/// snapshots (small structs, copy is cheap) so applying the inverse is
+/// just a slot swap in `project.clips`. `deleteClip` carries the
+/// `DeletedClip` value the trash directory tracks; at most one of
+/// these may exist across both undo and redo stacks combined, matching
+/// the on-disk invariant that we only keep one trashed `.mov` at a
+/// time.
+public enum UndoAction: Sendable {
+    case editClip(id: Clip.ID, before: Clip, after: Clip)
+    case deleteClip(DeletedClip)
+}
+
+/// Pure-data undo machinery for `Workspace`. Owns the undo / redo
+/// stacks and the push / pop / cap / eviction semantics. Does NOT
+/// apply actions — that's the caller's job (`Workspace.undo()` mutates
+/// `project.clips`, invalidates preview caches, moves files in and out
+/// of the trash directory). Keeping the stack manipulation here lets
+/// us cover the genuinely-tricky logic (the eviction invariant, the
+/// cap, the redo-clear) in `VideoCoachCoreTests` without dragging the
+/// app target's MPVKit / AppKit dependencies into the test target.
+///
+/// Newest entry at the end of each stack array.
+public struct UndoController {
+    public private(set) var undoStack: [UndoAction] = []
+    public private(set) var redoStack: [UndoAction] = []
+
+    /// Maximum length of `undoStack`. Excess entries drop from the
+    /// front (oldest first). `redoStack` inherits its bound
+    /// implicitly: it can only ever hold what was previously on
+    /// `undoStack`.
+    public static let stackCap = 100
+
+    public init() {}
+
+    public var canUndo: Bool { !undoStack.isEmpty }
+    public var canRedo: Bool { !redoStack.isEmpty }
+
+    /// Push a non-delete action onto the undo stack. Trims to cap;
+    /// clears redo. Use `pushDelete(_:)` for `.deleteClip` — it
+    /// carries extra eviction semantics tied to the on-disk trash
+    /// invariant.
+    public mutating func pushEdit(_ action: UndoAction) {
+        fatalError("Implement in Task 2")
     }
 
-    /// Per-project undo and redo histories. Newest entry at the end of
-    /// each array. Cleared on `openProject(...)` and never persisted —
-    /// quitting the app, switching projects, or relaunching loses the
-    /// stacks (matches the existing trash-shred behavior).
-    private(set) var undoStack: [UndoAction] = []
-    private(set) var redoStack: [UndoAction] = []
+    /// Push a delete onto the undo stack. Returns any prior delete
+    /// found in either stack, so the caller can shred its trash file
+    /// (the controller doesn't do file I/O). Trims to cap; clears
+    /// redo.
+    public mutating func pushDelete(_ stash: DeletedClip) -> DeletedClip? {
+        fatalError("Implement in Task 2")
+    }
 
-    /// Cap on `undoStack` length. Drops from the front (oldest) when a new
-    /// push would exceed it. The redo stack inherits its bound implicitly:
-    /// it can only ever hold what was previously on `undoStack`.
-    static let undoStackCap = 100
+    /// Pop top of `undoStack`, push it onto `redoStack`, and return
+    /// the popped action so the caller can apply its inverse. Returns
+    /// nil when the stack is empty.
+    public mutating func popForUndo() -> UndoAction? {
+        fatalError("Implement in Task 2")
+    }
 
-    var canUndo: Bool { !undoStack.isEmpty }
-    var canRedo: Bool { !redoStack.isEmpty }
+    /// Pop top of `redoStack`, push it onto `undoStack`, and return
+    /// the popped action so the caller can apply it forward. Returns
+    /// nil when the stack is empty.
+    public mutating func popForRedo() -> UndoAction? {
+        fatalError("Implement in Task 2")
+    }
+
+    /// Drop everything. Called by `Workspace.openProject(...)` so undo
+    /// state never carries across project switches.
+    public mutating func clearAll() {
+        fatalError("Implement in Task 2")
+    }
+}
 ```
 
-Leave `lastDeletedClip` removal for Task 3 — keep it in place for now so existing call sites in `ContentView` keep compiling. They get migrated together in Task 6.
+The `fatalError` stubs let the package build (the type compiles) without committing to an implementation that hasn't been driven by tests yet. Task 2 writes the tests, watches them crash on the stubs, then fills in the bodies.
 
-- [ ] **Step 2: Build to verify it compiles**
+- [ ] **Step 2: Build the package to verify it compiles**
 
-Run: `apple/scripts/run.sh`
-Expected: build succeeds, app launches. The new properties aren't wired to anything yet, so behavior is unchanged.
+Run:
+```
+cd /Users/taylor/dev/coach-cutups-2/apple/VideoCoachCore
+swift build
+```
+
+Expected: build succeeds. The new file compiles; nothing references the new types yet.
 
 - [ ] **Step 3: Commit**
 
 ```bash
-git add apple/App/Models/Workspace.swift
-git commit -m "feat(workspace): add UndoAction enum and empty stacks (no wiring yet)"
+cd /Users/taylor/dev/coach-cutups-2
+git add apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift
+git commit -m "feat(core): add UndoController skeleton + UndoAction/DeletedClip
+
+Stack types and shape live in VideoCoachCore so they're testable in
+the existing hermetic core test target — Workspace transitively
+imports Libmpv via MPVSourcePlayer, which the standalone test target
+can't pull in. Method bodies stubbed with fatalError; Task 2 drives
+the implementations with tests."
 ```
 
 ---
 
-## Task 2: TDD `commitClipEdit` + undo/redo for `.editClip`
+## Task 2: TDD `UndoController` implementations
 
 **Files:**
-- Create: `apple/Tests/AppTests/UndoStackTests.swift`
-- Modify: `apple/App/Models/Workspace.swift`
+- Create: `apple/VideoCoachCore/Tests/VideoCoachCoreTests/UndoControllerTests.swift`
+- Modify: `apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift`
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `apple/Tests/AppTests/UndoStackTests.swift`:
+Create `apple/VideoCoachCore/Tests/VideoCoachCoreTests/UndoControllerTests.swift`:
 
 ```swift
 import XCTest
-import VideoCoachCore
-@testable import VideoCoach
+@testable import VideoCoachCore
 
-@MainActor
-final class UndoStackTests: XCTestCase {
+final class UndoControllerTests: XCTestCase {
 
-    /// Helper: a Workspace seeded with one clip and no folder. Folder-less
-    /// workspaces can't persist, but commitClipEdit / undo / redo for
-    /// edit actions don't touch disk so the tests stay hermetic.
-    private func makeWorkspaceWithOneClip() -> (Workspace, Clip) {
-        let ws = Workspace()
-        let clip = Clip(
+    // MARK: - Test helpers
+
+    private func makeClip(name: String = "Clip") -> Clip {
+        Clip(
             id: UUID(),
-            name: "First",
+            name: name,
             sourceIndex: 0,
             startSourceSeconds: 0,
             recordingDuration: 1.0,
-            recordingFilename: "clip-test.mov",
+            recordingFilename: "clip-\(UUID()).mov",
             sortIndex: 0
         )
-        ws.project.clips = [clip]
-        return (ws, clip)
     }
 
-    func test_commitClipEdit_pushes_one_action() {
-        let (ws, clip) = makeWorkspaceWithOneClip()
+    private func makeDeletedClip(filename: String = "clip-x.mov") -> DeletedClip {
+        DeletedClip(
+            clip: makeClip(),
+            trashedRecordingURL: URL(fileURLWithPath: "/tmp/.trash/\(filename)")
+        )
+    }
+
+    private func makeEdit() -> UndoAction {
+        let clip = makeClip(name: "before")
         var after = clip
-        after.tags = ["shot"]
-        ws.project.clips[0] = after
-
-        ws.commitClipEdit(id: clip.id, before: clip, after: after)
-
-        XCTAssertEqual(ws.undoStack.count, 1)
-        XCTAssertTrue(ws.redoStack.isEmpty)
+        after.tags = ["a"]
+        return .editClip(id: clip.id, before: clip, after: after)
     }
 
-    func test_commitClipEdit_skips_when_before_equals_after() {
-        let (ws, clip) = makeWorkspaceWithOneClip()
-        ws.commitClipEdit(id: clip.id, before: clip, after: clip)
-        XCTAssertEqual(ws.undoStack.count, 0)
+    // MARK: - pushEdit
+
+    func test_pushEdit_appends_and_clears_redo() {
+        var c = UndoController()
+        // Seed redoStack via pop, then verify a new pushEdit clears it.
+        c.pushEdit(makeEdit())
+        _ = c.popForUndo()
+        XCTAssertEqual(c.redoStack.count, 1)
+
+        c.pushEdit(makeEdit())
+
+        XCTAssertEqual(c.undoStack.count, 1)
+        XCTAssertTrue(c.redoStack.isEmpty)
     }
 
-    func test_undo_editClip_restores_before() {
-        let (ws, clip) = makeWorkspaceWithOneClip()
-        var after = clip
-        after.tags = ["shot"]
-        ws.project.clips[0] = after
-        ws.commitClipEdit(id: clip.id, before: clip, after: after)
-
-        ws.undo()
-
-        XCTAssertEqual(ws.project.clips[0].tags, [])
-        XCTAssertTrue(ws.undoStack.isEmpty)
-        XCTAssertEqual(ws.redoStack.count, 1)
-    }
-
-    func test_redo_editClip_reapplies_after() {
-        let (ws, clip) = makeWorkspaceWithOneClip()
-        var after = clip
-        after.tags = ["shot"]
-        ws.project.clips[0] = after
-        ws.commitClipEdit(id: clip.id, before: clip, after: after)
-        ws.undo()
-
-        ws.redo()
-
-        XCTAssertEqual(ws.project.clips[0].tags, ["shot"])
-        XCTAssertEqual(ws.undoStack.count, 1)
-        XCTAssertTrue(ws.redoStack.isEmpty)
-    }
-
-    func test_new_commit_clears_redo_stack() {
-        let (ws, clip) = makeWorkspaceWithOneClip()
-        var v1 = clip; v1.tags = ["a"]
-        ws.project.clips[0] = v1
-        ws.commitClipEdit(id: clip.id, before: clip, after: v1)
-        ws.undo()
-        XCTAssertEqual(ws.redoStack.count, 1)
-
-        var v2 = clip; v2.tags = ["b"]
-        ws.project.clips[0] = v2
-        ws.commitClipEdit(id: clip.id, before: clip, after: v2)
-
-        XCTAssertTrue(ws.redoStack.isEmpty)
-        XCTAssertEqual(ws.undoStack.count, 1)
-    }
-
-    func test_undo_stack_cap_drops_oldest() {
-        let (ws, clip) = makeWorkspaceWithOneClip()
-        // Push 105 unique edits.
-        var current = clip
-        for i in 0..<105 {
-            var next = current
-            next.name = "edit \(i)"
-            ws.project.clips[0] = next
-            ws.commitClipEdit(id: clip.id, before: current, after: next)
-            current = next
+    func test_pushEdit_trims_to_cap() {
+        var c = UndoController()
+        for _ in 0..<(UndoController.stackCap + 5) {
+            c.pushEdit(makeEdit())
         }
-        XCTAssertEqual(ws.undoStack.count, Workspace.undoStackCap)
-        // The very first edit ("edit 0") fell off the bottom; the most
-        // recent edit ("edit 104") is on top.
-        if case let .editClip(_, _, after) = ws.undoStack.last! {
-            XCTAssertEqual(after.name, "edit 104")
+        XCTAssertEqual(c.undoStack.count, UndoController.stackCap)
+    }
+
+    // MARK: - pushDelete
+
+    func test_pushDelete_with_no_prior_returns_nil() {
+        var c = UndoController()
+        let evicted = c.pushDelete(makeDeletedClip())
+        XCTAssertNil(evicted)
+        XCTAssertEqual(c.undoStack.count, 1)
+    }
+
+    func test_pushDelete_evicts_prior_delete_from_undoStack() {
+        var c = UndoController()
+        let a = makeDeletedClip(filename: "a.mov")
+        _ = c.pushDelete(a)
+        XCTAssertEqual(c.undoStack.count, 1)
+
+        let b = makeDeletedClip(filename: "b.mov")
+        let evicted = c.pushDelete(b)
+
+        XCTAssertEqual(evicted?.trashedRecordingURL, a.trashedRecordingURL)
+        // Only B is on the stacks now.
+        let allDeletes = (c.undoStack + c.redoStack).filter { action in
+            if case .deleteClip = action { return true } else { return false }
+        }
+        XCTAssertEqual(allDeletes.count, 1)
+        if case let .deleteClip(d) = c.undoStack.last! {
+            XCTAssertEqual(d.trashedRecordingURL, b.trashedRecordingURL)
         } else {
-            XCTFail("Expected .editClip on top of undo stack")
+            XCTFail("Expected .deleteClip on top of undo stack")
         }
+    }
+
+    func test_pushDelete_evicts_prior_delete_from_redoStack() {
+        var c = UndoController()
+        let a = makeDeletedClip(filename: "a.mov")
+        _ = c.pushDelete(a)
+        // Move A onto redoStack via a pop.
+        _ = c.popForUndo()
+        XCTAssertTrue(c.undoStack.isEmpty)
+        XCTAssertEqual(c.redoStack.count, 1)
+
+        let b = makeDeletedClip(filename: "b.mov")
+        let evicted = c.pushDelete(b)
+
+        XCTAssertEqual(evicted?.trashedRecordingURL, a.trashedRecordingURL)
+        let allDeletes = (c.undoStack + c.redoStack).filter { action in
+            if case .deleteClip = action { return true } else { return false }
+        }
+        XCTAssertEqual(allDeletes.count, 1)
+    }
+
+    func test_pushDelete_clears_redo_when_pushing_succeeds() {
+        var c = UndoController()
+        // Stage some edits on redo by doing edit + pop.
+        c.pushEdit(makeEdit())
+        _ = c.popForUndo()
+        XCTAssertEqual(c.redoStack.count, 1)
+
+        _ = c.pushDelete(makeDeletedClip())
+        XCTAssertTrue(c.redoStack.isEmpty)
+    }
+
+    // MARK: - popForUndo / popForRedo
+
+    func test_popForUndo_moves_action_to_redoStack() {
+        var c = UndoController()
+        let edit = makeEdit()
+        c.pushEdit(edit)
+
+        let popped = c.popForUndo()
+
+        XCTAssertNotNil(popped)
+        XCTAssertTrue(c.undoStack.isEmpty)
+        XCTAssertEqual(c.redoStack.count, 1)
+    }
+
+    func test_popForUndo_returns_nil_when_empty() {
+        var c = UndoController()
+        XCTAssertNil(c.popForUndo())
+    }
+
+    func test_popForRedo_moves_action_back_to_undoStack() {
+        var c = UndoController()
+        c.pushEdit(makeEdit())
+        _ = c.popForUndo()
+
+        let popped = c.popForRedo()
+
+        XCTAssertNotNil(popped)
+        XCTAssertEqual(c.undoStack.count, 1)
+        XCTAssertTrue(c.redoStack.isEmpty)
+    }
+
+    func test_popForRedo_returns_nil_when_empty() {
+        var c = UndoController()
+        XCTAssertNil(c.popForRedo())
+    }
+
+    // MARK: - clearAll
+
+    func test_clearAll_drops_both_stacks() {
+        var c = UndoController()
+        c.pushEdit(makeEdit())
+        c.pushEdit(makeEdit())
+        _ = c.popForUndo()
+        XCTAssertFalse(c.undoStack.isEmpty)
+        XCTAssertFalse(c.redoStack.isEmpty)
+
+        c.clearAll()
+
+        XCTAssertTrue(c.undoStack.isEmpty)
+        XCTAssertTrue(c.redoStack.isEmpty)
+    }
+
+    // MARK: - canUndo / canRedo
+
+    func test_canUndo_canRedo_track_stacks() {
+        var c = UndoController()
+        XCTAssertFalse(c.canUndo)
+        XCTAssertFalse(c.canRedo)
+
+        c.pushEdit(makeEdit())
+        XCTAssertTrue(c.canUndo)
+        XCTAssertFalse(c.canRedo)
+
+        _ = c.popForUndo()
+        XCTAssertFalse(c.canUndo)
+        XCTAssertTrue(c.canRedo)
     }
 }
 ```
 
 - [ ] **Step 2: Run the tests to verify they fail**
 
-Run: `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:AppTests/UndoStackTests`
-Expected: FAIL — "value of type 'Workspace' has no member 'commitClipEdit'" / "no member 'undo'" / "no member 'redo'".
+Run:
+```
+cd /Users/taylor/dev/coach-cutups-2/apple/VideoCoachCore
+swift test --filter UndoControllerTests
+```
 
-- [ ] **Step 3: Implement `commitClipEdit`, `undo`, `redo` on `Workspace`**
+Expected: ALL FAIL with `fatalError("Implement in Task 2")` traps from the stubs. This proves the test file compiles, links against the controller, and exercises every method we need to implement.
 
-In `apple/App/Models/Workspace.swift`, add the following methods. Place them right after the stack property declarations from Task 1 (just below `var canRedo: Bool { !redoStack.isEmpty }`):
+- [ ] **Step 3: Implement the method bodies**
+
+In `apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift`, replace each `fatalError("Implement in Task 2")` body with the real implementation:
 
 ```swift
-    /// Push a single field-edit step onto the undo stack. Called by the
-    /// inspector on focus-loss for any of name / tags / notes when the
-    /// snapshot taken at focus-gain differs from the current clip. Skipped
-    /// when before == after so an unchanged focus session doesn't pollute
-    /// the stack. Any redo branch is dropped — making a new edit always
-    /// throws away forward history.
-    func commitClipEdit(id: Clip.ID, before: Clip, after: Clip) {
-        guard before != after else { return }
-        pushUndo(.editClip(id: id, before: before, after: after))
-    }
-
-    /// Undo the most recent stack entry. Quietly no-ops when the stack is
-    /// empty so menu wiring doesn't have to gate the call. Save errors
-    /// during the inverse apply are swallowed (project file may be on a
-    /// read-only volume mid-flight); the in-memory state is what the user
-    /// sees and is what counts for undo correctness.
-    func undo() {
-        guard let action = undoStack.popLast() else { return }
-        applyInverse(of: action)
-        redoStack.append(action)
-    }
-
-    /// Redo the most recent undone entry. Symmetric to `undo()`.
-    func redo() {
-        guard let action = redoStack.popLast() else { return }
-        applyForward(of: action)
+    public mutating func pushEdit(_ action: UndoAction) {
+        // Reject delete here so the eviction-aware `pushDelete` is the
+        // only way a `.deleteClip` enters the stacks. A misuse caught
+        // at runtime is better than silently bypassing eviction.
+        if case .deleteClip = action {
+            preconditionFailure("Use pushDelete(_:) for .deleteClip actions")
+        }
         undoStack.append(action)
-    }
-
-    /// Push helper: enforces the stack cap and clears redo. Eviction of a
-    /// prior `.deleteClip` (so the on-disk trash invariant holds) is
-    /// handled by `deleteClip(id:)` itself; this helper only handles the
-    /// length cap.
-    private func pushUndo(_ action: UndoAction) {
-        undoStack.append(action)
-        if undoStack.count > Self.undoStackCap {
-            undoStack.removeFirst(undoStack.count - Self.undoStackCap)
+        if undoStack.count > Self.stackCap {
+            undoStack.removeFirst(undoStack.count - Self.stackCap)
         }
         redoStack.removeAll()
     }
 
-    private func applyInverse(of action: UndoAction) {
-        switch action {
-        case let .editClip(id, before, _):
-            if let i = project.clips.firstIndex(where: { $0.id == id }) {
-                project.clips[i] = before
-                invalidatePreviewCache(for: id)
-                try? saveProject()
-            }
-        case .deleteClip:
-            // Filled in by Task 3 once the unified delete flow lands.
-            break
+    public mutating func pushDelete(_ stash: DeletedClip) -> DeletedClip? {
+        let evicted = evictPriorDelete()
+        undoStack.append(.deleteClip(stash))
+        if undoStack.count > Self.stackCap {
+            undoStack.removeFirst(undoStack.count - Self.stackCap)
         }
+        redoStack.removeAll()
+        return evicted
     }
 
-    private func applyForward(of action: UndoAction) {
-        switch action {
-        case let .editClip(id, _, after):
-            if let i = project.clips.firstIndex(where: { $0.id == id }) {
-                project.clips[i] = after
-                invalidatePreviewCache(for: id)
-                try? saveProject()
-            }
-        case .deleteClip:
-            // Filled in by Task 3.
-            break
+    public mutating func popForUndo() -> UndoAction? {
+        guard let action = undoStack.popLast() else { return nil }
+        redoStack.append(action)
+        return action
+    }
+
+    public mutating func popForRedo() -> UndoAction? {
+        guard let action = redoStack.popLast() else { return nil }
+        undoStack.append(action)
+        return action
+    }
+
+    public mutating func clearAll() {
+        undoStack.removeAll()
+        redoStack.removeAll()
+    }
+
+    /// Walks both stacks (undo first, redo as fallback) for an existing
+    /// `.deleteClip`, removes it, and returns the carried `DeletedClip`.
+    /// Returns nil when there's nothing to evict. Caller is responsible
+    /// for shredding the trashed file if a `DeletedClip` is returned.
+    private mutating func evictPriorDelete() -> DeletedClip? {
+        if let i = undoStack.lastIndex(where: { if case .deleteClip = $0 { return true } else { return false } }) {
+            if case let .deleteClip(d) = undoStack.remove(at: i) { return d }
         }
+        if let i = redoStack.lastIndex(where: { if case .deleteClip = $0 { return true } else { return false } }) {
+            if case let .deleteClip(d) = redoStack.remove(at: i) { return d }
+        }
+        return nil
     }
 ```
 
 - [ ] **Step 4: Run the tests to verify they pass**
 
-Run: `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:AppTests/UndoStackTests`
-Expected: PASS — all six tests green.
+Run:
+```
+cd /Users/taylor/dev/coach-cutups-2/apple/VideoCoachCore
+swift test --filter UndoControllerTests
+```
+
+Expected: PASS — all 11 tests green.
+
+If any test fails, debug the implementation. Don't proceed until all pass.
 
 - [ ] **Step 5: Commit**
 
-```bash
-git add apple/Tests/AppTests/UndoStackTests.swift apple/App/Models/Workspace.swift
-git commit -m "feat(workspace): commitClipEdit + undo/redo for clip field edits
+```
+cd /Users/taylor/dev/coach-cutups-2
+git add apple/VideoCoachCore/Sources/VideoCoachCore/UndoController.swift apple/VideoCoachCore/Tests/VideoCoachCoreTests/UndoControllerTests.swift
+git commit -m "feat(core): UndoController push/pop/cap/eviction (TDD)
 
-Adds commitClipEdit(id:before:after:) and unified undo()/redo() that
-walk the editClip case. Cap enforced at 100 entries; redo cleared on
-new commit. Delete handling lands in the next commit."
+Implementations for pushEdit, pushDelete, popForUndo, popForRedo,
+clearAll. pushDelete walks both stacks for a prior delete and
+returns the evicted DeletedClip so the caller can shred the trash
+file. Tests cover all branches; trash file shredding itself is
+the caller's job (file IO stays out of the package)."
 ```
 
 ---
 
-## Task 3: TDD migrate `deleteClip` to the unified stack and finish `.deleteClip` undo/redo
+## Task 3: Workspace adopts `UndoController` + ContentView/ClipCommands migration
+
+`UndoController` is now fully tested (Task 2). This task wires `Workspace` to own one and apply actions, then migrates the two existing call sites (`ContentView`, `ClipCommands`) so the app target compiles and the menus point at the new entry points. There are no new unit tests — the action-application logic isn't testable in the current target structure, and the controller's logic is already covered. Verification is build + manual smoke at the end.
 
 **Files:**
 - Modify: `apple/App/Models/Workspace.swift`
-- Modify: `apple/Tests/AppTests/UndoStackTests.swift`
+- Modify: `apple/App/ContentView.swift`
+- Modify: `apple/App/Views/ClipCommands.swift`
 
-- [ ] **Step 1: Write the failing tests**
+The three files land in one commit because they're a coupled rewrite — removing `lastDeletedClip` + `undoLastDelete()` from `Workspace` breaks `ContentView` and `ClipCommands` until they're migrated. Don't try to commit between them.
 
-Add a helper at the top of `UndoStackTests.swift` (above the existing helper) for tests that need a real folder for trash:
+- [ ] **Step 1: Update `Workspace.swift`**
 
-```swift
-    /// Helper: a Workspace with a temp project folder and one clip whose
-    /// recording file actually exists on disk. Used by delete/undelete
-    /// tests that exercise the trash directory.
-    private func makeWorkspaceWithFolderAndOneClip() throws -> (Workspace, Clip, URL) {
-        let folder = FileManager.default.temporaryDirectory
-            .appendingPathComponent("UndoStackTests-\(UUID().uuidString)")
-        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let recordingsDir = folder.appendingPathComponent("recordings")
-        try FileManager.default.createDirectory(at: recordingsDir, withIntermediateDirectories: true)
-        let filename = "clip-\(UUID()).mov"
-        let recordingURL = recordingsDir.appendingPathComponent(filename)
-        try Data([0x00]).write(to: recordingURL)
+Open `apple/App/Models/Workspace.swift`. The plan below is one logical edit; do all parts before saving. They land in one file so they don't have to be staged separately.
 
-        let ws = Workspace()
-        ws.folder = folder
-        let clip = Clip(
-            id: UUID(),
-            name: "Folderful",
-            sourceIndex: 0,
-            startSourceSeconds: 0,
-            recordingDuration: 1.0,
-            recordingFilename: filename,
-            sortIndex: 0
-        )
-        ws.project.clips = [clip]
-        try ws.saveProject()
-        return (ws, clip, folder)
-    }
-```
-
-Add new test methods at the bottom of the class:
-
-```swift
-    func test_deleteClip_pushes_deleteClip_action() throws {
-        let (ws, clip, folder) = try makeWorkspaceWithFolderAndOneClip()
-        defer { try? FileManager.default.removeItem(at: folder) }
-
-        try ws.deleteClip(id: clip.id)
-
-        XCTAssertEqual(ws.undoStack.count, 1)
-        if case .deleteClip = ws.undoStack.last! {
-            // ok
-        } else {
-            XCTFail("Expected .deleteClip on top of undo stack")
-        }
-        XCTAssertTrue(ws.project.clips.isEmpty)
-    }
-
-    func test_undo_deleteClip_restores_clip_and_recording() throws {
-        let (ws, clip, folder) = try makeWorkspaceWithFolderAndOneClip()
-        defer { try? FileManager.default.removeItem(at: folder) }
-        let recordingURL = folder
-            .appendingPathComponent("recordings")
-            .appendingPathComponent(clip.recordingFilename)
-        try ws.deleteClip(id: clip.id)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: recordingURL.path))
-
-        ws.undo()
-
-        XCTAssertEqual(ws.project.clips.count, 1)
-        XCTAssertEqual(ws.project.clips[0].id, clip.id)
-        XCTAssertTrue(FileManager.default.fileExists(atPath: recordingURL.path))
-        XCTAssertTrue(ws.undoStack.isEmpty)
-        XCTAssertEqual(ws.redoStack.count, 1)
-    }
-
-    func test_redo_deleteClip_re_deletes_clip() throws {
-        let (ws, clip, folder) = try makeWorkspaceWithFolderAndOneClip()
-        defer { try? FileManager.default.removeItem(at: folder) }
-        try ws.deleteClip(id: clip.id)
-        ws.undo()
-
-        ws.redo()
-
-        XCTAssertTrue(ws.project.clips.isEmpty)
-        XCTAssertEqual(ws.undoStack.count, 1)
-        XCTAssertTrue(ws.redoStack.isEmpty)
-    }
-
-    func test_second_delete_evicts_prior_delete_from_undo_stack() throws {
-        let (ws, clipA, folder) = try makeWorkspaceWithFolderAndOneClip()
-        defer { try? FileManager.default.removeItem(at: folder) }
-        // Add a second clip with its own recording file.
-        let filenameB = "clip-\(UUID()).mov"
-        let recordingsDir = folder.appendingPathComponent("recordings")
-        let recordingB = recordingsDir.appendingPathComponent(filenameB)
-        try Data([0x00]).write(to: recordingB)
-        let clipB = Clip(
-            id: UUID(), name: "B", sourceIndex: 0, startSourceSeconds: 0,
-            recordingDuration: 1.0, recordingFilename: filenameB, sortIndex: 1
-        )
-        ws.project.clips.append(clipB)
-        try ws.saveProject()
-
-        try ws.deleteClip(id: clipA.id)
-        try ws.deleteClip(id: clipB.id)
-
-        // Only one .deleteClip exists across both stacks (B's). A's prior
-        // entry was evicted from undoStack and its trash file shredded.
-        let allDeletes = (ws.undoStack + ws.redoStack).filter { action in
-            if case .deleteClip = action { return true } else { return false }
-        }
-        XCTAssertEqual(allDeletes.count, 1)
-        // A's trashed recording is gone; B's is in trash.
-        let trashA = recordingsDir.appendingPathComponent(".trash")
-            .appendingPathComponent(clipA.recordingFilename)
-        let trashB = recordingsDir.appendingPathComponent(".trash")
-            .appendingPathComponent(filenameB)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: trashA.path))
-        XCTAssertTrue(FileManager.default.fileExists(atPath: trashB.path))
-    }
-
-    func test_delete_evicts_a_redo_stack_delete_too() throws {
-        let (ws, clipA, folder) = try makeWorkspaceWithFolderAndOneClip()
-        defer { try? FileManager.default.removeItem(at: folder) }
-        let filenameB = "clip-\(UUID()).mov"
-        let recordingsDir = folder.appendingPathComponent("recordings")
-        try Data([0x00]).write(to: recordingsDir.appendingPathComponent(filenameB))
-        let clipB = Clip(
-            id: UUID(), name: "B", sourceIndex: 0, startSourceSeconds: 0,
-            recordingDuration: 1.0, recordingFilename: filenameB, sortIndex: 1
-        )
-        ws.project.clips.append(clipB)
-        try ws.saveProject()
-
-        // Delete A, then undo → A's deleteClip lives on redoStack.
-        try ws.deleteClip(id: clipA.id)
-        ws.undo()
-        // Now delete B. Since A is on redoStack, eviction must reach into
-        // redoStack, drop A's entry, shred A's trash file.
-        try ws.deleteClip(id: clipB.id)
-
-        let trashA = recordingsDir.appendingPathComponent(".trash")
-            .appendingPathComponent(clipA.recordingFilename)
-        XCTAssertFalse(FileManager.default.fileExists(atPath: trashA.path))
-        let allDeletes = (ws.undoStack + ws.redoStack).filter { action in
-            if case .deleteClip = action { return true } else { return false }
-        }
-        XCTAssertEqual(allDeletes.count, 1)
-    }
-```
-
-- [ ] **Step 2: Run the tests to verify they fail**
-
-Run: `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:AppTests/UndoStackTests`
-Expected: FAIL — current `deleteClip` still uses `lastDeletedClip`, doesn't push to `undoStack`. Also `applyInverse(.deleteClip)` is still a no-op stub.
-
-- [ ] **Step 3: Replace `deleteClip` body and the stubbed `.deleteClip` cases**
-
-In `apple/App/Models/Workspace.swift`, find the existing `deleteClip(id:)` method and replace its body with the version that pushes onto the unified stack and evicts any prior delete:
-
-```swift
-    /// Removes a clip from the project: drops the in-memory entry, MOVES
-    /// the underlying recording into `recordings/.trash/`, invalidates the
-    /// preview cache, and persists. Pushes a `.deleteClip` action onto the
-    /// undo stack. The on-disk trash holds at most one .mov; if a prior
-    /// `.deleteClip` exists in either undoStack or redoStack, evict it
-    /// (shred its trash file, drop it from whichever stack it lived on)
-    /// before pushing the new one. The clip's `sortIndex` gap is left
-    /// as-is — `reorderClips(from:to:)` re-numbers on next reorder, and
-    /// the sidebar sorts by `sortIndex`-ascending so a gap is invisible.
-    func deleteClip(id: Clip.ID) throws {
-        guard let idx = project.clips.firstIndex(where: { $0.id == id }) else { return }
-        let clip = project.clips[idx]
-        invalidatePreviewCache(for: id)
-
-        evictPriorDeleteAction()
-
-        var stash: DeletedClip?
-        if let folder {
-            let recordingsDir = ProjectStore.recordingsDir(in: folder)
-            let recordingURL = recordingsDir.appendingPathComponent(clip.recordingFilename)
-            let trashDir = recordingsDir.appendingPathComponent(".trash")
-            try? FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
-            let trashedURL = trashDir.appendingPathComponent(clip.recordingFilename)
-            if FileManager.default.fileExists(atPath: recordingURL.path) {
-                try? FileManager.default.removeItem(at: trashedURL)
-                try FileManager.default.moveItem(at: recordingURL, to: trashedURL)
-            }
-            stash = DeletedClip(clip: clip, trashedRecordingURL: trashedURL)
-        }
-
-        project.clips.remove(at: idx)
-        try saveProject()
-
-        if let stash {
-            pushUndo(.deleteClip(stash))
-        }
-    }
-
-    /// Walks both stacks looking for an existing `.deleteClip`. If found,
-    /// shreds its trash file and removes the entry. Caller is responsible
-    /// for then pushing a new delete onto `undoStack`. Idempotent — safe
-    /// to call when there's nothing to evict.
-    private func evictPriorDeleteAction() {
-        let prior: DeletedClip?
-        if let i = undoStack.lastIndex(where: { if case .deleteClip = $0 { return true } else { return false } }) {
-            if case let .deleteClip(d) = undoStack.remove(at: i) { prior = d } else { prior = nil }
-        } else if let i = redoStack.lastIndex(where: { if case .deleteClip = $0 { return true } else { return false } }) {
-            if case let .deleteClip(d) = redoStack.remove(at: i) { prior = d } else { prior = nil }
-        } else {
-            prior = nil
-        }
-        if let prior {
-            try? FileManager.default.removeItem(at: prior.trashedRecordingURL)
-        }
-    }
-```
-
-Also delete the `lastDeletedClip` property and the entire `undoLastDelete()` method now that the unified stack owns the behavior. Find:
+**1a. Remove the local `struct DeletedClip` declaration.** Find:
 
 ```swift
     /// In-memory record of the most-recently-deleted clip, available for
@@ -544,11 +488,86 @@ Also delete the `lastDeletedClip` property and the entire `undoLastDelete()` met
     /// Not persisted — quitting the app loses the undo. Each new project
     /// open also clears this and shreds the trash directory.
     private(set) var lastDeletedClip: DeletedClip?
+
+    /// Snapshot of a deleted clip plus the on-disk path of its recording in
+    /// the project's trash directory. The recording file itself was *moved*,
+    /// not copied, so undelete restores it without round-tripping data
+    /// through RAM (safer for the 30-70MB .mov files we deal with).
+    struct DeletedClip: Sendable {
+        let clip: Clip
+        let trashedRecordingURL: URL
+    }
 ```
 
-— delete that entire block.
+Replace with:
 
-Find:
+```swift
+    /// Per-project undo/redo machinery. Pure-data; lives in
+    /// `VideoCoachCore` so the package's existing test target can cover
+    /// the stack semantics without dragging in MPVKit. Application of
+    /// each `UndoAction` (mutating `project.clips`, invalidating the
+    /// preview cache, moving recording files in / out of `.trash`) is
+    /// owned by this class — the controller is a passive bookkeeper.
+    private var history = UndoController()
+
+    /// Forwarded from the controller so callers (the `undo` / `redo`
+    /// menu handlers, in particular) don't need to know the controller
+    /// exists.
+    var canUndo: Bool { history.canUndo }
+    var canRedo: Bool { history.canRedo }
+```
+
+(Note: `DeletedClip` is now in `VideoCoachCore` — already imported at the top of this file as `import VideoCoachCore` — so no new import needed.)
+
+**1b. Replace `deleteClip(id:)`** with the controller-aware version. Find the existing `func deleteClip(id: Clip.ID) throws { ... }` (uses `lastDeletedClip`) and replace its entire body with:
+
+```swift
+    /// Removes a clip from the project: drops the in-memory entry, MOVES
+    /// the underlying recording into `recordings/.trash/`, invalidates the
+    /// preview cache, and persists. Pushes a `.deleteClip` action onto
+    /// the undo stack via `history.pushDelete(_:)`, which evicts any
+    /// prior `.deleteClip` from either stack (returning the evicted
+    /// `DeletedClip` so we can shred its trash file). The clip's
+    /// `sortIndex` gap is left as-is — `reorderClips(from:to:)` re-numbers
+    /// on next reorder, and the sidebar sorts by `sortIndex`-ascending
+    /// so a gap is invisible.
+    func deleteClip(id: Clip.ID) throws {
+        guard let idx = project.clips.firstIndex(where: { $0.id == id }) else { return }
+        let clip = project.clips[idx]
+        invalidatePreviewCache(for: id)
+
+        guard let folder else {
+            // No folder open ⇒ no trash dir ⇒ no recoverable delete.
+            // Drop the clip metadata and bail. (In practice the menu
+            // gates on having a project, so this is defensive.)
+            project.clips.remove(at: idx)
+            try saveProject()
+            return
+        }
+
+        let recordingsDir = ProjectStore.recordingsDir(in: folder)
+        let recordingURL = recordingsDir.appendingPathComponent(clip.recordingFilename)
+        let trashDir = recordingsDir.appendingPathComponent(".trash")
+        try? FileManager.default.createDirectory(at: trashDir, withIntermediateDirectories: true)
+        let trashedURL = trashDir.appendingPathComponent(clip.recordingFilename)
+        if FileManager.default.fileExists(atPath: recordingURL.path) {
+            try? FileManager.default.removeItem(at: trashedURL)
+            try FileManager.default.moveItem(at: recordingURL, to: trashedURL)
+        }
+        let stash = DeletedClip(clip: clip, trashedRecordingURL: trashedURL)
+
+        project.clips.remove(at: idx)
+        try saveProject()
+
+        // Push onto the controller; if it returns an evicted prior
+        // delete, shred that trash file (the controller doesn't do IO).
+        if let evicted = history.pushDelete(stash) {
+            try? FileManager.default.removeItem(at: evicted.trashedRecordingURL)
+        }
+    }
+```
+
+**1c. Remove `undoLastDelete()`.** Find:
 
 ```swift
     /// Restores the most-recently-deleted clip: re-inserts the metadata into
@@ -562,25 +581,58 @@ Find:
     }
 ```
 
-— delete the whole method (the next call site, in `ContentView`, gets migrated in Task 6).
+Delete the whole method (including the doc comment and `@discardableResult`).
 
-Now fill in the `.deleteClip` cases in `applyInverse` and `applyForward`. Replace:
-
-```swift
-        case .deleteClip:
-            // Filled in by Task 3 once the unified delete flow lands.
-            break
-```
-
-…in `applyInverse` with:
+**1d. Add `commitClipEdit`, `undo()`, `redo()`** to `Workspace`. These are the application-logic entry points that callers use. Place them where `undoLastDelete` used to live (the spot is fine; group with related undo concerns):
 
 ```swift
+    /// Inspector calls this on every field's focus-loss when the
+    /// snapshot taken at focus-gain differs from the current clip. Skip
+    /// when before == after so an unchanged focus session doesn't pollute
+    /// the stack. Any redo branch is dropped.
+    func commitClipEdit(id: Clip.ID, before: Clip, after: Clip) {
+        guard before != after else { return }
+        history.pushEdit(.editClip(id: id, before: before, after: after))
+    }
+
+    /// Pop one action from the undo stack and apply its inverse. Quietly
+    /// no-ops when the stack is empty so menu wiring doesn't have to
+    /// gate the call. Returns the action that was applied so the caller
+    /// (ContentView) can adjust selection — it doesn't see the
+    /// controller directly. Save errors during the inverse are
+    /// swallowed (project file may be on a read-only volume mid-flight);
+    /// the in-memory state is what the user sees and is what counts for
+    /// undo correctness.
+    @discardableResult
+    func undo() -> UndoAction? {
+        guard let action = history.popForUndo() else { return nil }
+        applyInverse(of: action)
+        return action
+    }
+
+    /// Symmetric to `undo()`. Pops one action from the redo stack and
+    /// applies it forward. Returns the applied action.
+    @discardableResult
+    func redo() -> UndoAction? {
+        guard let action = history.popForRedo() else { return nil }
+        applyForward(of: action)
+        return action
+    }
+
+    private func applyInverse(of action: UndoAction) {
+        switch action {
+        case let .editClip(id, before, _):
+            if let i = project.clips.firstIndex(where: { $0.id == id }) {
+                project.clips[i] = before
+                invalidatePreviewCache(for: id)
+                try? saveProject()
+            }
         case let .deleteClip(stash):
-            // Restore: move .mov out of trash and re-insert the clip at
-            // its original sortIndex slot. Tolerate a missing trash file
+            // Move .mov out of trash and re-insert the clip at its
+            // original sortIndex slot. Tolerate a missing trash file
             // (someone may have cleaned it externally) — metadata still
-            // restores. Re-selection of the restored clip is done by the
-            // caller in ContentView.
+            // restores. Re-selection of the restored clip is done by
+            // the menu handler in ContentView, not here.
             if let folder, FileManager.default.fileExists(atPath: stash.trashedRecordingURL.path) {
                 let recordingsDir = ProjectStore.recordingsDir(in: folder)
                 let target = recordingsDir.appendingPathComponent(stash.clip.recordingFilename)
@@ -591,16 +643,21 @@ Now fill in the `.deleteClip` cases in `applyInverse` and `applyForward`. Replac
                 ?? project.clips.endIndex
             project.clips.insert(stash.clip, at: insertAt)
             try? saveProject()
-```
+        }
+    }
 
-And replace the same stub in `applyForward` with a re-delete:
-
-```swift
+    private func applyForward(of action: UndoAction) {
+        switch action {
+        case let .editClip(id, _, after):
+            if let i = project.clips.firstIndex(where: { $0.id == id }) {
+                project.clips[i] = after
+                invalidatePreviewCache(for: id)
+                try? saveProject()
+            }
         case let .deleteClip(stash):
             // Re-apply the delete: remove from project, move .mov back
-            // into trash. We don't need to mutate the action's stored
-            // DeletedClip — the trashedRecordingURL is the same path
-            // we'll re-occupy here.
+            // into trash. The action's `trashedRecordingURL` points at
+            // the same path we'll re-occupy.
             if let i = project.clips.firstIndex(where: { $0.id == stash.clip.id }) {
                 invalidatePreviewCache(for: stash.clip.id)
                 project.clips.remove(at: i)
@@ -616,9 +673,11 @@ And replace the same stub in `applyForward` with a re-delete:
                 }
             }
             try? saveProject()
+        }
+    }
 ```
 
-Note: with `lastDeletedClip` removed, the only other reference inside `Workspace.swift` is in `openProject(...)`. Find:
+**1e. Update `openProject(...)`.** Find:
 
 ```swift
         // Undo state is in-memory only — never carries across app launches
@@ -632,14 +691,15 @@ Replace with:
 ```swift
         // Undo state is in-memory only — never carries across app launches
         // or project switches. Shred any leftover trash from a prior session.
-        undoStack.removeAll()
-        redoStack.removeAll()
+        history.clearAll()
         shredTrashDirectory()
 ```
 
-After Step 3, `ContentView.swift` and `ClipCommands.swift` still reference `lastDeletedClip` / `undoLastDelete` — the build is broken until Step 4 migrates them. Step 4 lands in the same task and the same commit so the build is green again before the test run in Step 5.
+After step 1, `Workspace.swift` compiles in isolation, but `ContentView.swift` and `ClipCommands.swift` still reference `lastDeletedClip` / `undoLastDelete`. The full target won't link until step 2.
 
-- [ ] **Step 4: Migrate `ContentView`'s call sites in the same edit (so the target builds)**
+(The original plan revision had inline `Workspace`-coverage tests in `apple/Tests/AppTests/UndoStackTests.swift` at this step. Those tests now live as controller tests in `VideoCoachCoreTests/UndoControllerTests.swift` — Task 2 already created and ran them.)
+
+- [ ] **Step 2: Migrate `ContentView` and `ClipCommands` in the same edit**
 
 Open `apple/App/ContentView.swift`. Find:
 
@@ -835,27 +895,45 @@ struct ClipCommands: Commands {
 }
 ```
 
-- [ ] **Step 5: Run the tests to verify they pass**
+- [ ] **Step 3: Build and run the existing core tests**
 
-Run: `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:AppTests/UndoStackTests`
-Expected: PASS — all eleven tests green (six from Task 2 plus five new ones).
+Run the package's tests to confirm `UndoController` still works after the integration (it shouldn't have changed, but verify):
+```
+cd /Users/taylor/dev/coach-cutups-2/apple/VideoCoachCore
+swift test --filter UndoControllerTests
+```
+Expected: PASS — same 11 tests from Task 2.
 
-- [ ] **Step 6: Build the app to verify nothing else broke**
+Build and launch the app:
+```
+/Users/taylor/dev/coach-cutups-2/apple/scripts/run.sh
+```
+Expected: build succeeds, app launches.
 
-Run: `apple/scripts/run.sh`
-Expected: build succeeds, app launches. Manual check: select a clip, press Cmd+Delete to delete it; Cmd+Z to undo (clip comes back, gets re-selected). Cmd+Z and Shift+Cmd+Z appear in the Clip menu.
+Manual smoke check:
+- Open a project, select a clip, press Cmd+Delete to delete it.
+- Cmd+Z → clip comes back and gets re-selected (matches old `undoLastDelete` behavior plus the new selection rule).
+- Shift+Cmd+Z → clip is deleted again.
+- Open the Clip menu — both "Undo" and "Redo" appear, with the right enable/disable state.
 
-- [ ] **Step 7: Commit**
+If the build fails on `lastDeletedClip` or `undoLastDelete` references, you missed a call site. The full set is: `Workspace.deleteClip` (rewritten in 1b), `Workspace.openProject` (rewritten in 1e), `ContentView.undoLastDeleteHandler` + `.focusedValue` (rewritten in step 2), `ClipCommands.UndoLastDeleteKey` + menu (rewritten in step 2).
+
+- [ ] **Step 4: Commit**
 
 ```bash
-git add apple/App/Models/Workspace.swift apple/App/Views/ClipCommands.swift apple/App/ContentView.swift apple/Tests/AppTests/UndoStackTests.swift
-git commit -m "feat(workspace): unify delete-clip undo into UndoAction stack
+cd /Users/taylor/dev/coach-cutups-2
+git add apple/App/Models/Workspace.swift apple/App/Views/ClipCommands.swift apple/App/ContentView.swift
+git commit -m "feat(workspace): adopt UndoController + add Undo/Redo menu
 
-Replaces lastDeletedClip + undoLastDelete() with the new undoStack /
-redoStack and a deleteClip action that evicts any prior delete from
-either stack so the on-disk trash invariant (one .mov) holds. Renames
-the menu item from \"Undo Delete Clip\" to \"Undo\" and adds \"Redo\"
-(⇧⌘Z). FocusedValueKey renamed undoLastDelete → undoAction + redoAction."
+Workspace replaces local lastDeletedClip + undoLastDelete() with a
+private UndoController (from VideoCoachCore) plus app-side
+applyInverse / applyForward that mutate project.clips, invalidate
+the preview cache, and move recording files in / out of .trash.
+deleteClip pushes through history.pushDelete and shreds the evicted
+trash file when one is returned. ContentView publishes undoAction +
+redoAction focused values; ClipCommands menu renames \"Undo Delete
+Clip\" to \"Undo\" and adds \"Redo\" (⇧⌘Z). Always selects the
+affected clip on undo/redo so non-selected-clip edits are visible."
 ```
 
 ---
@@ -1285,10 +1363,14 @@ zoom + drawing-controls cluster is preserved."
 
 **Files:** none (verification only).
 
-- [ ] **Step 1: Run the full app test suite**
+- [ ] **Step 1: Run the full test suite**
 
-Run: `xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:AppTests`
-Expected: ALL PASS — `RecordingZoomCaptureTests` (existing) + `UndoStackTests` (new).
+Run both:
+```
+cd /Users/taylor/dev/coach-cutups-2/apple/VideoCoachCore && swift test
+cd /Users/taylor/dev/coach-cutups-2 && xcodebuild -project apple/VideoCoach.xcodeproj -scheme VideoCoach test -only-testing:VideoCoachTests
+```
+Expected: ALL PASS — `UndoControllerTests` (new in VideoCoachCoreTests) + `RecordingZoomCaptureTests` (existing in VideoCoachTests) + every other existing core test.
 
 - [ ] **Step 2: Manual smoke test of the integrated behaviors**
 
