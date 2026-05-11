@@ -253,6 +253,7 @@ struct ContentView: View {
                 workspace: workspace,
                 selectedClipID: $selectedClipID,
                 appMode: appMode,
+                selectedTagFilter: $selectedTagFilter,
                 onRequestDeleteClip: { id in requestDeleteClip(id) }
             )
             .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)

@@ -11,6 +11,7 @@ struct ClipSidebar: View {
     @Bindable var workspace: Workspace
     @Binding var selectedClipID: Clip.ID?
     let appMode: AppMode
+    @Binding var selectedTagFilter: String?
     var onRequestDeleteClip: (Clip.ID) -> Void
 
     /// Persisted across launches — the user picked their preference once,
@@ -19,6 +20,15 @@ struct ClipSidebar: View {
 
     private var sortedClips: [Clip] {
         workspace.project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
+    }
+
+    /// Sorted clips after applying `selectedTagFilter`. When nil,
+    /// equivalent to `sortedClips`. Used by `clipsSection` for
+    /// rendering — `sortedClips` is preserved for any non-filtered
+    /// callers.
+    private var visibleClips: [Clip] {
+        guard let filter = selectedTagFilter else { return sortedClips }
+        return sortedClips.filter { $0.tags.contains(filter) }
     }
 
     private var isRecording: Bool {
@@ -35,6 +45,11 @@ struct ClipSidebar: View {
                 .disabled(isRecording)
 
             Divider()
+
+            if let activeFilter = selectedTagFilter {
+                filterChip(activeFilter)
+                Divider()
+            }
 
             List(selection: $selectedClipID) {
                 sourcesSection
@@ -111,28 +126,77 @@ struct ClipSidebar: View {
         }
     }
 
+    // MARK: - Filter chip
+
+    @ViewBuilder
+    private func filterChip(_ tag: String) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: "tag.fill")
+                .foregroundStyle(.secondary)
+                .font(.caption)
+            Text("Filtered: \(tag)")
+                .font(.callout)
+            Spacer()
+            Button {
+                selectedTagFilter = nil
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Clear filter")
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color.accentColor.opacity(0.10))
+    }
+
     // MARK: - Clips
 
     @ViewBuilder
     private var clipsSection: some View {
         Section {
-            ForEach(sortedClips) { clip in
-                HStack {
-                    Text(clip.name).lineLimit(1)
-                    Spacer()
-                    Text(formatDuration(clip.recordingDuration))
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .monospacedDigit()
+            // Use `visibleClips` (filtered) when a tag filter is
+            // active, otherwise the full `sortedClips`. The two
+            // ForEach branches let us attach .onMove conditionally —
+            // SwiftUI requires .onMove directly on a ForEach, not
+            // wrapped in an `if`.
+            if selectedTagFilter != nil {
+                ForEach(visibleClips) { clip in
+                    clipRow(clip)
                 }
-                .tag(clip.id)
-            }
-            .onMove { indices, dest in
-                workspace.reorderClips(from: indices, to: dest)
+                // No .onMove while filtered — reordering a subset
+                // would permute sortIndex of clips you can't see.
+                if visibleClips.isEmpty {
+                    Text("No clips with tag '\(selectedTagFilter!)'")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .padding(.vertical, 4)
+                }
+            } else {
+                ForEach(sortedClips) { clip in
+                    clipRow(clip)
+                }
+                .onMove { indices, dest in
+                    workspace.reorderClips(from: indices, to: dest)
+                }
             }
         } header: {
             Text("Clips")
         }
+    }
+
+    @ViewBuilder
+    private func clipRow(_ clip: Clip) -> some View {
+        HStack {
+            Text(clip.name).lineLimit(1)
+            Spacer()
+            Text(formatDuration(clip.recordingDuration))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .tag(clip.id)
     }
 }
 
