@@ -19,16 +19,36 @@ Jump source video to clip start
 
 Action when clicked:
 
-1. If a clip preview is currently open (`selectedClipID != nil`),
-   close it via the existing `handleClosePreview` path so the
-   player view swaps from `PreviewPlayerSurface` back to
-   `MPVPlayerView` (the source view).
-2. Seek the source player to `(clip.sourceIndex,
-   clip.startSourceSeconds)` with `exact: true`, paused.
+1. Prime the source player's position via a new
+   `MPVSourcePlayer.setReplayPosition(playlistPos:timeSeconds:)`
+   method (see below). When the source mpv handle is attached
+   (scanning mode), this issues a coarse seek immediately. When
+   detached (preview mode), it mutates the player's cached state so
+   the attach-replay path at `MPVSourcePlayer.swift:192` picks up
+   the new values when the view re-mounts.
+2. Pause the source player.
+3. If a clip preview is currently open (`selectedClipID != nil`),
+   close it via the existing `handleClosePreview` path. The player
+   view swaps from `PreviewPlayerSurface` back to `MPVPlayerView`,
+   which re-attaches a fresh mpv handle that lands at the position
+   set in step 1.
 
 Playback is left **paused** — user presses Space if they want to
-play. This is consistent with how the source view behaves after
-every other seek (skip-forward/back, hotkey seeks).
+play. Seek uses `exact: false` (coarse, keyframe-tolerant) for
+navigation responsiveness — `exact: true` on long-GOP HEVC can take
+200–600 ms.
+
+### Why `setReplayPosition` is needed
+
+`MPVSourcePlayer.detachLayer()` calls `mpv_terminate_destroy(h)` —
+the mpv instance is destroyed on every detach, not just unbound from
+its layer. While the user is in preview mode, the source
+`MPVPlayerView` is unmounted, so the source mpv handle is nil. A
+direct call to `player.seek(...)` in that state hits the
+`guard handle != nil` early-return at `MPVSourcePlayer.swift:514`
+and silently drops the seek. The fix mutates the player's cached
+`playlistPos` / `timePos` so the attach-replay path positions the
+freshly created mpv instance at the requested point.
 
 ## Disabled states
 
@@ -83,26 +103,39 @@ private func sourceMissing(for clipID: Clip.ID) -> Bool {
 }
 ```
 
-### `apple/App/ContentView.swift`
+### `apple/App/Source/MPVSourcePlayer.swift`
 
-Add the handler method:
+Add `setReplayPosition` (see "Why" above):
 
 ```swift
-/// Right-click action from the sidebar. Closes any active preview,
-/// then seeks the source player to the clip's recorded start
-/// position. Leaves the source paused — Space starts playback.
+public func setReplayPosition(playlistPos: Int, timeSeconds: Double) {
+    self.playlistPos = playlistPos
+    self.timePos = timeSeconds
+    if handle != nil {
+        seek(playlistPos: playlistPos, timeSeconds: timeSeconds,
+             exact: false, completion: {})
+    }
+}
+```
+
+### `apple/App/ContentView.swift`
+
+Add the handler method. The order matters: prime the position FIRST,
+THEN close the preview — so by the time `MPVPlayerView` re-mounts
+and re-attaches, the player's cached state already has the right
+values to replay.
+
+```swift
 private func jumpToClipStart(_ id: Clip.ID) {
     guard let clip = workspace.project.clips.first(where: { $0.id == id })
     else { return }
-    if selectedClipID != nil { handleClosePreview() }
     guard let player = workspace.sourcePlayer else { return }
-    player.pause()
-    player.seek(
+    player.setReplayPosition(
         playlistPos: clip.sourceIndex,
-        timeSeconds: clip.startSourceSeconds,
-        exact: true,
-        completion: {}
+        timeSeconds: clip.startSourceSeconds
     )
+    player.pause()
+    if selectedClipID != nil { handleClosePreview() }
 }
 ```
 
