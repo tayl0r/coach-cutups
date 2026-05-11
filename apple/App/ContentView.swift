@@ -254,7 +254,8 @@ struct ContentView: View {
                 selectedClipID: $selectedClipID,
                 appMode: appMode,
                 selectedTagFilter: $selectedTagFilter,
-                onRequestDeleteClip: { id in requestDeleteClip(id) }
+                onRequestDeleteClip: { id in requestDeleteClip(id) },
+                onJumpToClipStart: { id in jumpToClipStart(id) }
             )
             .navigationSplitViewColumnWidth(min: 200, ideal: 240, max: 320)
         } content: {
@@ -745,6 +746,40 @@ struct ContentView: View {
         // somehow holds a reference past the swap.
         workspace.previewPlayer(for: selectedClipID ?? UUID())?.pause()
         selectedClipID = nil
+    }
+
+    /// Right-click action from the sidebar: closes any active preview,
+    /// then positions the source player at the clip's recorded start.
+    /// Leaves the source paused — the user presses Space if they want
+    /// to play.
+    ///
+    /// Uses `setReplayPosition` rather than `seek` because the call
+    /// may fire while the source mpv handle is detached (preview mode
+    /// unmounts `MPVPlayerView`, which destroys the handle via
+    /// `detachLayer` → `mpv_terminate_destroy`). `seek` would no-op
+    /// in that state; `setReplayPosition` mutates the cached Swift
+    /// state so the attach-replay on next mount lands at the right
+    /// position.
+    private func jumpToClipStart(_ id: Clip.ID) {
+        guard let clip = workspace.project.clips.first(where: { $0.id == id })
+        else { return }
+        guard let player = workspace.sourcePlayer else { return }
+
+        // Prime the player's position state FIRST. If currently
+        // attached (scanning mode), this also issues a real seek so
+        // the change is visible immediately. If detached (preview
+        // mode), the call just mutates cached state; the seek will
+        // take effect when the preview close triggers a re-attach.
+        player.setReplayPosition(
+            playlistPos: clip.sourceIndex,
+            timeSeconds: clip.startSourceSeconds
+        )
+        player.pause()
+
+        // Close any active preview so the player view swaps back to
+        // MPVPlayerView. On re-attach, attachLayer's replay path picks
+        // up the playlistPos/timePos we just set.
+        if selectedClipID != nil { handleClosePreview() }
     }
 
     /// Delete a specific clip. No confirm alert — the action is recoverable

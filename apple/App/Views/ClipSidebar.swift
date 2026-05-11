@@ -13,6 +13,10 @@ struct ClipSidebar: View {
     let appMode: AppMode
     @Binding var selectedTagFilter: String?
     var onRequestDeleteClip: (Clip.ID) -> Void
+    /// Right-click action that closes any active preview and seeks the
+    /// source player to this clip's recorded start position. Wired by
+    /// ContentView; no-op-safe if called with an unknown id.
+    var onJumpToClipStart: (Clip.ID) -> Void
 
     /// Persisted across launches — the user picked their preference once,
     /// don't re-impose the default each session.
@@ -29,6 +33,17 @@ struct ClipSidebar: View {
     private var visibleClips: [Clip] {
         guard let filter = selectedTagFilter else { return sortedClips }
         return sortedClips.filter { $0.tags.contains(filter) }
+    }
+
+    /// True when the clip's source bookmark didn't resolve in this
+    /// session. Used to gate the "Jump source video to clip start"
+    /// menu item — seeking into an unresolved playlist would silently
+    /// fail. Also returns true for an unknown clip id (defensive;
+    /// shouldn't happen because the menu is built from the selection).
+    private func sourceMissing(for clipID: Clip.ID) -> Bool {
+        guard let clip = workspace.project.clips.first(where: { $0.id == clipID })
+        else { return true }
+        return workspace.missingSourceIndices.contains(clip.sourceIndex)
     }
 
     private var isRecording: Bool {
@@ -60,6 +75,16 @@ struct ClipSidebar: View {
             // trigger this — only Clip.IDs land here.
             .contextMenu(forSelectionType: Clip.ID.self) { ids in
                 if let id = ids.first {
+                    Button {
+                        onJumpToClipStart(id)
+                    } label: {
+                        Label("Jump source video to clip start",
+                              systemImage: "arrow.left.to.line")
+                    }
+                    .disabled(isRecording || sourceMissing(for: id))
+
+                    Divider()
+
                     Button(role: .destructive) {
                         onRequestDeleteClip(id)
                     } label: {

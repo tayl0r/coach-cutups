@@ -544,6 +544,37 @@ public final class MPVSourcePlayer {
         }
     }
 
+    /// Set the position to land at after the next `attachLayer` (or
+    /// immediately, if currently attached). The attach-replay path at
+    /// `attachLayer` (see the `playlistPos == 0 && timePos > 0` branch
+    /// above) reads `self.playlistPos` and `self.timePos` to position
+    /// the freshly created mpv handle — overwriting those values here
+    /// is what makes the requested position survive a detach/re-attach
+    /// cycle. When the handle is currently live, we also issue a real
+    /// (coarse) seek so the user sees the change without waiting for
+    /// a re-attach. Use this when the caller can't guarantee the mpv
+    /// handle exists at call time (e.g., when triggered from preview
+    /// mode where the source `MPVPlayerView` is unmounted and the
+    /// SwiftUI view-tree swap hasn't happened yet).
+    public func setReplayPosition(playlistPos: Int, timeSeconds: Double) {
+        // Mutating self.playlistPos / self.timePos directly is safe
+        // here: the `private(set)` access keeps the public API
+        // read-only externally, but this method is on the player
+        // itself. mpv's next property-change event will overwrite
+        // these values once mpv catches up — which is exactly what we
+        // want (Swift state stays in lockstep with mpv state).
+        self.playlistPos = playlistPos
+        self.timePos = timeSeconds
+        if handle != nil {
+            seek(
+                playlistPos: playlistPos,
+                timeSeconds: timeSeconds,
+                exact: false,
+                completion: {}
+            )
+        }
+    }
+
     private func issueAsync(
         args: [String],
         completion: @escaping @MainActor () -> Void
