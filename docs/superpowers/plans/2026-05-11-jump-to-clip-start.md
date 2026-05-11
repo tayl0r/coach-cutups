@@ -93,25 +93,27 @@ Find the existing `.contextMenu(forSelectionType: Clip.ID.self)` block (around l
             }
 ```
 
-Add a second Button below the Delete one:
+Add the new Button ABOVE the Delete one (macOS HIG convention puts destructive actions at the bottom, often visually separated):
 
 ```swift
             .contextMenu(forSelectionType: Clip.ID.self) { ids in
                 if let id = ids.first {
+                    Button {
+                        onJumpToClipStart(id)
+                    } label: {
+                        Label("Jump source video to clip start",
+                              systemImage: "arrow.left.to.line")
+                    }
+                    .disabled(isRecording || sourceMissing(for: id))
+
+                    Divider()
+
                     Button(role: .destructive) {
                         onRequestDeleteClip(id)
                     } label: {
                         Label("Delete Clip", systemImage: "trash")
                     }
                     .disabled(isRecording)
-
-                    Button {
-                        onJumpToClipStart(id)
-                    } label: {
-                        Label("Jump source video to clip start",
-                              systemImage: "arrowshape.turn.up.left")
-                    }
-                    .disabled(isRecording || sourceMissing(for: id))
                 }
             }
 ```
@@ -138,7 +140,7 @@ In `apple/App/ContentView.swift`, find an appropriate spot for the handler — g
         player.seek(
             playlistPos: clip.sourceIndex,
             timeSeconds: clip.startSourceSeconds,
-            exact: true,
+            exact: false,
             completion: {}
         )
     }
