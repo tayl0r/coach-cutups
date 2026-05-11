@@ -25,6 +25,13 @@ struct KeyCommandView: NSViewRepresentable {
     /// the black surround zooms toward the nearest player edge rather than
     /// producing an out-of-range pivot.
     let onZoomLevel: (Double, CGPoint) -> Void
+    /// True when ContentView's selectedTagFilter is non-nil. Lets the
+    /// Esc handler fire onClearTagFilter as a third cascade layer
+    /// (after stop-recording and close-preview).
+    let hasTagFilter: Bool
+    /// Invoked when Esc fires in scanning mode and a filter is active.
+    /// Owned by ContentView; sets selectedTagFilter = nil.
+    let onClearTagFilter: () -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
@@ -44,6 +51,8 @@ struct KeyCommandView: NSViewRepresentable {
         v.onResetZoom = onResetZoom
         v.currentZoomScale = currentZoomScale
         v.onZoomLevel = onZoomLevel
+        v.hasTagFilter = hasTagFilter
+        v.onClearTagFilter = onClearTagFilter
     }
 }
 
@@ -79,6 +88,8 @@ final class KeyCatchingView: NSView {
     var onResetZoom: () -> Void = {}
     var currentZoomScale: Double = 1.0
     var onZoomLevel: (Double, CGPoint) -> Void = { _, _ in }
+    var hasTagFilter: Bool = false
+    var onClearTagFilter: () -> Void = {}
 
     private func isPreviewMode() -> Bool {
         switch appMode {
@@ -131,10 +142,11 @@ final class KeyCatchingView: NSView {
                     return event
                 }
             case KeyCode.escape:
-                // Esc handles "exit current mode": stop recording during
-                // .recording, close clip preview during .previewClip /
-                // .previewLoading. Outside those modes it falls through so
-                // AppKit's normal Esc (close popover, dismiss sheet) works.
+                // Esc cascade: stop recording, close preview, clear tag
+                // filter, then fall through to AppKit (close popover,
+                // dismiss sheet). Each layer unwinds one piece of view
+                // state so two Esc presses from "previewing with a
+                // filter" leave you at default scanning + no filter.
                 switch self.appMode {
                 case .recording:
                     self.onToggleRecord()
@@ -143,6 +155,10 @@ final class KeyCatchingView: NSView {
                     self.onClosePreview()
                     return nil
                 default:
+                    if self.hasTagFilter {
+                        self.onClearTagFilter()
+                        return nil
+                    }
                     return event
                 }
             case KeyCode.leftArrow, KeyCode.a:

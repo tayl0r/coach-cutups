@@ -350,7 +350,9 @@ struct ContentView: View {
                             let next = workspace.currentZoom
                                 .zoomedToCursor(newScale: newScale, cursor: cursor)
                             workspace.setCurrentZoomImmediate(next)
-                        }
+                        },
+                        hasTagFilter: selectedTagFilter != nil,
+                        onClearTagFilter: { selectedTagFilter = nil }
                     )
                     // Empty / error states cover the player area when there's
                     // nothing meaningful to show. They sit ON TOP of preview
