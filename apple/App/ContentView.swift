@@ -30,6 +30,11 @@ struct ContentView: View {
     /// (disabled when there's no project open or the project has no clips —
     /// a no-op export sheet would have nothing to do anyway).
     @State private var showExportSheet = false
+    /// Currently active sidebar tag filter. nil = show all clips.
+    /// Toggled by clicking rows in the inspector's TagOverview when
+    /// no clip is selected. Cleared on project switch (below) and by
+    /// Esc in scanning mode (Task 3). View-state only; never persisted.
+    @State private var selectedTagFilter: String? = nil
 
     // MARK: - Capture / recording state
 
@@ -107,6 +112,11 @@ struct ContentView: View {
             }
             .onChange(of: selectedClipID) { _, newID in
                 handleSelectionChange(newID)
+            }
+            .onChange(of: workspace.folder) { _, _ in
+                // Filter is view-state tied to the current project; reset
+                // it when the user opens or switches projects.
+                selectedTagFilter = nil
             }
             .task {
                 // Auto-restore last project on launch. Silently skip on any error
@@ -364,7 +374,8 @@ struct ContentView: View {
         } detail: {
             ClipInspector(
                 workspace: workspace,
-                selectedClipID: $selectedClipID
+                selectedClipID: $selectedClipID,
+                selectedTagFilter: $selectedTagFilter
             )
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
         }

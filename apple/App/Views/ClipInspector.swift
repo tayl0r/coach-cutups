@@ -7,6 +7,14 @@ import VideoCoachCore
 struct ClipInspector: View {
     @Bindable var workspace: Workspace
     @Binding var selectedClipID: Clip.ID?
+    @Binding var selectedTagFilter: String?
+
+    /// Sort mode for the no-clip-selected tag overview. Hoisted here
+    /// (rather than as @State inside TagOverview) so the user's
+    /// chosen sort survives clip-selection cycles — the inspector's
+    /// body switches between EditorView and TagOverview, tearing
+    /// down whichever isn't currently shown.
+    @State private var tagOverviewSort: TagOverviewSortMode = .alpha
 
     var body: some View {
         Group {
@@ -31,11 +39,11 @@ struct ClipInspector: View {
     }
 
     private var placeholder: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Inspector").font(.headline)
-            Text("No clip selected").foregroundStyle(.secondary)
-            Spacer()
-        }
+        TagOverview(
+            workspace: workspace,
+            selectedTagFilter: $selectedTagFilter,
+            sort: $tagOverviewSort
+        )
     }
 
     /// Binding into the clip with the given id, resolved on every read/write.
@@ -65,6 +73,126 @@ struct ClipInspector: View {
 
     private var tagSuggestions: Set<String> {
         Set(workspace.project.clips.flatMap(\.tags))
+    }
+}
+
+/// Shown in the inspector when no clip is selected. Lists every tag
+/// used across the project's clips with per-tag count and total
+/// duration. Default sort is alpha; the sort toggle button flips to
+/// duration-descending (ties break alpha so the order is stable).
+/// Clicking a row toggles the global `selectedTagFilter`: nil → this
+/// tag, this tag → nil, other tag → this tag. The active filter row
+/// gets a subtle accent background so the user can see what's on.
+enum TagOverviewSortMode: Hashable {
+    case alpha
+    case durationDesc
+}
+
+private struct TagOverview: View {
+    let workspace: Workspace
+    @Binding var selectedTagFilter: String?
+    /// Sort mode is hoisted to the parent `ClipInspector` so it
+    /// survives clip-selection cycles. `TagOverview` is torn down
+    /// whenever a clip is selected (the inspector body switches to
+    /// `EditorView`); a `@State` here would reset on every cycle.
+    @Binding var sort: TagOverviewSortMode
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            header
+
+            if workspace.project.clips.isEmpty {
+                emptyMessage("No clips yet")
+            } else {
+                let summaries = sortedSummaries()
+                if summaries.isEmpty {
+                    emptyMessage("No tags yet — add tags to clips in the Inspector.")
+                } else {
+                    list(summaries)
+                }
+            }
+            // No trailing Spacer here. The ScrollView inside `list`
+            // needs to expand to consume the remaining vertical
+            // space; a Spacer would compete with it and collapse the
+            // ScrollView to its content's intrinsic height (which on
+            // a long tag list would clip).
+        }
+    }
+
+    private var header: some View {
+        HStack {
+            Text("Tags").font(.headline)
+            Spacer()
+            Button {
+                sort = (sort == .alpha) ? .durationDesc : .alpha
+            } label: {
+                // Label shows the CURRENT mode so users can see which sort
+                // is active without having to recognize which icon means
+                // which direction.
+                Text(sort == .alpha ? "A–Z" : "Duration")
+                    .font(.caption)
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Toggle sort order")
+        }
+    }
+
+    @ViewBuilder
+    private func emptyMessage(_ text: String) -> some View {
+        Text(text)
+            .foregroundStyle(.secondary)
+            .font(.callout)
+    }
+
+    private func list(_ summaries: [TagSummary]) -> some View {
+        ScrollView {
+            LazyVStack(alignment: .leading, spacing: 0) {
+                ForEach(summaries, id: \.tag) { summary in
+                    row(for: summary)
+                }
+            }
+        }
+    }
+
+    private func row(for summary: TagSummary) -> some View {
+        let isActive = selectedTagFilter == summary.tag
+        return Button {
+            // Toggle: clicking the active tag clears, clicking a
+            // different tag swaps, clicking when nil sets.
+            selectedTagFilter = isActive ? nil : summary.tag
+        } label: {
+            HStack {
+                Text(summary.tag)
+                    .foregroundStyle(.primary)
+                Spacer()
+                Text("\(summary.clipCount) · \(formatDuration(summary.totalDurationSeconds))")
+                    .foregroundStyle(.secondary)
+                    .font(.callout.monospacedDigit())
+            }
+            .padding(.vertical, 4)
+            .padding(.horizontal, 6)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(isActive ? Color.accentColor.opacity(0.18) : Color.clear)
+            .clipShape(RoundedRectangle(cornerRadius: 4))
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private func sortedSummaries() -> [TagSummary] {
+        let base = TagAggregation.aggregate(project: workspace.project)
+        switch sort {
+        case .alpha:
+            return base                                      // already alpha
+        case .durationDesc:
+            return base.sorted { lhs, rhs in
+                if lhs.totalDurationSeconds != rhs.totalDurationSeconds {
+                    return lhs.totalDurationSeconds > rhs.totalDurationSeconds
+                }
+                return lhs.tag < rhs.tag                     // stable tie-break
+            }
+        }
     }
 }
 
