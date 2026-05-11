@@ -100,6 +100,13 @@ struct ClipInspector: View {
     @Binding var selectedClipID: Clip.ID?
     @Binding var selectedTagFilter: String?
 
+    /// Sort mode for the no-clip-selected tag overview. Hoisted here
+    /// (rather than as @State inside TagOverview) so the user's
+    /// chosen sort survives clip-selection cycles — the inspector's
+    /// body switches between EditorView and TagOverview, tearing
+    /// down whichever isn't currently shown.
+    @State private var tagOverviewSort: TagOverviewSortMode = .alpha
+
     var body: some View {
 ```
 
@@ -115,13 +122,14 @@ Find the `placeholder` private view (around line 33–39):
     }
 ```
 
-Replace with a call to a new view that takes the workspace and the filter binding:
+Replace with a call to a new view that takes the workspace, the filter binding, and the sort binding:
 
 ```swift
     private var placeholder: some View {
         TagOverview(
             workspace: workspace,
-            selectedTagFilter: $selectedTagFilter
+            selectedTagFilter: $selectedTagFilter,
+            sort: $tagOverviewSort
         )
     }
 ```
@@ -136,16 +144,19 @@ Then add the new `TagOverview` view at the bottom of `ClipInspector.swift` (afte
 /// Clicking a row toggles the global `selectedTagFilter`: nil → this
 /// tag, this tag → nil, other tag → this tag. The active filter row
 /// gets a subtle accent background so the user can see what's on.
+enum TagOverviewSortMode: Hashable {
+    case alpha
+    case durationDesc
+}
+
 private struct TagOverview: View {
     let workspace: Workspace
     @Binding var selectedTagFilter: String?
-
-    @State private var sort: SortMode = .alpha
-
-    private enum SortMode {
-        case alpha
-        case durationDesc
-    }
+    /// Sort mode is hoisted to the parent `ClipInspector` so it
+    /// survives clip-selection cycles. `TagOverview` is torn down
+    /// whenever a clip is selected (the inspector body switches to
+    /// `EditorView`); a `@State` here would reset on every cycle.
+    @Binding var sort: TagOverviewSortMode
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -161,8 +172,11 @@ private struct TagOverview: View {
                     list(summaries)
                 }
             }
-
-            Spacer()
+            // No trailing Spacer here. The ScrollView inside `list`
+            // needs to expand to consume the remaining vertical
+            // space; a Spacer would compete with it and collapse the
+            // ScrollView to its content's intrinsic height (which on
+            // a long tag list would clip).
         }
     }
 
@@ -311,14 +325,16 @@ Replace with:
 
 - [ ] **Step 2: Apply the filter in ClipSidebar**
 
-In `apple/App/Views/ClipSidebar.swift`, add the new binding to the struct's stored properties. Find the existing property list (around line 8–14):
+Read the current `apple/App/Views/ClipSidebar.swift` in full before editing — it has a `TextField` for project name + a `Divider` + a `List` with TWO sections (`sourcesSection`, `clipsSection`) wrapped in a `VStack`. The filter chip slots BETWEEN the existing `Divider` and the `List`; only `clipsSection` filters; `sourcesSection` is unchanged.
+
+**Edit 1 — add the binding.** Find the existing property list (around line 10–14):
 
 ```swift
 struct ClipSidebar: View {
     @Bindable var workspace: Workspace
     @Binding var selectedClipID: Clip.ID?
     let appMode: AppMode
-    let onRequestDeleteClip: (Clip.ID) -> Void
+    var onRequestDeleteClip: (Clip.ID) -> Void
 ```
 
 Insert `selectedTagFilter` before `onRequestDeleteClip`:
@@ -329,69 +345,78 @@ struct ClipSidebar: View {
     @Binding var selectedClipID: Clip.ID?
     let appMode: AppMode
     @Binding var selectedTagFilter: String?
-    let onRequestDeleteClip: (Clip.ID) -> Void
+    var onRequestDeleteClip: (Clip.ID) -> Void
 ```
 
-Find the `body` block and the `List` it builds. Locate the line that drives `ForEach` — it iterates `workspace.project.clips`. Replace that iteration with one that uses a computed filtered list. Above the `body`'s return, add a helper property; then thread it through.
-
-For concreteness — the existing `body` looks like this (around line 25–60, adjust to actual content):
+**Edit 2 — add a filtered-clips computed property.** Just below the existing `sortedClips` property (around lines 20–22):
 
 ```swift
-    var body: some View {
-        List(selection: $selectedClipID) {
-            // … sources section …
-            ForEach(workspace.project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })) { clip in
-                clipRow(clip)
-            }
-            .onMove { offsets, dest in
-                workspace.reorderClips(from: offsets, to: dest)
-            }
-        }
+    private var sortedClips: [Clip] {
+        workspace.project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
     }
 ```
 
-Refactor it to read filtered clips and conditionally include `.onMove` only when no filter is active. Replace the iteration body with:
+Add:
+
+```swift
+    /// Sorted clips after applying `selectedTagFilter`. When nil,
+    /// equivalent to `sortedClips`. Used by `clipsSection` for
+    /// rendering — `sortedClips` is preserved for any non-filtered
+    /// callers.
+    private var visibleClips: [Clip] {
+        guard let filter = selectedTagFilter else { return sortedClips }
+        return sortedClips.filter { $0.tags.contains(filter) }
+    }
+```
+
+**Edit 3 — insert the filter chip between the existing Divider and List.** Find this block in `body` (around lines 28–42):
 
 ```swift
     var body: some View {
-        VStack(spacing: 0) {
+        VStack(alignment: .leading, spacing: 0) {
+            TextField("Project name", text: $workspace.project.name)
+                .textFieldStyle(.plain)
+                .font(.headline)
+                .padding(8)
+                .onSubmit { try? workspace.saveProject() }
+                .disabled(isRecording)
+
+            Divider()
+
+            List(selection: $selectedClipID) {
+                sourcesSection
+                clipsSection
+            }
+```
+
+Insert the chip after `Divider()` and before `List`:
+
+```swift
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            TextField("Project name", text: $workspace.project.name)
+                .textFieldStyle(.plain)
+                .font(.headline)
+                .padding(8)
+                .onSubmit { try? workspace.saveProject() }
+                .disabled(isRecording)
+
+            Divider()
+
             if let activeFilter = selectedTagFilter {
                 filterChip(activeFilter)
+                Divider()
             }
+
             List(selection: $selectedClipID) {
-                // … (preserve the existing sources section verbatim) …
-                let filteredClips = visibleClips()
-                if selectedTagFilter != nil {
-                    ForEach(filteredClips) { clip in
-                        clipRow(clip)
-                    }
-                    // No .onMove while filtered — reordering a subset
-                    // changes sortIndex of clips you can't see.
-                    if filteredClips.isEmpty {
-                        Text("No clips with tag '\(selectedTagFilter!)'")
-                            .foregroundStyle(.secondary)
-                            .font(.callout)
-                            .padding(.vertical, 8)
-                    }
-                } else {
-                    ForEach(filteredClips) { clip in
-                        clipRow(clip)
-                    }
-                    .onMove { offsets, dest in
-                        workspace.reorderClips(from: offsets, to: dest)
-                    }
-                }
+                sourcesSection
+                clipsSection
             }
-        }
-    }
+```
 
-    /// Sorted+filtered clips for the current binding state.
-    private func visibleClips() -> [Clip] {
-        let sorted = workspace.project.clips.sorted { $0.sortIndex < $1.sortIndex }
-        guard let filter = selectedTagFilter else { return sorted }
-        return sorted.filter { $0.tags.contains(filter) }
-    }
+**Edit 4 — add the `filterChip` builder.** Place it near the bottom of `ClipSidebar`, just above the closing brace of the struct (after `clipsSection` / `sourceRow` / `sourcesSection`):
 
+```swift
     @ViewBuilder
     private func filterChip(_ tag: String) -> some View {
         HStack(spacing: 6) {
@@ -416,7 +441,83 @@ Refactor it to read filtered clips and conditionally include `.onMove` only when
     }
 ```
 
-**Important:** the existing `body` likely has more structure than the snippet above (a sources section, headers, padding). Preserve everything that's already there — only swap the clip-iteration block and conditionally include `.onMove`, and wrap the whole `List` in a `VStack` with the chip above. Read the current file before editing so you can keep all existing sections intact.
+**Edit 5 — modify `clipsSection` to use `visibleClips`, conditionally disable `.onMove`, and show the empty-state message.** Find the current `clipsSection` (around lines 116–136):
+
+```swift
+    @ViewBuilder
+    private var clipsSection: some View {
+        Section {
+            ForEach(sortedClips) { clip in
+                HStack {
+                    Text(clip.name).lineLimit(1)
+                    Spacer()
+                    Text(formatDuration(clip.recordingDuration))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .monospacedDigit()
+                }
+                .tag(clip.id)
+            }
+            .onMove { indices, dest in
+                workspace.reorderClips(from: indices, to: dest)
+            }
+        } header: {
+            Text("Clips")
+        }
+    }
+```
+
+Replace with:
+
+```swift
+    @ViewBuilder
+    private var clipsSection: some View {
+        Section {
+            // Use `visibleClips` (filtered) when a tag filter is
+            // active, otherwise the full `sortedClips`. The two
+            // ForEach branches let us attach .onMove conditionally —
+            // SwiftUI requires .onMove directly on a ForEach, not
+            // wrapped in an `if`.
+            if selectedTagFilter != nil {
+                ForEach(visibleClips) { clip in
+                    clipRow(clip)
+                }
+                // No .onMove while filtered — reordering a subset
+                // would permute sortIndex of clips you can't see.
+                if visibleClips.isEmpty {
+                    Text("No clips with tag '\(selectedTagFilter!)'")
+                        .foregroundStyle(.secondary)
+                        .font(.callout)
+                        .padding(.vertical, 4)
+                }
+            } else {
+                ForEach(sortedClips) { clip in
+                    clipRow(clip)
+                }
+                .onMove { indices, dest in
+                    workspace.reorderClips(from: indices, to: dest)
+                }
+            }
+        } header: {
+            Text("Clips")
+        }
+    }
+
+    @ViewBuilder
+    private func clipRow(_ clip: Clip) -> some View {
+        HStack {
+            Text(clip.name).lineLimit(1)
+            Spacer()
+            Text(formatDuration(clip.recordingDuration))
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .monospacedDigit()
+        }
+        .tag(clip.id)
+    }
+```
+
+(The clip-row body is extracted into `clipRow(_:)` so the two ForEach branches share it.)
 
 - [ ] **Step 3: Build and verify**
 
