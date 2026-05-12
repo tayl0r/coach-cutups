@@ -300,7 +300,7 @@ struct ExportSheet: View {
                 }
             }
             Text(runSummaryLine)
-                .font(.callout)
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
         }
     }
@@ -370,7 +370,7 @@ struct ExportSheet: View {
             return " · done \(Self.clockFormatter.string(from: date))"
         }()
         Text("\(formatDuration(item.videoDurationSeconds)) video · ~\(formatDuration(encodeOnly)) to encode\(doneDateString)")
-            .font(.callout)
+            .font(.callout.monospacedDigit())
             .foregroundStyle(.secondary)
     }
 
@@ -387,14 +387,14 @@ struct ExportSheet: View {
             return " · ETA \(formatDuration(wallLeft)) (\(Self.clockFormatter.string(from: date)))"
         }()
         Text("\(fpsText)\(formatDuration(videoLeft)) video left\(etaText)")
-            .font(.callout)
+            .font(.callout.monospacedDigit())
             .foregroundStyle(.secondary)
     }
 
     @ViewBuilder
     private func doneDetail(_ item: VideoExportItem, encodeWall: Double, avgFps: Double) -> some View {
         Text("✓ \(formatDuration(item.videoDurationSeconds)) video · \(formatDuration(encodeWall)) encode · avg \(Int(avgFps.rounded())) fps")
-            .font(.callout)
+            .font(.callout.monospacedDigit())
             .foregroundStyle(.secondary)
     }
 

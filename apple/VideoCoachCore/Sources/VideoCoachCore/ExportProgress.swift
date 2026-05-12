@@ -63,8 +63,10 @@ public struct RunProjection: Sendable, Equatable {
     /// remaining fraction ÷ rate. Done items are absent.
     public let perItemRemaining: [String: Double]
     /// Per-item absolute clock time at which it's projected to finish,
-    /// keyed by `VideoExportItem.id`. Includes done items at their actual
-    /// finish time when supplied.
+    /// keyed by `VideoExportItem.id`. Done items are omitted — their
+    /// finish time isn't carried on `VideoExportItem.Status.done` today.
+    /// Callers that need it (e.g., for a "done at 3:18 PM" UI line) can
+    /// stamp it separately at the transition site.
     public let perItemDoneDate: [String: Date]
 
     public init(
