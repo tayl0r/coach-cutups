@@ -659,6 +659,25 @@ final class Workspace {
         try? saveProject()
     }
 
+    /// Rewrite every clip's `sortIndex` so the sidebar (and therefore
+    /// the export) follows the order the clips appear inside the source
+    /// videos: by `sourceIndex` first, then by `startSourceSeconds`. One-
+    /// shot — the user clicks the button, this runs, normal drag-to-
+    /// reorder still works afterward. Save-without-undo, same as
+    /// `reorderClips(from:to:)`.
+    func sortClipsBySourcePosition() {
+        var clips = project.clips
+        clips.sort {
+            if $0.sourceIndex != $1.sourceIndex {
+                return $0.sourceIndex < $1.sourceIndex
+            }
+            return $0.startSourceSeconds < $1.startSourceSeconds
+        }
+        for i in clips.indices { clips[i].sortIndex = i }
+        project.clips = clips
+        try? saveProject()
+    }
+
     // MARK: - Recording (Mode B) helpers
 
     /// Maps a cumulative source time (sum of prior source durations + the

@@ -207,7 +207,22 @@ struct ClipSidebar: View {
                 }
             }
         } header: {
-            Text("Clips")
+            HStack(spacing: 6) {
+                Text("Clips")
+                Spacer()
+                Button {
+                    workspace.sortClipsBySourcePosition()
+                } label: {
+                    Image(systemName: "arrow.up.arrow.down")
+                        .imageScale(.small)
+                }
+                .buttonStyle(.borderless)
+                .help("Sort clips by their position in the source video")
+                // Pointless when there's nothing to reorder, and unsafe
+                // mid-capture (would mutate the project while a clip is
+                // being recorded into it).
+                .disabled(workspace.project.clips.count < 2 || isRecording)
+            }
         }
     }
 
