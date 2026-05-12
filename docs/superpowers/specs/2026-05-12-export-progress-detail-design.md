@@ -14,9 +14,14 @@ User-visible changes during a running export:
 Exporting shot (1 of 3 tags)…
 [========================            ]   ← determinate
 Clip 4 of 12 — "shot-2-12:34"
-0:18 left in clip · 1:42 left in tag
-Rendering at 47 fps · ETA 2:08
+0:18 of clip remaining · 1:42 of tag remaining     ← composition (video) time
+Rendering at 47 fps · ETA 2:08 (wall time)         ← wall-clock prediction
+0:21 ETA this clip (wall time)                     ← wall-clock prediction
 ```
+
+The two unit families are deliberately separated by line so the user
+can read them without confusing video-content-remaining (stable,
+monotonic) with wall-clock prediction (volatile, rate-driven).
 
 ## Scope
 
@@ -26,13 +31,16 @@ report position WITHIN the currently-running compilation:
 
 - **Clip i of N** — which clip in the compilation is currently
   being encoded (derived from session progress).
-- **Time left in clip** — encode time remaining for the active
-  clip's composition range.
-- **Time left in tag** — encode time remaining for the whole
-  compilation.
+- **Clip / tag remaining** — composition (video) seconds remaining
+  in the active clip's range and in the whole compilation. Labeled
+  "of clip remaining" / "of tag remaining" so the unit is clear.
 - **Rendering FPS** — encoded-frame throughput averaged over the
   last ~30s of wall time.
-- **ETA** — wall time remaining for the active tag.
+- **ETA** — wall-clock seconds until the active tag finishes
+  encoding. Labeled "(wall time)" to distinguish from the
+  composition-time lines.
+- **Per-clip ETA** — wall-clock seconds until the active clip
+  finishes encoding. Also labeled "(wall time)."
 
 ## Non-goals
 
@@ -218,22 +226,26 @@ private var progressSection: some View {
                     .font(.callout)
             }
 
-            // 0:18 left in clip · 1:42 left in tag
-            Text(timeLeftLine(p))
+            // Composition (video) time remaining. Stable — ticks
+            // down monotonically as encoding progresses.
+            //   "0:18 of clip remaining · 1:42 of tag remaining"
+            Text(contentRemainingLine(p))
                 .font(.callout)
                 .foregroundStyle(.secondary)
 
-            // Rendering at 47 fps · ETA 2:08  (omitted while rate is unknown)
+            // Wall-time ETA for the active tag.
+            //   "Rendering at 47 fps · ETA 2:08 (wall time)"
             if let fps = p.renderingFramesPerSecond, let eta = p.etaTagSeconds {
-                Text("Rendering at \(Int(fps.rounded())) fps · ETA \(formatDuration(eta))")
+                Text("Rendering at \(Int(fps.rounded())) fps · ETA \(formatDuration(eta)) (wall time)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
-            // Per-clip ETA: "0:21 ETA this clip". Same nil guard as
+            // Wall-time ETA for the active clip. Same nil guard as
             // the rendering FPS — both depend on a measured rate.
+            //   "0:21 ETA this clip (wall time)"
             if let etaClip = p.etaCurrentClipSeconds {
-                Text("\(formatDuration(etaClip)) ETA this clip")
+                Text("\(formatDuration(etaClip)) ETA this clip (wall time)")
                     .font(.callout)
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
@@ -247,10 +259,13 @@ private var progressSection: some View {
 practice we use the existing `if let run` pattern that the file
 already follows.)
 
-`timeLeftLine(_:)` is a small private helper that returns
-`"\(formatDuration(p.remainingInCurrentClipSeconds)) left in clip · \(formatDuration(p.remainingInTagSeconds)) left in tag"`. Both
-durations use the existing `formatDuration` from `ClipSidebar.swift`
-(same target).
+`contentRemainingLine(_:)` is a small private helper that returns
+`"\(formatDuration(p.remainingInCurrentClipSeconds)) of clip remaining · \(formatDuration(p.remainingInTagSeconds)) of tag remaining"`.
+Both durations use the existing `formatDuration` from
+`ClipSidebar.swift` (same target). The phrasing ("of clip
+remaining" / "of tag remaining") is chosen so the unit reads as
+*video content*, not as wall-clock time — the wall-clock ETAs
+live on the lines below.
 
 The "Tags export sequentially. This may take several minutes…"
 informational line is removed — the real numbers replace it.
