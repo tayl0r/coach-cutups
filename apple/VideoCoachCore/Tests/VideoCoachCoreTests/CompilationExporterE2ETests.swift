@@ -138,6 +138,85 @@ final class CompilationExporterE2ETests: XCTestCase {
             "leading freeze should show source frame ≈\(expected) (sourceTime=5s); got \(frame)")
     }
 
+    // MARK: - PiP placement and base orientation
+
+    /// Pixel-correctness lock for the compositor GPU-render path: verifies that
+    /// (1) the base frame is rendered right-side-up (center pixel matches the
+    /// source center fiducial's BLUE color), and (2) the PiP lands at
+    /// bottom-right — the bottom-right corner of the output matches the dark-
+    /// gray webcam color, while the top-right corner does NOT (it shows the
+    /// source's GREEN fiducial instead).
+    ///
+    /// The webcam is a 320×240 `SyntheticAsset` with `videoColor:
+    /// (r:0x40, g:0x40, b:0x40)` (~25% gray), clearly distinguishable from
+    /// both mid-gray background (0x80) and every saturated fiducial.
+    ///
+    /// PiP geometry from `CompilationCompositor.startRequest`:
+    ///   pipW = outW * 0.22, margin = outH * 0.022
+    ///   CIImage origin = bottom-left → in CGImage (y=0 top) coordinates the
+    ///   PiP occupies the bottom-right corner.
+    func test_first_frame_pip_lands_bottom_right_and_base_is_upright() async throws {
+        let clip = Clip(
+            name: "pip-orientation",
+            tags: ["test"],
+            sourceIndex: 0,
+            startSourceSeconds: 2,
+            recordingDuration: 2,
+            recordingFilename: camURL.lastPathComponent,
+            events: [
+                .init(recordTime: 0, kind: .zoom(.identity)),
+                .init(recordTime: 0, kind: .play(sourceTime: 2)),
+            ],
+            sortIndex: 0
+        )
+
+        try await runExport(clip: clip)
+
+        let cg = try await sampleFrame(of: outURL, atOutputTime: 0.5)
+
+        // ── 1. Base-orientation check ─────────────────────────────────────
+        // The center fiducial is BLUE (0x00, 0x00, 0xFF) at source (0.5, 0.4).
+        // At identity zoom it maps 1:1 to viewport (0.5, 0.4). We probe a 4%
+        // window centered there and classify it.
+        let centerProbeRect = CGRect(x: 0.48, y: 0.38, width: 0.04, height: 0.04)
+        let centerRGB = PixelSampling.averageRGB(in: cg, normalizedRect: centerProbeRect)
+        let centerClass = FiducialAsset.classify(rgb: centerRGB)
+        XCTAssertEqual(centerClass, .center,
+            "base frame center should be the BLUE center fiducial; got \(String(describing: centerClass)) (sample=\(centerRGB)). A nil/other result means base orientation or zoom math is wrong after the GPU-render refactor.")
+
+        // ── 2. PiP is at bottom-right ─────────────────────────────────────
+        // compositor PiP geometry:
+        //   pipW = outW*0.22 → x ∈ [0.758, 0.978] (normalized)
+        //   pipH = pipW*(240/320) = outW*0.165/outH ≈ 0.165  (720p: 165/720 ≈ 0.229)
+        //   CIImage y=0 is bottom; CGImage y=0 is top, so PiP CGImage y ∈ [0.813, 0.978]
+        // Probe at (0.93, 0.93) — well inside the PiP region in CGImage coords.
+        let webcamExpectedR = Double(0x40) / 255.0   // ≈ 0.251
+        let webcamExpectedG = Double(0x40) / 255.0
+        let webcamExpectedB = Double(0x40) / 255.0
+        let tolerance = 0.10   // wide enough to absorb HEVC + BT.709 bias
+
+        let pipProbeRect = CGRect(x: 0.91, y: 0.91, width: 0.04, height: 0.04)
+        let pipRGB = PixelSampling.averageRGB(in: cg, normalizedRect: pipProbeRect)
+        XCTAssertEqual(pipRGB.r, webcamExpectedR, accuracy: tolerance,
+            "bottom-right corner should show webcam dark-gray R≈\(webcamExpectedR); got \(pipRGB). PiP may not be placed at bottom-right (or Y math is inverted).")
+        XCTAssertEqual(pipRGB.g, webcamExpectedG, accuracy: tolerance,
+            "bottom-right corner should show webcam dark-gray G≈\(webcamExpectedG); got \(pipRGB).")
+        XCTAssertEqual(pipRGB.b, webcamExpectedB, accuracy: tolerance,
+            "bottom-right corner should show webcam dark-gray B≈\(webcamExpectedB); got \(pipRGB).")
+
+        // ── 3. Top-right is NOT the webcam (PiP isn't full-height or inverted) ─
+        // The topRight fiducial is GREEN at source (0.85, 0.15), which maps to
+        // viewport (0.85, 0.15) at identity zoom. Probe at (0.93, 0.05) —
+        // outside the PiP region, inside the source image.
+        let topRightProbeRect = CGRect(x: 0.91, y: 0.03, width: 0.04, height: 0.04)
+        let topRightRGB = PixelSampling.averageRGB(in: cg, normalizedRect: topRightProbeRect)
+        // This pixel must NOT look like webcam dark-gray: it should be
+        // substantially brighter than 0x40 in at least one channel.
+        let maxChannel = max(topRightRGB.r, topRightRGB.g, topRightRGB.b)
+        XCTAssertGreaterThan(maxChannel, webcamExpectedR + tolerance,
+            "top-right corner should not show the webcam dark-gray color; got \(topRightRGB). If the PiP covered the full right edge or Y was inverted, the PiP would appear here too.")
+    }
+
     // MARK: - Helpers
 
     private func runExport(clip: Clip) async throws {
