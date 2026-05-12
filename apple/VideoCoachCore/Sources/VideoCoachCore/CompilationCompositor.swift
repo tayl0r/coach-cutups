@@ -30,16 +30,28 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
 
     private var renderContext: AVVideoCompositionRenderContext?
 
-    /// Shared CIContext for `CVPixelBuffer → CGImage` conversions in
-    /// ``makeCGImage(_:)``. Allocated once per compositor instance (one
-    /// allocation per export, not per frame). Working color space is pinned
-    /// to deviceRGB so the CG draw matches our output buffer's colorspace
-    /// (avoids subtle color shifts in the export).
+    /// Hoisted to type scope so `CIContext.render(_:to:bounds:colorSpace:)`
+    /// doesn't allocate a fresh `CGColorSpace` per frame on the hot path.
+    /// Mirrors `PreviewCompositor.outputColorSpace`.
+    private static let outputColorSpace: CGColorSpace = CGColorSpaceCreateDeviceRGB()
+
+    /// Shared CIContext used to render the composed base + PiP CIImage
+    /// directly into the output CVPixelBuffer (stage 1 of startRequest).
+    /// `CIContext.render(_:to:bounds:colorSpace:)` writes into the buffer's
+    /// IOSurface without an intermediate CGImage, keeping the frame
+    /// GPU-resident from source decode through encoder hand-off. Working
+    /// and output color spaces are pinned to deviceRGB so the subsequent
+    /// CGContext overlay pass (stage 2) draws on bytes laid down in the
+    /// same color space.
+    ///
+    /// `render(_:to:bounds:colorSpace:)` is synchronous — it flushes the
+    /// GPU pipeline before returning, so stage 2's `CVPixelBufferLockBaseAddress`
+    /// safely reads the bytes stage 1 wrote with no ordering hazard.
     ///
     /// Eager init (NOT `lazy var`) — `lazy var` is not thread-safe, and
-    /// AVFoundation may call `startRequest(_:)` from a private dispatch queue
-    /// without a documented serialization guarantee. Eager init dodges the
-    /// race entirely.
+    /// AVFoundation may call `startRequest(_:)` from a private dispatch
+    /// queue without a documented serialization guarantee. Eager init dodges
+    /// the race entirely.
     private let ciContext: CIContext = CIContext(options: [
         .workingColorSpace: CGColorSpaceCreateDeviceRGB(),
         .outputColorSpace: CGColorSpaceCreateDeviceRGB(),
@@ -64,16 +76,9 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         let inst = request.videoCompositionInstruction as? CompilationInstruction
         let recordTime = inst.map { (request.compositionTime - $0.clipCompositionStart).seconds } ?? 0
 
-        // 1. Base buffer: live source frame from the composition track. The
-        //    exporter inserts content for both `.play` AND `.freeze` segments
-        //    (freezes are stretched 1-tick slices via `scaleTimeRange`), so
-        //    `request.sourceFrame(byTrackID:)` returns a real frame at every
-        //    compositionTime — no per-clip cache fallback needed. When the
-        //    instruction subclass is stripped (macOS 26 has been seen to do
-        //    this), we don't know the source track ID directly; fall back to
-        //    the instruction's `requiredSourceTrackIDs` (set on the parent
-        //    class) in declaration order, which by convention puts source
-        //    first.
+        // Resolve source + webcam track IDs (same logic as before — the
+        // instruction subclass exposes them directly, with a fallback to
+        // `requiredSourceTrackIDs` declaration order when stripped).
         let sourceTrackID: CMPersistentTrackID
         if let inst {
             sourceTrackID = inst.sourceTrackID
@@ -83,67 +88,6 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         } else {
             sourceTrackID = kCMPersistentTrackID_Invalid
         }
-
-        let base: CVPixelBuffer? = request.sourceFrame(byTrackID: sourceTrackID)
-
-        // 2. Output buffer + CG context (flip Y to top-left origin).
-        guard let out = renderContext?.newPixelBuffer() else {
-            request.finishCancelledRequest()
-            return
-        }
-        CVPixelBufferLockBaseAddress(out, [])
-        defer { CVPixelBufferUnlockBaseAddress(out, []) }
-
-        let w = CVPixelBufferGetWidth(out)
-        let h = CVPixelBufferGetHeight(out)
-        let cs = CGColorSpaceCreateDeviceRGB()
-        guard let cg = CGContext(
-            data: CVPixelBufferGetBaseAddress(out),
-            width: w,
-            height: h,
-            bitsPerComponent: 8,
-            bytesPerRow: CVPixelBufferGetBytesPerRow(out),
-            space: cs,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                | CGBitmapInfo.byteOrder32Little.rawValue
-        ) else {
-            request.finishCancelledRequest()
-            return
-        }
-
-        // newPixelBuffer() doesn't guarantee zeroed memory — fill black first
-        // so a missing base (e.g. clip starts paused with no cached frame)
-        // renders cleanly instead of showing whatever was in the pool slot.
-        cg.setFillColor(CGColor(gray: 0, alpha: 1))
-        cg.fill(CGRect(x: 0, y: 0, width: w, height: h))
-
-        // After this transform, user-space (0, 0) is the top-left of the
-        // image — strokes stored top-left then pass through directly with
-        // flipY: false. (flipY: true would double-flip — see the misuse
-        // warning in design § "Drawing capture".)
-        cg.translateBy(x: 0, y: CGFloat(h))
-        cg.scaleBy(x: 1, y: -1)
-
-        let size = CGSize(width: w, height: h)
-
-        // 3. Base full-frame (only if we have one — otherwise the black fill
-        //    remains). Apply zoom delta on top of the existing stretch-to-fill
-        //    at non-identity zoom; identity is bit-identical to today's output.
-        if let base, let img = makeCGImage(base) {
-            let zoom = inst?.events.zoomAt(recordTime: recordTime) ?? .identity
-            if zoom == .identity {
-                cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-            } else {
-                cg.saveGState()
-                cg.concatenate(zoom.deltaTransform(viewportSize: CGSize(width: w, height: h)))
-                cg.draw(img, in: CGRect(x: 0, y: 0, width: w, height: h))
-                cg.restoreGState()
-            }
-        }
-
-        // 4. Webcam PiP, bottom-right at 22% width with 2.2% margin. With a
-        //    missing subclass we fall back to the second declared required
-        //    track ID (convention: source first, webcam second).
         let webcamTrackID: CMPersistentTrackID
         if let inst {
             webcamTrackID = inst.webcamTrackID
@@ -154,25 +98,123 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         } else {
             webcamTrackID = kCMPersistentTrackID_Invalid
         }
-        if let webcam = request.sourceFrame(byTrackID: webcamTrackID),
-           let wImg = makeCGImage(webcam) {
-            let pipW = CGFloat(w) * 0.22
-            let webcamH = CVPixelBufferGetHeight(webcam)
-            let webcamW = CVPixelBufferGetWidth(webcam)
-            let pipH = pipW * CGFloat(webcamH) / CGFloat(max(webcamW, 1))
-            let margin = CGFloat(h) * 0.022
-            let rect = CGRect(
-                x: CGFloat(w) - pipW - margin,
-                y: CGFloat(h) - pipH - margin,
-                width: pipW,
-                height: pipH
+
+        let base: CVPixelBuffer? = request.sourceFrame(byTrackID: sourceTrackID)
+        let webcam: CVPixelBuffer? = request.sourceFrame(byTrackID: webcamTrackID)
+
+        guard let renderContext, let out = renderContext.newPixelBuffer() else {
+            request.finishCancelledRequest()
+            return
+        }
+        let outW = CGFloat(CVPixelBufferGetWidth(out))
+        let outH = CGFloat(CVPixelBufferGetHeight(out))
+        let outRect = CGRect(x: 0, y: 0, width: outW, height: outH)
+
+        // ── Stage 1: GPU-direct render of base + PiP ───────────────────
+        //
+        // This block is a structural mirror of PreviewCompositor.startRequest
+        // lines 117–177. If you change anything here that's not strictly a
+        // stroke/text overlay concern, mirror it in PreviewCompositor too —
+        // they're paired by visual contract (preview must match export).
+
+        var composite: CIImage = CIImage(color: .black).cropped(to: outRect)
+
+        if let base {
+            let baseCI = CIImage(cvPixelBuffer: base)
+            // baseCI.extent.origin is (0,0) for any CIImage made from an
+            // AVFoundation-allocated CVPixelBuffer (which is what
+            // `request.sourceFrame(byTrackID:)` always returns). The fit
+            // math below assumes origin (0,0); we don't translate by
+            // -origin because the assumption holds for all real inputs.
+            let baseScale = CGAffineTransform(
+                scaleX: outW / max(baseCI.extent.width, 1),
+                y: outH / max(baseCI.extent.height, 1)
             )
-            cg.draw(wImg, in: rect)
+            let stretched = baseCI.transformed(by: baseScale)
+            let zoom = inst?.events.zoomAt(recordTime: recordTime) ?? .identity
+            // Identity-zoom early-out — skip `.cropped(to: outRect)` op so
+            // behavior is bit-identical to the prior pipeline at zoom=1.
+            // `deltaTransform` early-outs at identity already, but `.cropped`
+            // is a non-trivial CIImage op we don't want on the hot path.
+            // At any non-identity zoom the cropped path is required to keep
+            // the zoomed image bounded by outRect.
+            let zoomed = (zoom == .identity)
+                ? stretched
+                : stretched.transformed(by: zoom.deltaTransform(viewportSize: outRect.size))
+                           .cropped(to: outRect)
+            composite = zoomed.composited(over: composite)
         }
 
-        // 5. Strokes + 6. text bar — only available when the per-clip
-        //    instruction context survived. When stripped, we still emit the
-        //    base frame + PiP, just without strokes / text bar.
+        if let webcam {
+            let camCI = CIImage(cvPixelBuffer: webcam)
+            let camW = camCI.extent.width
+            let camH = camCI.extent.height
+            let pipW = outW * 0.22
+            let pipH = pipW * camH / max(camW, 1)
+            let margin = outH * 0.022
+            // CIImage's coordinate origin is bottom-left, so "bottom-right
+            // with margin" = (outW - margin - pipW, margin). This matches
+            // PreviewCompositor.startRequest lines 159–173 exactly.
+            let scale = CGAffineTransform(
+                scaleX: pipW / max(camW, 1),
+                y: pipH / max(camH, 1)
+            )
+            let translate = CGAffineTransform(
+                translationX: outW - margin - pipW,
+                y: margin
+            )
+            composite = camCI.transformed(by: scale)
+                .transformed(by: translate)
+                .composited(over: composite)
+        }
+
+        ciContext.render(
+            composite,
+            to: out,
+            bounds: outRect,
+            colorSpace: Self.outputColorSpace
+        )
+
+        // ── Stage 2: CGContext overlays (strokes + text bar) ───────────
+        //
+        // The output buffer now contains the composed base + PiP. Open a
+        // CGContext over its IOSurface-backed memory to draw the smaller
+        // overlays (strokes are typically a few thousand pixels of work
+        // per frame; text bar is a single-line CoreText draw). The Y-flip
+        // is preserved so stroke coordinates (top-left, normalized) and
+        // the text-bar Y math continue to work unchanged.
+        //
+        // `CIContext.render` is synchronous (flushes GPU before returning),
+        // so there's no ordering hazard between the IOSurface write above
+        // and the lockBaseAddress + CG draws below.
+
+        CVPixelBufferLockBaseAddress(out, [])
+        defer { CVPixelBufferUnlockBaseAddress(out, []) }
+
+        let w = Int(outW)
+        let h = Int(outH)
+        guard let cg = CGContext(
+            data: CVPixelBufferGetBaseAddress(out),
+            width: w,
+            height: h,
+            bitsPerComponent: 8,
+            bytesPerRow: CVPixelBufferGetBytesPerRow(out),
+            space: Self.outputColorSpace,
+            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
+                | CGBitmapInfo.byteOrder32Little.rawValue
+        ) else {
+            request.finishCancelledRequest()
+            return
+        }
+
+        // After this transform, user-space (0, 0) is top-left — matches how
+        // strokes are recorded and how drawTextBar's bar-rect math is
+        // written.
+        cg.translateBy(x: 0, y: outH)
+        cg.scaleBy(x: 1, y: -1)
+
+        let size = CGSize(width: outW, height: outH)
+
         if let inst {
             let synthClip = Clip(
                 name: "_compositorReplay",
@@ -305,18 +347,5 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         cg.restoreGState()
     }
 
-    private func makeCGImage(_ buffer: CVPixelBuffer) -> CGImage? {
-        let ci = CIImage(cvPixelBuffer: buffer)
-        // CIImage's native coordinate convention is bottom-left origin, but
-        // a CVPixelBuffer's pixel rows are top-down. `createCGImage` produces
-        // a CGImage whose row 0 corresponds to CIImage y=0 (the BOTTOM of
-        // the source image). When that CGImage is drawn into our top-left
-        // CGContext (flipped above), the image lands upside-down. Apply a
-        // vertical flip to the CIImage so its row 0 = TOP of source, then
-        // the CGImage we hand to cg.draw is naturally right-side-up.
-        let flipped = ci
-            .transformed(by: CGAffineTransform(scaleX: 1, y: -1))
-            .transformed(by: CGAffineTransform(translationX: 0, y: ci.extent.height))
-        return ciContext.createCGImage(flipped, from: flipped.extent)
-    }
+
 }
