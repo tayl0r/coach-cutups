@@ -29,6 +29,11 @@ public struct DeletedClip: Sendable {
 public enum UndoAction: Sendable {
     case editClip(id: Clip.ID, before: Clip, after: Clip)
     case deleteClip(DeletedClip)
+    /// Snapshot of clip-ID order before and after a reorder or
+    /// `sortClipsBySourcePosition`. Applied best-effort: clips whose id
+    /// is missing from the snapshot are appended at the end so the
+    /// action survives an add/delete between push and pop.
+    case reorderClips(beforeOrder: [Clip.ID], afterOrder: [Clip.ID])
 }
 
 /// Pure-data undo machinery for `Workspace`. Owns the undo / redo

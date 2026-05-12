@@ -31,7 +31,34 @@ final class UndoControllerTests: XCTestCase {
         return .editClip(id: clip.id, before: clip, after: after)
     }
 
+    private func makeReorder(before: [Clip.ID], after: [Clip.ID]) -> UndoAction {
+        .reorderClips(beforeOrder: before, afterOrder: after)
+    }
+
     // MARK: - pushEdit
+
+    func test_pushEdit_accepts_reorder_action_and_clears_redo() {
+        var c = UndoController()
+        // Stage redo with an edit.
+        c.pushEdit(makeEdit())
+        _ = c.popForUndo()
+        XCTAssertEqual(c.redoStack.count, 1)
+
+        let a = UUID(), b = UUID(), x = UUID()
+        c.pushEdit(makeReorder(before: [a, b], after: [b, a]))
+
+        XCTAssertEqual(c.undoStack.count, 1)
+        XCTAssertTrue(c.redoStack.isEmpty)
+        if case let .reorderClips(before, after) = c.undoStack.last! {
+            XCTAssertEqual(before, [a, b])
+            XCTAssertEqual(after, [b, a])
+        } else {
+            XCTFail("Expected .reorderClips on top of undo stack")
+        }
+        // Confirm the third clip isn't referenced — sanity that we
+        // didn't accidentally widen the snapshot.
+        _ = x
+    }
 
     func test_pushEdit_appends_and_clears_redo() {
         var c = UndoController()

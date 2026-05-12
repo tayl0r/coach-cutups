@@ -547,6 +547,9 @@ final class Workspace {
                 invalidatePreviewCache(for: id)
                 try? saveProject()
             }
+        case let .reorderClips(beforeOrder, _):
+            applyClipOrder(beforeOrder)
+            try? saveProject()
         case let .deleteClip(stash):
             // Move .mov out of trash and re-insert the clip at its
             // original sortIndex slot. Tolerate a missing trash file
@@ -574,6 +577,9 @@ final class Workspace {
                 invalidatePreviewCache(for: id)
                 try? saveProject()
             }
+        case let .reorderClips(_, afterOrder):
+            applyClipOrder(afterOrder)
+            try? saveProject()
         case let .deleteClip(stash):
             // Re-apply the delete: remove from project, move .mov back
             // into trash. The action's `trashedRecordingURL` points at
@@ -649,13 +655,17 @@ final class Workspace {
     // MARK: - Clip ordering
 
     /// Drag-to-reorder support for the sidebar list. Resorts by current
-    /// `sortIndex`, applies the SwiftUI move, then rewrites `sortIndex` to
-    /// match the new ordering and persists.
+    /// `sortIndex`, applies the SwiftUI move, then rewrites `sortIndex`
+    /// to match the new ordering and persists. Undoable.
     func reorderClips(from offsets: IndexSet, to destination: Int) {
+        let beforeOrder = project.clips.sorted(by: { $0.sortIndex < $1.sortIndex }).map(\.id)
         var clips = project.clips.sorted(by: { $0.sortIndex < $1.sortIndex })
         clips.move(fromOffsets: offsets, toOffset: destination)
+        let afterOrder = clips.map(\.id)
+        guard afterOrder != beforeOrder else { return }
         for i in clips.indices { clips[i].sortIndex = i }
         project.clips = clips
+        history.pushEdit(.reorderClips(beforeOrder: beforeOrder, afterOrder: afterOrder))
         try? saveProject()
     }
 
@@ -663,9 +673,9 @@ final class Workspace {
     /// the export) follows the order the clips appear inside the source
     /// videos: by `sourceIndex` first, then by `startSourceSeconds`. One-
     /// shot — the user clicks the button, this runs, normal drag-to-
-    /// reorder still works afterward. Save-without-undo, same as
-    /// `reorderClips(from:to:)`.
+    /// reorder still works afterward. Undoable.
     func sortClipsBySourcePosition() {
+        let beforeOrder = project.clips.sorted(by: { $0.sortIndex < $1.sortIndex }).map(\.id)
         var clips = project.clips
         clips.sort {
             if $0.sourceIndex != $1.sourceIndex {
@@ -673,9 +683,34 @@ final class Workspace {
             }
             return $0.startSourceSeconds < $1.startSourceSeconds
         }
+        let afterOrder = clips.map(\.id)
+        guard afterOrder != beforeOrder else { return }
         for i in clips.indices { clips[i].sortIndex = i }
         project.clips = clips
+        history.pushEdit(.reorderClips(beforeOrder: beforeOrder, afterOrder: afterOrder))
         try? saveProject()
+    }
+
+    /// Apply an ID-ordering to `project.clips`: clips appear in the
+    /// listed order first, with their `sortIndex` reassigned positionally;
+    /// any clips whose id isn't in the order get appended at the end
+    /// preserving their current relative order (so add/delete between
+    /// reorder-push and reorder-pop doesn't corrupt or wipe them).
+    private func applyClipOrder(_ order: [Clip.ID]) {
+        let byID = Dictionary(uniqueKeysWithValues: project.clips.map { ($0.id, $0) })
+        var ordered: [Clip] = []
+        ordered.reserveCapacity(project.clips.count)
+        for id in order {
+            if let c = byID[id] { ordered.append(c) }
+        }
+        let listed = Set(order)
+        // Append any clips not in the snapshot, in their current order.
+        let leftovers = project.clips
+            .sorted(by: { $0.sortIndex < $1.sortIndex })
+            .filter { !listed.contains($0.id) }
+        ordered.append(contentsOf: leftovers)
+        for i in ordered.indices { ordered[i].sortIndex = i }
+        project.clips = ordered
     }
 
     // MARK: - Recording (Mode B) helpers

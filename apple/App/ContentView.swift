@@ -420,15 +420,11 @@ struct ContentView: View {
                     .disabled(appMode != .recording)
                 }
             }
-            // Right side: app-name label, then Export. The window's
-            // navigationTitle still drives the macOS window chrome — this
-            // toolbar label is a redundant in-pane affordance the user
-            // asked for.
-            ToolbarItem(placement: .primaryAction) {
-                Text("Coach Cutups")
-                    .font(.headline)
-                    .foregroundStyle(.secondary)
-            }
+            // Right side: just the Export button. The window's
+            // navigationTitle("Coach Cutups") already renders the app
+            // name in the macOS title bar — no need to duplicate it in
+            // the toolbar, where SwiftUI would cram it into the
+            // primaryAction capsule alongside Export.
             ToolbarItem(placement: .primaryAction) {
                 Button {
                     showExportSheet = true
@@ -823,6 +819,10 @@ struct ContentView: View {
                 selectedClipID = id
             case let .deleteClip(stash):
                 selectedClipID = stash.clip.id
+            case .reorderClips:
+                // Position changed, identity didn't — leave the
+                // selection alone so the user's focus is preserved.
+                break
             }
         }
     }
@@ -844,6 +844,8 @@ struct ContentView: View {
                 if selectedClipID == stash.clip.id {
                     selectedClipID = nil
                 }
+            case .reorderClips:
+                break
             }
         }
     }
