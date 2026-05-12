@@ -139,6 +139,66 @@ final class CompilationCompositorZoomTests: XCTestCase {
         XCTAssertGreaterThan(center.b, 0.50, "center not BLUE at zoom=2")
     }
 
+    // MARK: - Zoom with pan: Y direction
+
+    func test_zoom_2x_with_pan_to_top_left_shows_red_corner_in_output_top_left() async throws {
+        // Regression test for the GPU-render-rewrite (`23e358f`) Y-inversion
+        // bug: `zoom.deltaTransform(viewportSize:)` is authored for TOP-LEFT
+        // coordinate space (matching how `ClipPreviewBuilder`'s
+        // `AVMutableVideoCompositionLayerInstruction.setTransform` consumes
+        // it), but the rewritten `CompilationCompositor` applied it to a
+        // `CIImage` in BOTTOM-LEFT space → the panY direction was inverted in
+        // the export. Panning toward the source's TOP-LEFT corner showed the
+        // BOTTOM-LEFT of the source in the exported viewport instead.
+        //
+        // Setup: 200×200 source with a 50×50 red corner at TOP-LEFT, blue
+        // elsewhere. Zoom: scale=2, panX=-0.25, panY=-0.25 → viewport center
+        // samples normalized source(0.25, 0.25) → pixel(50, 50). Visible
+        // viewport spans source(0..0.5, 0..0.5) — the top-left quadrant,
+        // including the red corner.
+        //
+        // Correct behavior: output top-left samples source(0, 0) → RED.
+        // Bug behavior:     output top-left samples source(0, 100) → BLUE
+        //                   (lower half of source, because the Y pan was
+        //                   inverted by the bottom-left coordinate space).
+        let tmp = FileManager.default.temporaryDirectory
+        let srcURL = tmp.appendingPathComponent("zoom-pan-tl-src-\(UUID()).mov")
+        let outURL = tmp.appendingPathComponent("zoom-pan-tl-out-\(UUID()).mp4")
+        defer {
+            try? FileManager.default.removeItem(at: srcURL)
+            try? FileManager.default.removeItem(at: outURL)
+        }
+        try writeRedCornerOnBlueAsset(to: srcURL, width: 200, height: 200, redCornerSize: 50)
+
+        let cg = try await renderCompilation(
+            sourceURL: srcURL,
+            renderSize: CGSize(width: 200, height: 200),
+            events: [CommentaryEvent(
+                recordTime: 0,
+                kind: .zoom(Zoom(scale: 2, panX: -0.25, panY: -0.25))
+            )],
+            outURL: outURL
+        )
+
+        // Output top-left should sample the source's red corner.
+        let topLeft = PixelSampling.averageRGB(
+            in: cg,
+            normalizedRect: CGRect(x: 0.05, y: 0.05, width: 0.10, height: 0.10)
+        )
+        print("[zoom pan top-left] output top-left (expect RED): \(topLeft)")
+        XCTAssertGreaterThan(topLeft.r, 0.50, "output top-left not RED at panY=-0.25 — Y pan direction is inverted in the CIImage-applied zoom transform")
+        XCTAssertLessThan(topLeft.b, 0.30, "output top-left has too much BLUE at panY=-0.25 — red corner not visible where it should be")
+
+        // Output bottom (well above the 8% text bar zone) should be blue —
+        // beyond the red corner's reach in source Y.
+        let lower = PixelSampling.averageRGB(
+            in: cg,
+            normalizedRect: CGRect(x: 0.05, y: 0.75, width: 0.10, height: 0.10)
+        )
+        print("[zoom pan top-left] output lower-left (expect BLUE): \(lower)")
+        XCTAssertGreaterThan(lower.b, 0.50, "output lower-left not BLUE — red corner extends past where it should")
+    }
+
     // MARK: - Test infrastructure
 
     /// Run one compilation export and return the decoded mid-clip frame as a

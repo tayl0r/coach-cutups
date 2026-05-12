@@ -105,4 +105,27 @@ public extension Zoom {
             .translatedBy(x: -(0.5 + panX) * viewportSize.width,
                           y: -(0.5 + panY) * viewportSize.height)
     }
+
+    /// Same as ``deltaTransform(viewportSize:)`` but for callers that apply
+    /// the transform to a `CIImage` (or any geometry in bottom-left origin).
+    ///
+    /// `deltaTransform` is authored for TOP-LEFT origin (matching
+    /// `AVMutableVideoCompositionLayerInstruction.setTransform`, the AppKit
+    /// view-tree, and `CGContext` after the standard `translateBy(0,h);
+    /// scaleBy(1,-1)` flip). `CIImage` lives in BOTTOM-LEFT space, so a
+    /// `panY > 0` ("show lower content") would translate the image the
+    /// wrong direction along Y. The fix is one sign flip: where the
+    /// top-left formula uses `(0.5 + panY)`, the bottom-left formula uses
+    /// `(0.5 − panY)` — equivalent to reflecting the desired-center-source
+    /// point across the image's mid-Y line before building the transform.
+    func deltaTransformForCIImage(viewportSize: CGSize) -> CGAffineTransform {
+        guard scale != 1.0 || panX != 0 || panY != 0 else { return .identity }
+        let cx = viewportSize.width / 2
+        let cy = viewportSize.height / 2
+        return CGAffineTransform.identity
+            .translatedBy(x: cx, y: cy)
+            .scaledBy(x: scale, y: scale)
+            .translatedBy(x: -(0.5 + panX) * viewportSize.width,
+                          y: -(0.5 - panY) * viewportSize.height)
+    }
 }

@@ -135,7 +135,11 @@ public final class PreviewCompositor: NSObject, AVVideoCompositing {
             // we don't have events — fall back to identity (no zoom).
             let recordTime = inst.map { (request.compositionTime - $0.clipCompositionStart).seconds } ?? 0
             let zoom = inst?.events.zoomAt(recordTime: recordTime) ?? .identity
-            let zoomDelta = zoom.deltaTransform(viewportSize: outRect.size)
+            // Bottom-left variant — `CIImage` is bottom-left while the live
+            // preview path's `setTransform` is top-left. Both consume the
+            // same `Zoom` data, so the variant chosen has to match the
+            // coordinate space of the target.
+            let zoomDelta = zoom.deltaTransformForCIImage(viewportSize: outRect.size)
             let stretched = baseCI.transformed(by: baseScale)
             // Explicit identity check: skip the `.cropped(to: outRect)` op when
             // zoom is identity so behavior is bit-identical to the prior

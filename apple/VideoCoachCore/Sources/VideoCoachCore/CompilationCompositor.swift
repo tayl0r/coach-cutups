@@ -138,9 +138,12 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
             // is a non-trivial CIImage op we don't want on the hot path.
             // At any non-identity zoom the cropped path is required to keep
             // the zoomed image bounded by outRect.
+            // `deltaTransformForCIImage` (not `deltaTransform`) — `CIImage`
+            // is bottom-left, the live preview path is top-left. They use the
+            // same `Zoom` data and must produce visually identical pans.
             let zoomed = (zoom == .identity)
                 ? stretched
-                : stretched.transformed(by: zoom.deltaTransform(viewportSize: outRect.size))
+                : stretched.transformed(by: zoom.deltaTransformForCIImage(viewportSize: outRect.size))
                            .cropped(to: outRect)
             composite = zoomed.composited(over: composite)
         }
