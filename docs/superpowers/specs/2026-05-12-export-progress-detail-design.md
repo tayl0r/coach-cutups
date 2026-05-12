@@ -101,11 +101,13 @@ struct RollingRate {
 }
 ```
 
-- `record` appends a sample and evicts samples older than
-  `windowSeconds` from the front.
+- `record` appends a sample, then evicts samples older than
+  `windowSeconds` from the front. The sufficiency gate below is
+  evaluated AFTER eviction — so a stale-only window correctly
+  surfaces as nil even if many samples accumulated earlier.
 - Returns nil until at least 5 samples are present AND ≥2s of wall
-  time has elapsed since the oldest sample (avoids spurious
-  early-rate readings).
+  time has elapsed since the oldest surviving sample (avoids
+  spurious early-rate readings).
 - When the rate is computed: `(latest.fraction − oldest.fraction)
   * totalDuration / (latest.wallTime − oldest.wallTime)`.
 - When all samples have the same `fraction` (encoder stalled),
@@ -138,20 +140,43 @@ public func export(
 ) async throws
 ```
 
-Inside `export`, after the export session is configured and
-`exportSession.export()` is launched, run a sibling task with
-`async let` or `Task.detached` that:
+Inside `export`, **before** `await exportSession.export()`, spawn the
+sampler as a `Task.detached` (NOT `async let`, NOT a plain `Task { }`).
+`CompilationExporter` is a `public actor`, so a child task without
+detachment would inherit actor isolation and could serialize with the
+export call. `Task.detached` runs off-actor so the sampler's polling
+never contends with `export()`.
 
-1. Captures `totalDuration = plan.totalDurationSeconds`, the plan
-   itself, `clipsByID`, and the videoComp's frame rate.
-2. Initializes a `RollingRate(windowSeconds: 30)`.
-3. Loops at 5Hz while `session.status` is `.exporting`:
+The sampler's closure captures by value:
+- `plan` (Sendable struct)
+- `clipsByID` (Dictionary of Sendable values)
+- `totalDuration = plan.totalDurationSeconds`
+- `outputFrameRate = Double(videoComp.frameDuration.timescale) / Double(videoComp.frameDuration.value)`
+- A reference to the `AVAssetExportSession` (its `progress`/`status` properties are thread-safe per Apple docs)
+- `onProgress` (`@Sendable` closure parameter)
+
+Sampler body:
+
+1. Initializes a `RollingRate(windowSeconds: 30)`.
+2. Loops at 5Hz while `session.status == .exporting` and
+   `!Task.isCancelled`:
    - Reads `(progress, wallTime)`, records into the rolling rate.
    - Computes `compositionTime = progress * totalDuration`.
    - Looks up the active clip via `locate`.
-   - Builds `ExportProgress` and calls `onProgress` on the main
-     actor.
-4. Exits when session status leaves `.exporting`.
+   - Builds `ExportProgress` and dispatches `onProgress(snapshot)`
+     via `await MainActor.run { … }` so the SwiftUI consumer sees
+     state changes on the main actor.
+3. Exits when session status leaves `.exporting` or the task is
+   cancelled.
+
+After `await exportSession.export()` returns, `export` MUST
+`cancel()` the sampler task explicitly before returning, even on
+success. The status-transition exit at the loop top runs at most
+200ms later than the export's actual completion; a stale snapshot
+could otherwise land in `ExportSheet` after the sheet has moved on
+to the next tag. Use a `defer { samplerTask.cancel() }` immediately
+after spawning the task so the cancellation also runs on error
+paths.
 
 The existing `progress(of:)` AsyncStream method is removed (no
 internal or external callers after this change).
@@ -205,6 +230,14 @@ private var progressSection: some View {
                     .foregroundStyle(.secondary)
                     .monospacedDigit()
             }
+            // Per-clip ETA: "0:21 ETA this clip". Same nil guard as
+            // the rendering FPS — both depend on a measured rate.
+            if let etaClip = p.etaCurrentClipSeconds {
+                Text("\(formatDuration(etaClip)) ETA this clip")
+                    .font(.callout)
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
+            }
         }
     }
 }
@@ -238,6 +271,16 @@ sample lands in `@State`. SwiftUI re-renders the section.
   half-open `[start, start+duration)`. The last clip's terminal
   edge is inclusive (`compositionTime == totalDuration` maps to
   the last entry, not nil).
+- **CMTime/Double drift across the plan.** `CompilationExporter`
+  tracks its actual composition cursor in CMTime (timescale 600);
+  the `CompilationPlan.Entry.compositionStart` field is a Double
+  cumulative sum that can drift by sub-millisecond amounts per
+  entry — up to roughly 10ms over a long compilation. `locate`
+  uses the Double values, so at a clip boundary the converted
+  `session.progress * totalDuration` may briefly fall in a gap of
+  a few ms and `locate` returns nil. This is cosmetically
+  acceptable: at 5Hz polling, the worst case is a single 200ms
+  sample where the UI omits the clip name + per-clip lines.
 - **Multi-tag run between tags.** Each tag's export creates a fresh
   session; `currentProgress` is cleared between tags so the bar
   jumps to 0 at the start of each tag rather than appearing to
