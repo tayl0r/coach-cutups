@@ -32,11 +32,22 @@ appear in the top of the profile.
 
 ## Approach
 
+**Reference implementation:** `PreviewCompositor.startRequest(_:)` in
+the same package already uses this exact pattern (see lines 65–189
+of `apple/VideoCoachCore/Sources/VideoCoachCore/PreviewCompositor.swift`).
+PreviewCompositor is shipping and proven against months of playback
+use. The work here is mirroring its stage-1 (base + PiP CIImage build
++ `CIContext.render`) verbatim into `CompilationCompositor`, then
+adding a stage-2 CGContext pass for the overlays (strokes + text bar)
+that PreviewCompositor doesn't need.
+
 `CIContext.render(_:to:bounds:colorSpace:)` writes a `CIImage`
 directly into a `CVPixelBuffer`'s IOSurface-backed memory.
-GPU-resident the whole way. We use it for the **base frame + PiP
-webcam** composition. Strokes and the text bar continue to render
-via `CGContext` because:
+GPU-resident the whole way. The call is synchronous — it flushes the
+GPU pipeline before returning — so the subsequent CGContext over the
+same buffer reads bytes the GPU has already written. No ordering
+hazard. We use it for the **base frame + PiP webcam** composition.
+Strokes and the text bar continue to render via `CGContext` because:
 
 - Both are small in pixel-count (a few hundred to a few thousand
   pixels of work per frame) and contribute negligibly to the
