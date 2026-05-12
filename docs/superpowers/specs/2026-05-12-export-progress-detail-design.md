@@ -1,344 +1,420 @@
-# Richer export progress UI
+# Per-video export progress with projections
 
 ## Goal
 
-The export sheet currently shows "Exporting <tag> (N of M)…" with an
-indeterminate spinner. Add per-clip granularity, a determinate
-progress bar, a rendering-FPS readout, and ETAs so the user can see
-how the current tag's compilation is progressing and how long is
-left.
+Replace the export sheet's indeterminate spinner with a structured
+view: a top summary of the whole run, plus a list with one row per
+output video showing live or projected stats based on each video's
+state (pending / active / done).
 
-User-visible changes during a running export:
+User-visible behaviour during an export:
 
 ```
-Exporting shot (1 of 3 tags)…
-[========================            ]   ← determinate
-Clip 4 of 12 — "shot-2-12:34"
-0:18 of clip remaining · 1:42 of tag remaining     ← composition (video) time
-Rendering at 47 fps · ETA 2:08 (wall time)         ← wall-clock prediction
-0:21 ETA this clip (wall time)                     ← wall-clock prediction
+Exporting (1 of 4 videos done)             47 fps · 1:08 video left
+                                            ETA 1:25 (3:42 PM)
+
+Done    shot.mp4         ✓ 0:45 video · 0:29 encode · avg 48 fps
+Active  on-goal.mp4      ────[=======          ]── 38%
+                         47 fps · 0:18 video left · ETA 0:23 (3:18 PM)
+Pending set-piece.mp4    0:33 video · ~0:22 to encode · done 3:42 PM
+Pending all-clips.mp4    2:12 video · ~1:24 to encode · done 5:06 PM
 ```
 
-The two unit families are deliberately separated by line so the user
-can read them without confusing video-content-remaining (stable,
-monotonic) with wall-clock prediction (volatile, rate-driven).
+## Concept
+
+A "video" is one output `.mp4`. Each selected row in the export
+sheet — a tag's compilation, or the `all-clips` synthetic — is one
+video. The run exports them sequentially, one
+`AVAssetExportSession` at a time.
 
 ## Scope
 
-Per-tag granularity within a multi-tag export run. The existing
-"Exporting <tag> (N of M tags)…" headline stays. The new lines
-report position WITHIN the currently-running compilation:
-
-- **Clip i of N** — which clip in the compilation is currently
-  being encoded (derived from session progress).
-- **Clip / tag remaining** — composition (video) seconds remaining
-  in the active clip's range and in the whole compilation. Labeled
-  "of clip remaining" / "of tag remaining" so the unit is clear.
-- **Rendering FPS** — encoded-frame throughput averaged over the
-  last ~30s of wall time.
-- **ETA** — wall-clock seconds until the active tag finishes
-  encoding. Labeled "(wall time)" to distinguish from the
-  composition-time lines.
-- **Per-clip ETA** — wall-clock seconds until the active clip
-  finishes encoding. Also labeled "(wall time)."
+- Per-video state (pending / active / done) shown as rows.
+- Top summary with `X/Y` videos done, current FPS, total video
+  content remaining, run-level wall-clock ETA, and an absolute
+  "estimated done" clock time.
+- Live encoding-rate measurement (30s rolling window) feeds FPS,
+  per-active ETA, and projections for pending rows.
+- Projected absolute completion clock time per pending row,
+  factoring videos ahead of it.
 
 ## Non-goals
 
-- ETA across the whole multi-tag run. Each tag is a separate export
-  session; tags later in the queue won't have a measured rate yet.
-- A cancel button. ExportSheet's comment already calls this out as
-  deferred; not part of this feature.
-- Per-clip ETA broken out as its own readout (the "0:18 left in
-  clip" line already covers it indirectly via rate × remaining).
-- Configurable smoothing window. 30s is hardcoded.
-- Frame counter (e.g., "1234 / 5678 frames"). The fps + time-left
-  cover the same information without the awkward big number.
+- Per-clip-within-a-compilation granularity (the prior spec
+  iteration). Each video is one row, regardless of how many clips
+  it bundles.
+- A cancel button. Same deferral as before — exporter doesn't
+  expose a cancel hook today.
+- Persisting the displayed stats after the export sheet closes.
+- Estimating size of output files.
+- Handling the corner case where the user opens a second export
+  sheet during a running export (the UI gates this off today).
 
 ## Architecture
 
 The exporter (`CompilationExporter`, in `VideoCoachCore`) gains an
 optional `onProgress` callback. While `AVAssetExportSession.export()`
-runs, a sibling `Task` polls `session.progress` at 5Hz, derives an
-`ExportProgress` snapshot, and calls `onProgress` on the main actor.
-The derivation is pulled into two pure helpers in a new
-`ExportProgress.swift` so the genuinely-tricky parts (clip lookup
-from composition time, rolling-window rate) are unit-tested in
-`VideoCoachCoreTests`.
+runs, a `Task.detached` polls `session.progress` at 5Hz, derives
+the current row's fraction + rate, and emits an `ExportProgress`
+snapshot.
 
-The UI (`ExportSheet`) accepts `ExportProgress` snapshots into a new
-`@State currentProgress` and renders the new lines. The
-indeterminate `ProgressView()` becomes determinate, driven by
-`fractionCompleted`.
+The full run-level state lives in `ExportSheet`. It tracks the
+ordered list of selected outputs, transitions their `Status` as
+each export starts / completes, holds the latest `RollingRate`
+across the whole run (so the rate survives between videos), and
+re-projects pending rows on every snapshot.
+
+The genuinely-tricky logic (rolling rate, per-row projection)
+lives in `VideoCoachCore` as pure helpers so they're tested in
+`VideoCoachCoreTests`.
 
 ## Data model (`apple/VideoCoachCore/Sources/VideoCoachCore/ExportProgress.swift`)
 
 ```swift
+public struct VideoExportItem: Sendable, Identifiable {
+    public enum Status: Sendable, Equatable {
+        case pending
+        case active(fractionCompleted: Float)
+        case done(encodeWallSeconds: Double, averageFps: Double)
+    }
+    public let id: String                  // tag key or all-clips sentinel
+    public let displayName: String         // "shot.mp4"
+    public let videoDurationSeconds: Double
+    public var status: Status
+}
+
 public struct ExportProgress: Sendable {
-    public let fractionCompleted: Float           // 0…1 from session
-    public let currentClipIndex: Int              // 1-based
-    public let totalClipCount: Int                // plan.entries.count
-    public let currentClipName: String?
-    public let remainingInCurrentClipSeconds: Double
-    public let remainingInTagSeconds: Double
-    public let renderingFramesPerSecond: Double?  // nil until rate stabilises
-    public let etaCurrentClipSeconds: Double?     // nil until rate known
-    public let etaTagSeconds: Double?
+    /// All output videos in queue order. First item is always the
+    /// first one that started; done items appear before active /
+    /// pending, in the order they finished (== queue order).
+    public let items: [VideoExportItem]
+
+    /// Current rendering rate measured by the active row. nil
+    /// before the rate has stabilised (first ~2s of the first
+    /// video).
+    public let currentRenderingFps: Double?
+
+    /// Sum of remaining composition seconds across active + pending.
+    /// Used by the top summary's "video left" reading.
+    public let totalVideoSecondsRemaining: Double
+
+    /// Run-level wall-clock ETA (seconds from "now"). nil until
+    /// the rate is known. Includes the pending queue.
+    public let totalEtaSeconds: Double?
+
+    /// Absolute clock time when the whole run is projected to
+    /// finish. nil until the rate is known.
+    public let projectedCompletionDate: Date?
 }
 ```
 
-### Helper 1: `locate(compositionTime:in:)`
+### Helper: `RollingRate`
 
-Given a composition time in seconds and a `CompilationPlan`,
-returns `(clipIndex: Int, entry: CompilationPlan.Entry)?` or nil
-if the time falls outside any entry's range.
-
-- Entry range is `[compositionStart, compositionStart + duration)`.
-- `clipIndex` is 1-based for direct display.
-- Returns nil only when compositionTime > totalDuration (encoder
-  reports progress beyond the composition end during finalisation).
-
-### Helper 2: `RollingRate`
+Same shape as the prior iteration. Lives in
+`ExportProgress.swift`. Holds the last ~30s of
+`(wallTime, fractionCompleted, compositionDuration)` samples for
+the active video and reports `compositionSecondsPerWallSecond`
+once the sample window satisfies the sufficiency gate.
 
 ```swift
 struct RollingRate {
-    let windowSeconds: Double   // 30 by default
-    private var samples: [(wallTime: Double, fraction: Double)]
+    let windowSeconds: Double           // 30 by default
+    private var samples: [Sample]       // (wallTime, encodedCompSeconds)
 
-    mutating func record(wallTime: Double, fraction: Double)
-    func compositionSecondsPerWallSecond(totalDuration: Double) -> Double?
+    mutating func record(wallTime: Double, encodedCompSeconds: Double)
+    func compositionSecondsPerWallSecond() -> Double?
 }
 ```
 
 - `record` appends a sample, then evicts samples older than
   `windowSeconds` from the front. The sufficiency gate below is
-  evaluated AFTER eviction — so a stale-only window correctly
-  surfaces as nil even if many samples accumulated earlier.
+  evaluated AFTER eviction.
 - Returns nil until at least 5 samples are present AND ≥2s of wall
-  time has elapsed since the oldest surviving sample (avoids
-  spurious early-rate readings).
-- When the rate is computed: `(latest.fraction − oldest.fraction)
-  * totalDuration / (latest.wallTime − oldest.wallTime)`.
-- When all samples have the same `fraction` (encoder stalled),
-  returns 0.0 — caller must treat 0 as "ETA unknown."
+  time has elapsed since the oldest surviving sample.
+- Rate = `(latest.encoded − oldest.encoded) / (latest.wallTime − oldest.wallTime)`.
+- The rate persists across video boundaries: the run-level
+  `RollingRate` is not reset when one video finishes, so the rate
+  carries forward to inform projections for the next video. The
+  sampler resets only the wall-time baseline when re-attached.
 
-Rendering FPS is `compSecPerWallSec * outputFrameRate`, where
-`outputFrameRate` is read from `videoComp.frameDuration` in the
-exporter (currently hardcoded `1/30`; we read it back so changing
-the frame rate later doesn't require updating two places).
+Rendering FPS for display = `compSecPerWallSec × outputFrameRate`,
+where `outputFrameRate = videoComp.frameDuration.timescale / value`
+(currently `1/30`, read at runtime so future changes don't drift).
 
-ETA is `remainingSeconds / compSecPerWallSec` when the rate is > 0,
-else nil.
+### Helper: `projectRun`
+
+```swift
+struct RunProjection {
+    let totalSecondsRemaining: Double       // active + pending
+    let perItemRemaining: [String: Double]  // by item id, wall-time remaining
+    let perItemDoneDate: [String: Date]     // by item id, absolute clock time
+}
+
+func projectRun(
+    items: [VideoExportItem],
+    rate: Double,            // compSecPerWallSec; > 0
+    now: Date
+) -> RunProjection
+```
+
+Pure function, easily tested. Behaviour:
+
+- For each `.done` item: not included in the remaining sums; date
+  for that item is omitted from `perItemDoneDate` (or set to the
+  actual finish time — see Section "Subtleties" below).
+- For the (at most one) `.active` item: wall remaining =
+  `(1 − fraction) × video.duration / rate`. Its date =
+  `now + wallRemaining`.
+- For each `.pending` item N (in queue order after the active):
+  cumulative wall remaining = active remaining + Σ pending[1..N−1]
+  duration / rate + pending[N].duration / rate. Date =
+  `now + cumulative`.
+- Sum of all per-item remainings is `totalSecondsRemaining`.
+
+Rate fallback when no measured rate yet (caller decides — see
+`ExportSheet` section): use `1.0` (realtime). Projections still
+display so the user has something to look at, with the
+understanding that they'll refine once a real rate is known.
 
 ## Exporter changes (`CompilationExporter.swift`)
 
-`export(...)` gets one new trailing arg:
+`export(...)` signature gains one trailing arg:
 
 ```swift
 public func export(
-    plan: CompilationPlan,
-    clipsByID: [UUID: Clip],
-    sourceAssets: [Int: AVURLAsset],
-    clipWebcamAssets: [UUID: AVURLAsset],
-    outputURL: URL,
-    resolution: Resolution,
-    quality: Quality,
-    sourceVolume: Double,
-    commentaryVolume: Double,
-    onProgress: ((ExportProgress) -> Void)? = nil
+    ...,
+    onProgress: ((Float) -> Void)? = nil
 ) async throws
 ```
 
-Inside `export`, **before** `await exportSession.export()`, spawn the
-sampler as a `Task.detached` (NOT `async let`, NOT a plain `Task { }`).
-`CompilationExporter` is a `public actor`, so a child task without
-detachment would inherit actor isolation and could serialize with the
-export call. `Task.detached` runs off-actor so the sampler's polling
-never contends with `export()`.
+Note: the exporter publishes ONLY the active session's
+`fractionCompleted`. The run-level state (item list, projections)
+lives in `ExportSheet` because the exporter doesn't know about the
+queue of videos — it only sees one at a time.
 
-The sampler's closure captures by value:
-- `plan` (Sendable struct)
-- `clipsByID` (Dictionary of Sendable values)
-- `totalDuration = plan.totalDurationSeconds`
-- `outputFrameRate = Double(videoComp.frameDuration.timescale) / Double(videoComp.frameDuration.value)`
-- A reference to the `AVAssetExportSession` (its `progress`/`status` properties are thread-safe per Apple docs)
-- `onProgress` (`@Sendable` closure parameter)
+Inside `export`:
 
-Sampler body:
+- Configure the session as today.
+- Before `await exportSession.export()`, spawn the sampler as a
+  `Task.detached` (NOT `async let`, NOT plain `Task { }`).
+  `CompilationExporter` is a `public actor`, so child tasks without
+  detachment would inherit actor isolation and could serialize
+  with the export call.
+- The detached task captures by value: the session reference (its
+  `progress`/`status` are thread-safe per Apple docs) and the
+  `onProgress` closure.
+- Sampler loop at 5Hz while `session.status == .exporting` and
+  `!Task.isCancelled`: read `session.progress`, dispatch
+  `onProgress(progress)` via `await MainActor.run { … }`.
+- Immediately after spawning the task, `defer { samplerTask.cancel() }`
+  so the cancellation also fires on error paths and prevents a stale
+  late callback from landing in `ExportSheet` after the next video
+  has started.
 
-1. Initializes a `RollingRate(windowSeconds: 30)`.
-2. Loops at 5Hz while `session.status == .exporting` and
-   `!Task.isCancelled`:
-   - Reads `(progress, wallTime)`, records into the rolling rate.
-   - Computes `compositionTime = progress * totalDuration`.
-   - Looks up the active clip via `locate`.
-   - Builds `ExportProgress` and dispatches `onProgress(snapshot)`
-     via `await MainActor.run { … }` so the SwiftUI consumer sees
-     state changes on the main actor.
-3. Exits when session status leaves `.exporting` or the task is
-   cancelled.
+The exporter's existing public `progress(of:)` AsyncStream is
+removed (no callers; superseded by `onProgress`).
 
-After `await exportSession.export()` returns, `export` MUST
-`cancel()` the sampler task explicitly before returning, even on
-success. The status-transition exit at the loop top runs at most
-200ms later than the export's actual completion; a stale snapshot
-could otherwise land in `ExportSheet` after the sheet has moved on
-to the next tag. Use a `defer { samplerTask.cancel() }` immediately
-after spawning the task so the cancellation also runs on error
-paths.
+## ExportSheet changes
 
-The existing `progress(of:)` AsyncStream method is removed (no
-internal or external callers after this change).
-
-## UI changes (`ExportSheet.swift`)
-
-State additions on the sheet:
+### State additions
 
 ```swift
-@State private var currentProgress: ExportProgress? = nil
+@State private var items: [VideoExportItem] = []
+@State private var runRate = RollingRate(windowSeconds: 30)
+@State private var runStartedAt: Date? = nil
+@State private var currentVideoStartedAt: Date? = nil
+@State private var projection: RunProjection? = nil
+@State private var lastSnapshot: ExportProgress? = nil
 ```
 
-Cleared when the export run starts (so old values don't bleed into
-the next tag).
+The existing `Run` model already enumerates outputs in queue order;
+`items` is initialised from it when the user presses Export. Status
+starts `.pending` for all entries.
 
-`progressSection` is restructured. Replace the existing
-implementation with:
+### State machine
+
+- **On run start:** `items` populated, all `.pending`. `runStartedAt = Date()`.
+- **On video N start:** flip `items[N].status` to
+  `.active(fractionCompleted: 0)`. `currentVideoStartedAt = Date()`.
+- **On `onProgress(fraction)`:** update the active item's
+  `fractionCompleted`. Compute `encodedComp = fraction × video.duration`,
+  `runRate.record(wallTime: Date().timeIntervalSince1970, encodedCompSeconds: encodedSoFar)`
+  where `encodedSoFar = Σ done videos' durations + active's
+  encodedComp`. Rebuild the `ExportProgress` snapshot and
+  `projection` for the UI.
+- **On video N completion (returned from `export(...)`):** flip
+  `items[N].status` to
+  `.done(encodeWallSeconds: Date().timeIntervalSince(currentVideoStartedAt!),
+   averageFps: averageFpsForThisVideo)`. Average FPS is computed as
+  `video.duration / encodeWallSeconds × outputFrameRate`. Then
+  proceed to video N+1.
+- **On final completion:** `projection = nil`, transition to the
+  existing summary sheet.
+
+`averageFpsForThisVideo` is independent of the rolling rate — it's
+a single end-of-video calculation, so a video that ran slowly then
+fast still shows its truthful average.
+
+### `progressSection` rewrite
+
+Replace the existing implementation entirely:
 
 ```swift
 private var progressSection: some View {
-    VStack(alignment: .leading, spacing: 8) {
-        guard let run = run else { return AnyView(EmptyView()) }
+    VStack(alignment: .leading, spacing: 12) {
+        runSummary
+        Divider()
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(items) { item in
+                videoRow(item)
+            }
+        }
+    }
+}
 
-        // Headline: unchanged — tag-of-tags + active tag display.
-        Text(headlineText(for: run))
+@ViewBuilder
+private var runSummary: some View {
+    let doneCount = items.filter {
+        if case .done = $0.status { return true } else { return false }
+    }.count
+    HStack {
+        Text("Exporting (\(doneCount) of \(items.count) videos done)")
             .font(.headline)
-
-        // Determinate progress bar driven by the latest snapshot.
-        ProgressView(value: Double(currentProgress?.fractionCompleted ?? 0))
-            .progressViewStyle(.linear)
-
-        if let p = currentProgress {
-            // Clip i of N — "clipname"
-            if let name = p.currentClipName {
-                Text("Clip \(p.currentClipIndex) of \(p.totalClipCount) — \"\(name)\"")
-                    .font(.callout)
-            } else {
-                Text("Clip \(p.currentClipIndex) of \(p.totalClipCount)")
-                    .font(.callout)
-            }
-
-            // Composition (video) time remaining. Stable — ticks
-            // down monotonically as encoding progresses.
-            //   "0:18 of clip remaining · 1:42 of tag remaining"
-            Text(contentRemainingLine(p))
-                .font(.callout)
+        Spacer()
+        if let snapshot = lastSnapshot,
+           let fps = snapshot.currentRenderingFps {
+            Text("\(Int(fps.rounded())) fps")
+                .font(.callout.monospacedDigit())
                 .foregroundStyle(.secondary)
+        }
+    }
+    let totalLeft = lastSnapshot?.totalVideoSecondsRemaining ?? 0
+    let etaSecs = lastSnapshot?.totalEtaSeconds
+    let doneDate = lastSnapshot?.projectedCompletionDate
+    Text(runSummaryLine(totalLeft: totalLeft, etaSecs: etaSecs, doneDate: doneDate))
+        .font(.callout)
+        .foregroundStyle(.secondary)
+}
 
-            // Wall-time ETA for the active tag.
-            //   "Rendering at 47 fps · ETA 2:08 (wall time)"
-            if let fps = p.renderingFramesPerSecond, let eta = p.etaTagSeconds {
-                Text("Rendering at \(Int(fps.rounded())) fps · ETA \(formatDuration(eta)) (wall time)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
-            }
-            // Wall-time ETA for the active clip. Same nil guard as
-            // the rendering FPS — both depend on a measured rate.
-            //   "0:21 ETA this clip (wall time)"
-            if let etaClip = p.etaCurrentClipSeconds {
-                Text("\(formatDuration(etaClip)) ETA this clip (wall time)")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
-                    .monospacedDigit()
+@ViewBuilder
+private func videoRow(_ item: VideoExportItem) -> some View {
+    HStack(alignment: .firstTextBaseline) {
+        Text(item.displayName)
+            .font(.callout.weight(.medium))
+            .frame(width: 160, alignment: .leading)
+            .lineLimit(1).truncationMode(.middle)
+        VStack(alignment: .leading, spacing: 2) {
+            switch item.status {
+            case .pending:
+                pendingDetail(item)
+            case .active(let frac):
+                ProgressView(value: Double(frac))
+                    .progressViewStyle(.linear)
+                activeDetail(item, fraction: frac)
+            case .done(let wall, let avgFps):
+                doneDetail(item, encodeWall: wall, avgFps: avgFps)
             }
         }
     }
 }
 ```
 
-(The pseudocode wraps in `AnyView` for the guard short-circuit; in
-practice we use the existing `if let run` pattern that the file
-already follows.)
+Each detail builder produces one or two `Text` lines with the
+required wording:
 
-`contentRemainingLine(_:)` is a small private helper that returns
-`"\(formatDuration(p.remainingInCurrentClipSeconds)) of clip remaining · \(formatDuration(p.remainingInTagSeconds)) of tag remaining"`.
-Both durations use the existing `formatDuration` from
-`ClipSidebar.swift` (same target). The phrasing ("of clip
-remaining" / "of tag remaining") is chosen so the unit reads as
-*video content*, not as wall-clock time — the wall-clock ETAs
-live on the lines below.
+- **Pending:** `"\(formatDuration(item.videoDurationSeconds)) video · ~\(formatDuration(projection.perItemRemaining[item.id])) to encode · done \(clockTime(projection.perItemDoneDate[item.id]))"`
+- **Active:** `"\(Int(fps.rounded())) fps · \(formatDuration(videoLeft)) video left · ETA \(formatDuration(wallLeft)) (\(clockTime(doneDate)))"`
+- **Done:** `"✓ \(formatDuration(item.videoDurationSeconds)) video · \(formatDuration(encodeWall)) encode · avg \(Int(avgFps.rounded())) fps"`
 
-The "Tags export sequentially. This may take several minutes…"
-informational line is removed — the real numbers replace it.
+`clockTime(_:)` uses `DateFormatter` with `.short` time style for
+the user's locale (e.g., "3:42 PM" in en_US).
 
-The `ExportSheet` wiring that calls `CompilationExporter.export(...)`
-passes `onProgress: { snap in self.currentProgress = snap }` so each
-sample lands in `@State`. SwiftUI re-renders the section.
+### `Run` aggregator wiring
 
-## Edge cases
+`ExportSheet` already drives the multi-output loop. Within that
+loop, before each `CompilationExporter.export(...)` call, transition
+the matching item to `.active`. Pass `onProgress: { fraction in
+self.handleSampleFromActiveVideo(fraction) }`. After the call
+returns, transition the item to `.done` with the measured
+wall-time + average FPS, then continue to the next video.
 
-- **Stalled encoder.** `RollingRate` returns 0 when fraction hasn't
-  moved; the UI omits the FPS/ETA line (because the `if let` guard
-  on both nil values fails).
-- **Rate jitter at start.** The "≥5 samples and ≥2s of wall time"
-  gate suppresses early-rate noise. The line appears within ~3s of
-  starting any export of nontrivial length.
-- **Composition time at exact entry boundary.** `locate` uses
-  half-open `[start, start+duration)`. The last clip's terminal
-  edge is inclusive (`compositionTime == totalDuration` maps to
-  the last entry, not nil).
-- **CMTime/Double drift across the plan.** `CompilationExporter`
-  tracks its actual composition cursor in CMTime (timescale 600);
-  the `CompilationPlan.Entry.compositionStart` field is a Double
-  cumulative sum that can drift by sub-millisecond amounts per
-  entry — up to roughly 10ms over a long compilation. `locate`
-  uses the Double values, so at a clip boundary the converted
-  `session.progress * totalDuration` may briefly fall in a gap of
-  a few ms and `locate` returns nil. This is cosmetically
-  acceptable: at 5Hz polling, the worst case is a single 200ms
-  sample where the UI omits the clip name + per-clip lines.
-- **Multi-tag run between tags.** Each tag's export creates a fresh
-  session; `currentProgress` is cleared between tags so the bar
-  jumps to 0 at the start of each tag rather than appearing to
-  rewind from 100%.
-- **Encoder reports progress > 1.0.** AVFoundation occasionally
-  bumps progress just past 1.0 during finalisation; the UI clamps
-  the linear bar at 1.0 visually (SwiftUI's `ProgressView(value:)`
-  clamps automatically).
+`handleSampleFromActiveVideo(_:)` is the central state update:
+
+1. Update `items[active].status = .active(fraction)`.
+2. `runRate.record(...)` — wall time `now`, encoded comp seconds
+   = sum of `.done` items' durations + `fraction × active.duration`.
+3. Compute `rate = runRate.compositionSecondsPerWallSecond() ?? 1.0`.
+4. Compute `currentRenderingFps = rate × outputFrameRate` (nil when
+   `runRate` returns nil).
+5. `projection = projectRun(items: items, rate: rate, now: Date())`.
+6. `lastSnapshot = ExportProgress(items: items, currentRenderingFps:, …)`.
+
+## Subtleties
+
+- **`outputFrameRate` is read once per export call** from the
+  current `videoComp.frameDuration`. It's the same `1/30` across
+  all of today's exports; reading it (rather than hardcoding 30)
+  keeps the code honest if the frame rate ever changes.
+- **Rate persistence across video boundaries** — `runRate` is run-
+  scoped (one per export run, not one per video). When a video
+  finishes, the sampler stops; the next video's first sample
+  pushes onto the existing window. After ~30s of total encoding
+  time, samples from the previous video age out naturally.
+- **The very first projection** (no rate yet) uses the 1.0 fallback.
+  The estimates show but visibly snap when the first real rate
+  arrives — that's acceptable UX (better than no estimate at all
+  for ~2s).
+- **`done` items' clock time in `perItemDoneDate`** — keep the
+  actual finish time (i.e., the time the snapshot was taken when
+  the transition fired) so the UI can show "done at 3:18 PM" if
+  ever wanted. Today's UI doesn't show it, but the data is cheap.
+- **Encoder reports progress > 1.0 briefly.** `ProgressView(value:)`
+  clamps automatically. `runRate.record` clamps `fraction` to
+  `[0, 1]` before computing `encodedComp` so a spurious 1.01 doesn't
+  pollute the rate.
+- **Clip in multiple tags appears in multiple output rows.** This
+  is correct — `shot.mp4` and `on-goal.mp4` are separate outputs
+  that legitimately include the same source clip. No dedup.
+- **Sheet height** — with 1–6 videos this fits without scrolling.
+  For dozens of selected tags, the list scrolls; the sheet's
+  existing `ScrollView` for the tag picker is precedent.
 
 ## Testing
 
 New unit tests in
 `apple/VideoCoachCore/Tests/VideoCoachCoreTests/ExportProgressTests.swift`:
 
-- `locate(compositionTime:in:)`:
-  - returns clip 1 for time 0
-  - returns clip 1 for time just before entry 1's end
-  - returns clip 2 for time at entry 1's end (boundary belongs to
-    next clip)
-  - returns last clip for `time == totalDuration`
-  - returns nil for `time > totalDuration`
-  - returns nil for a plan with zero entries
-
 - `RollingRate`:
   - returns nil with fewer than 5 samples
   - returns nil before 2s of wall time elapsed
   - returns a steady rate for evenly-spaced samples
-  - returns the *recent* rate when oldest samples are evicted
-    (changing throughput is reflected)
-  - returns 0 when all samples have the same fraction
+  - reflects rate change when oldest samples are evicted past
+    `windowSeconds`
+  - returns 0 when all samples report the same `encodedCompSeconds`
 
-UI behaviour (snapshot rendering, determinate bar, conditional FPS
-line) is verified manually during a real export.
+- `projectRun`:
+  - empty items → empty projection (zero remaining, no dates)
+  - all-pending: queue order matches projected dates
+  - one active + several pending: cumulative dates are monotonic
+  - rate fallback (`1.0`) when called with rate ≤ 0 (sanity guard)
+  - mixing done + active + pending: only active + pending sum into
+    `totalSecondsRemaining`
+
+UI behaviour (row transitions, top summary aggregation, clock-time
+rendering) is verified manually during a real export.
 
 ## File changes summary
 
 - `apple/VideoCoachCore/Sources/VideoCoachCore/ExportProgress.swift`
-  (new) — struct, `locate`, `RollingRate`.
+  (new) — `VideoExportItem`, `ExportProgress`, `RollingRate`,
+  `RunProjection`, `projectRun(...)`.
 - `apple/VideoCoachCore/Tests/VideoCoachCoreTests/ExportProgressTests.swift`
-  (new) — TDD coverage.
+  (new) — TDD coverage of `RollingRate` and `projectRun`.
 - `apple/VideoCoachCore/Sources/VideoCoachCore/CompilationExporter.swift` —
-  add `onProgress` parameter, spawn the sampler task, remove the
-  obsolete `progress(of:)` method.
-- `apple/App/Export/ExportSheet.swift` — add
-  `@State currentProgress`, restructure `progressSection`, wire the
-  callback into the export call site.
+  add `onProgress: ((Float) -> Void)?` parameter; spawn detached
+  sampler with deferred cancel; remove obsolete `progress(of:)`.
+- `apple/App/Export/ExportSheet.swift` — significant rewrite of
+  `progressSection`; new `@State items / runRate / projection /
+  lastSnapshot`; per-snapshot state updater
+  `handleSampleFromActiveVideo`; transition-on-start /
+  transition-on-complete around the existing per-output loop.
