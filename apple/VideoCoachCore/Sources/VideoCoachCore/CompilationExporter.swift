@@ -37,9 +37,10 @@ public enum CompilationExportError: Error, CustomStringConvertible, LocalizedErr
 /// 5ms boundary ramps on the source-audio track per design § "Audio").
 ///
 /// `export(...)` runs to completion and throws on failure. Callers that want
-/// progress observation should call ``progress(of:)`` in parallel after
-/// retrieving the underlying `AVAssetExportSession` — but for v1 the API
-/// hides the session and the smoke test does not need progress.
+/// live progress pass an `onProgress` closure; the exporter polls
+/// `AVAssetExportSession.progress` at 5Hz from a detached task and forwards
+/// the fraction to the closure on whatever queue the closure was created on
+/// (typically MainActor via `await MainActor.run { … }` in the closure body).
 ///
 /// **Quality mapping caveat (v1):** the `quality` argument is currently
 /// ignored — `AVAssetExportSession` presets do not expose direct bitrate
@@ -88,7 +89,8 @@ public actor CompilationExporter {
         resolution: Resolution,
         quality: Quality,
         sourceVolume: Double,
-        commentaryVolume: Double
+        commentaryVolume: Double,
+        onProgress: (@Sendable (Float) -> Void)? = nil
     ) async throws {
         Log.export.info("export start: entries=\(plan.entries.count) total=\(plan.totalDurationSeconds, format: .fixed(precision: 2))s resolution=\(resolution.rawValue) quality=\(quality.rawValue) output=\(outputURL.lastPathComponent)")
 
@@ -413,6 +415,36 @@ public actor CompilationExporter {
         exportSession.audioMix = audioMix
 
         Log.export.info("starting AVAssetExportSession (preset=\(presetName), fileType=mp4)")
+
+        // Spawn the progress sampler. `Task.detached` (NOT `Task { }` or
+        // `async let`) is required: `CompilationExporter` is a `public actor`,
+        // and a non-detached child task would inherit actor isolation and
+        // serialize with `exportSession.export()` instead of running in
+        // parallel.
+        //
+        // `defer { samplerTask.cancel() }` guarantees the sampler stops on
+        // every exit path (success, throw, status check failure), so a
+        // stale tick can't land in `ExportSheet` after the next video has
+        // already started.
+        let samplerTask: Task<Void, Never>?
+        if let onProgress {
+            let session = exportSession
+            samplerTask = Task.detached {
+                while !Task.isCancelled {
+                    let status = session.status
+                    let value = session.progress
+                    onProgress(value)
+                    if status == .completed || status == .failed || status == .cancelled {
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 200_000_000) // 5Hz
+                }
+            }
+        } else {
+            samplerTask = nil
+        }
+        defer { samplerTask?.cancel() }
+
         await exportSession.export()
 
         if exportSession.status != .completed {
@@ -454,29 +486,6 @@ public actor CompilationExporter {
             }
         }
         return parts.joined(separator: " | ")
-    }
-
-    /// Polls the given session's `progress` at 5Hz and emits the values to
-    /// the returned stream until the session completes/fails/cancels.
-    /// `nonisolated` so the caller can await the stream without serializing
-    /// through the actor's executor.
-    public nonisolated func progress(of session: AVAssetExportSession) -> AsyncStream<Float> {
-        AsyncStream { continuation in
-            let task = Task {
-                while !Task.isCancelled {
-                    let status = session.status
-                    let value = session.progress
-                    continuation.yield(value)
-                    if status == .completed || status == .failed || status == .cancelled {
-                        continuation.finish()
-                        return
-                    }
-                    try? await Task.sleep(nanoseconds: 200_000_000) // 5Hz
-                }
-                continuation.finish()
-            }
-            continuation.onTermination = { _ in task.cancel() }
-        }
     }
 
     // MARK: - Internals

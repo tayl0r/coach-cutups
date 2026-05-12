@@ -13,11 +13,10 @@ import VideoCoachCore
 /// VideoToolbox saturates on a single export and parallelism would just add
 /// queue contention without speeding anything up.
 ///
-/// **Live progress is deferred.** ``CompilationExporter.progress(of:)`` takes
-/// an `AVAssetExportSession`, but `export(...)` doesn't expose the underlying
-/// session, so we'd need a wider API change to wire a real progress bar. For
-/// v1 we show "Exporting <tag> (N of M)…" with an indeterminate spinner; if
-/// users want a real bar we'll change the exporter API in a follow-up.
+/// **Live progress is deferred.** `export(...)` now accepts an `onProgress`
+/// closure, but for v1 we show "Exporting <tag> (N of M)…" with an
+/// indeterminate spinner. Wire `onProgress` in a follow-up when a real
+/// progress bar is added to this sheet.
 struct ExportSheet: View {
     @Bindable var workspace: Workspace
     /// Set by ContentView; we toggle it to dismiss.
