@@ -45,7 +45,6 @@ struct ExportSheet: View {
     // New per-run state for the per-video progress UI.
     @State private var items: [VideoExportItem] = []
     @State private var runRate = RollingRate(windowSeconds: 30)
-    @State private var runStartedAt: Date? = nil
     @State private var currentVideoStartedAt: Date? = nil
     @State private var projection: RunProjection = .empty
     @State private var lastSnapshot: ExportProgress? = nil
@@ -545,12 +544,11 @@ struct ExportSheet: View {
         items = plans.map { tagKey, plan in
             VideoExportItem(
                 id: tagKey,
-                displayName: "\(sanitizeFilename(displayLabel(forKey: tagKey)))",
+                displayName: "\(sanitizeFilename(displayLabel(forKey: tagKey))).mp4",
                 videoDurationSeconds: plan.totalDurationSeconds
             )
         }
         runRate = RollingRate(windowSeconds: 30)
-        runStartedAt = Date()
         currentVideoStartedAt = nil
         projection = .empty
         lastSnapshot = nil

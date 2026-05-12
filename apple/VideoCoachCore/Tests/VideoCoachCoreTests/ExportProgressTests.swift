@@ -119,7 +119,7 @@ final class ProjectRunTests: XCTestCase {
         XCTAssertLessThan(p.perItemDoneDate["b"]!, p.perItemDoneDate["c"]!)
     }
 
-    func test_doneItemsExcludedFromRemainingButKeptInDoneDates() {
+    func test_doneItemsExcludedFromBothRemainingAndDoneDates() {
         let items: [VideoExportItem] = [
             VideoExportItem(
                 id: "a", displayName: "a.mp4",
@@ -135,6 +135,7 @@ final class ProjectRunTests: XCTestCase {
         ]
         let p = projectRun(items: items, rate: 1.0, now: now)
         XCTAssertNil(p.perItemRemaining["a"])
+        XCTAssertNil(p.perItemDoneDate["a"])
         // b active from 0 → (1-0)*10/1 = 10 alone
         XCTAssertEqual(p.perItemRemaining["b"]!, 10.0, accuracy: 0.001)
         // c pending alone = 10
