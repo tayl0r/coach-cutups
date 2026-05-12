@@ -61,3 +61,93 @@ final class RollingRateTests: XCTestCase {
         XCTAssertEqual(rate!, 0.0, accuracy: 0.001)
     }
 }
+
+final class ProjectRunTests: XCTestCase {
+    private let now = Date(timeIntervalSince1970: 1_700_000_000)
+
+    func test_emptyItemsYieldEmptyProjection() {
+        let p = projectRun(items: [], rate: 1.0, now: now)
+        XCTAssertEqual(p.totalSecondsRemaining, 0)
+        XCTAssertTrue(p.perItemRemaining.isEmpty)
+        XCTAssertTrue(p.perItemDoneDate.isEmpty)
+    }
+
+    func test_allPendingQueueOrderMatchesProjectedDates() {
+        let items: [VideoExportItem] = [
+            VideoExportItem(id: "a", displayName: "a.mp4", videoDurationSeconds: 10),
+            VideoExportItem(id: "b", displayName: "b.mp4", videoDurationSeconds: 20),
+            VideoExportItem(id: "c", displayName: "c.mp4", videoDurationSeconds: 30),
+        ]
+        let p = projectRun(items: items, rate: 2.0, now: now)
+        // Per-item wall time alone at rate 2.0× = duration / 2.
+        XCTAssertEqual(p.perItemRemaining["a"]!, 5.0, accuracy: 0.001)
+        XCTAssertEqual(p.perItemRemaining["b"]!, 10.0, accuracy: 0.001)
+        XCTAssertEqual(p.perItemRemaining["c"]!, 15.0, accuracy: 0.001)
+        // Total = sum = 30.
+        XCTAssertEqual(p.totalSecondsRemaining, 30.0, accuracy: 0.001)
+        // Dates are cumulative — a finishes at +5, b at +15, c at +30.
+        XCTAssertEqual(p.perItemDoneDate["a"]!, now.addingTimeInterval(5))
+        XCTAssertEqual(p.perItemDoneDate["b"]!, now.addingTimeInterval(15))
+        XCTAssertEqual(p.perItemDoneDate["c"]!, now.addingTimeInterval(30))
+    }
+
+    func test_oneActiveAndPendingHaveMonotonicDates() {
+        let items: [VideoExportItem] = [
+            VideoExportItem(
+                id: "a", displayName: "a.mp4",
+                videoDurationSeconds: 10, status: .active(fractionCompleted: 0.5)
+            ),
+            VideoExportItem(id: "b", displayName: "b.mp4", videoDurationSeconds: 10),
+            VideoExportItem(id: "c", displayName: "c.mp4", videoDurationSeconds: 10),
+        ]
+        let p = projectRun(items: items, rate: 1.0, now: now)
+        // Per-item wall time alone (NOT cumulative — see spec: "Sum of all
+        // per-item remainings is `totalSecondsRemaining`").
+        // active: (1-0.5)*10 / 1.0 = 5
+        XCTAssertEqual(p.perItemRemaining["a"]!, 5.0, accuracy: 0.001)
+        // b alone: 10 / 1.0 = 10
+        XCTAssertEqual(p.perItemRemaining["b"]!, 10.0, accuracy: 0.001)
+        // c alone: 10 / 1.0 = 10
+        XCTAssertEqual(p.perItemRemaining["c"]!, 10.0, accuracy: 0.001)
+        // Total wall = 5 + 10 + 10 = 25
+        XCTAssertEqual(p.totalSecondsRemaining, 25.0, accuracy: 0.001)
+        // Dates are cumulative (a@+5, b@+15, c@+25) so they're monotonic.
+        XCTAssertEqual(p.perItemDoneDate["a"]!, now.addingTimeInterval(5))
+        XCTAssertEqual(p.perItemDoneDate["b"]!, now.addingTimeInterval(15))
+        XCTAssertEqual(p.perItemDoneDate["c"]!, now.addingTimeInterval(25))
+        XCTAssertLessThan(p.perItemDoneDate["a"]!, p.perItemDoneDate["b"]!)
+        XCTAssertLessThan(p.perItemDoneDate["b"]!, p.perItemDoneDate["c"]!)
+    }
+
+    func test_doneItemsExcludedFromRemainingButKeptInDoneDates() {
+        let items: [VideoExportItem] = [
+            VideoExportItem(
+                id: "a", displayName: "a.mp4",
+                videoDurationSeconds: 10,
+                status: .done(encodeWallSeconds: 7, averageFps: 30)
+            ),
+            VideoExportItem(
+                id: "b", displayName: "b.mp4",
+                videoDurationSeconds: 10,
+                status: .active(fractionCompleted: 0)
+            ),
+            VideoExportItem(id: "c", displayName: "c.mp4", videoDurationSeconds: 10),
+        ]
+        let p = projectRun(items: items, rate: 1.0, now: now)
+        XCTAssertNil(p.perItemRemaining["a"])
+        // b active from 0 → (1-0)*10/1 = 10 alone
+        XCTAssertEqual(p.perItemRemaining["b"]!, 10.0, accuracy: 0.001)
+        // c pending alone = 10
+        XCTAssertEqual(p.perItemRemaining["c"]!, 10.0, accuracy: 0.001)
+        XCTAssertEqual(p.totalSecondsRemaining, 20.0, accuracy: 0.001)
+    }
+
+    func test_rateZeroOrNegativeFallsBackToOne() {
+        let items = [VideoExportItem(id: "a", displayName: "a.mp4", videoDurationSeconds: 10)]
+        // rate of 0 would divide-by-zero; the function must guard.
+        let pZero = projectRun(items: items, rate: 0, now: now)
+        XCTAssertEqual(pZero.perItemRemaining["a"]!, 10.0, accuracy: 0.001)
+        let pNeg = projectRun(items: items, rate: -5, now: now)
+        XCTAssertEqual(pNeg.perItemRemaining["a"]!, 10.0, accuracy: 0.001)
+    }
+}

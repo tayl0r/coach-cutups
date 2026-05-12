@@ -137,9 +137,32 @@ public func projectRun(
     rate: Double,
     now: Date
 ) -> RunProjection {
-    // Body implemented in Task 3.
-    _ = items
-    _ = rate
-    _ = now
-    return .empty
+    let safeRate = rate > 0 ? rate : 1.0
+    var perItemRemaining: [String: Double] = [:]
+    var perItemDoneDate: [String: Date] = [:]
+    var cumulative = 0.0
+
+    for item in items {
+        switch item.status {
+        case .done:
+            continue
+        case .active(let fraction):
+            let frac = Double(max(0, min(1, fraction)))
+            let wallRemaining = (1.0 - frac) * item.videoDurationSeconds / safeRate
+            cumulative += wallRemaining
+            perItemRemaining[item.id] = wallRemaining
+            perItemDoneDate[item.id] = now.addingTimeInterval(cumulative)
+        case .pending:
+            let wallRemaining = item.videoDurationSeconds / safeRate
+            cumulative += wallRemaining
+            perItemRemaining[item.id] = wallRemaining
+            perItemDoneDate[item.id] = now.addingTimeInterval(cumulative)
+        }
+    }
+
+    return RunProjection(
+        totalSecondsRemaining: cumulative,
+        perItemRemaining: perItemRemaining,
+        perItemDoneDate: perItemDoneDate
+    )
 }
