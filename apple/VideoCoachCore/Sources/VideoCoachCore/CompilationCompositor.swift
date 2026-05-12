@@ -148,6 +148,22 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
             composite = zoomed.composited(over: composite)
         }
 
+        // Text-bar BACKGROUND draws here — BEFORE the PiP — so the PiP
+        // composites on top of the bar tint rather than getting darkened
+        // by it. Same geometry as `drawTextBar` (bottom 8%, semi-
+        // transparent black) but in CIImage bottom-left coords. The text
+        // GLYPHS still draw in Stage 2's CGContext path, on top of
+        // everything. `inst == nil` means no text bar at all (the
+        // existing contract — `drawTextBar` is only called when inst is
+        // present), so we gate on the same condition.
+        if inst != nil {
+            let barH = outH * 0.08
+            let barRect = CGRect(x: 0, y: 0, width: outW, height: barH)
+            let barFill = CIImage(color: CIColor(red: 0, green: 0, blue: 0, alpha: 0.6))
+                .cropped(to: barRect)
+            composite = barFill.composited(over: composite)
+        }
+
         if let webcam {
             let camCI = CIImage(cvPixelBuffer: webcam)
             let camW = camCI.extent.width
@@ -294,14 +310,17 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         let barH = size.height * 0.08
         // Bottom strip — but we're under a flipped CGContext, so "bottom" in
         // image coordinates is at user-space y = height - barH.
+        //
+        // The bar's semi-transparent BACKGROUND is composited in Stage 1
+        // (before the PiP, so PiP isn't darkened by the bar tint). Here
+        // we only draw the text glyphs — they're allowed to be on top of
+        // everything including the PiP, just like strokes.
         let barRect = CGRect(
             x: 0,
             y: size.height - barH,
             width: size.width,
             height: barH
         )
-        cg.setFillColor(CGColor(gray: 0, alpha: 0.6))
-        cg.fill(barRect)
 
         guard !line.isEmpty else { return }
 

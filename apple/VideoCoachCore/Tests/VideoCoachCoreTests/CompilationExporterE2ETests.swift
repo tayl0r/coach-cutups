@@ -217,6 +217,57 @@ final class CompilationExporterE2ETests: XCTestCase {
             "top-right corner should not show the webcam dark-gray color; got \(topRightRGB). If the PiP covered the full right edge or Y was inverted, the PiP would appear here too.")
     }
 
+    /// Regression test for the "text bar darkens the PiP" bug. The text
+    /// bar (semi-transparent black, bottom 8% of output) overlaps the
+    /// bottom slice of the PiP at typical 16:9 / 4:3 layouts. When the
+    /// bar fill is drawn AFTER the PiP, the PiP's lower edge gets tinted.
+    /// Fix: the bar fill draws in Stage 1 before the PiP composites, so
+    /// the PiP appears on top of the bar tint.
+    ///
+    /// Probe: a small box inside the PiP's horizontal range AND inside
+    /// the bar's vertical strip. Expected color: clean webcam dark-gray
+    /// (~0.251 per channel). Buggy color: webcam dark-gray darkened by
+    /// 60% alpha black → ~0.10 per channel.
+    func test_text_bar_renders_below_pip_so_pip_is_not_darkened() async throws {
+        let clip = Clip(
+            name: "bar-zorder",
+            tags: ["test"],
+            sourceIndex: 0,
+            startSourceSeconds: 2,
+            recordingDuration: 2,
+            recordingFilename: camURL.lastPathComponent,
+            events: [
+                .init(recordTime: 0, kind: .zoom(.identity)),
+                .init(recordTime: 0, kind: .play(sourceTime: 2)),
+            ],
+            sortIndex: 0
+        )
+        // textBarLine is "1 / 1 | bar-zorder | test" (the exporter's
+        // assembly). With test active the bar is non-empty so the fill
+        // gets drawn.
+        try await runExport(clip: clip)
+
+        let cg = try await sampleFrame(of: outURL, atOutputTime: 0.5)
+
+        // Probe inside PiP horizontal (x ∈ [0.758, 0.978]) AND inside
+        // bar vertical (y ∈ [0.92, 1.0]). At 720p that overlap is the
+        // PiP's bottom slice ≈ y ∈ [0.92, 0.978]. Same tolerance as the
+        // companion `test_first_frame_pip_lands_bottom_right_…` test —
+        // BT.709 conversion lifts 0x40 to roughly 0.30 in the decoded
+        // RGB, and HEVC adds a bit more drift on top.
+        let webcamExpected = Double(0x40) / 255.0   // ≈ 0.251
+        let tolerance = 0.10
+
+        let probe = CGRect(x: 0.85, y: 0.94, width: 0.04, height: 0.02)
+        let rgb = PixelSampling.averageRGB(in: cg, normalizedRect: probe)
+        XCTAssertEqual(rgb.r, webcamExpected, accuracy: tolerance,
+            "PiP's bottom slice should show clean webcam dark-gray (R≈\(webcamExpected)); got \(rgb). The text bar's semi-transparent fill is darkening the PiP — it must draw below the PiP, not above.")
+        XCTAssertEqual(rgb.g, webcamExpected, accuracy: tolerance,
+            "PiP's bottom slice G channel; got \(rgb).")
+        XCTAssertEqual(rgb.b, webcamExpected, accuracy: tolerance,
+            "PiP's bottom slice B channel; got \(rgb).")
+    }
+
     // MARK: - Helpers
 
     private func runExport(clip: Clip) async throws {
