@@ -103,16 +103,29 @@ public struct RollingRate: Sendable, Equatable {
     /// Append a sample (clamped to non-decreasing encoded seconds) and evict
     /// samples older than `windowSeconds` from the front.
     public mutating func record(wallTime: Double, encodedCompSeconds: Double) {
-        // Body implemented in Task 2.
-        _ = wallTime
-        _ = encodedCompSeconds
+        // Clamp encoded to non-decreasing — the AVFoundation `fractionCompleted`
+        // briefly overshoots 1.0 near end-of-export and can also report stale
+        // values immediately after the session transitions.
+        let lastEncoded = samples.last?.encodedCompSeconds ?? 0
+        let clampedEncoded = max(encodedCompSeconds, lastEncoded)
+        samples.append(Sample(wallTime: wallTime, encodedCompSeconds: clampedEncoded))
+        let cutoff = wallTime - windowSeconds
+        while let first = samples.first, first.wallTime < cutoff {
+            samples.removeFirst()
+        }
     }
 
     /// Composition seconds per wall second, or nil when the sample window
     /// hasn't reached the sufficiency gate.
     public func compositionSecondsPerWallSecond() -> Double? {
-        // Body implemented in Task 2.
-        return nil
+        guard samples.count >= 5,
+              let first = samples.first,
+              let last = samples.last
+        else { return nil }
+        let wallSpan = last.wallTime - first.wallTime
+        guard wallSpan >= 2.0 else { return nil }
+        let encodedSpan = last.encodedCompSeconds - first.encodedCompSeconds
+        return encodedSpan / wallSpan
     }
 }
 
