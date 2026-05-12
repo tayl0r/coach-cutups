@@ -41,6 +41,22 @@ struct ExportSheet: View {
     /// with a "Reveal in Finder" button and a "Done" button.
     @State private var summary: Summary?
 
+    // New per-run state for the per-video progress UI.
+    @State private var items: [VideoExportItem] = []
+    @State private var runRate = RollingRate(windowSeconds: 30)
+    @State private var runStartedAt: Date? = nil
+    @State private var currentVideoStartedAt: Date? = nil
+    @State private var projection: RunProjection = .empty
+    @State private var lastSnapshot: ExportProgress? = nil
+
+    /// Frame rate of the export's video composition. Read once per run from
+    /// the exporter's internal `videoComp.frameDuration` (currently 1/30).
+    /// Hard-coded here because the exporter doesn't expose it, and the value
+    /// is stable across today's code. If the exporter ever varies frame rate
+    /// per export, surface it via the `onProgress` closure or a separate
+    /// callback.
+    private static let outputFrameRate: Double = 30
+
     /// Sentinel key for the "all-clips" row. Tag strings are lowercased on
     /// ingest (see `Tag.normalize`) and can't contain spaces, so this never
     /// collides with a real tag.
@@ -377,6 +393,46 @@ struct ExportSheet: View {
         workspace.project.preferences.lastExportQuality = qualityChoice
         try? workspace.saveProject()
 
+        // Build the per-video item list now so the UI has rows from the
+        // very first frame. Each entry's `videoDurationSeconds` comes from
+        // the plan that will be built inside the Task. We pre-compute it
+        // here from the project state — it's a sum we already know how to
+        // compute, and it's cheap.
+        let sourceDurations: [Int: Double] = Dictionary(
+            uniqueKeysWithValues: workspace.project.sourceVideos.enumerated().map { i, ref in
+                (i, ref.durationSeconds)
+            }
+        )
+        let plans: [(key: String, plan: CompilationPlan)] = chosenTags.compactMap { tagKey -> (String, CompilationPlan)? in
+            // Empty plans get skipped in the loop; mirror that here so they
+            // don't appear as zero-second items.
+            let plan: CompilationPlan
+            if tagKey == Self.allClipsKey {
+                plan = workspace.project.allClipsCompilationPlan(
+                    sourceDurations: sourceDurations
+                )
+            } else {
+                plan = workspace.project.compilationPlan(
+                    for: tagKey,
+                    sourceDurations: sourceDurations
+                )
+            }
+            return plan.entries.isEmpty ? nil : (tagKey, plan)
+        }
+
+        items = plans.map { tagKey, plan in
+            VideoExportItem(
+                id: tagKey,
+                displayName: "\(sanitizeFilename(displayLabel(forKey: tagKey)))",
+                videoDurationSeconds: plan.totalDurationSeconds
+            )
+        }
+        runRate = RollingRate(windowSeconds: 30)
+        runStartedAt = Date()
+        currentVideoStartedAt = nil
+        projection = .empty
+        lastSnapshot = nil
+
         run = RunState(totalCount: chosenTags.count, completedCount: 0, currentTag: chosenTags.first)
 
         Task {
@@ -412,19 +468,24 @@ struct ExportSheet: View {
                         )
                     }
 
-                    // Skip empty plans silently — a checked tag with no clips
-                    // shouldn't crash the run. (Could happen if the user
-                    // edited tags after the sheet opened, though the sheet
-                    // is modal so that's unlikely.)
                     guard !plan.entries.isEmpty else { continue }
 
                     let label = displayLabel(forKey: tagKey)
                     let filename = "\(sanitizeFilename(label)) - \(sanitizeFilename(projectNameChoice)).mp4"
                     let outputURL = outFolder.appendingPathComponent(filename)
-
-                    // If a prior export wrote here, remove it first — the
-                    // exporter will fail if the file already exists.
                     try? FileManager.default.removeItem(at: outputURL)
+
+                    // Transition the matching item to .active and record
+                    // its start time. The item index in `items` may differ
+                    // from `i` because empty-plan tags don't appear in
+                    // `items`; find it by id.
+                    await MainActor.run {
+                        if let idx = items.firstIndex(where: { $0.id == tagKey }) {
+                            items[idx].status = .active(fractionCompleted: 0)
+                        }
+                        currentVideoStartedAt = Date()
+                        rebuildSnapshot()
+                    }
 
                     try await exporter.export(
                         plan: plan,
@@ -435,8 +496,28 @@ struct ExportSheet: View {
                         resolution: resolutionChoice,
                         quality: qualityChoice,
                         sourceVolume: workspace.project.preferences.previewSourceVolume,
-                        commentaryVolume: workspace.project.preferences.previewCommentaryVolume
+                        commentaryVolume: workspace.project.preferences.previewCommentaryVolume,
+                        onProgress: { fraction in
+                            Task { @MainActor in
+                                handleSampleFromActiveVideo(fraction)
+                            }
+                        }
                     )
+
+                    // Transition .active → .done with the measured wall
+                    // time and the (post-hoc) average FPS for this video.
+                    await MainActor.run {
+                        if let idx = items.firstIndex(where: { $0.id == tagKey }),
+                           let startedAt = currentVideoStartedAt {
+                            let wall = Date().timeIntervalSince(startedAt)
+                            let dur = items[idx].videoDurationSeconds
+                            // avgFps = (composition seconds / wall seconds) * frame rate
+                            let avgFps = wall > 0 ? (dur / wall) * Self.outputFrameRate : 0
+                            items[idx].status = .done(encodeWallSeconds: wall, averageFps: avgFps)
+                        }
+                        currentVideoStartedAt = nil
+                        rebuildSnapshot()
+                    }
                 }
 
                 await MainActor.run {
@@ -461,6 +542,69 @@ struct ExportSheet: View {
         let others = selectedTags.filter { $0 != Self.allClipsKey }.sorted()
         out.append(contentsOf: others)
         return out
+    }
+
+    // MARK: - Per-sample state updaters
+
+    /// Updates the active item's fraction, records a rate sample, recomputes
+    /// the projection, and rebuilds `lastSnapshot`. Called from the
+    /// `onProgress` callback on MainActor.
+    private func handleSampleFromActiveVideo(_ fraction: Float) {
+        guard let activeIdx = items.firstIndex(where: { isActive($0.status) }) else {
+            return
+        }
+        let clamped = max(0, min(1, fraction))
+        items[activeIdx].status = .active(fractionCompleted: clamped)
+
+        let activeDur = items[activeIdx].videoDurationSeconds
+        let doneEncoded = items.reduce(0.0) { acc, item in
+            if case .done = item.status {
+                return acc + item.videoDurationSeconds
+            }
+            return acc
+        }
+        let activeEncoded = Double(clamped) * activeDur
+        let encodedSoFar = doneEncoded + activeEncoded
+        let wallNow = Date().timeIntervalSince1970
+        runRate.record(wallTime: wallNow, encodedCompSeconds: encodedSoFar)
+
+        rebuildSnapshot()
+    }
+
+    private func isActive(_ status: VideoExportItem.Status) -> Bool {
+        if case .active = status { return true } else { return false }
+    }
+
+    /// Recompute `projection` and `lastSnapshot` from current `items` +
+    /// `runRate`. Separate from `handleSampleFromActiveVideo` so transition
+    /// points (start of a video, end of a video) can refresh the UI without
+    /// inventing a fake sample.
+    private func rebuildSnapshot() {
+        let measured = runRate.compositionSecondsPerWallSecond()
+        let rate = measured ?? 1.0
+        let now = Date()
+        let proj = projectRun(items: items, rate: rate, now: now)
+        let fps = measured.map { $0 * Self.outputFrameRate }
+        // Composition-seconds remaining is rate-INDEPENDENT — it's the
+        // remaining video content the encoder still has to chew through.
+        // Use it for the "X video left" reading.
+        let compSecondsRemaining: Double = items.reduce(0.0) { acc, item in
+            switch item.status {
+            case .done:                       return acc
+            case .pending:                    return acc + item.videoDurationSeconds
+            case .active(let frac):           return acc + (1.0 - Double(frac)) * item.videoDurationSeconds
+            }
+        }
+        let etaSecs = measured == nil ? nil : proj.totalSecondsRemaining
+        let doneDate = measured == nil ? nil : now.addingTimeInterval(proj.totalSecondsRemaining)
+        projection = proj
+        lastSnapshot = ExportProgress(
+            items: items,
+            currentRenderingFps: fps,
+            totalVideoSecondsRemaining: compSecondsRemaining,
+            totalEtaSeconds: etaSecs,
+            projectedCompletionDate: doneDate
+        )
     }
 
     // MARK: - Asset wiring
