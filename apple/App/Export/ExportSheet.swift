@@ -272,20 +272,141 @@ struct ExportSheet: View {
 
     private var progressSection: some View {
         VStack(alignment: .leading, spacing: 12) {
-            if let run {
-                // The run is sequential — show the active tag plus an N of M.
-                Text(run.currentTag.map { tag in
-                    "Exporting \(displayLabel(forKey: tag)) (\(min(run.completedCount + 1, run.totalCount)) of \(run.totalCount))…"
-                } ?? "Preparing…")
-                    .font(.headline)
-                ProgressView()
-                    .progressViewStyle(.linear)
-                Text("Tags export sequentially. This may take several minutes per tag depending on length and resolution.")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+            runSummary
+            Divider()
+            VStack(alignment: .leading, spacing: 8) {
+                ForEach(items) { item in
+                    videoRow(item)
+                }
             }
         }
     }
+
+    @ViewBuilder
+    private var runSummary: some View {
+        let doneCount = items.reduce(0) { acc, item in
+            if case .done = item.status { return acc + 1 }
+            return acc
+        }
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Exporting (\(doneCount) of \(items.count) videos done)")
+                    .font(.headline)
+                Spacer()
+                if let fps = lastSnapshot?.currentRenderingFps {
+                    Text("\(Int(fps.rounded())) fps")
+                        .font(.callout.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Text(runSummaryLine)
+                .font(.callout)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The "1:08 video left · ETA 1:25 (3:42 PM)" line under the headline.
+    /// Falls back gracefully when the rate hasn't stabilized yet — just the
+    /// total video remaining, no ETA, no clock.
+    private var runSummaryLine: String {
+        let totalLeft = lastSnapshot?.totalVideoSecondsRemaining ?? items.reduce(0.0) { acc, item in
+            switch item.status {
+            case .done: return acc
+            case .active, .pending: return acc + item.videoDurationSeconds
+            }
+        }
+        var parts: [String] = ["\(formatDuration(totalLeft)) video left"]
+        if let etaSecs = lastSnapshot?.totalEtaSeconds,
+           let doneDate = lastSnapshot?.projectedCompletionDate {
+            parts.append("ETA \(formatDuration(etaSecs)) (\(Self.clockFormatter.string(from: doneDate)))")
+        }
+        return parts.joined(separator: " · ")
+    }
+
+    @ViewBuilder
+    private func videoRow(_ item: VideoExportItem) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            // Status pill — small, fixed-width label so rows align.
+            Text(statusPill(item.status))
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .frame(width: 56, alignment: .leading)
+            Text(item.displayName)
+                .font(.callout.weight(.medium))
+                .frame(width: 160, alignment: .leading)
+                .lineLimit(1)
+                .truncationMode(.middle)
+            VStack(alignment: .leading, spacing: 2) {
+                switch item.status {
+                case .pending:
+                    pendingDetail(item)
+                case .active(let frac):
+                    ProgressView(value: Double(frac))
+                        .progressViewStyle(.linear)
+                    activeDetail(item, fraction: frac)
+                case .done(let wall, let avgFps):
+                    doneDetail(item, encodeWall: wall, avgFps: avgFps)
+                }
+            }
+        }
+    }
+
+    private func statusPill(_ status: VideoExportItem.Status) -> String {
+        switch status {
+        case .pending: return "Pending"
+        case .active:  return "Active"
+        case .done:    return "Done"
+        }
+    }
+
+    @ViewBuilder
+    private func pendingDetail(_ item: VideoExportItem) -> some View {
+        // `perItemRemaining[id]` is this video's encode time alone (per-item,
+        // not cumulative — see Task 3 spec). Use it directly.
+        let encodeOnly = projection.perItemRemaining[item.id] ?? item.videoDurationSeconds
+        let doneDateString: String = {
+            guard let date = projection.perItemDoneDate[item.id],
+                  lastSnapshot?.currentRenderingFps != nil else { return "" }
+            return " · done \(Self.clockFormatter.string(from: date))"
+        }()
+        Text("\(formatDuration(item.videoDurationSeconds)) video · ~\(formatDuration(encodeOnly)) to encode\(doneDateString)")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private func activeDetail(_ item: VideoExportItem, fraction: Float) -> some View {
+        let videoLeft = max(0, (1.0 - Double(fraction)) * item.videoDurationSeconds)
+        let wallLeft = projection.perItemRemaining[item.id] ?? 0
+        let fpsText: String = lastSnapshot.flatMap { snap in
+            snap.currentRenderingFps.map { "\(Int($0.rounded())) fps · " }
+        } ?? ""
+        let etaText: String = {
+            guard let date = projection.perItemDoneDate[item.id],
+                  lastSnapshot?.currentRenderingFps != nil else { return "" }
+            return " · ETA \(formatDuration(wallLeft)) (\(Self.clockFormatter.string(from: date)))"
+        }()
+        Text("\(fpsText)\(formatDuration(videoLeft)) video left\(etaText)")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+    }
+
+    @ViewBuilder
+    private func doneDetail(_ item: VideoExportItem, encodeWall: Double, avgFps: Double) -> some View {
+        Text("✓ \(formatDuration(item.videoDurationSeconds)) video · \(formatDuration(encodeWall)) encode · avg \(Int(avgFps.rounded())) fps")
+            .font(.callout)
+            .foregroundStyle(.secondary)
+    }
+
+    /// Short, locale-sensitive clock-time formatter (e.g., "3:42 PM" in
+    /// en_US, "15:42" in fr_FR). One per type — recreating a DateFormatter
+    /// per row would be wasteful.
+    private static let clockFormatter: DateFormatter = {
+        let f = DateFormatter()
+        f.dateStyle = .none
+        f.timeStyle = .short
+        return f
+    }()
 
     private func summarySection(_ summary: Summary) -> some View {
         VStack(alignment: .leading, spacing: 12) {
