@@ -13,10 +13,11 @@ import VideoCoachCore
 /// VideoToolbox saturates on a single export and parallelism would just add
 /// queue contention without speeding anything up.
 ///
-/// **Live progress is deferred.** `export(...)` now accepts an `onProgress`
-/// closure, but for v1 we show "Exporting <tag> (N of M)…" with an
-/// indeterminate spinner. Wire `onProgress` in a follow-up when a real
-/// progress bar is added to this sheet.
+/// **Live progress.** ``CompilationExporter.export(...)`` accepts an
+/// `onProgress: (Float) -> Void` closure that fires at ~5Hz from a detached
+/// task during each export. `ExportSheet` threads each tick through
+/// ``handleSampleFromActiveVideo(_:)`` to update the active item's
+/// fraction, feed the run-level ``RollingRate``, and re-project the run.
 struct ExportSheet: View {
     @Bindable var workspace: Workspace
     /// Set by ContentView; we toggle it to dismiss.
