@@ -26,7 +26,7 @@ enum CaptureError: Error, LocalizedError {
             return "Permission denied for \(media == .video ? "camera" : "microphone")."
         case .alreadyRecording: return "A recording is already in progress."
         case .firstSampleTimeout:
-            return "Capture timed out waiting for the first frame from the camera (2s)."
+            return "Capture timed out waiting for the first frame from the camera (5s)."
         case .deviceUnavailable(let id):
             return "Selected device (\(String(id.prefix(12)))…) is unavailable."
         }
@@ -222,7 +222,7 @@ final class CaptureSessionController: NSObject,
                 self.movieOutput.startRecording(to: url, recordingDelegate: self)
                 self.isRecording = true
                 self.firstSampleTimeoutTask = Task { [weak self] in
-                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    try? await Task.sleep(nanoseconds: 5_000_000_000)
                     self?.dataQueue.async {
                         guard let self, let cont = self.t0Continuation else { return }
                         self.t0Continuation = nil
