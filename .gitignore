@@ -1,0 +1,27 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Swift
+.build/
+Package.resolved
+.swiftpm/
+
+# macOS
+.DS_Store
+
+# XcodeGen
+*.xcodeproj
+apple/App/Info.plist
+
+# Claude Code workspace
+.claude/
+
+# Rust build artifacts
+target/
+
+# Local test fixtures (large video files; not tracked)
+fixtures/

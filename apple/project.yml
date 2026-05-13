@@ -1,0 +1,77 @@
+name: VideoCoach
+options:
+  bundleIdPrefix: com.videocoach
+  deploymentTarget:
+    macOS: "14.0"
+  developmentLanguage: en
+packages:
+  VideoCoachCore:
+    path: VideoCoachCore
+  MPVKit:
+    url: https://github.com/mpvkit/MPVKit
+    from: 0.39.0
+targets:
+  VideoCoach:
+    type: application
+    platform: macOS
+    scheme:
+      testTargets:
+        - VideoCoachTests
+        - VideoCoachUITests
+    sources:
+      - App
+    dependencies:
+      - package: VideoCoachCore
+      - package: MPVKit
+        product: MPVKit
+    info:
+      path: App/Info.plist
+      properties:
+        NSCameraUsageDescription: Video Coach uses your camera to record commentary on match clips.
+        NSMicrophoneUsageDescription: Video Coach uses your microphone to record commentary on match clips.
+        CFBundleDisplayName: Video Coach
+        LSMinimumSystemVersion: "14.0"
+    settings:
+      base:
+        CODE_SIGN_ENTITLEMENTS: App/VideoCoach.entitlements
+        CODE_SIGN_STYLE: Automatic
+        ENABLE_HARDENED_RUNTIME: YES
+        SWIFT_VERSION: 5.9
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
+  VideoCoachUITests:
+    type: bundle.ui-testing
+    platform: macOS
+    sources:
+      - path: AppUITests
+        excludes:
+          - "*.entitlements"
+    dependencies:
+      - target: VideoCoach
+    settings:
+      base:
+        TEST_TARGET_NAME: VideoCoach
+        SWIFT_VERSION: 5.9
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachUITests
+        CODE_SIGN_ENTITLEMENTS: AppUITests/VideoCoachUITests.entitlements
+        ENABLE_APP_SANDBOX: NO
+  VideoCoachTests:
+    type: bundle.unit-test
+    platform: macOS
+    sources:
+      - path: Tests/AppTests
+      - path: App/Recording/RecordingController.swift
+    dependencies:
+      - package: VideoCoachCore
+    settings:
+      base:
+        SWIFT_VERSION: 5.9
+        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        ARCHS: arm64
+        GENERATE_INFOPLIST_FILE: YES
+        PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachTests
+        TEST_HOST: ""
+        BUNDLE_LOADER: ""

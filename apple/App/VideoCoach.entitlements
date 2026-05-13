@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.device.camera</key>
+    <true/>
+    <key>com.apple.security.device.audio-input</key>
+    <true/>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <!-- MPVKit bundles LuaJIT, which generates JIT-compiled pages for
+         built-in scripts (stats, console, ytdl_hook, …). Hardened
+         Runtime kills the process with CODESIGNING / Invalid Page when
+         it tries to execute those pages without one of these two
+         exceptions. allow-jit covers the modern MAP_JIT path;
+         allow-unsigned-executable-memory is the broader fallback that
+         covers any executable VM_ALLOCATE region — LuaJIT 2.1 on
+         macOS uses both depending on the allocation site. Debug
+         builds inherit get-task-allow which sidesteps this; only
+         Release crashes without the entitlements. -->
+    <key>com.apple.security.cs.allow-jit</key>
+    <true/>
+    <key>com.apple.security.cs.allow-unsigned-executable-memory</key>
+    <true/>
+</dict>
+</plist>
