@@ -370,6 +370,7 @@ struct ContentView: View {
                     appMode: $appMode,
                     openProjectError: $openProjectError,
                     recordingStartedAtHostTime: recordingStartedAtHostTime,
+                    capture: capture,
                     onStopRecording: handleToggleRecord,
                     onClosePreview: handleClosePreview
                 )
