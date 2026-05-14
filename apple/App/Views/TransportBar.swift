@@ -14,12 +14,7 @@ struct TransportBar: View {
     /// landed. Drives the live elapsed counter in `RecordingTransport`.
     /// nil when not recording.
     var recordingStartedAtHostTime: Double?
-    /// Owned by `ContentView`. Used by `RecordingTransport` to read live
-    /// audio level (`audioAveragePowerDB` / `audioPeakHoldDB`) for the
-    /// small input-level meter shown beside the Stop button. Required by
-    /// SwiftUI's @Observable tracking so the meter redraws at the timer's
-    /// ~20Hz update cadence.
-    @Bindable var capture: CaptureSessionController
+    let capture: CaptureSessionController
     /// Invoked when the user clicks the Stop button during `.recording`.
     /// Wired by `ContentView` to the same handler as the R/Esc key path.
     var onStopRecording: () -> Void
@@ -230,8 +225,7 @@ struct RecordingTransport: View {
     /// Host time of t=0 for the active recording. Used to derive elapsed
     /// time. nil while `.recordingStarting`.
     var startedAtHostTime: Double?
-    /// Source of `audioAveragePowerDB` / `audioPeakHoldDB` for the meter.
-    @Bindable var capture: CaptureSessionController
+    let capture: CaptureSessionController
     var onStop: () -> Void
 
     private var isStarting: Bool { appMode == .recordingStarting }
@@ -266,15 +260,14 @@ struct RecordingTransport: View {
 
             Spacer()
 
-            // Tiny input-level meter — primary purpose is to catch the
-            // "I plugged in AirPods but the wrong mic is recording"
-            // scenario at a glance. `audioAveragePowerDB` is nil until
-            // the file output opens, so it's empty/idle during
-            // .recordingStarting and lights up once samples flow.
-            AudioLevelMeter(
-                averageDB: capture.audioAveragePowerDB,
-                peakDB: capture.audioPeakHoldDB
-            )
+            // Visible only after the file output opens; otherwise the
+            // ~500ms warmup would render a "no audio" state every record.
+            if !isStarting {
+                AudioLevelMeter(
+                    averageDB: capture.audioAveragePowerDB,
+                    peakDB: capture.audioPeakHoldDB
+                )
+            }
 
             Button(action: onStop) {
                 HStack(spacing: 4) {
@@ -455,25 +448,26 @@ fileprivate func formatDurationHMS(_ seconds: Double) -> String {
     return String(format: "%d:%02d", m, s)
 }
 
-/// Small input-level indicator shown in the recording transport bar.
-/// Displays the live `averagePowerLevel` from the recording's audio
-/// connection (dBFS, typically -160…0) as a horizontal bar with a fixed
-/// green→yellow→red gradient. A "no audio" state (mic.slash icon, empty
-/// bar) shows when either the meter hasn't started yet (.recordingStarting)
-/// or no audio channel is available — both situations the user wants to
-/// see at a glance so they can stop and fix mic routing before recording
-/// the entire clip in silence.
 private struct AudioLevelMeter: View {
     let averageDB: Float?
     let peakDB: Float?
 
-    /// Display window in dBFS. -60 is roughly the noise floor of a quiet
-    /// room with a decent mic; speech reads around -25..-15, peaks may
-    /// brush -6, clipping at 0. Picking the window this wide means the
-    /// bar is visibly responsive across the realistic speaking range
-    /// without bottoming out on room noise.
+    /// Display window in dBFS. -60 is roughly a quiet room's noise floor;
+    /// speech reads around -25..-15, peaks may brush -6. Wider than that
+    /// and room noise wouldn't bottom out the bar.
     private static let minDB: Float = -60
     private static let maxDB: Float = 0
+
+    private static let levelGradient = LinearGradient(
+        stops: [
+            .init(color: .green, location: 0.0),
+            .init(color: .green, location: 0.66),
+            .init(color: .yellow, location: 0.9),
+            .init(color: .red, location: 1.0),
+        ],
+        startPoint: .leading,
+        endPoint: .trailing
+    )
 
     private func normalize(_ db: Float?) -> Double {
         guard let db, db.isFinite else { return 0 }
@@ -496,16 +490,7 @@ private struct AudioLevelMeter: View {
                 RoundedRectangle(cornerRadius: 1.5)
                     .fill(Color.gray.opacity(0.25))
                 RoundedRectangle(cornerRadius: 1.5)
-                    .fill(LinearGradient(
-                        stops: [
-                            .init(color: .green, location: 0.0),
-                            .init(color: .green, location: 0.66),
-                            .init(color: .yellow, location: 0.9),
-                            .init(color: .red, location: 1.0),
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    ))
+                    .fill(Self.levelGradient)
                     .frame(width: barWidth * CGFloat(avgFill))
                 if isLive, peakFill > 0 {
                     Rectangle()
@@ -517,7 +502,7 @@ private struct AudioLevelMeter: View {
             .frame(width: barWidth, height: barHeight)
         }
         .help(isLive
-              ? String(format: "Mic level: %.0f dB", Double(averageDB ?? -160))
+              ? String(format: "Mic level: %.0f dB", Double(averageDB!))
               : "Waiting for audio…")
     }
 }

@@ -57,13 +57,10 @@ final class CaptureSessionController: NSObject,
     private(set) var lastFallbackReason: String?
 
     /// Live average power level (decibels, typically -160…0) from the
-    /// recording's audio connection, polled at ~20Hz while
-    /// `movieOutput.isRecording == true`. `nil` between recordings — the
-    /// meter UI reads this and shows an empty/idle state when nil.
+    /// recording's audio connection. `nil` between recordings.
     private(set) var audioAveragePowerDB: Float?
 
-    /// Brief peak hold (~1s) tracked alongside `audioAveragePowerDB`. Same
-    /// units; same lifetime.
+    /// Companion ~1s peak hold to `audioAveragePowerDB`.
     private(set) var audioPeakHoldDB: Float?
 
     let session = AVCaptureSession()
@@ -100,9 +97,6 @@ final class CaptureSessionController: NSObject,
     private var stopContinuation: CheckedContinuation<Double, Error>?
     private var videoDevice: AVCaptureDevice?
 
-    /// 20Hz timer that polls `movieOutput.connection(.audio).audioChannels[0]`
-    /// for live levels. Created in `didStartRecordingTo`, invalidated in
-    /// `didFinishRecordingTo`. Only valid while `movieOutput.isRecording`.
     @ObservationIgnored
     private var levelMonitorTimer: Timer?
     @ObservationIgnored
@@ -350,16 +344,18 @@ final class CaptureSessionController: NSObject,
             fallbackMessages: &fallbackMessages,
             kind: "Camera"
         )
+        guard let targetVideo else { throw CaptureError.noVideoDevice }
         let targetAudio = Self.resolveDevice(
             preferredID: preferredMicID,
             mediaType: .audio,
             fallbackMessages: &fallbackMessages,
             kind: "Microphone"
         )
-        if let targetVideo, targetVideo.uniqueID != videoDeviceUniqueID {
+        guard let targetAudio else { throw CaptureError.noAudioDevice }
+        if targetVideo.uniqueID != videoDeviceUniqueID {
             try await switchVideoDevice(uniqueID: targetVideo.uniqueID)
         }
-        if let targetAudio, targetAudio.uniqueID != audioDeviceUniqueID {
+        if targetAudio.uniqueID != audioDeviceUniqueID {
             try await switchAudioDevice(uniqueID: targetAudio.uniqueID)
         }
         // `switchXDevice` clears `lastFallbackReason` on each successful
@@ -498,10 +494,8 @@ final class CaptureSessionController: NSObject,
 
     // MARK: - Audio level monitoring
 
-    /// Begin polling the recording's audio connection at ~20Hz so the
-    /// transport-bar meter can show live input level. Must run on the
-    /// main runloop — Timer.scheduledTimer requires one, and the values
-    /// it writes are SwiftUI-observed @Observable properties.
+    /// Must run on the main runloop — `Timer.scheduledTimer` requires one,
+    /// and the values it writes are SwiftUI-observed @Observable properties.
     @MainActor
     private func startLevelMonitoring() {
         stopLevelMonitoring()
@@ -513,20 +507,25 @@ final class CaptureSessionController: NSObject,
             guard let channel = self.movieOutput
                 .connection(with: .audio)?.audioChannels.first
             else {
-                self.audioAveragePowerDB = nil
-                self.audioPeakHoldDB = nil
+                if self.audioAveragePowerDB != nil { self.audioAveragePowerDB = nil }
+                if self.audioPeakHoldDB != nil { self.audioPeakHoldDB = nil }
                 return
             }
-            // `averagePowerLevel` is the recent RMS in dBFS (max 0).
-            // `peakHoldLevel` is the max-over-some-window; we add our own
-            // ~1s peak hold on top so a brief loud transient stays visible
-            // long enough for the user to notice it.
+            // Custom peak hold on top of AVFoundation's `peakHoldLevel` so a
+            // brief transient stays visible ~1s — long enough for a glance
+            // at the bar to register that audio is actually flowing.
             let avg = channel.averagePowerLevel
-            self.audioAveragePowerDB = avg
+            // Skip identical-value writes — @Observable doesn't diff and
+            // every assignment triggers a SwiftUI redraw of the meter.
+            if avg != self.audioAveragePowerDB {
+                self.audioAveragePowerDB = avg
+            }
             let now = CACurrentMediaTime()
             let currentPeak = self.audioPeakHoldDB ?? -160
             if avg >= currentPeak || now > self.peakHoldUntilHostTime {
-                self.audioPeakHoldDB = avg
+                if avg != self.audioPeakHoldDB {
+                    self.audioPeakHoldDB = avg
+                }
                 self.peakHoldUntilHostTime = now + 1.0
             }
         }
@@ -538,6 +537,16 @@ final class CaptureSessionController: NSObject,
         levelMonitorTimer = nil
         audioAveragePowerDB = nil
         audioPeakHoldDB = nil
+    }
+
+    deinit {
+        // Safety net for the (theoretically possible) case where the
+        // controller is released between `didStartRecordingTo` and
+        // `didFinishRecordingTo` — the timer's [weak self] returns nil
+        // and self-cleans on the next tick, but invalidating here means
+        // the runloop drops it immediately rather than firing one more
+        // dead tick.
+        levelMonitorTimer?.invalidate()
     }
 
     // MARK: - Device discovery
