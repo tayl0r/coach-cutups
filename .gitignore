@@ -20,6 +20,9 @@ apple/App/Info.plist
 # Claude Code workspace
 .claude/
 
+# Superpowers brainstorm sessions (visual companion mockups)
+.superpowers/
+
 # Rust build artifacts
 target/
 
