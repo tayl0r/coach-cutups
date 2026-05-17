@@ -113,6 +113,12 @@ struct ContentView: View {
             .onChange(of: selectedClipID) { _, newID in
                 handleSelectionChange(newID)
             }
+            .onChange(of: workspace.project.clips.first(where: { $0.id == selectedClipID })?.showPiP) { _, _ in
+                if case .previewClip(let id) = appMode {
+                    selectedClipID = nil
+                    DispatchQueue.main.async { selectedClipID = id }
+                }
+            }
             .onChange(of: workspace.folder) { _, _ in
                 // Filter is view-state tied to the current project; reset
                 // it when the user opens or switches projects.
