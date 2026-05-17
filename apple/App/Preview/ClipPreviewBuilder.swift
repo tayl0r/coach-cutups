@@ -303,25 +303,6 @@ enum ClipPreviewBuilder {
             }
         }
 
-        // Webcam PiP layer: scale to 22% of viewport width, preserve cam
-        // aspect, anchor bottom-right with a 2.2% margin. AVMutableVideoCompositionLayerInstruction
-        // transforms work in TOP-LEFT origin (the same as the renderSize
-        // coordinate system), so the PiP's top-left corner sits at
-        // (renderSize.width - margin - pipW, renderSize.height - margin - pipH).
-        let camNatural = try await webcamVideoTrack.load(.naturalSize)
-        let camW = max(abs(camNatural.width), 1)
-        let camH = max(abs(camNatural.height), 1)
-        let pipW = renderSize.width * 0.22
-        let pipH = pipW * camH / camW
-        let margin = renderSize.height * 0.022
-        let webcamScale = CGAffineTransform(scaleX: pipW / camW, y: pipH / camH)
-        let webcamTranslate = CGAffineTransform(
-            translationX: renderSize.width - margin - pipW,
-            y: renderSize.height - margin - pipH
-        )
-        let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
-        webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
-
         // `addMutableTrack(preferredTrackID:)` doesn't always honor the
         // preferred ID — if there's a collision or constraint, it generates
         // a fresh one. Use the ACTUAL assigned trackIDs for both
@@ -330,25 +311,65 @@ enum ClipPreviewBuilder {
         // renders the layer instruction against the wrong track.
         let actualSourceID = sourceVideoComp.trackID
         let actualWebcamID = webcamVideoComp.trackID
-        NSLog("[Preview] track IDs: source=\(actualSourceID) webcam=\(actualWebcamID) (preferred was \(sourceTrackID)/\(webcamTrackID))")
+        NSLog("[Preview] track IDs: source=\(actualSourceID) webcam=\(actualWebcamID) (preferred was \(sourceTrackID)/\(webcamTrackID)) showPiP=\(clip.showPiP)")
+
+        // Webcam PiP layer: scale to 22% of viewport width, preserve cam
+        // aspect, anchor bottom-right with a 2.2% margin. AVMutableVideoCompositionLayerInstruction
+        // transforms work in TOP-LEFT origin (the same as the renderSize
+        // coordinate system), so the PiP's top-left corner sits at
+        // (renderSize.width - margin - pipW, renderSize.height - margin - pipH).
+        //
+        // When `clip.showPiP == false`, omit the webcam layer instruction
+        // entirely so the built-in compositor renders only the source.
         // requiredSourceTrackIDs is read-only on the mutable base class in
         // Swift, so we still need PreviewInstruction's getter override to
         // declare which tracks AVPlayer must deliver. Without it, AVPlayer's
         // built-in compositor will fail to vend either source or webcam
         // frames and the entire preview renders black.
-        let inst = PreviewInstruction.make(
-            sourceTrackID: actualSourceID,
-            webcamTrackID: actualWebcamID,
-            compositionStart: .zero,
-            clipDuration: clipDuration,
-            segments: [],
-            frozenFrames: [:],
-            events: []
-        )
-        // AVFoundation layer order: first instruction is on TOP, subsequent
-        // ones are beneath. Webcam (PiP) goes first so it overlays the
-        // full-frame source.
-        inst.layerInstructions = [webcamLayer, sourceLayer]
+        let inst: PreviewInstruction
+        if clip.showPiP {
+            let camNatural = try await webcamVideoTrack.load(.naturalSize)
+            let camW = max(abs(camNatural.width), 1)
+            let camH = max(abs(camNatural.height), 1)
+            let pipW = renderSize.width * 0.22
+            let pipH = pipW * camH / camW
+            let margin = renderSize.height * 0.022
+            let webcamScale = CGAffineTransform(scaleX: pipW / camW, y: pipH / camH)
+            let webcamTranslate = CGAffineTransform(
+                translationX: renderSize.width - margin - pipW,
+                y: renderSize.height - margin - pipH
+            )
+            let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
+            webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
+
+            inst = PreviewInstruction.make(
+                sourceTrackID: actualSourceID,
+                webcamTrackID: actualWebcamID,
+                compositionStart: .zero,
+                clipDuration: clipDuration,
+                segments: [],
+                frozenFrames: [:],
+                events: []
+            )
+            // AVFoundation layer order: first instruction is on TOP, subsequent
+            // ones are beneath. Webcam (PiP) goes first so it overlays the
+            // full-frame source.
+            inst.layerInstructions = [webcamLayer, sourceLayer]
+        } else {
+            // PiP suppressed: drop the webcam track from
+            // `requiredSourceTrackIDs` (via the invalid sentinel) so AVPlayer
+            // doesn't even decode it, and omit the webcam layer instruction.
+            inst = PreviewInstruction.make(
+                sourceTrackID: actualSourceID,
+                webcamTrackID: kCMPersistentTrackID_Invalid,
+                compositionStart: .zero,
+                clipDuration: clipDuration,
+                segments: [],
+                frozenFrames: [:],
+                events: []
+            )
+            inst.layerInstructions = [sourceLayer]
+        }
         videoComp.instructions = [inst]
 
         let zoomEventCount = clip.events.reduce(into: 0) { acc, e in
