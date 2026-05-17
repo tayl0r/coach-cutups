@@ -243,6 +243,21 @@ private struct EditorView: View {
             }
 
             Group {
+                Text("PiP").font(.caption).foregroundStyle(.secondary)
+                Toggle("Show picture-in-picture", isOn: Binding(
+                    get: { clip.showPiP },
+                    set: { newValue in
+                        let before = clip
+                        clip.showPiP = newValue
+                        workspace.commitClipEdit(id: clip.id, before: before, after: clip)
+                        try? workspace.saveProject()
+                        workspace.invalidatePreviewCache(for: clip.id)
+                    }
+                ))
+                .toggleStyle(.checkbox)
+            }
+
+            Group {
                 Text("Notes").font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $clip.notes)
                     .font(.body)
