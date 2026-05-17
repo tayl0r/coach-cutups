@@ -65,6 +65,15 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         // requiredSourceTrackIDs is `[NSValue]`-typed; NSNumber is the
         // conventional boxing for CMPersistentTrackID. Passing raw Int32s
         // won't compile.
+        //
+        // Webcam stays in the required-track list even when `showPiP`
+        // is false. `CompilationExporter` always inserts the webcam track
+        // (so a hidden PiP can be re-enabled later by flipping the flag);
+        // the compositor reads `showPiP` and skips the draw without
+        // touching the composition shape. Asymmetric with
+        // `PreviewInstruction.make`, which drops the webcam ID when
+        // suppressed because the preview builder DOES omit the layer
+        // instruction entirely.
         i._requiredSourceTrackIDs = [
             NSNumber(value: sourceTrackID),
             NSNumber(value: webcamTrackID),
