@@ -59,10 +59,6 @@ public enum ProjectStore {
         return try JSONSerialization.data(withJSONObject: root, options: [])
     }
 
-    internal static func _testOnly_migrate(_ data: Data) throws -> Data {
-        try migrateIfNeeded(data)
-    }
-
     public static func write(_ project: Project, to folder: URL) throws {
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)

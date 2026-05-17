@@ -56,6 +56,10 @@ final class ProjectTests: XCTestCase {
         // Legacy project.json from before the Devices menu shipped: no
         // preferredCameraID / preferredMicID keys present. Must decode
         // cleanly with both fields nil — this is the back-compat contract.
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("legacy-device-ids-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
         let legacyJSON = """
         {
           "formatVersion": 1,
@@ -67,12 +71,12 @@ final class ProjectTests: XCTestCase {
             "previewSourceVolume": 1.0,
             "previewCommentaryVolume": 1.0,
             "lastExportResolution": "r1080",
-            "lastExportQuality": "medium",
-            "pipForNewRecordings": true
+            "lastExportQuality": "medium"
           }
         }
         """.data(using: .utf8)!
-        let decoded = try JSONDecoder().decode(Project.self, from: legacyJSON)
+        try legacyJSON.write(to: dir.appendingPathComponent("project.json"))
+        let decoded = try ProjectStore.read(from: dir)
         XCTAssertNil(decoded.preferences.preferredCameraID)
         XCTAssertNil(decoded.preferences.preferredMicID)
         XCTAssertEqual(decoded.name, "Legacy")
@@ -140,6 +144,10 @@ final class ProjectTests: XCTestCase {
     }
 
     func test_migrateV2ToV3_legacyJSONGetsDefaults() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hide-pip-migrate-v2-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
         let legacy = """
         {
           "formatVersion": 2,
@@ -167,16 +175,18 @@ final class ProjectTests: XCTestCase {
           }
         }
         """.data(using: .utf8)!
-        let migrated = try ProjectStore._testOnly_migrate(legacy)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let decoded = try decoder.decode(Project.self, from: migrated)
-        XCTAssertEqual(decoded.formatVersion, 3)
-        XCTAssertTrue(decoded.preferences.pipForNewRecordings)
-        XCTAssertTrue(decoded.clips[0].showPiP)
+        try legacy.write(to: dir.appendingPathComponent("project.json"))
+        let loaded = try ProjectStore.read(from: dir)
+        XCTAssertEqual(loaded.formatVersion, 3)
+        XCTAssertTrue(loaded.preferences.pipForNewRecordings)
+        XCTAssertTrue(loaded.clips[0].showPiP)
     }
 
     func test_migrateV1ToV3_legacyJSONGetsDefaults() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hide-pip-migrate-v1-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
         let legacy = """
         {
           "formatVersion": 1,
@@ -192,11 +202,9 @@ final class ProjectTests: XCTestCase {
           }
         }
         """.data(using: .utf8)!
-        let migrated = try ProjectStore._testOnly_migrate(legacy)
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        let decoded = try decoder.decode(Project.self, from: migrated)
-        XCTAssertEqual(decoded.formatVersion, 3)
-        XCTAssertTrue(decoded.preferences.pipForNewRecordings)
+        try legacy.write(to: dir.appendingPathComponent("project.json"))
+        let loaded = try ProjectStore.read(from: dir)
+        XCTAssertEqual(loaded.formatVersion, 3)
+        XCTAssertTrue(loaded.preferences.pipForNewRecordings)
     }
 }

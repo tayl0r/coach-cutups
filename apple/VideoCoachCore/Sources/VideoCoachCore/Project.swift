@@ -86,7 +86,7 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
 }
 
 public struct Project: Codable, Hashable, Sendable {
-    public var formatVersion: Int = 3  // bumped from 2 for Clip.showPiP / Preferences.pipForNewRecordings
+    public var formatVersion: Int = 3
     public var name: String
     public var sourceVideos: [SourceRef] = []
     public var clips: [Clip] = []
