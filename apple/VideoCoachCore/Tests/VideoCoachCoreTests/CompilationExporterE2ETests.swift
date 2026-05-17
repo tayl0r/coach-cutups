@@ -287,29 +287,7 @@ final class CompilationExporterE2ETests: XCTestCase {
             sortIndex: 0
         )
 
-        var project = Project(name: "hide-pip-export-e2e")
-        project.clips = [clip]
-        let plan = project.compilationPlan(
-            for: "test",
-            sourceDurations: [0: Self.sourceDuration]
-        )
-        XCTAssertEqual(plan.entries.count, 1)
-
-        let sourceAsset = AVURLAsset(url: srcURL)
-        let webcamAsset = AVURLAsset(url: camURL)
-        let exporter = CompilationExporter()
-        try await exporter.export(
-            plan: plan,
-            clipsByID: [clip.id: clip],
-            sourceAssets: [0: sourceAsset],
-            clipWebcamAssets: [clip.id: webcamAsset],
-            outputURL: outURL,
-            resolution: .r720,
-            quality: .medium,
-            sourceVolume: 1.0,
-            commentaryVolume: 1.0
-        )
-        XCTAssertTrue(FileManager.default.fileExists(atPath: outURL.path))
+        try await runExport(clip: clip)
 
         // Probe inside the original PiP region (CGImage x≈0.91, y≈0.85 —
         // PiP x ∈ [0.758, 0.978], y ∈ [0.813, 0.978]) but ABOVE the text-
@@ -323,7 +301,6 @@ final class CompilationExporterE2ETests: XCTestCase {
         let cg = try await sampleFrame(of: outURL, atOutputTime: 0.5)
         let pipProbeRect = CGRect(x: 0.91, y: 0.85, width: 0.04, height: 0.04)
         let pipRGB = PixelSampling.averageRGB(in: cg, normalizedRect: pipProbeRect)
-        print("[exporter hide-PiP] bottom-right probe: \(pipRGB) — expect non-gray source pixels")
         let maxChannel = max(pipRGB.r, pipRGB.g, pipRGB.b)
         XCTAssertGreaterThan(
             maxChannel, 0.40,
