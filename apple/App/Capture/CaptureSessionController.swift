@@ -56,6 +56,13 @@ final class CaptureSessionController: NSObject,
     /// by every successful `switchVideoDevice` / `switchAudioDevice` call.
     private(set) var lastFallbackReason: String?
 
+    /// Live average power level (decibels, typically -160…0) from the
+    /// recording's audio connection. `nil` between recordings.
+    private(set) var audioAveragePowerDB: Float?
+
+    /// Companion ~1s peak hold to `audioAveragePowerDB`.
+    private(set) var audioPeakHoldDB: Float?
+
     let session = AVCaptureSession()
     private let movieOutput = AVCaptureMovieFileOutput()
     private let dataOutput = AVCaptureVideoDataOutput()
@@ -89,6 +96,11 @@ final class CaptureSessionController: NSObject,
 
     private var stopContinuation: CheckedContinuation<Double, Error>?
     private var videoDevice: AVCaptureDevice?
+
+    @ObservationIgnored
+    private var levelMonitorTimer: Timer?
+    @ObservationIgnored
+    private var peakHoldUntilHostTime: Double = 0
 
     func configure(
         preferredCameraID: String? = nil,
@@ -281,12 +293,25 @@ final class CaptureSessionController: NSObject,
     /// actually producing. Without that warmup, `movieOutput.startRecording`
     /// races AVFoundation's startup window and times out on a cold session.
     /// Idempotent — safe to call repeatedly.
+    ///
+    /// On warm calls (already configured), the preferred-or-default device
+    /// is re-resolved and swapped if it differs from the live input. This
+    /// is what makes a freshly-plugged-in mic (AirPods between recordings,
+    /// USB interface hot-plugged) actually take effect on the next record —
+    /// without this, the inputs added by the first `configure` call would
+    /// be reused forever and the user would silently keep recording with
+    /// the device that was default at app launch.
     func prepareForRecording(
         preferredCameraID: String? = nil,
         preferredMicID: String? = nil
     ) async throws {
         if !isReady {
             try await configure(
+                preferredCameraID: preferredCameraID,
+                preferredMicID: preferredMicID
+            )
+        } else {
+            try await reconcileLiveDevices(
                 preferredCameraID: preferredCameraID,
                 preferredMicID: preferredMicID
             )
@@ -300,6 +325,44 @@ final class CaptureSessionController: NSObject,
         // to actually deliver a sample so `movieOutput.startRecording` can
         // race-free assume the session is hot.
         try await waitForWarmup(timeout: 5.0)
+    }
+
+    /// Resolve preferred-or-default camera/mic and, for each one whose
+    /// resolved uniqueID differs from the currently-installed input, call
+    /// the existing `switchXDevice` swap. Same fallback-message machinery
+    /// as `configure(...)` so a saved-but-vanished device surfaces an
+    /// alert rather than failing silently. Called only on warm
+    /// `prepareForRecording` — cold calls go through `configure` instead.
+    private func reconcileLiveDevices(
+        preferredCameraID: String?,
+        preferredMicID: String?
+    ) async throws {
+        var fallbackMessages: [String] = []
+        let targetVideo = Self.resolveDevice(
+            preferredID: preferredCameraID,
+            mediaType: .video,
+            fallbackMessages: &fallbackMessages,
+            kind: "Camera"
+        )
+        guard let targetVideo else { throw CaptureError.noVideoDevice }
+        let targetAudio = Self.resolveDevice(
+            preferredID: preferredMicID,
+            mediaType: .audio,
+            fallbackMessages: &fallbackMessages,
+            kind: "Microphone"
+        )
+        guard let targetAudio else { throw CaptureError.noAudioDevice }
+        if targetVideo.uniqueID != videoDeviceUniqueID {
+            try await switchVideoDevice(uniqueID: targetVideo.uniqueID)
+        }
+        if targetAudio.uniqueID != audioDeviceUniqueID {
+            try await switchAudioDevice(uniqueID: targetAudio.uniqueID)
+        }
+        // `switchXDevice` clears `lastFallbackReason` on each successful
+        // swap, so set it last to preserve any new fallback we computed.
+        lastFallbackReason = fallbackMessages.isEmpty
+            ? nil
+            : fallbackMessages.joined(separator: "\n")
     }
 
     // MARK: AVCaptureVideoDataOutputSampleBufferDelegate
@@ -368,6 +431,13 @@ final class CaptureSessionController: NSObject,
         dataQueue.async { [weak self] in
             self?.awaitingFirstSample = true
         }
+        // Audio-channel power levels only update while the file output is
+        // actively writing, so the meter polling lifecycle is bracketed by
+        // these two delegate calls. Hop to main because Timer.scheduledTimer
+        // requires a thread with a runloop and we touch @Observable state.
+        Task { @MainActor [weak self] in
+            self?.startLevelMonitoring()
+        }
     }
 
     func fileOutput(_ output: AVCaptureFileOutput,
@@ -375,6 +445,9 @@ final class CaptureSessionController: NSObject,
                     from connections: [AVCaptureConnection],
                     error: Error?) {
         isRecording = false
+        Task { @MainActor [weak self] in
+            self?.stopLevelMonitoring()
+        }
         if let error {
             stopContinuation?.resume(throwing: error)
             stopContinuation = nil
@@ -417,6 +490,63 @@ final class CaptureSessionController: NSObject,
             return deviceInput.device.uniqueID
         }
         return nil
+    }
+
+    // MARK: - Audio level monitoring
+
+    /// Must run on the main runloop — `Timer.scheduledTimer` requires one,
+    /// and the values it writes are SwiftUI-observed @Observable properties.
+    @MainActor
+    private func startLevelMonitoring() {
+        stopLevelMonitoring()
+        peakHoldUntilHostTime = 0
+        levelMonitorTimer = Timer.scheduledTimer(
+            withTimeInterval: 1.0 / 20.0, repeats: true
+        ) { [weak self] _ in
+            guard let self else { return }
+            guard let channel = self.movieOutput
+                .connection(with: .audio)?.audioChannels.first
+            else {
+                if self.audioAveragePowerDB != nil { self.audioAveragePowerDB = nil }
+                if self.audioPeakHoldDB != nil { self.audioPeakHoldDB = nil }
+                return
+            }
+            // Custom peak hold on top of AVFoundation's `peakHoldLevel` so a
+            // brief transient stays visible ~1s — long enough for a glance
+            // at the bar to register that audio is actually flowing.
+            let avg = channel.averagePowerLevel
+            // Skip identical-value writes — @Observable doesn't diff and
+            // every assignment triggers a SwiftUI redraw of the meter.
+            if avg != self.audioAveragePowerDB {
+                self.audioAveragePowerDB = avg
+            }
+            let now = CACurrentMediaTime()
+            let currentPeak = self.audioPeakHoldDB ?? -160
+            if avg >= currentPeak || now > self.peakHoldUntilHostTime {
+                if avg != self.audioPeakHoldDB {
+                    self.audioPeakHoldDB = avg
+                }
+                self.peakHoldUntilHostTime = now + 1.0
+            }
+        }
+    }
+
+    @MainActor
+    private func stopLevelMonitoring() {
+        levelMonitorTimer?.invalidate()
+        levelMonitorTimer = nil
+        audioAveragePowerDB = nil
+        audioPeakHoldDB = nil
+    }
+
+    deinit {
+        // Safety net for the (theoretically possible) case where the
+        // controller is released between `didStartRecordingTo` and
+        // `didFinishRecordingTo` — the timer's [weak self] returns nil
+        // and self-cleans on the next tick, but invalidating here means
+        // the runloop drops it immediately rather than firing one more
+        // dead tick.
+        levelMonitorTimer?.invalidate()
     }
 
     // MARK: - Device discovery

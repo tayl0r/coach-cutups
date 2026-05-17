@@ -14,6 +14,7 @@ struct TransportBar: View {
     /// landed. Drives the live elapsed counter in `RecordingTransport`.
     /// nil when not recording.
     var recordingStartedAtHostTime: Double?
+    let capture: CaptureSessionController
     /// Invoked when the user clicks the Stop button during `.recording`.
     /// Wired by `ContentView` to the same handler as the R/Esc key path.
     var onStopRecording: () -> Void
@@ -35,6 +36,7 @@ struct TransportBar: View {
                     workspace: workspace,
                     appMode: $appMode,
                     startedAtHostTime: recordingStartedAtHostTime,
+                    capture: capture,
                     onStop: onStopRecording
                 )
             case .previewLoading:
@@ -223,6 +225,7 @@ struct RecordingTransport: View {
     /// Host time of t=0 for the active recording. Used to derive elapsed
     /// time. nil while `.recordingStarting`.
     var startedAtHostTime: Double?
+    let capture: CaptureSessionController
     var onStop: () -> Void
 
     private var isStarting: Bool { appMode == .recordingStarting }
@@ -256,6 +259,15 @@ struct RecordingTransport: View {
             }
 
             Spacer()
+
+            // Visible only after the file output opens; otherwise the
+            // ~500ms warmup would render a "no audio" state every record.
+            if !isStarting {
+                AudioLevelMeter(
+                    averageDB: capture.audioAveragePowerDB,
+                    peakDB: capture.audioPeakHoldDB
+                )
+            }
 
             Button(action: onStop) {
                 HStack(spacing: 4) {
@@ -434,6 +446,65 @@ fileprivate func formatDurationHMS(_ seconds: Double) -> String {
         return String(format: "%d:%02d:%02d", h, m, s)
     }
     return String(format: "%d:%02d", m, s)
+}
+
+private struct AudioLevelMeter: View {
+    let averageDB: Float?
+    let peakDB: Float?
+
+    /// Display window in dBFS. -60 is roughly a quiet room's noise floor;
+    /// speech reads around -25..-15, peaks may brush -6. Wider than that
+    /// and room noise wouldn't bottom out the bar.
+    private static let minDB: Float = -60
+    private static let maxDB: Float = 0
+
+    private static let levelGradient = LinearGradient(
+        stops: [
+            .init(color: .green, location: 0.0),
+            .init(color: .green, location: 0.66),
+            .init(color: .yellow, location: 0.9),
+            .init(color: .red, location: 1.0),
+        ],
+        startPoint: .leading,
+        endPoint: .trailing
+    )
+
+    private func normalize(_ db: Float?) -> Double {
+        guard let db, db.isFinite else { return 0 }
+        let clamped = max(Self.minDB, min(Self.maxDB, db))
+        return Double((clamped - Self.minDB) / (Self.maxDB - Self.minDB))
+    }
+
+    var body: some View {
+        let isLive = averageDB != nil
+        let avgFill = normalize(averageDB)
+        let peakFill = normalize(peakDB)
+        let barWidth: CGFloat = 90
+        let barHeight: CGFloat = 6
+
+        HStack(spacing: 4) {
+            Image(systemName: isLive ? "mic.fill" : "mic.slash")
+                .font(.system(size: 10))
+                .foregroundStyle(isLive ? Color.secondary : Color.orange)
+            ZStack(alignment: .leading) {
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Color.gray.opacity(0.25))
+                RoundedRectangle(cornerRadius: 1.5)
+                    .fill(Self.levelGradient)
+                    .frame(width: barWidth * CGFloat(avgFill))
+                if isLive, peakFill > 0 {
+                    Rectangle()
+                        .fill(Color.white.opacity(0.9))
+                        .frame(width: 1.5, height: barHeight)
+                        .offset(x: max(0, barWidth * CGFloat(peakFill) - 1.5))
+                }
+            }
+            .frame(width: barWidth, height: barHeight)
+        }
+        .help(isLive
+              ? String(format: "Mic level: %.0f dB", Double(averageDB!))
+              : "Waiting for audio…")
+    }
 }
 
 private struct VolumeSlider: View {
