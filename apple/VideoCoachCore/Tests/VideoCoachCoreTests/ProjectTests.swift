@@ -14,7 +14,7 @@ final class ProjectTests: XCTestCase {
         let data = try JSONEncoder().encode(p)
         let decoded = try JSONDecoder().decode(Project.self, from: data)
         XCTAssertEqual(decoded.name, "MyMatch")
-        XCTAssertEqual(decoded.formatVersion, 2)
+        XCTAssertEqual(decoded.formatVersion, 3)
         XCTAssertTrue(decoded.clips.isEmpty)
     }
 
@@ -67,7 +67,8 @@ final class ProjectTests: XCTestCase {
             "previewSourceVolume": 1.0,
             "previewCommentaryVolume": 1.0,
             "lastExportResolution": "r1080",
-            "lastExportQuality": "medium"
+            "lastExportQuality": "medium",
+            "pipForNewRecordings": true
           }
         }
         """.data(using: .utf8)!
@@ -110,5 +111,92 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(decodedStroke.id, strokeID)
         XCTAssertEqual(decodedStroke.points.count, 2)
         XCTAssertEqual(decodedStroke.lineWidth, 0.0125)
+    }
+
+    func test_freshProjectHasShowPiPDefaultsAndFormatVersion3() throws {
+        let p = Project(name: "M")
+        XCTAssertEqual(p.formatVersion, 3)
+        XCTAssertTrue(p.preferences.pipForNewRecordings)
+        var withClip = p
+        withClip.clips.append(Clip(
+            name: "c", sourceIndex: 0, startSourceSeconds: 0,
+            recordingDuration: 1, recordingFilename: "c.mov", sortIndex: 0
+        ))
+        XCTAssertTrue(withClip.clips[0].showPiP, "Clip.showPiP must default to true")
+    }
+
+    func test_showPiPFalseRoundtripsThroughJSON() throws {
+        var p = Project(name: "M")
+        p.preferences.pipForNewRecordings = false
+        p.clips.append(Clip(
+            name: "c", sourceIndex: 0, startSourceSeconds: 0,
+            recordingDuration: 1, recordingFilename: "c.mov",
+            showPiP: false, sortIndex: 0
+        ))
+        let data = try JSONEncoder().encode(p)
+        let decoded = try JSONDecoder().decode(Project.self, from: data)
+        XCTAssertFalse(decoded.preferences.pipForNewRecordings)
+        XCTAssertFalse(decoded.clips[0].showPiP)
+    }
+
+    func test_migrateV2ToV3_legacyJSONGetsDefaults() throws {
+        let legacy = """
+        {
+          "formatVersion": 2,
+          "name": "Legacy",
+          "sourceVideos": [],
+          "clips": [{
+            "id": "12345678-1234-1234-1234-123456789012",
+            "name": "old",
+            "notes": "",
+            "tags": [],
+            "sourceIndex": 0,
+            "startSourceSeconds": 0,
+            "recordingDuration": 1.0,
+            "recordingFilename": "c.mov",
+            "events": [],
+            "sortIndex": 0,
+            "createdAt": "2024-01-01T00:00:00Z"
+          }],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium"
+          }
+        }
+        """.data(using: .utf8)!
+        let migrated = try ProjectStore._testOnly_migrate(legacy)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Project.self, from: migrated)
+        XCTAssertEqual(decoded.formatVersion, 3)
+        XCTAssertTrue(decoded.preferences.pipForNewRecordings)
+        XCTAssertTrue(decoded.clips[0].showPiP)
+    }
+
+    func test_migrateV1ToV3_legacyJSONGetsDefaults() throws {
+        let legacy = """
+        {
+          "formatVersion": 1,
+          "name": "V1",
+          "sourceVideos": [],
+          "clips": [],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium"
+          }
+        }
+        """.data(using: .utf8)!
+        let migrated = try ProjectStore._testOnly_migrate(legacy)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let decoded = try decoder.decode(Project.self, from: migrated)
+        XCTAssertEqual(decoded.formatVersion, 3)
+        XCTAssertTrue(decoded.preferences.pipForNewRecordings)
     }
 }

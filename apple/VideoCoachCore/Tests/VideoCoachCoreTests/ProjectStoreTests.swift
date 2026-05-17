@@ -40,6 +40,36 @@ final class ProjectStoreTests: XCTestCase {
 
     /// Regression: encoder uses .iso8601 for dates; the decoder must match or
     /// any saved Clip (which has a createdAt: Date) will fail to read back.
+    func test_unsupportedFormatVersionV4_isRejected() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hide-pip-migrate-reject-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let v4 = """
+        {
+          "formatVersion": 4,
+          "name": "Future",
+          "sourceVideos": [],
+          "clips": [],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "pipForNewRecordings": true
+          }
+        }
+        """.data(using: .utf8)!
+        try v4.write(to: dir.appendingPathComponent("project.json"))
+        XCTAssertThrowsError(try ProjectStore.read(from: dir)) { error in
+            guard case ProjectStoreError.unsupportedFormatVersion(let v) = error else {
+                XCTFail("expected .unsupportedFormatVersion, got \(error)"); return
+            }
+            XCTAssertEqual(v, 4)
+        }
+    }
+
     func test_projectWithClipCreatedAtRoundtrips() throws {
         var p = Project(name: "WithClip")
         let clip = Clip(

@@ -15,17 +15,52 @@ public enum ProjectStore {
             throw ProjectStoreError.missingProjectJSON
         }
         let data = try Data(contentsOf: url)
+        let migratedData = try migrateIfNeeded(data)
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
-        let project = try decoder.decode(Project.self, from: data)
-        // Accept v1 (legacy) and v2 (added .zoom event variant). Newer formats
-        // are rejected so we don't silently misinterpret unknown future fields.
-        // Unknown CommentaryEvent.Kind discriminators within a v2 file decode
-        // as `.unknown` rather than throwing — see CommentaryEvent.swift.
-        if project.formatVersion < 1 || project.formatVersion > 2 {
+        let project = try decoder.decode(Project.self, from: migratedData)
+        if project.formatVersion < 1 || project.formatVersion > 3 {
             throw ProjectStoreError.unsupportedFormatVersion(project.formatVersion)
         }
         return project
+    }
+
+    /// Project file format migrator. Each `vN → v(N+1)` step is a small
+    /// in-blob patch — keeps `Project` / `Clip` / `Preferences` on
+    /// synthesized `Codable` so future field additions don't have to
+    /// remember to update a hand-rolled decoder. A forgotten migrator step
+    /// fails LOUD (decoder throws `.keyNotFound`); a forgotten
+    /// `decodeIfPresent` would fail SILENT (new field decodes as zero
+    /// without anyone noticing).
+    private static func migrateIfNeeded(_ data: Data) throws -> Data {
+        guard var root = try JSONSerialization.jsonObject(
+            with: data, options: []) as? [String: Any]
+        else { return data }
+        let version = (root["formatVersion"] as? Int) ?? 1
+        // Fast path for v3+ files. `ProjectStore.read` runs on every project
+        // open + Open Recent — once every project has been written as v3 the
+        // re-encode below would be pure overhead.
+        if version >= 3 { return data }
+
+        if var prefs = root["preferences"] as? [String: Any] {
+            if prefs["pipForNewRecordings"] == nil {
+                prefs["pipForNewRecordings"] = true
+                root["preferences"] = prefs
+            }
+        }
+        if var clips = root["clips"] as? [[String: Any]] {
+            for i in clips.indices where clips[i]["showPiP"] == nil {
+                clips[i]["showPiP"] = true
+            }
+            root["clips"] = clips
+        }
+        root["formatVersion"] = 3
+
+        return try JSONSerialization.data(withJSONObject: root, options: [])
+    }
+
+    internal static func _testOnly_migrate(_ data: Data) throws -> Data {
+        try migrateIfNeeded(data)
     }
 
     public static func write(_ project: Project, to folder: URL) throws {
