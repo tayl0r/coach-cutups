@@ -268,6 +268,69 @@ final class CompilationExporterE2ETests: XCTestCase {
             "PiP's bottom slice B channel; got \(rgb).")
     }
 
+    func test_exportSuppressesPiPWhenClipShowPiPFalse() async throws {
+        // Mirrors the existing PiP-positive tests but with showPiP=false on
+        // the single clip. The bottom-right corner of the output must be
+        // source pixels, not the webcam's solid dark-gray.
+        let clip = Clip(
+            name: "noPiP",
+            tags: ["test"],
+            sourceIndex: 0,
+            startSourceSeconds: 0,
+            recordingDuration: 2,
+            recordingFilename: camURL.lastPathComponent,
+            events: [
+                .init(recordTime: 0, kind: .zoom(.identity)),
+                .init(recordTime: 0, kind: .play(sourceTime: 0)),
+            ],
+            showPiP: false,
+            sortIndex: 0
+        )
+
+        var project = Project(name: "hide-pip-export-e2e")
+        project.clips = [clip]
+        let plan = project.compilationPlan(
+            for: "test",
+            sourceDurations: [0: Self.sourceDuration]
+        )
+        XCTAssertEqual(plan.entries.count, 1)
+
+        let sourceAsset = AVURLAsset(url: srcURL)
+        let webcamAsset = AVURLAsset(url: camURL)
+        let exporter = CompilationExporter()
+        try await exporter.export(
+            plan: plan,
+            clipsByID: [clip.id: clip],
+            sourceAssets: [0: sourceAsset],
+            clipWebcamAssets: [clip.id: webcamAsset],
+            outputURL: outURL,
+            resolution: .r720,
+            quality: .medium,
+            sourceVolume: 1.0,
+            commentaryVolume: 1.0
+        )
+        XCTAssertTrue(FileManager.default.fileExists(atPath: outURL.path))
+
+        // Probe inside the original PiP region (CGImage x≈0.91, y≈0.85 —
+        // PiP x ∈ [0.758, 0.978], y ∈ [0.813, 0.978]) but ABOVE the text-
+        // bar strip (bar y ∈ [0.92, 1.0]), so the bar's semi-transparent
+        // black fill doesn't contaminate the sample. With showPiP=false
+        // this pixel comes from the FiducialAsset source background
+        // (mid-gray 0x80 ≈ 0.5 per channel). With PiP drawn (the
+        // regression we're guarding against), it would instead be the
+        // webcam dark-gray (0x40, 0x40, 0x40 ≈ 0.25 per channel,
+        // ≈0.32 after BT.709 + HEVC drift).
+        let cg = try await sampleFrame(of: outURL, atOutputTime: 0.5)
+        let pipProbeRect = CGRect(x: 0.91, y: 0.85, width: 0.04, height: 0.04)
+        let pipRGB = PixelSampling.averageRGB(in: cg, normalizedRect: pipProbeRect)
+        print("[exporter hide-PiP] bottom-right probe: \(pipRGB) — expect non-gray source pixels")
+        let maxChannel = max(pipRGB.r, pipRGB.g, pipRGB.b)
+        XCTAssertGreaterThan(
+            maxChannel, 0.40,
+            "bottom-right looks like webcam dark-gray (~0.32/ch after drift) — PiP drew despite showPiP=false. Sample=\(pipRGB)"
+        )
+    }
+
     // MARK: - Helpers
 
     private func runExport(clip: Clip) async throws {
