@@ -111,4 +111,20 @@ final class PreviewCompositorTests: XCTestCase {
         XCTAssertLessThan(pip.g, 0.25, "PiP center should be red, was \(pip)")
         XCTAssertLessThan(pip.b, 0.25, "PiP center should be red, was \(pip)")
     }
+
+    func test_make_withInvalidWebcamTrackID_omitsWebcamFromRequired() {
+        let inst = PreviewInstruction.make(
+            sourceTrackID: 1,
+            webcamTrackID: kCMPersistentTrackID_Invalid,
+            compositionStart: .zero,
+            clipDuration: CMTime(seconds: 1, preferredTimescale: 600),
+            segments: [],
+            frozenFrames: [:],
+            events: []
+        )
+        XCTAssertEqual(inst.requiredSourceTrackIDs.count, 1,
+                       "invalid webcam ID must be omitted from required tracks")
+        XCTAssertEqual(inst.requiredSourceTrackIDs[0] as? NSNumber,
+                       NSNumber(value: Int32(1)))
+    }
 }

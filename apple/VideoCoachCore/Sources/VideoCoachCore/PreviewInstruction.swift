@@ -55,10 +55,15 @@ public final class PreviewInstruction: AVMutableVideoCompositionInstruction, @un
     ) -> PreviewInstruction {
         let i = PreviewInstruction()
         i.timeRange = CMTimeRange(start: compositionStart, duration: clipDuration)
-        i._requiredSourceTrackIDs = [
-            NSNumber(value: sourceTrackID),
-            NSNumber(value: webcamTrackID),
-        ]
+        if webcamTrackID == kCMPersistentTrackID_Invalid {
+            // PiP suppressed: AVPlayer doesn't need to vend a webcam frame.
+            i._requiredSourceTrackIDs = [NSNumber(value: sourceTrackID)]
+        } else {
+            i._requiredSourceTrackIDs = [
+                NSNumber(value: sourceTrackID),
+                NSNumber(value: webcamTrackID),
+            ]
+        }
         i.clipIndex = clipIndex
         i.sourceTrackID = sourceTrackID
         i.webcamTrackID = webcamTrackID
