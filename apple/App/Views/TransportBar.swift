@@ -541,17 +541,12 @@ private struct VolumeSlider: View {
 private struct PiPToggle: View {
     @Bindable var workspace: Workspace
     var body: some View {
-        Toggle(isOn: Binding(
-            get: { workspace.project.preferences.pipForNewRecordings },
-            set: { newValue in
-                workspace.project.preferences.pipForNewRecordings = newValue
+        Toggle("PiP", isOn: Bindable(workspace).project.preferences.pipForNewRecordings)
+            .toggleStyle(.checkbox)
+            .help("Show webcam picture-in-picture on new clips")
+            .disabled(workspace.folder == nil)
+            .onChange(of: workspace.project.preferences.pipForNewRecordings) { _, _ in
                 try? workspace.saveProject()
             }
-        )) {
-            Text("PiP")
-        }
-        .toggleStyle(.checkbox)
-        .help("Show webcam picture-in-picture on new clips")
-        .disabled(workspace.folder == nil)
     }
 }
