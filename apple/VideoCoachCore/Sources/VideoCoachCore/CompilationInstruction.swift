@@ -37,6 +37,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
     /// helper unchanged (which needs the events list to honor `.clearAll`).
     public var events: [CommentaryEvent] = []
     public var textBarLine: String = ""
+    public var showPiP: Bool = true
 
     private var _requiredSourceTrackIDs: [NSValue] = []
     public override var requiredSourceTrackIDs: [NSValue] {
@@ -53,6 +54,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         clipDuration: CMTime,
         sourceTrackID: CMPersistentTrackID = 1,
         webcamTrackID: CMPersistentTrackID,
+        showPiP: Bool = true,
         segments: [PlaybackSegment],
         strokes: [Stroke],
         events: [CommentaryEvent],
@@ -77,6 +79,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         i.strokes = strokes
         i.events = events
         i.textBarLine = textBarLine
+        i.showPiP = showPiP
         return i
     }
 }
