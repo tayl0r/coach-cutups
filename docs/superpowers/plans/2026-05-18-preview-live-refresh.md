@@ -26,12 +26,15 @@
 
 - Modify: `apple/App/Preview/ClipPreviewBuilder.swift`
 - Modify: `apple/App/Models/Workspace.swift`
+- Modify: `apple/Tests/AppTests/ClipPreviewBuilderTests.swift`
 
 This task is the structural refactor. Behavior is unchanged at this step: `buildPreviewItem` still returns an `AVPlayerItem` that draws PiP exactly as today (or omits it exactly as today, based on initial `clip.showPiP`). What changes is that `Workspace` now caches enough state to rebuild Phase B on demand without re-running Phase A.
 
-- [ ] **Step 1: Define `PreviewCacheEntry` in `Workspace.swift`**
+- [ ] **Step 1: Define `PreviewCacheEntry` at the top of `ClipPreviewBuilder.swift`**
 
-Add a file-private (or nested) struct above the existing `_previewCache` declaration:
+Place the struct above `ClipPreviewBuilderError` in `apple/App/Preview/ClipPreviewBuilder.swift`. The struct lives here (not in `Workspace.swift`) because: (a) it's the direct output of Phase A, (b) `ClipPreviewBuilder.swift` already imports `AVFoundation` / `CoreMedia` / `CoreGraphics` (its only deps), (c) it's already in `VideoCoachTests.sources` in `project.yml` so the test bundle sees it for free, and (d) the file is 454 lines today — adding a 9-line struct doesn't make it overgrown, and the project's convention is to keep small builder-output types in the builder file (cf. `ClipPreviewBuilderError`).
+
+Putting it in `Workspace.swift` would force `App/Models/Workspace.swift` into `VideoCoachTests.sources`, which transitively requires `MPVKit` and `ProjectStore` in the test bundle — a heavy dependency for a 9-line data carrier.
 
 ```swift
 /// Cached preview state for a single clip. Phase A of `ClipPreviewBuilder`
@@ -235,9 +238,7 @@ private func buildEntry(showPiP: Bool) async throws -> PreviewCacheEntry {
 }
 ```
 
-(`PreviewCacheEntry` is visible to the test bundle because Workspace.swift is built into the `VideoCoach` app target, and `@testable import VideoCoachCore` doesn't reach App-target types. Add `App/Models/Workspace.swift` to `VideoCoachTests.sources` in `project.yml` so the struct is visible. `@testable import` from the test target into the app target isn't a thing for non-package code; the existing test-bundle setup compiles app sources directly. Verify by reading the current `VideoCoachTests.sources` block — it already includes `App/Recording/RecordingController.swift`, `App/Preview/ClipPreviewBuilder.swift`, and `App/Models/Workspace.swift` is the natural addition.)
-
-If adding `Workspace.swift` to the test target's sources pulls in app-target dependencies that don't compile in a unit-test bundle (e.g. SwiftUI views via cross-imports), STOP and report. Workspace itself imports `Foundation`, `VideoCoachCore`, `AVFoundation`, `Observation`, `QuartzCore` — all should be fine. But its compilation may transitively need other app files if the file references types declared in sibling files (e.g. `RecordingController` is one; it's already in the test target). Check `Workspace.swift`'s declarations for any sibling references and ensure they're also in `VideoCoachTests.sources` OR are reachable via the package import.
+`PreviewCacheEntry` is visible to the test bundle because it's defined at the top of `ClipPreviewBuilder.swift`, which is already in `VideoCoachTests.sources` (added during the predecessor hide-PiP plan's Task 5). No `project.yml` change is needed.
 
 - [ ] **Step 6: Run the test target, confirm green**
 
@@ -271,7 +272,6 @@ Expected: `** BUILD SUCCEEDED **`.
 ```bash
 git add apple/App/Preview/ClipPreviewBuilder.swift \
         apple/App/Models/Workspace.swift \
-        apple/project.yml \
         apple/Tests/AppTests/ClipPreviewBuilderTests.swift
 git commit -m "$(cat <<'EOF'
 preview: split builder into geometry + composition phases
@@ -304,7 +304,7 @@ EOF
 
 This task adds the live-swap API and changes the call sites that drove the clear-and-reselect hack from Task 9 to use it instead.
 
-- [ ] **Step 1: Add `Workspace.setShowPiP(_:for:)`**
+- [ ] **Step 1: Add `Workspace.setShowPiP(_:for:)` and close the toggle-during-build race in `preparePreviewPlayer`**
 
 In `apple/App/Models/Workspace.swift`, alongside `previewPlayer(for:)` / `invalidatePreviewCache(for:)`:
 
@@ -328,52 +328,58 @@ func setShowPiP(_ showPiP: Bool, for id: Clip.ID) {
 }
 ```
 
-- [ ] **Step 2: Write the failing live-swap test**
-
-Append to `apple/Tests/AppTests/ClipPreviewBuilderTests.swift`:
+Then amend `preparePreviewPlayer(for:)` (changed in Task 1 Step 4) to sync if `showPiP` was toggled during Phase A. The inspector PiP toggle is interactive throughout `.previewLoading` (no `.disabled` gate on the inspector pane), so a user can toggle during the 100-800ms build window. Without this sync, the cache lands with the snapshot's pre-toggle `showPiP` value and the user sees the wrong PiP state until they toggle again. Up until Task 2 Step 6 drops the `.onChange` clear-and-reselect, the Task 9 modifier masks this — but Task 2 Step 6 removes that safety net, so this fix is load-bearing for the final shape.
 
 ```swift
-@MainActor
-func test_setShowPiP_swapsLayerInstructionsInPlace() async throws {
-    // Build the initial entry with showPiP=true; install it in a
-    // local workspace cache; flip via setShowPiP; assert the same
-    // AVPlayer's currentItem.videoComposition now has 1 layer
-    // instruction instead of 2.
-    var project = Project(name: "live-swap")
-    let bookmark = try srcURL.bookmarkData(options: [])
-    project.sourceVideos.append(.init(
-        bookmark: bookmark,
-        displayName: srcURL.lastPathComponent,
-        durationSeconds: 1.0
-    ))
-    let clip = Clip(
-        name: "c",
-        sourceIndex: 0,
-        startSourceSeconds: 0,
-        recordingDuration: 1.0,
-        recordingFilename: webcamFilename,
-        events: [.init(recordTime: 0, kind: .play(sourceTime: 0))],
-        showPiP: true,
-        sortIndex: 0
-    )
-    project.clips = [clip]
+private func preparePreviewPlayer(for id: Clip.ID) async throws {
+    guard let clip = project.clips.first(where: { $0.id == id }),
+          let folder = self.folder else { return }
+    let snapshot = project
     let entry = try await ClipPreviewBuilder.buildPreviewEntry(
         for: clip,
-        project: project,
-        projectFolder: projectFolder
+        project: snapshot,
+        projectFolder: folder
     )
-    let player = entry.player
-    let item = try XCTUnwrap(player.currentItem)
-
-    // Sanity check the initial state: two layer instructions.
-    do {
-        let vc = try XCTUnwrap(item.videoComposition)
-        let inst = try XCTUnwrap(vc.instructions.first as? AVVideoCompositionInstruction)
-        XCTAssertEqual(inst.layerInstructions.count, 2)
+    entry.player.currentItem?.audioMix = audioMix(for: clip)
+    entry.player.volume = 1.0
+    _previewCache[id] = entry
+    // If `showPiP` was toggled while Phase A was in flight, the cached
+    // entry was built with the stale snapshot value. Re-read the live
+    // value and re-run Phase B in place if it differs.
+    if let currentClip = project.clips.first(where: { $0.id == id }),
+       currentClip.showPiP != clip.showPiP {
+        setShowPiP(currentClip.showPiP, for: id)
     }
+    _previewFailed.removeValue(forKey: id)
+}
+```
+
+- [ ] **Step 2: Write the failing live-swap test**
+
+Append to `apple/Tests/AppTests/ClipPreviewBuilderTests.swift`. Reuses the existing `buildEntry(showPiP:)` helper (the renamed `buildItem` from Task 1 Step 5) so the test focuses on what's new — the layer-instruction swap — instead of re-staging Project/Clip/bookmark setup.
+
+```swift
+/// Verifies that `makeVideoComposition` — the helper that
+/// `Workspace.setShowPiP(_:for:)` wraps — correctly rebuilds the
+/// composition with one vs. two layer instructions when called against
+/// a live AVPlayerItem. The guard in `setShowPiP`
+/// (`guard let entry = _previewCache[id] else { return }`) is a
+/// trivial cache-miss no-op; exercising it end-to-end would require
+/// constructing a full `Workspace` with a real project folder, which
+/// transitively pulls MPVKit and ProjectStore into the test bundle —
+/// not worth it for a one-line guard.
+@MainActor
+func test_makeVideoComposition_swapsLayerInstructionsInPlace() async throws {
+    let entry = try await buildEntry(showPiP: true)
+    let item = try XCTUnwrap(entry.player.currentItem)
+
+    // Sanity: two layer instructions initially.
+    let vcBefore = try XCTUnwrap(item.videoComposition)
+    let instBefore = try XCTUnwrap(vcBefore.instructions.first as? AVVideoCompositionInstruction)
+    XCTAssertEqual(instBefore.layerInstructions.count, 2)
 
     // Flip via the helper that setShowPiP wraps.
-    let newVC = ClipPreviewBuilder.makeVideoComposition(
+    item.videoComposition = ClipPreviewBuilder.makeVideoComposition(
         renderSize: entry.renderSize,
         clipDuration: entry.clipDuration,
         sourceTrackID: entry.sourceTrackID,
@@ -382,7 +388,6 @@ func test_setShowPiP_swapsLayerInstructionsInPlace() async throws {
         webcamLayer: entry.webcamLayer,
         showPiP: false
     )
-    item.videoComposition = newVC
 
     // After the swap: the SAME AVPlayer instance now sees a single
     // layer instruction.
@@ -392,7 +397,7 @@ func test_setShowPiP_swapsLayerInstructionsInPlace() async throws {
         "live-swap must reduce layer count to 1 without rebuilding the player")
 
     // Flip back to confirm symmetry.
-    let restoredVC = ClipPreviewBuilder.makeVideoComposition(
+    item.videoComposition = ClipPreviewBuilder.makeVideoComposition(
         renderSize: entry.renderSize,
         clipDuration: entry.clipDuration,
         sourceTrackID: entry.sourceTrackID,
@@ -409,17 +414,15 @@ func test_setShowPiP_swapsLayerInstructionsInPlace() async throws {
 }
 ```
 
-- [ ] **Step 3: Run the test, confirm it FAILS to compile**
+- [ ] **Step 3: Run the test, confirm it passes**
 
 ```
 cd apple && xcodebuild -project VideoCoach.xcodeproj -scheme VideoCoach \
-  -only-testing:VideoCoachTests/ClipPreviewBuilderTests/test_setShowPiP_swapsLayerInstructionsInPlace test 2>&1 \
+  -only-testing:VideoCoachTests/ClipPreviewBuilderTests/test_makeVideoComposition_swapsLayerInstructionsInPlace test 2>&1 \
   | grep -E "Test Case|error:|\*\* (BUILD|TEST)"
 ```
 
-Expected: compile error — `makeVideoComposition` doesn't exist yet (Task 1 must have shipped the refactor; if it's already in place, the test should compile and pass for the helper-direct portion, since the helper is what produces the new vc).
-
-Hmm — if Task 1 already shipped, the helper already exists and the test passes outright. That's fine; this test is verifying the contract works as designed. The "failing" red phase is conceptual.
+Expected: pass. Task 1 already shipped `makeVideoComposition`, so the helper exists and the test verifies the contract works end-to-end against a real built `AVPlayerItem`. No conceptual red phase here — the test is a forward-looking check that the swap mechanism does what the rest of Task 2 relies on.
 
 - [ ] **Step 4: Modify `Workspace.applyInverse(of:)` and `applyForward(of:)` to use `setShowPiP` instead of `invalidatePreviewCache`**
 
@@ -429,16 +432,19 @@ The existing `.editClip` cases (around lines 543–549 and 573–578 of `Workspa
 case let .editClip(id, before, _):
     if let i = project.clips.firstIndex(where: { $0.id == id }) {
         project.clips[i] = before
-        // The only clip field that affects the rendered preview is
-        // `showPiP`; other field edits (name, tags, notes) don't
-        // touch playback. Use the live-swap so undo of a PiP toggle
-        // doesn't pay the ~100-800ms full-rebuild cost.
+        // Among all Clip fields reachable from the inspector today, only
+        // `showPiP` affects rendered playback — name, tags, and notes are
+        // pure metadata. `events` affects playback (zoom keyframes, freeze
+        // segments) but is set at recording time and has no inspector UI.
+        // If a future field both affects playback AND gains inspector UI,
+        // this call site must also call `invalidatePreviewCache(for: id)`
+        // for that field.
         setShowPiP(before.showPiP, for: id)
         try? saveProject()
     }
 ```
 
-Mirror change in `applyForward`:
+Mirror change in `applyForward` (same comment):
 
 ```swift
 case let .editClip(id, _, after):
