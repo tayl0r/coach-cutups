@@ -55,6 +55,57 @@ final class ClipPreviewBuilderTests: XCTestCase {
             "showPiP=false must emit only the source layer instruction")
     }
 
+    /// Verifies that `makeVideoComposition` — the helper that
+    /// `Workspace.setShowPiP(_:for:)` wraps — correctly rebuilds the
+    /// composition with one vs. two layer instructions when called against
+    /// a live AVPlayerItem. The guard in `setShowPiP`
+    /// (`guard let entry = _previewCache[id] else { return }`) is a
+    /// trivial cache-miss no-op; exercising it end-to-end would require
+    /// constructing a full `Workspace` with a real project folder, which
+    /// transitively pulls MPVKit and ProjectStore into the test bundle —
+    /// not worth it for a one-line guard.
+    @MainActor
+    func test_makeVideoComposition_swapsLayerInstructionsInPlace() async throws {
+        let entry = try await buildEntry(showPiP: true)
+        let item = try XCTUnwrap(entry.player.currentItem)
+
+        // Sanity: two layer instructions initially.
+        let vcBefore = try XCTUnwrap(item.videoComposition)
+        let instBefore = try XCTUnwrap(vcBefore.instructions.first as? AVVideoCompositionInstruction)
+        XCTAssertEqual(instBefore.layerInstructions.count, 2)
+
+        // Flip via the helper that setShowPiP wraps.
+        item.videoComposition = ClipPreviewBuilder.makeVideoComposition(
+            renderSize: entry.renderSize,
+            clipDuration: entry.clipDuration,
+            sourceTrackID: entry.sourceTrackID,
+            webcamTrackID: entry.webcamTrackID,
+            sourceLayer: entry.sourceLayer,
+            webcamLayer: entry.webcamLayer,
+            showPiP: false
+        )
+
+        let vcAfter = try XCTUnwrap(item.videoComposition)
+        let instAfter = try XCTUnwrap(vcAfter.instructions.first as? AVVideoCompositionInstruction)
+        XCTAssertEqual(instAfter.layerInstructions.count, 1,
+            "live-swap must reduce layer count to 1 without rebuilding the player")
+
+        // Flip back to confirm symmetry.
+        item.videoComposition = ClipPreviewBuilder.makeVideoComposition(
+            renderSize: entry.renderSize,
+            clipDuration: entry.clipDuration,
+            sourceTrackID: entry.sourceTrackID,
+            webcamTrackID: entry.webcamTrackID,
+            sourceLayer: entry.sourceLayer,
+            webcamLayer: entry.webcamLayer,
+            showPiP: true
+        )
+        let vcRestored = try XCTUnwrap(item.videoComposition)
+        let instRestored = try XCTUnwrap(vcRestored.instructions.first as? AVVideoCompositionInstruction)
+        XCTAssertEqual(instRestored.layerInstructions.count, 2,
+            "live-swap back to showPiP=true must restore both layer instructions")
+    }
+
     private func buildEntry(showPiP: Bool) async throws -> PreviewCacheEntry {
         var project = Project(name: "preview-builder")
         let bookmark = try srcURL.bookmarkData(options: [])

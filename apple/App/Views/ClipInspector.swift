@@ -251,7 +251,7 @@ private struct EditorView: View {
                         clip.showPiP = newValue
                         workspace.commitClipEdit(id: clip.id, before: before, after: clip)
                         try? workspace.saveProject()
-                        workspace.invalidatePreviewCache(for: clip.id)
+                        workspace.setShowPiP(newValue, for: clip.id)
                     }
                 ))
                 .toggleStyle(.checkbox)

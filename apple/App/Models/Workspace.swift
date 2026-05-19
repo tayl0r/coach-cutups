@@ -448,6 +448,24 @@ final class Workspace {
         _previewFailed.removeValue(forKey: id)
     }
 
+    /// Swap the cached preview's PiP visibility without rebuilding the
+    /// composition or re-loading assets. If no cache entry exists yet
+    /// (preview never opened, or already invalidated), this is a no-op —
+    /// the next preview build will pick up the current `clip.showPiP`.
+    func setShowPiP(_ showPiP: Bool, for id: Clip.ID) {
+        guard let entry = _previewCache[id] else { return }
+        let newVC = ClipPreviewBuilder.makeVideoComposition(
+            renderSize: entry.renderSize,
+            clipDuration: entry.clipDuration,
+            sourceTrackID: entry.sourceTrackID,
+            webcamTrackID: entry.webcamTrackID,
+            sourceLayer: entry.sourceLayer,
+            webcamLayer: entry.webcamLayer,
+            showPiP: showPiP
+        )
+        entry.player.currentItem?.videoComposition = newVC
+    }
+
     /// Per-project undo/redo machinery. Pure-data; lives in
     /// `VideoCoachCore` so the package's existing test target can cover
     /// the stack semantics without dragging in MPVKit. Application of
@@ -544,7 +562,14 @@ final class Workspace {
         case let .editClip(id, before, _):
             if let i = project.clips.firstIndex(where: { $0.id == id }) {
                 project.clips[i] = before
-                invalidatePreviewCache(for: id)
+                // Among all Clip fields reachable from the inspector today, only
+                // `showPiP` affects rendered playback — name, tags, and notes are
+                // pure metadata. `events` affects playback (zoom keyframes, freeze
+                // segments) but is set at recording time and has no inspector UI.
+                // If a future field both affects playback AND gains inspector UI,
+                // this call site must also call `invalidatePreviewCache(for: id)`
+                // for that field.
+                setShowPiP(before.showPiP, for: id)
                 try? saveProject()
             }
         case let .reorderClips(beforeOrder, _):
@@ -574,7 +599,14 @@ final class Workspace {
         case let .editClip(id, _, after):
             if let i = project.clips.firstIndex(where: { $0.id == id }) {
                 project.clips[i] = after
-                invalidatePreviewCache(for: id)
+                // Among all Clip fields reachable from the inspector today, only
+                // `showPiP` affects rendered playback — name, tags, and notes are
+                // pure metadata. `events` affects playback (zoom keyframes, freeze
+                // segments) but is set at recording time and has no inspector UI.
+                // If a future field both affects playback AND gains inspector UI,
+                // this call site must also call `invalidatePreviewCache(for: id)`
+                // for that field.
+                setShowPiP(after.showPiP, for: id)
                 try? saveProject()
             }
         case let .reorderClips(_, afterOrder):
@@ -623,6 +655,13 @@ final class Workspace {
         entry.player.currentItem?.audioMix = audioMix(for: clip)
         entry.player.volume = 1.0
         _previewCache[id] = entry
+        // If `showPiP` was toggled while Phase A was in flight, the cached
+        // entry was built with the stale snapshot value. Re-read the live
+        // value and re-run Phase B in place if it differs.
+        if let currentClip = project.clips.first(where: { $0.id == id }),
+           currentClip.showPiP != clip.showPiP {
+            setShowPiP(currentClip.showPiP, for: id)
+        }
         _previewFailed.removeValue(forKey: id)
     }
 
