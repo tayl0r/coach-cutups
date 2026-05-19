@@ -332,6 +332,7 @@ public actor CompilationExporter {
                 clipDuration: entryRange.duration,
                 sourceTrackID: sourceVideoTrackID,
                 webcamTrackID: webcamID,
+                showPiP: clip.showPiP,
                 segments: entry.segments,
                 strokes: strokes,
                 events: drawingEvents,

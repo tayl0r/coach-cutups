@@ -141,6 +141,8 @@ struct ScanningTransport: View {
             }
 
             Spacer()
+
+            PiPToggle(workspace: workspace)
         }
     }
 
@@ -259,6 +261,8 @@ struct RecordingTransport: View {
             }
 
             Spacer()
+
+            PiPToggle(workspace: workspace)
 
             // Visible only after the file output opens; otherwise the
             // ~500ms warmup would render a "no audio" state every record.
@@ -527,5 +531,22 @@ private struct VolumeSlider: View {
             .frame(width: 100)
             .onChange(of: value) { _, new in onChange?(new) }
         }
+    }
+}
+
+/// Shared "PiP?" checkbox rendered in both `ScanningTransport` and
+/// `RecordingTransport`. Bound to the project-level preference; the
+/// value is sampled at clip-stop in `ContentView.stopRecording` and
+/// written to the new clip's `showPiP`.
+private struct PiPToggle: View {
+    @Bindable var workspace: Workspace
+    var body: some View {
+        Toggle("PiP", isOn: Bindable(workspace).project.preferences.pipForNewRecordings)
+            .toggleStyle(.checkbox)
+            .help("Show webcam picture-in-picture on new clips")
+            .disabled(workspace.folder == nil)
+            .onChange(of: workspace.project.preferences.pipForNewRecordings) { _, _ in
+                try? workspace.saveProject()
+            }
     }
 }

@@ -150,7 +150,7 @@ final class Workspace {
     /// preparation Task that hands off finished `AVPlayerItem`s built by
     /// `ClipPreviewBuilder`. Lookup-only via `previewPlayer(for:)`; that
     /// method also kicks off the build Task on a cache miss.
-    private var _previewCache: [Clip.ID: AVPlayer] = [:]
+    private var _previewCache: [Clip.ID: PreviewCacheEntry] = [:]
     /// Clip IDs whose preview is currently being built. Prevents a SwiftUI
     /// thundering herd (several view re-renders during the load window) from
     /// spawning duplicate Tasks per clip.
@@ -420,7 +420,7 @@ final class Workspace {
     /// the error so the UI can show it without re-attempting on every
     /// subsequent re-render.
     func previewPlayer(for id: Clip.ID) -> AVPlayer? {
-        if let cached = _previewCache[id] { return cached }
+        if let cached = _previewCache[id] { return cached.player }
         if _previewFailed[id] != nil { return nil }
         guard !_previewInflight.contains(id) else { return nil }
         _previewInflight.insert(id)
@@ -446,6 +446,16 @@ final class Workspace {
     func invalidatePreviewCache(for id: Clip.ID) {
         _previewCache.removeValue(forKey: id)
         _previewFailed.removeValue(forKey: id)
+    }
+
+    /// Swap the cached preview's PiP visibility without rebuilding the
+    /// composition or re-loading assets. If no cache entry exists yet
+    /// (preview never opened, or already invalidated), this is a no-op —
+    /// the next preview build will pick up the current `clip.showPiP`.
+    func setShowPiP(_ showPiP: Bool, for id: Clip.ID) {
+        guard let entry = _previewCache[id] else { return }
+        entry.player.currentItem?.videoComposition =
+            ClipPreviewBuilder.makeVideoComposition(entry: entry, showPiP: showPiP)
     }
 
     /// Per-project undo/redo machinery. Pure-data; lives in
@@ -544,7 +554,13 @@ final class Workspace {
         case let .editClip(id, before, _):
             if let i = project.clips.firstIndex(where: { $0.id == id }) {
                 project.clips[i] = before
-                invalidatePreviewCache(for: id)
+                // `showPiP` is the only inspector-editable field that needs an
+                // imperative side-effect: AVFoundation doesn't observe @Observable,
+                // so the video composition must be swapped explicitly. `name` and
+                // `tags` appear in the SwiftUI preview overlay and export text bar
+                // but re-render automatically when `project` is written. (`events`
+                // also affects composition but has no inspector UI yet.)
+                setShowPiP(before.showPiP, for: id)
                 try? saveProject()
             }
         case let .reorderClips(beforeOrder, _):
@@ -574,7 +590,13 @@ final class Workspace {
         case let .editClip(id, _, after):
             if let i = project.clips.firstIndex(where: { $0.id == id }) {
                 project.clips[i] = after
-                invalidatePreviewCache(for: id)
+                // `showPiP` is the only inspector-editable field that needs an
+                // imperative side-effect: AVFoundation doesn't observe @Observable,
+                // so the video composition must be swapped explicitly. `name` and
+                // `tags` appear in the SwiftUI preview overlay and export text bar
+                // but re-render automatically when `project` is written. (`events`
+                // also affects composition but has no inspector UI yet.)
+                setShowPiP(after.showPiP, for: id)
                 try? saveProject()
             }
         case let .reorderClips(_, afterOrder):
@@ -615,15 +637,21 @@ final class Workspace {
         guard let clip = project.clips.first(where: { $0.id == id }),
               let folder = self.folder else { return }
         let snapshot = project   // copy off the main actor for the nonisolated build
-        let item = try await ClipPreviewBuilder.buildPreviewItem(
+        let entry = try await ClipPreviewBuilder.buildPreviewEntry(
             for: clip,
             project: snapshot,
             projectFolder: folder
         )
-        item.audioMix = audioMix(for: clip)
-        let player = AVPlayer(playerItem: item)
-        player.volume = 1.0
-        _previewCache[id] = player
+        entry.player.currentItem?.audioMix = audioMix(for: clip)
+        entry.player.volume = 1.0
+        _previewCache[id] = entry
+        // If `showPiP` was toggled while Phase A was in flight, the cached
+        // entry was built with the stale snapshot value. Re-read the live
+        // value and re-run Phase B in place if it differs.
+        if let currentClip = project.clips.first(where: { $0.id == id }),
+           currentClip.showPiP != clip.showPiP {
+            setShowPiP(currentClip.showPiP, for: id)
+        }
         _previewFailed.removeValue(forKey: id)
     }
 
@@ -648,8 +676,8 @@ final class Workspace {
     /// changes take effect during playback.
     func updatePreviewVolumes(for id: Clip.ID) {
         guard let clip = project.clips.first(where: { $0.id == id }),
-              let player = _previewCache[id] else { return }
-        player.currentItem?.audioMix = audioMix(for: clip)
+              let entry = _previewCache[id] else { return }
+        entry.player.currentItem?.audioMix = audioMix(for: clip)
     }
 
     // MARK: - Clip ordering

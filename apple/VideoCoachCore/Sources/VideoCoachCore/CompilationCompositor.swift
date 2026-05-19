@@ -98,6 +98,7 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
         } else {
             webcamTrackID = kCMPersistentTrackID_Invalid
         }
+        let showPiP: Bool = inst?.showPiP ?? true
 
         let base: CVPixelBuffer? = request.sourceFrame(byTrackID: sourceTrackID)
         let webcam: CVPixelBuffer? = request.sourceFrame(byTrackID: webcamTrackID)
@@ -164,7 +165,7 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
             composite = barFill.composited(over: composite)
         }
 
-        if let webcam {
+        if showPiP, let webcam {
             let camCI = CIImage(cvPixelBuffer: webcam)
             let camW = camCI.extent.width
             let camH = camCI.extent.height

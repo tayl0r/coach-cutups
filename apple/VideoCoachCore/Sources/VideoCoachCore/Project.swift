@@ -32,6 +32,7 @@ public struct Preferences: Codable, Hashable, Sendable {
     /// `AVCaptureDevice.uniqueID` of the user's preferred microphone. Same
     /// fallback semantics as `preferredCameraID`.
     public var preferredMicID: String? = nil
+    public var pipForNewRecordings: Bool = true
     public init() {}
 }
 
@@ -57,6 +58,7 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
     public var recordingFilename: String
 
     public var events: [CommentaryEvent]
+    public var showPiP: Bool
     public var sortIndex: Int
     public var createdAt: Date
 
@@ -70,18 +72,21 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
         recordingDuration: Double,
         recordingFilename: String,
         events: [CommentaryEvent] = [],
+        showPiP: Bool = true,
         sortIndex: Int,
         createdAt: Date = .init()
     ) {
         self.id = id; self.name = name; self.notes = notes; self.tags = tags
         self.sourceIndex = sourceIndex; self.startSourceSeconds = startSourceSeconds
         self.recordingDuration = recordingDuration; self.recordingFilename = recordingFilename
-        self.events = events; self.sortIndex = sortIndex; self.createdAt = createdAt
+        self.events = events
+        self.showPiP = showPiP
+        self.sortIndex = sortIndex; self.createdAt = createdAt
     }
 }
 
 public struct Project: Codable, Hashable, Sendable {
-    public var formatVersion: Int = 2  // bumped from 1 for .zoom event variant
+    public var formatVersion: Int = 3
     public var name: String
     public var sourceVideos: [SourceRef] = []
     public var clips: [Clip] = []

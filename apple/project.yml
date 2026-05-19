@@ -64,6 +64,8 @@ targets:
     sources:
       - path: Tests/AppTests
       - path: App/Recording/RecordingController.swift
+      - path: App/Preview/ClipPreviewBuilder.swift
+      - path: VideoCoachCore/Tests/VideoCoachCoreTests/Helpers/SyntheticAsset.swift
     dependencies:
       - package: VideoCoachCore
     settings:

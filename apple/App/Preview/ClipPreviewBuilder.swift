@@ -9,35 +9,48 @@ import VideoCoachCore
 import AppKit
 #endif
 
+/// Cached preview state for a single clip. Phase A of `ClipPreviewBuilder`
+/// (asset loads, composition track inserts, source/webcam layer instructions
+/// with their geometry baked in) produces this entry once; Phase B
+/// re-runs whenever `showPiP` toggles to rebuild just the
+/// `AVMutableVideoComposition` (cheap — no asset I/O).
+struct PreviewCacheEntry {
+    let player: AVPlayer
+    let renderSize: CGSize
+    let clipDuration: CMTime
+    let sourceTrackID: CMPersistentTrackID
+    let webcamTrackID: CMPersistentTrackID
+    let sourceLayer: AVMutableVideoCompositionLayerInstruction
+    let webcamLayer: AVMutableVideoCompositionLayerInstruction
+}
+
 enum ClipPreviewBuilderError: Error {
     case bookmarkResolutionFailed(displayName: String)
     case missingSourceVideo
     case noSourceVideoTrack(URL)
     case noWebcamVideoTrack(URL)
-    case pixelBufferAllocFailed
-    case freezeFrameDecodeFailed(URL, CMTime, underlying: Error)
     case invalidSourceNaturalSize(URL)
 }
 
-/// Builds the `AVPlayerItem` for Mode C clip preview.
+/// Builds a `PreviewCacheEntry` for Mode C clip preview.
 ///
 /// **`nonisolated` is load-bearing.** `Workspace` is `@MainActor`-isolated and
-/// awaits `buildPreviewItem`. Without `nonisolated`, the heavy work — N ×
-/// `AVAssetImageGenerator.image(at:)` calls that each take 100–800ms on
-/// long-GOP HEVC sources — would run on the main actor and freeze the UI for
-/// seconds at a time. The annotation lets Swift schedule the work on the
-/// cooperative thread pool.
+/// awaits `buildPreviewEntry`. Without `nonisolated`, the heavy work — N ×
+/// AVFoundation asset loads (duration, video/audio tracks, naturalSize) and
+/// composition track insertions, which on long-GOP HEVC can take 100–800ms —
+/// would run on the main actor and freeze the UI for seconds at a time. The
+/// annotation lets Swift schedule the work on the cooperative thread pool.
 enum ClipPreviewBuilder {
 
-    /// Builds an `AVPlayerItem` that plays a single clip's composited preview:
-    /// source-with-freezes + continuous webcam + audio mix. Strokes and the
-    /// bottom text bar are drawn as AppKit overlays (see `StrokeReplayLayer`)
-    /// outside this builder's scope.
-    nonisolated static func buildPreviewItem(
+    /// Builds a `PreviewCacheEntry` that plays a single clip's composited
+    /// preview: source-with-freezes + continuous webcam + audio mix. Strokes
+    /// and the bottom text bar are drawn as AppKit overlays (see
+    /// `StrokeReplayLayer`) outside this builder's scope.
+    nonisolated static func buildPreviewEntry(
         for clip: Clip,
         project: Project,
         projectFolder: URL
-    ) async throws -> AVPlayerItem {
+    ) async throws -> PreviewCacheEntry {
         // 1. Resolve the source video URL via the bookmark. Plain bookmarks —
         //    we run unsandboxed under hardened runtime.
         guard project.sourceVideos.indices.contains(clip.sourceIndex) else {
@@ -250,9 +263,6 @@ enum ClipPreviewBuilder {
             renderSize = nativeRender
         }
 
-        let videoComp = AVMutableVideoComposition()
-        videoComp.renderSize = renderSize
-        videoComp.frameDuration = CMTime(value: 1, timescale: 30)
         // No custom compositor: AVPlayer's playback path on macOS 26 strips
         // any subclass of AVMutableVideoCompositionInstruction (along with the
         // `requiredSourceTrackIDs` override carried on it), causing every
@@ -303,11 +313,19 @@ enum ClipPreviewBuilder {
             }
         }
 
-        // Webcam PiP layer: scale to 22% of viewport width, preserve cam
-        // aspect, anchor bottom-right with a 2.2% margin. AVMutableVideoCompositionLayerInstruction
-        // transforms work in TOP-LEFT origin (the same as the renderSize
-        // coordinate system), so the PiP's top-left corner sits at
-        // (renderSize.width - margin - pipW, renderSize.height - margin - pipH).
+        // `addMutableTrack(preferredTrackID:)` doesn't always honor the
+        // preferred ID — if there's a collision or constraint, it generates
+        // a fresh one. Use the ACTUAL assigned trackIDs for both
+        // `requiredSourceTrackIDs` and the layer instruction's source track,
+        // otherwise AVPlayer either fails to load the webcam track or
+        // renders the layer instruction against the wrong track.
+        let actualSourceID = sourceVideoComp.trackID
+        let actualWebcamID = webcamVideoComp.trackID
+        NSLog("[Preview] track IDs: source=\(actualSourceID) webcam=\(actualWebcamID) (preferred was \(sourceTrackID)/\(webcamTrackID)) showPiP=\(clip.showPiP)")
+
+        // Always build BOTH layer instructions during Phase A so a later
+        // `setShowPiP` toggle can swap layerInstructions without re-loading the
+        // webcam asset. Cheap: one naturalSize metadata load + transform math.
         let camNatural = try await webcamVideoTrack.load(.naturalSize)
         let camW = max(abs(camNatural.width), 1)
         let camH = max(abs(camNatural.height), 1)
@@ -322,35 +340,6 @@ enum ClipPreviewBuilder {
         let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
         webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
 
-        // `addMutableTrack(preferredTrackID:)` doesn't always honor the
-        // preferred ID — if there's a collision or constraint, it generates
-        // a fresh one. Use the ACTUAL assigned trackIDs for both
-        // `requiredSourceTrackIDs` and the layer instruction's source track,
-        // otherwise AVPlayer either fails to load the webcam track or
-        // renders the layer instruction against the wrong track.
-        let actualSourceID = sourceVideoComp.trackID
-        let actualWebcamID = webcamVideoComp.trackID
-        NSLog("[Preview] track IDs: source=\(actualSourceID) webcam=\(actualWebcamID) (preferred was \(sourceTrackID)/\(webcamTrackID))")
-        // requiredSourceTrackIDs is read-only on the mutable base class in
-        // Swift, so we still need PreviewInstruction's getter override to
-        // declare which tracks AVPlayer must deliver. Without it, AVPlayer's
-        // built-in compositor will fail to vend either source or webcam
-        // frames and the entire preview renders black.
-        let inst = PreviewInstruction.make(
-            sourceTrackID: actualSourceID,
-            webcamTrackID: actualWebcamID,
-            compositionStart: .zero,
-            clipDuration: clipDuration,
-            segments: [],
-            frozenFrames: [:],
-            events: []
-        )
-        // AVFoundation layer order: first instruction is on TOP, subsequent
-        // ones are beneath. Webcam (PiP) goes first so it overlays the
-        // full-frame source.
-        inst.layerInstructions = [webcamLayer, sourceLayer]
-        videoComp.instructions = [inst]
-
         let zoomEventCount = clip.events.reduce(into: 0) { acc, e in
             if case .zoom = e.kind { acc += 1 }
         }
@@ -358,32 +347,83 @@ enum ClipPreviewBuilder {
         NSLog("[Preview] build complete; AVPlayerItem ready (built-in compositor)")
 
         let item = AVPlayerItem(asset: comp)
-        item.videoComposition = videoComp
-        return item
+        let entry = PreviewCacheEntry(
+            player: AVPlayer(playerItem: item),
+            renderSize: renderSize,
+            clipDuration: clipDuration,
+            sourceTrackID: actualSourceID,
+            webcamTrackID: actualWebcamID,
+            sourceLayer: sourceLayer,
+            webcamLayer: webcamLayer
+        )
+        item.videoComposition = makeVideoComposition(entry: entry, showPiP: clip.showPiP)
+        return entry
+    }
+
+    /// Rebuilds just the `AVMutableVideoComposition` from a cached entry's
+    /// geometry. Used by `Workspace.setShowPiP` to flip the PiP overlay
+    /// without re-running Phase A's asset loads or composition track inserts.
+    nonisolated static func makeVideoComposition(
+        entry: PreviewCacheEntry,
+        showPiP: Bool
+    ) -> AVMutableVideoComposition {
+        makeVideoComposition(
+            renderSize: entry.renderSize,
+            clipDuration: entry.clipDuration,
+            sourceTrackID: entry.sourceTrackID,
+            webcamTrackID: entry.webcamTrackID,
+            sourceLayer: entry.sourceLayer,
+            webcamLayer: entry.webcamLayer,
+            showPiP: showPiP
+        )
+    }
+
+    nonisolated private static func makeVideoComposition(
+        renderSize: CGSize,
+        clipDuration: CMTime,
+        sourceTrackID: CMPersistentTrackID,
+        webcamTrackID: CMPersistentTrackID,
+        sourceLayer: AVMutableVideoCompositionLayerInstruction,
+        webcamLayer: AVMutableVideoCompositionLayerInstruction,
+        showPiP: Bool
+    ) -> AVMutableVideoComposition {
+        let videoComp = AVMutableVideoComposition()
+        videoComp.renderSize = renderSize
+        videoComp.frameDuration = CMTime(value: 1, timescale: 30)
+        let inst: PreviewInstruction
+        if showPiP {
+            inst = PreviewInstruction.make(
+                sourceTrackID: sourceTrackID,
+                webcamTrackID: webcamTrackID,
+                compositionStart: .zero,
+                clipDuration: clipDuration,
+                segments: [],
+                frozenFrames: [:],
+                events: []
+            )
+            // AVFoundation layer order: first instruction is on TOP, so the
+            // webcam (PiP) goes first to overlay the full-frame source.
+            inst.layerInstructions = [webcamLayer, sourceLayer]
+        } else {
+            // PiP suppressed: drop the webcam track from `requiredSourceTrackIDs`
+            // (via the invalid sentinel) so AVPlayer doesn't decode it, and
+            // omit the webcam layer instruction.
+            inst = PreviewInstruction.make(
+                sourceTrackID: sourceTrackID,
+                webcamTrackID: kCMPersistentTrackID_Invalid,
+                compositionStart: .zero,
+                clipDuration: clipDuration,
+                segments: [],
+                frozenFrames: [:],
+                events: []
+            )
+            inst.layerInstructions = [sourceLayer]
+        }
+        videoComp.instructions = [inst]
+        return videoComp
     }
 
     // MARK: - Helpers
-
-    /// Source-time at the END of the `.play` segment immediately preceding
-    /// `freezeIndex`. The frozen frame for that freeze should display
-    /// whatever the user last saw before pausing. If no `.play` segment
-    /// precedes it (the unusual case of a clip that begins with `.freeze`),
-    /// fall back to the very first segment's `sourceStart` — the earliest
-    /// source-time the compositor knows about.
-    nonisolated private static func sourceTimeAtEndOfPlay(
-        precedingSegment freezeIndex: Int,
-        in segments: [PlaybackSegment]
-    ) -> Double {
-        var i = freezeIndex - 1
-        while i >= 0 {
-            let seg = segments[i]
-            if seg.kind == .play {
-                return seg.sourceStart + seg.outDuration
-            }
-            i -= 1
-        }
-        return segments.first?.sourceStart ?? 0
-    }
 
     nonisolated private static func resolveBookmark(_ data: Data,
                                                     displayName: String) throws -> URL {
@@ -397,37 +437,5 @@ enum ClipPreviewBuilder {
         } catch {
             throw ClipPreviewBuilderError.bookmarkResolutionFailed(displayName: displayName)
         }
-    }
-
-    nonisolated private static func cgImageToBGRAPixelBuffer(_ image: CGImage) throws -> CVPixelBuffer {
-        var pb: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-        ]
-        CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            image.width, image.height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pb
-        )
-        guard let buf = pb else { throw ClipPreviewBuilderError.pixelBufferAllocFailed }
-        CVPixelBufferLockBaseAddress(buf, [])
-        defer { CVPixelBufferUnlockBaseAddress(buf, []) }
-        let cs = CGColorSpaceCreateDeviceRGB()
-        let ctx = CGContext(
-            data: CVPixelBufferGetBaseAddress(buf),
-            width: image.width,
-            height: image.height,
-            bitsPerComponent: 8,
-            bytesPerRow: CVPixelBufferGetBytesPerRow(buf),
-            space: cs,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                | CGBitmapInfo.byteOrder32Little.rawValue
-        )
-        ctx?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
-        return buf
     }
 }

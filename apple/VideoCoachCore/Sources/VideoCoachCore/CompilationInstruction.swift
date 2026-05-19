@@ -37,6 +37,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
     /// helper unchanged (which needs the events list to honor `.clearAll`).
     public var events: [CommentaryEvent] = []
     public var textBarLine: String = ""
+    public var showPiP: Bool = true
 
     private var _requiredSourceTrackIDs: [NSValue] = []
     public override var requiredSourceTrackIDs: [NSValue] {
@@ -53,6 +54,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         clipDuration: CMTime,
         sourceTrackID: CMPersistentTrackID = 1,
         webcamTrackID: CMPersistentTrackID,
+        showPiP: Bool = true,
         segments: [PlaybackSegment],
         strokes: [Stroke],
         events: [CommentaryEvent],
@@ -63,6 +65,15 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         // requiredSourceTrackIDs is `[NSValue]`-typed; NSNumber is the
         // conventional boxing for CMPersistentTrackID. Passing raw Int32s
         // won't compile.
+        //
+        // Webcam stays in the required-track list even when `showPiP`
+        // is false. `CompilationExporter` always inserts the webcam track
+        // (so a hidden PiP can be re-enabled later by flipping the flag);
+        // the compositor reads `showPiP` and skips the draw without
+        // touching the composition shape. Asymmetric with
+        // `PreviewInstruction.make`, which drops the webcam ID when
+        // suppressed because the preview builder DOES omit the layer
+        // instruction entirely.
         i._requiredSourceTrackIDs = [
             NSNumber(value: sourceTrackID),
             NSNumber(value: webcamTrackID),
@@ -77,6 +88,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         i.strokes = strokes
         i.events = events
         i.textBarLine = textBarLine
+        i.showPiP = showPiP
         return i
     }
 }

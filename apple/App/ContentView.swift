@@ -987,6 +987,7 @@ struct ContentView: View {
                         recordingDuration: duration,
                         recordingFilename: pending.filename,
                         events: events,
+                        showPiP: workspace.project.preferences.pipForNewRecordings,
                         sortIndex: count
                     )
                     workspace.addClip(clip)
