@@ -75,15 +75,7 @@ final class ClipPreviewBuilderTests: XCTestCase {
         XCTAssertEqual(instBefore.layerInstructions.count, 2)
 
         // Flip via the helper that setShowPiP wraps.
-        item.videoComposition = ClipPreviewBuilder.makeVideoComposition(
-            renderSize: entry.renderSize,
-            clipDuration: entry.clipDuration,
-            sourceTrackID: entry.sourceTrackID,
-            webcamTrackID: entry.webcamTrackID,
-            sourceLayer: entry.sourceLayer,
-            webcamLayer: entry.webcamLayer,
-            showPiP: false
-        )
+        item.videoComposition = ClipPreviewBuilder.makeVideoComposition(entry: entry, showPiP: false)
 
         let vcAfter = try XCTUnwrap(item.videoComposition)
         let instAfter = try XCTUnwrap(vcAfter.instructions.first as? AVVideoCompositionInstruction)
@@ -91,15 +83,7 @@ final class ClipPreviewBuilderTests: XCTestCase {
             "live-swap must reduce layer count to 1 without rebuilding the player")
 
         // Flip back to confirm symmetry.
-        item.videoComposition = ClipPreviewBuilder.makeVideoComposition(
-            renderSize: entry.renderSize,
-            clipDuration: entry.clipDuration,
-            sourceTrackID: entry.sourceTrackID,
-            webcamTrackID: entry.webcamTrackID,
-            sourceLayer: entry.sourceLayer,
-            webcamLayer: entry.webcamLayer,
-            showPiP: true
-        )
+        item.videoComposition = ClipPreviewBuilder.makeVideoComposition(entry: entry, showPiP: true)
         let vcRestored = try XCTUnwrap(item.videoComposition)
         let instRestored = try XCTUnwrap(vcRestored.instructions.first as? AVVideoCompositionInstruction)
         XCTAssertEqual(instRestored.layerInstructions.count, 2,

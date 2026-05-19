@@ -454,16 +454,8 @@ final class Workspace {
     /// the next preview build will pick up the current `clip.showPiP`.
     func setShowPiP(_ showPiP: Bool, for id: Clip.ID) {
         guard let entry = _previewCache[id] else { return }
-        let newVC = ClipPreviewBuilder.makeVideoComposition(
-            renderSize: entry.renderSize,
-            clipDuration: entry.clipDuration,
-            sourceTrackID: entry.sourceTrackID,
-            webcamTrackID: entry.webcamTrackID,
-            sourceLayer: entry.sourceLayer,
-            webcamLayer: entry.webcamLayer,
-            showPiP: showPiP
-        )
-        entry.player.currentItem?.videoComposition = newVC
+        entry.player.currentItem?.videoComposition =
+            ClipPreviewBuilder.makeVideoComposition(entry: entry, showPiP: showPiP)
     }
 
     /// Per-project undo/redo machinery. Pure-data; lives in
@@ -562,13 +554,12 @@ final class Workspace {
         case let .editClip(id, before, _):
             if let i = project.clips.firstIndex(where: { $0.id == id }) {
                 project.clips[i] = before
-                // Among all Clip fields reachable from the inspector today, only
-                // `showPiP` affects rendered playback — name, tags, and notes are
-                // pure metadata. `events` affects playback (zoom keyframes, freeze
-                // segments) but is set at recording time and has no inspector UI.
-                // If a future field both affects playback AND gains inspector UI,
-                // this call site must also call `invalidatePreviewCache(for: id)`
-                // for that field.
+                // `showPiP` is the only inspector-editable field that needs an
+                // imperative side-effect: AVFoundation doesn't observe @Observable,
+                // so the video composition must be swapped explicitly. `name` and
+                // `tags` appear in the SwiftUI preview overlay and export text bar
+                // but re-render automatically when `project` is written. (`events`
+                // also affects composition but has no inspector UI yet.)
                 setShowPiP(before.showPiP, for: id)
                 try? saveProject()
             }
@@ -599,13 +590,12 @@ final class Workspace {
         case let .editClip(id, _, after):
             if let i = project.clips.firstIndex(where: { $0.id == id }) {
                 project.clips[i] = after
-                // Among all Clip fields reachable from the inspector today, only
-                // `showPiP` affects rendered playback — name, tags, and notes are
-                // pure metadata. `events` affects playback (zoom keyframes, freeze
-                // segments) but is set at recording time and has no inspector UI.
-                // If a future field both affects playback AND gains inspector UI,
-                // this call site must also call `invalidatePreviewCache(for: id)`
-                // for that field.
+                // `showPiP` is the only inspector-editable field that needs an
+                // imperative side-effect: AVFoundation doesn't observe @Observable,
+                // so the video composition must be swapped explicitly. `name` and
+                // `tags` appear in the SwiftUI preview overlay and export text bar
+                // but re-render automatically when `project` is written. (`events`
+                // also affects composition but has no inspector UI yet.)
                 setShowPiP(after.showPiP, for: id)
                 try? saveProject()
             }

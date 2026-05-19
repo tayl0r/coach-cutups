@@ -340,16 +340,6 @@ enum ClipPreviewBuilder {
         let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
         webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
 
-        let videoComp = makeVideoComposition(
-            renderSize: renderSize,
-            clipDuration: clipDuration,
-            sourceTrackID: actualSourceID,
-            webcamTrackID: actualWebcamID,
-            sourceLayer: sourceLayer,
-            webcamLayer: webcamLayer,
-            showPiP: clip.showPiP
-        )
-
         let zoomEventCount = clip.events.reduce(into: 0) { acc, e in
             if case .zoom = e.kind { acc += 1 }
         }
@@ -357,7 +347,6 @@ enum ClipPreviewBuilder {
         NSLog("[Preview] build complete; AVPlayerItem ready (built-in compositor)")
 
         let item = AVPlayerItem(asset: comp)
-        item.videoComposition = videoComp
         let entry = PreviewCacheEntry(
             player: AVPlayer(playerItem: item),
             renderSize: renderSize,
@@ -367,10 +356,29 @@ enum ClipPreviewBuilder {
             sourceLayer: sourceLayer,
             webcamLayer: webcamLayer
         )
+        item.videoComposition = makeVideoComposition(entry: entry, showPiP: clip.showPiP)
         return entry
     }
 
+    /// Rebuilds just the `AVMutableVideoComposition` from a cached entry's
+    /// geometry. Used by `Workspace.setShowPiP` to flip the PiP overlay
+    /// without re-running Phase A's asset loads or composition track inserts.
     nonisolated static func makeVideoComposition(
+        entry: PreviewCacheEntry,
+        showPiP: Bool
+    ) -> AVMutableVideoComposition {
+        makeVideoComposition(
+            renderSize: entry.renderSize,
+            clipDuration: entry.clipDuration,
+            sourceTrackID: entry.sourceTrackID,
+            webcamTrackID: entry.webcamTrackID,
+            sourceLayer: entry.sourceLayer,
+            webcamLayer: entry.webcamLayer,
+            showPiP: showPiP
+        )
+    }
+
+    nonisolated private static func makeVideoComposition(
         renderSize: CGSize,
         clipDuration: CMTime,
         sourceTrackID: CMPersistentTrackID,
