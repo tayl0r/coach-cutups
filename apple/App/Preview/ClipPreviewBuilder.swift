@@ -29,19 +29,17 @@ enum ClipPreviewBuilderError: Error {
     case missingSourceVideo
     case noSourceVideoTrack(URL)
     case noWebcamVideoTrack(URL)
-    case pixelBufferAllocFailed
-    case freezeFrameDecodeFailed(URL, CMTime, underlying: Error)
     case invalidSourceNaturalSize(URL)
 }
 
-/// Builds the `AVPlayerItem` for Mode C clip preview.
+/// Builds a `PreviewCacheEntry` for Mode C clip preview.
 ///
 /// **`nonisolated` is load-bearing.** `Workspace` is `@MainActor`-isolated and
 /// awaits `buildPreviewEntry`. Without `nonisolated`, the heavy work — N ×
-/// `AVAssetImageGenerator.image(at:)` calls that each take 100–800ms on
-/// long-GOP HEVC sources — would run on the main actor and freeze the UI for
-/// seconds at a time. The annotation lets Swift schedule the work on the
-/// cooperative thread pool.
+/// AVFoundation asset loads (duration, video/audio tracks, naturalSize) and
+/// composition track insertions, which on long-GOP HEVC can take 100–800ms —
+/// would run on the main actor and freeze the UI for seconds at a time. The
+/// annotation lets Swift schedule the work on the cooperative thread pool.
 enum ClipPreviewBuilder {
 
     /// Builds a `PreviewCacheEntry` that plays a single clip's composited
@@ -419,27 +417,6 @@ enum ClipPreviewBuilder {
 
     // MARK: - Helpers
 
-    /// Source-time at the END of the `.play` segment immediately preceding
-    /// `freezeIndex`. The frozen frame for that freeze should display
-    /// whatever the user last saw before pausing. If no `.play` segment
-    /// precedes it (the unusual case of a clip that begins with `.freeze`),
-    /// fall back to the very first segment's `sourceStart` — the earliest
-    /// source-time the compositor knows about.
-    nonisolated private static func sourceTimeAtEndOfPlay(
-        precedingSegment freezeIndex: Int,
-        in segments: [PlaybackSegment]
-    ) -> Double {
-        var i = freezeIndex - 1
-        while i >= 0 {
-            let seg = segments[i]
-            if seg.kind == .play {
-                return seg.sourceStart + seg.outDuration
-            }
-            i -= 1
-        }
-        return segments.first?.sourceStart ?? 0
-    }
-
     nonisolated private static func resolveBookmark(_ data: Data,
                                                     displayName: String) throws -> URL {
         var stale = false
@@ -452,37 +429,5 @@ enum ClipPreviewBuilder {
         } catch {
             throw ClipPreviewBuilderError.bookmarkResolutionFailed(displayName: displayName)
         }
-    }
-
-    nonisolated private static func cgImageToBGRAPixelBuffer(_ image: CGImage) throws -> CVPixelBuffer {
-        var pb: CVPixelBuffer?
-        let attrs: [CFString: Any] = [
-            kCVPixelBufferIOSurfacePropertiesKey: [:] as CFDictionary,
-            kCVPixelBufferCGImageCompatibilityKey: true,
-            kCVPixelBufferCGBitmapContextCompatibilityKey: true,
-        ]
-        CVPixelBufferCreate(
-            kCFAllocatorDefault,
-            image.width, image.height,
-            kCVPixelFormatType_32BGRA,
-            attrs as CFDictionary,
-            &pb
-        )
-        guard let buf = pb else { throw ClipPreviewBuilderError.pixelBufferAllocFailed }
-        CVPixelBufferLockBaseAddress(buf, [])
-        defer { CVPixelBufferUnlockBaseAddress(buf, []) }
-        let cs = CGColorSpaceCreateDeviceRGB()
-        let ctx = CGContext(
-            data: CVPixelBufferGetBaseAddress(buf),
-            width: image.width,
-            height: image.height,
-            bitsPerComponent: 8,
-            bytesPerRow: CVPixelBufferGetBytesPerRow(buf),
-            space: cs,
-            bitmapInfo: CGImageAlphaInfo.premultipliedFirst.rawValue
-                | CGBitmapInfo.byteOrder32Little.rawValue
-        )
-        ctx?.draw(image, in: CGRect(x: 0, y: 0, width: image.width, height: image.height))
-        return buf
     }
 }
