@@ -150,7 +150,7 @@ final class Workspace {
     /// preparation Task that hands off finished `AVPlayerItem`s built by
     /// `ClipPreviewBuilder`. Lookup-only via `previewPlayer(for:)`; that
     /// method also kicks off the build Task on a cache miss.
-    private var _previewCache: [Clip.ID: AVPlayer] = [:]
+    private var _previewCache: [Clip.ID: PreviewCacheEntry] = [:]
     /// Clip IDs whose preview is currently being built. Prevents a SwiftUI
     /// thundering herd (several view re-renders during the load window) from
     /// spawning duplicate Tasks per clip.
@@ -420,7 +420,7 @@ final class Workspace {
     /// the error so the UI can show it without re-attempting on every
     /// subsequent re-render.
     func previewPlayer(for id: Clip.ID) -> AVPlayer? {
-        if let cached = _previewCache[id] { return cached }
+        if let cached = _previewCache[id] { return cached.player }
         if _previewFailed[id] != nil { return nil }
         guard !_previewInflight.contains(id) else { return nil }
         _previewInflight.insert(id)
@@ -615,15 +615,14 @@ final class Workspace {
         guard let clip = project.clips.first(where: { $0.id == id }),
               let folder = self.folder else { return }
         let snapshot = project   // copy off the main actor for the nonisolated build
-        let item = try await ClipPreviewBuilder.buildPreviewItem(
+        let entry = try await ClipPreviewBuilder.buildPreviewEntry(
             for: clip,
             project: snapshot,
             projectFolder: folder
         )
-        item.audioMix = audioMix(for: clip)
-        let player = AVPlayer(playerItem: item)
-        player.volume = 1.0
-        _previewCache[id] = player
+        entry.player.currentItem?.audioMix = audioMix(for: clip)
+        entry.player.volume = 1.0
+        _previewCache[id] = entry
         _previewFailed.removeValue(forKey: id)
     }
 
@@ -648,8 +647,8 @@ final class Workspace {
     /// changes take effect during playback.
     func updatePreviewVolumes(for id: Clip.ID) {
         guard let clip = project.clips.first(where: { $0.id == id }),
-              let player = _previewCache[id] else { return }
-        player.currentItem?.audioMix = audioMix(for: clip)
+              let entry = _previewCache[id] else { return }
+        entry.player.currentItem?.audioMix = audioMix(for: clip)
     }
 
     // MARK: - Clip ordering

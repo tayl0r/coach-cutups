@@ -9,6 +9,21 @@ import VideoCoachCore
 import AppKit
 #endif
 
+/// Cached preview state for a single clip. Phase A of `ClipPreviewBuilder`
+/// (asset loads, composition track inserts, source/webcam layer instructions
+/// with their geometry baked in) produces this entry once; Phase B
+/// re-runs whenever `showPiP` toggles to rebuild just the
+/// `AVMutableVideoComposition` (cheap — no asset I/O).
+struct PreviewCacheEntry {
+    let player: AVPlayer
+    let renderSize: CGSize
+    let clipDuration: CMTime
+    let sourceTrackID: CMPersistentTrackID
+    let webcamTrackID: CMPersistentTrackID
+    let sourceLayer: AVMutableVideoCompositionLayerInstruction
+    let webcamLayer: AVMutableVideoCompositionLayerInstruction
+}
+
 enum ClipPreviewBuilderError: Error {
     case bookmarkResolutionFailed(displayName: String)
     case missingSourceVideo
@@ -22,22 +37,22 @@ enum ClipPreviewBuilderError: Error {
 /// Builds the `AVPlayerItem` for Mode C clip preview.
 ///
 /// **`nonisolated` is load-bearing.** `Workspace` is `@MainActor`-isolated and
-/// awaits `buildPreviewItem`. Without `nonisolated`, the heavy work — N ×
+/// awaits `buildPreviewEntry`. Without `nonisolated`, the heavy work — N ×
 /// `AVAssetImageGenerator.image(at:)` calls that each take 100–800ms on
 /// long-GOP HEVC sources — would run on the main actor and freeze the UI for
 /// seconds at a time. The annotation lets Swift schedule the work on the
 /// cooperative thread pool.
 enum ClipPreviewBuilder {
 
-    /// Builds an `AVPlayerItem` that plays a single clip's composited preview:
-    /// source-with-freezes + continuous webcam + audio mix. Strokes and the
-    /// bottom text bar are drawn as AppKit overlays (see `StrokeReplayLayer`)
-    /// outside this builder's scope.
-    nonisolated static func buildPreviewItem(
+    /// Builds a `PreviewCacheEntry` that plays a single clip's composited
+    /// preview: source-with-freezes + continuous webcam + audio mix. Strokes
+    /// and the bottom text bar are drawn as AppKit overlays (see
+    /// `StrokeReplayLayer`) outside this builder's scope.
+    nonisolated static func buildPreviewEntry(
         for clip: Clip,
         project: Project,
         projectFolder: URL
-    ) async throws -> AVPlayerItem {
+    ) async throws -> PreviewCacheEntry {
         // 1. Resolve the source video URL via the bookmark. Plain bookmarks —
         //    we run unsandboxed under hardened runtime.
         guard project.sourceVideos.indices.contains(clip.sourceIndex) else {
@@ -250,9 +265,6 @@ enum ClipPreviewBuilder {
             renderSize = nativeRender
         }
 
-        let videoComp = AVMutableVideoComposition()
-        videoComp.renderSize = renderSize
-        videoComp.frameDuration = CMTime(value: 1, timescale: 30)
         // No custom compositor: AVPlayer's playback path on macOS 26 strips
         // any subclass of AVMutableVideoCompositionInstruction (along with the
         // `requiredSourceTrackIDs` override carried on it), causing every
@@ -313,54 +325,85 @@ enum ClipPreviewBuilder {
         let actualWebcamID = webcamVideoComp.trackID
         NSLog("[Preview] track IDs: source=\(actualSourceID) webcam=\(actualWebcamID) (preferred was \(sourceTrackID)/\(webcamTrackID)) showPiP=\(clip.showPiP)")
 
-        // Webcam PiP layer: scale to 22% of viewport width, preserve cam
-        // aspect, anchor bottom-right with a 2.2% margin. AVMutableVideoCompositionLayerInstruction
-        // transforms work in TOP-LEFT origin (the same as the renderSize
-        // coordinate system), so the PiP's top-left corner sits at
-        // (renderSize.width - margin - pipW, renderSize.height - margin - pipH).
-        //
-        // When `clip.showPiP == false`, omit the webcam layer instruction
-        // entirely so the built-in compositor renders only the source.
-        // requiredSourceTrackIDs is read-only on the mutable base class in
-        // Swift, so we still need PreviewInstruction's getter override to
-        // declare which tracks AVPlayer must deliver. Without it, AVPlayer's
-        // built-in compositor will fail to vend either source or webcam
-        // frames and the entire preview renders black.
-        let inst: PreviewInstruction
-        if clip.showPiP {
-            let camNatural = try await webcamVideoTrack.load(.naturalSize)
-            let camW = max(abs(camNatural.width), 1)
-            let camH = max(abs(camNatural.height), 1)
-            let pipW = renderSize.width * 0.22
-            let pipH = pipW * camH / camW
-            let margin = renderSize.height * 0.022
-            let webcamScale = CGAffineTransform(scaleX: pipW / camW, y: pipH / camH)
-            let webcamTranslate = CGAffineTransform(
-                translationX: renderSize.width - margin - pipW,
-                y: renderSize.height - margin - pipH
-            )
-            let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
-            webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
+        // Always build BOTH layer instructions during Phase A so a later
+        // `setShowPiP` toggle can swap layerInstructions without re-loading the
+        // webcam asset. Cheap: one naturalSize metadata load + transform math.
+        let camNatural = try await webcamVideoTrack.load(.naturalSize)
+        let camW = max(abs(camNatural.width), 1)
+        let camH = max(abs(camNatural.height), 1)
+        let pipW = renderSize.width * 0.22
+        let pipH = pipW * camH / camW
+        let margin = renderSize.height * 0.022
+        let webcamScale = CGAffineTransform(scaleX: pipW / camW, y: pipH / camH)
+        let webcamTranslate = CGAffineTransform(
+            translationX: renderSize.width - margin - pipW,
+            y: renderSize.height - margin - pipH
+        )
+        let webcamLayer = AVMutableVideoCompositionLayerInstruction(assetTrack: webcamVideoComp)
+        webcamLayer.setTransform(webcamScale.concatenating(webcamTranslate), at: .zero)
 
+        let videoComp = makeVideoComposition(
+            renderSize: renderSize,
+            clipDuration: clipDuration,
+            sourceTrackID: actualSourceID,
+            webcamTrackID: actualWebcamID,
+            sourceLayer: sourceLayer,
+            webcamLayer: webcamLayer,
+            showPiP: clip.showPiP
+        )
+
+        let zoomEventCount = clip.events.reduce(into: 0) { acc, e in
+            if case .zoom = e.kind { acc += 1 }
+        }
+        NSLog("[Preview] renderSize=\(renderSize) zoomEvents=\(zoomEventCount) totalEvents=\(clip.events.count)")
+        NSLog("[Preview] build complete; AVPlayerItem ready (built-in compositor)")
+
+        let item = AVPlayerItem(asset: comp)
+        item.videoComposition = videoComp
+        let entry = PreviewCacheEntry(
+            player: AVPlayer(playerItem: item),
+            renderSize: renderSize,
+            clipDuration: clipDuration,
+            sourceTrackID: actualSourceID,
+            webcamTrackID: actualWebcamID,
+            sourceLayer: sourceLayer,
+            webcamLayer: webcamLayer
+        )
+        return entry
+    }
+
+    nonisolated static func makeVideoComposition(
+        renderSize: CGSize,
+        clipDuration: CMTime,
+        sourceTrackID: CMPersistentTrackID,
+        webcamTrackID: CMPersistentTrackID,
+        sourceLayer: AVMutableVideoCompositionLayerInstruction,
+        webcamLayer: AVMutableVideoCompositionLayerInstruction,
+        showPiP: Bool
+    ) -> AVMutableVideoComposition {
+        let videoComp = AVMutableVideoComposition()
+        videoComp.renderSize = renderSize
+        videoComp.frameDuration = CMTime(value: 1, timescale: 30)
+        let inst: PreviewInstruction
+        if showPiP {
             inst = PreviewInstruction.make(
-                sourceTrackID: actualSourceID,
-                webcamTrackID: actualWebcamID,
+                sourceTrackID: sourceTrackID,
+                webcamTrackID: webcamTrackID,
                 compositionStart: .zero,
                 clipDuration: clipDuration,
                 segments: [],
                 frozenFrames: [:],
                 events: []
             )
-            // AVFoundation layer order: first instruction is on TOP, subsequent
-            // ones are beneath. Webcam (PiP) goes first so it overlays the
-            // full-frame source.
+            // AVFoundation layer order: first instruction is on TOP, so the
+            // webcam (PiP) goes first to overlay the full-frame source.
             inst.layerInstructions = [webcamLayer, sourceLayer]
         } else {
-            // PiP suppressed: drop the webcam track from
-            // `requiredSourceTrackIDs` (via the invalid sentinel) so AVPlayer
-            // doesn't even decode it, and omit the webcam layer instruction.
+            // PiP suppressed: drop the webcam track from `requiredSourceTrackIDs`
+            // (via the invalid sentinel) so AVPlayer doesn't decode it, and
+            // omit the webcam layer instruction.
             inst = PreviewInstruction.make(
-                sourceTrackID: actualSourceID,
+                sourceTrackID: sourceTrackID,
                 webcamTrackID: kCMPersistentTrackID_Invalid,
                 compositionStart: .zero,
                 clipDuration: clipDuration,
@@ -371,16 +414,7 @@ enum ClipPreviewBuilder {
             inst.layerInstructions = [sourceLayer]
         }
         videoComp.instructions = [inst]
-
-        let zoomEventCount = clip.events.reduce(into: 0) { acc, e in
-            if case .zoom = e.kind { acc += 1 }
-        }
-        NSLog("[Preview] renderSize=\(renderSize) zoomEvents=\(zoomEventCount) totalEvents=\(clip.events.count)")
-        NSLog("[Preview] build complete; AVPlayerItem ready (built-in compositor)")
-
-        let item = AVPlayerItem(asset: comp)
-        item.videoComposition = videoComp
-        return item
+        return videoComp
     }
 
     // MARK: - Helpers

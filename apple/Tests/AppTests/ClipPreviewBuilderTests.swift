@@ -38,7 +38,8 @@ final class ClipPreviewBuilderTests: XCTestCase {
     }
 
     func test_showPiPTrue_includesWebcamLayerInstruction() async throws {
-        let item = try await buildItem(showPiP: true)
+        let entry = try await buildEntry(showPiP: true)
+        let item = try XCTUnwrap(entry.player.currentItem)
         let vc = try XCTUnwrap(item.videoComposition)
         let inst = try XCTUnwrap(vc.instructions.first as? AVVideoCompositionInstruction)
         XCTAssertEqual(inst.layerInstructions.count, 2,
@@ -46,14 +47,15 @@ final class ClipPreviewBuilderTests: XCTestCase {
     }
 
     func test_showPiPFalse_omitsWebcamLayerInstruction() async throws {
-        let item = try await buildItem(showPiP: false)
+        let entry = try await buildEntry(showPiP: false)
+        let item = try XCTUnwrap(entry.player.currentItem)
         let vc = try XCTUnwrap(item.videoComposition)
         let inst = try XCTUnwrap(vc.instructions.first as? AVVideoCompositionInstruction)
         XCTAssertEqual(inst.layerInstructions.count, 1,
             "showPiP=false must emit only the source layer instruction")
     }
 
-    private func buildItem(showPiP: Bool) async throws -> AVPlayerItem {
+    private func buildEntry(showPiP: Bool) async throws -> PreviewCacheEntry {
         var project = Project(name: "preview-builder")
         let bookmark = try srcURL.bookmarkData(options: [])
         project.sourceVideos.append(.init(
@@ -72,7 +74,7 @@ final class ClipPreviewBuilderTests: XCTestCase {
             sortIndex: 0
         )
         project.clips = [clip]
-        return try await ClipPreviewBuilder.buildPreviewItem(
+        return try await ClipPreviewBuilder.buildPreviewEntry(
             for: clip,
             project: project,
             projectFolder: projectFolder
