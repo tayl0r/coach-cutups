@@ -182,6 +182,49 @@ final class ProjectTests: XCTestCase {
         XCTAssertTrue(loaded.clips[0].showPiP)
     }
 
+    /// Regression: an intermediate scoreboard-branch build wrote v4 files
+    /// without the PiP fields. The migrator must field-check rather than
+    /// short-circuit on `version >= 3`, otherwise the decoder throws
+    /// `keyNotFound` for the non-optional PiP fields.
+    func test_migrateV4WithoutPiPFields_injectsDefaults() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appendingPathComponent("hide-pip-migrate-v4-\(UUID())")
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let legacy = """
+        {
+          "formatVersion": 4,
+          "name": "v4-no-pip",
+          "sourceVideos": [],
+          "clips": [{
+            "id": "12345678-1234-1234-1234-123456789012",
+            "name": "old",
+            "notes": "",
+            "tags": [],
+            "sourceIndex": 0,
+            "startSourceSeconds": 0,
+            "recordingDuration": 1.0,
+            "recordingFilename": "c.mov",
+            "events": [],
+            "sortIndex": 0,
+            "createdAt": "2024-01-01T00:00:00Z"
+          }],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium"
+          }
+        }
+        """.data(using: .utf8)!
+        try legacy.write(to: dir.appendingPathComponent("project.json"))
+        let loaded = try ProjectStore.read(from: dir)
+        XCTAssertEqual(loaded.formatVersion, 4, "v4+ files keep their stored version even when a missing field is back-filled")
+        XCTAssertTrue(loaded.preferences.pipForNewRecordings)
+        XCTAssertTrue(loaded.clips[0].showPiP)
+    }
+
     func test_migrateV1ToV3_legacyJSONGetsDefaults() throws {
         let dir = FileManager.default.temporaryDirectory
             .appendingPathComponent("hide-pip-migrate-v1-\(UUID())")

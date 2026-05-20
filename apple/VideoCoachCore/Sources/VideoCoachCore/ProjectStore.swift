@@ -39,27 +39,38 @@ public enum ProjectStore {
         guard var root = try JSONSerialization.jsonObject(
             with: data, options: []) as? [String: Any]
         else { return data }
-        let version = (root["formatVersion"] as? Int) ?? 1
-        // Fast path for v3+ files. `ProjectStore.read` runs on every project
-        // open + Open Recent — once every project has been written as v3 the
-        // re-encode below would be pure overhead.
-        if version >= 3 { return data }
 
-        if var prefs = root["preferences"] as? [String: Any] {
-            if prefs["pipForNewRecordings"] == nil {
-                prefs["pipForNewRecordings"] = true
-                root["preferences"] = prefs
-            }
+        // Check field-by-field rather than gating on formatVersion: an
+        // intermediate scoreboard-branch build wrote v4 files that lack
+        // the PiP fields (v3 introduced them), so version alone isn't a
+        // reliable signal that defaults have been baked in.
+        var changed = false
+        if var prefs = root["preferences"] as? [String: Any],
+           prefs["pipForNewRecordings"] == nil {
+            prefs["pipForNewRecordings"] = true
+            root["preferences"] = prefs
+            changed = true
         }
         if var clips = root["clips"] as? [[String: Any]] {
             for i in clips.indices where clips[i]["showPiP"] == nil {
                 clips[i]["showPiP"] = true
+                changed = true
             }
-            root["clips"] = clips
+            if changed {
+                root["clips"] = clips
+            }
         }
-        root["formatVersion"] = 3
+        // Bump formatVersion only when migrating up from pre-PiP (v1/v2).
+        // v3+ files keep their stored version even if the field check
+        // injected a default — the file shape on disk is otherwise current.
+        let version = (root["formatVersion"] as? Int) ?? 1
+        if changed && version < 3 {
+            root["formatVersion"] = 3
+        }
 
-        return try JSONSerialization.data(withJSONObject: root, options: [])
+        return changed
+            ? try JSONSerialization.data(withJSONObject: root, options: [])
+            : data
     }
 
     public static func write(_ project: Project, to folder: URL) throws {
