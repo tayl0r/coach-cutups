@@ -121,15 +121,11 @@ public struct Project: Codable, Hashable, Sendable {
 }
 
 public extension Project {
-    /// Migration history:
+    /// Schema version history:
     /// - v1: original schema (no formatVersion field)
     /// - v2: added `.zoom` event variant
-    /// - v3: added per-clip PiP visibility (`Clip.showPiP`,
-    ///   `Preferences.pipForNewRecordings`). v1/v2 files migrate via
-    ///   `ProjectStore.migrateIfNeeded` (in-blob field injection).
-    /// - v4: added `scoreboard` (TeamConfig + MatchFormat) and `matchEvents`.
-    ///   v3 files lacking these keys decode cleanly via `Project.init(from:)`'s
-    ///   `decodeIfPresent`.
+    /// - v3: added per-clip PiP visibility
+    /// - v4: added `scoreboard` (TeamConfig + MatchFormat) and `matchEvents`
     static let currentFormatVersion: Int = 4
 }
 
