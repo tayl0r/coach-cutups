@@ -525,6 +525,35 @@ final class Workspace {
         history.pushEdit(.editClip(id: id, before: before, after: after))
     }
 
+    /// Snapshot-then-mutate-then-push-undo wrapper for all match-event edits.
+    /// Skips the undo push when the mutation didn't actually change anything
+    /// so no-op tag toggles don't pollute the stack. Persist is deferred to
+    /// the undo/redo arms (and is implicit on next `saveProject` from another
+    /// path) — keeping this aligned with the other `pushEdit` callers in this
+    /// file which let their existing `try? saveProject()` paths cover persist.
+    func mutateMatchEvents(_ mutate: (inout Project) -> Void) {
+        let before = project.matchEvents
+        mutate(&project)
+        let after = project.matchEvents
+        guard before != after else { return }
+        history.pushEdit(.editMatchEvents(before: before, after: after))
+        try? saveProject()
+    }
+
+    @MainActor
+    func tagEvent(_ kind: MatchEventKind) {
+        guard let player = sourcePlayer else { return }
+        let idx = player.playlistPos
+        let sec = player.timePos
+        mutateMatchEvents { p in
+            switch kind {
+            case .homeGoal:  p.appendHomeGoal(sourceIndex: idx, sourceSeconds: sec)
+            case .awayGoal:  p.appendAwayGoal(sourceIndex: idx, sourceSeconds: sec)
+            case .startStop: p.appendStartStop(sourceIndex: idx, sourceSeconds: sec)
+            }
+        }
+    }
+
     /// Pop one action from the undo stack and apply its inverse. Quietly
     /// no-ops when the stack is empty so menu wiring doesn't have to
     /// gate the call. Returns the action that was applied so the caller
@@ -582,6 +611,9 @@ final class Workspace {
                 ?? project.clips.endIndex
             project.clips.insert(stash.clip, at: insertAt)
             try? saveProject()
+        case let .editMatchEvents(before, _):
+            project.matchEvents = before
+            try? saveProject()
         }
     }
 
@@ -621,6 +653,9 @@ final class Workspace {
                 }
             }
             try? saveProject()
+        case let .editMatchEvents(_, after):
+            project.matchEvents = after
+            try? saveProject()
         }
     }
 
@@ -642,7 +677,7 @@ final class Workspace {
             project: snapshot,
             projectFolder: folder
         )
-        entry.player.currentItem?.audioMix = audioMix(for: clip)
+        entry.player.currentItem?.audioMix = audioMix()
         entry.player.volume = 1.0
         _previewCache[id] = entry
         // If `showPiP` was toggled while Phase A was in flight, the cached
@@ -659,7 +694,7 @@ final class Workspace {
     /// preview-volume preferences. Note: mutating an existing mix on a
     /// playing item doesn't take effect — the caller must reassign the mix
     /// to `currentItem.audioMix`. See `updatePreviewVolumes(for:)`.
-    func audioMix(for clip: Clip) -> AVMutableAudioMix {
+    func audioMix() -> AVMutableAudioMix {
         let mix = AVMutableAudioMix()
         let sourceParams = AVMutableAudioMixInputParameters()
         sourceParams.trackID = 2
@@ -675,9 +710,8 @@ final class Workspace {
     /// preferences. Called by the volume sliders so source/commentary level
     /// changes take effect during playback.
     func updatePreviewVolumes(for id: Clip.ID) {
-        guard let clip = project.clips.first(where: { $0.id == id }),
-              let entry = _previewCache[id] else { return }
-        entry.player.currentItem?.audioMix = audioMix(for: clip)
+        guard let entry = _previewCache[id] else { return }
+        entry.player.currentItem?.audioMix = audioMix()
     }
 
     // MARK: - Clip ordering

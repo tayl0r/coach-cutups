@@ -4,6 +4,12 @@ import AVFoundation
 import QuartzCore
 import VideoCoachCore
 
+/// Owned by `ContentView` and threaded into `MatchInspectorPanel`. The
+/// inspector swaps its body between an events view (live score + tag
+/// list) and a settings form for team/venue/format edits. `⇧⌘M` flips
+/// the panel to `.settings` in place — replaces the old modal sheet.
+enum InspectorMode { case events, settings }
+
 struct ContentView: View {
     /// Owned by `VideoCoachApp` so the same instance backs both the
     /// top-level Devices menu and this view's onChange handlers. Passed in
@@ -35,6 +41,18 @@ struct ContentView: View {
     /// no clip is selected. Cleared on project switch (below) and by
     /// Esc in scanning mode (Task 3). View-state only; never persisted.
     @State private var selectedTagFilter: String? = nil
+    /// Current mode of the right-hand match inspector panel. Flipped to
+    /// `.settings` by the Project → Match Setup… menu item (⇧⌘M) — that
+    /// menu lives at app scope in `VideoCoachApp`'s `.commands` block
+    /// and reaches this state via a `@FocusedValue` bridge (see
+    /// `ProjectCommands`). The panel returns itself to `.events` via
+    /// its Done button.
+    @State private var inspectorMode: InspectorMode = .events
+    /// True while the inspector's "Add Event" picker overlay is showing.
+    /// Owned here (not on the panel) because the `E` key handler on
+    /// `KeyCommandView` toggles it too, and Esc's cascade needs to be
+    /// able to clear it from outside the panel.
+    @State private var eventModeActive: Bool = false
 
     // MARK: - Capture / recording state
 
@@ -100,7 +118,7 @@ struct ContentView: View {
                 onCameraChange: handleCameraSelectionChange,
                 onMicChange: handleMicSelectionChange
             ))
-            .onChange(of: selectedClipID) { _, _ in
+            .onChange(of: selectedClipID) { _, newID in
                 // Bump both generations so any late completions from the
                 // prior selection's seeks are dropped. Even if the user
                 // navigates A → B → A, the cache may return the *same*
@@ -109,14 +127,28 @@ struct ContentView: View {
                 previewSkipGeneration &+= 1
                 workspace.sourcePlayer?.bumpGeneration()
                 resetSkipState()
-            }
-            .onChange(of: selectedClipID) { _, newID in
                 handleSelectionChange(newID)
             }
             .onChange(of: workspace.folder) { _, _ in
-                // Filter is view-state tied to the current project; reset
-                // it when the user opens or switches projects.
+                // View-state tied to the current project; reset on switch.
                 selectedTagFilter = nil
+                inspectorMode = .events
+            }
+            .onChange(of: appMode) { _, _ in
+                // Event mode is a transient inspector affordance — it must
+                // not persist across a recording transition (enter or leave).
+                // Without this, pressing E → R → R returns to .scanning with
+                // event mode still latched on; bare 1/2/3 would tag instead
+                // of zoom and the picker overlay would still be visible.
+                eventModeActive = false
+            }
+            .onChange(of: inspectorMode) { _, _ in
+                // Same rationale across inspector-mode flips: a user can
+                // press E (overlay up), click Edit → settings, then Done →
+                // events, and the latched flag would re-show the overlay
+                // immediately. macOS 14+ two-arg onChange skips the initial
+                // mount, so this is idempotent.
+                eventModeActive = false
             }
             .task {
                 // Auto-restore last project on launch. Silently skip on any error
@@ -143,6 +175,11 @@ struct ContentView: View {
             // nil while recording so the menu items auto-disable.
             .focusedValue(\.undoAction, undoHandler)
             .focusedValue(\.redoAction, redoHandler)
+            // Publish the "open Match Settings" handler so the app-level
+            // Project menu (`ProjectCommands`) can flip the inspector
+            // into settings mode in place. nil when no project is open
+            // — the menu item then disables itself.
+            .focusedValue(\.openMatchSettings, openMatchSettingsHandler)
             // No `.task { capture.configure() }` here on purpose: opening the
             // capture session at launch turns on the camera/mic indicator
             // light and triggers the OS permission prompt before the user
@@ -286,6 +323,19 @@ struct ContentView: View {
                         case .previewClip(let id):
                             PreviewPlayerSurface(player: workspace.previewPlayer(for: id))
                         }
+                        // Scoreboard overlay — rendered on top of the source
+                        // player during scanning + recording. Single mount
+                        // covers both modes because the MPVPlayerView itself
+                        // is shared across .scanning / .recordingStarting /
+                        // .recording in the switch above. Gated on the same
+                        // mode set so we don't mount it during preview where
+                        // the player surface is an AVPlayer instead of mpv.
+                        if appMode == .scanning
+                            || appMode == .recordingStarting
+                            || appMode == .recording {
+                            ScoreboardOverlayView(workspace: workspace)
+                                .allowsHitTesting(false)
+                        }
                         // Mode C overlays — only mounted when previewing so the
                         // periodic time observer in StrokeReplayLayer doesn't run
                         // during scanning/recording.
@@ -293,6 +343,8 @@ struct ContentView: View {
                            let player = workspace.previewPlayer(for: id),
                            let clip = workspace.project.clips.first(where: { $0.id == id }) {
                             StrokeReplayOverlay(player: player, clip: clip, replayFrozen: coarseSeekInFlight)
+                                .allowsHitTesting(false)
+                            ScoreboardReplayOverlay(player: player, clip: clip, workspace: workspace)
                                 .allowsHitTesting(false)
                             previewTextBar(for: clip)
                                 .allowsHitTesting(false)
@@ -353,7 +405,14 @@ struct ContentView: View {
                             workspace.setCurrentZoomImmediate(next)
                         },
                         hasTagFilter: selectedTagFilter != nil,
-                        onClearTagFilter: { selectedTagFilter = nil }
+                        onClearTagFilter: { selectedTagFilter = nil },
+                        eventModeActive: eventModeActive,
+                        onEnterEventMode: { eventModeActive = true },
+                        onExitEventMode:  { eventModeActive = false },
+                        onTagEventInMode: { kind in
+                            workspace.tagEvent(kind)
+                            eventModeActive = false
+                        }
                     )
                     // Empty / error states cover the player area when there's
                     // nothing meaningful to show. They sit ON TOP of preview
@@ -377,11 +436,21 @@ struct ContentView: View {
                 .frame(minHeight: 44)
             }
         } detail: {
-            ClipInspector(
-                workspace: workspace,
-                selectedClipID: $selectedClipID,
-                selectedTagFilter: $selectedTagFilter
-            )
+            VStack(spacing: 0) {
+                if appMode == .scanning {
+                    MatchInspectorPanel(
+                        workspace: workspace,
+                        mode: $inspectorMode,
+                        eventModeActive: $eventModeActive
+                    )
+                    Divider()
+                }
+                ClipInspector(
+                    workspace: workspace,
+                    selectedClipID: $selectedClipID,
+                    selectedTagFilter: $selectedTagFilter
+                )
+            }
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
         }
         .toolbar {
@@ -560,7 +629,7 @@ struct ContentView: View {
             // math would feed the coordinator a bogus zero.
             guard player.hasLoadedFile else { return }
             let project = workspace.project
-            let cumulativeCurrent = project.cumulativeOffset(forSourceIndex: player.playlistPos) + player.timePos
+            let cumulativeCurrent = project.absSeconds(sourceIndex: player.playlistPos, sourceSeconds: player.timePos)
             let total = project.totalSourceDuration
             // SkipCoordinator does NOT walk a playlist; it operates on a
             // single scalar `current/duration`. We feed it cumulative-time
@@ -824,6 +893,10 @@ struct ContentView: View {
                 // Position changed, identity didn't — leave the
                 // selection alone so the user's focus is preserved.
                 break
+            case .editMatchEvents:
+                // Project-level match-event edit — not tied to a
+                // particular clip. Leave clip selection alone.
+                break
             }
         }
     }
@@ -847,8 +920,20 @@ struct ContentView: View {
                 }
             case .reorderClips:
                 break
+            case .editMatchEvents:
+                break
             }
         }
+    }
+
+    /// Handler published to the Project ▸ Match Setup… (⇧⌘M) menu. nil
+    /// when no project folder is open — without a project there's nothing
+    /// to attach a `ScoreboardConfig` to, so the menu disables itself.
+    /// Flips the inspector panel into settings mode in place; the panel
+    /// returns itself to `.events` via its Done button.
+    private var openMatchSettingsHandler: (() -> Void)? {
+        guard workspace.folder != nil else { return nil }
+        return { inspectorMode = .settings }
     }
 
     // MARK: - Recording flow

@@ -86,12 +86,51 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
 }
 
 public struct Project: Codable, Hashable, Sendable {
-    public var formatVersion: Int = 3
+    /// JSON schema version. See `currentFormatVersion` for migration history.
+    public var formatVersion: Int = Project.currentFormatVersion
     public var name: String
     public var sourceVideos: [SourceRef] = []
     public var clips: [Clip] = []
     public var preferences: Preferences = .init()
+    public var scoreboard: ScoreboardConfig? = nil
+    public var matchEvents: [MatchEventRecord] = []
     public init(name: String) { self.name = name }
+
+    // Custom decoder so legacy JSON (v1/v2) lacking `matchEvents` decodes
+    // cleanly with the field defaulting to []. `scoreboard` is Optional so it
+    // already decodes to nil when missing — but we still need to teach the
+    // synthesised decoder to tolerate the missing array key.
+    private enum CodingKeys: String, CodingKey {
+        case formatVersion, name, sourceVideos, clips, preferences, scoreboard, matchEvents
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        // Default to 1 (not `currentFormatVersion`) when the key is missing:
+        // a file with no `formatVersion` predates the field, which means v1.
+        // Defaulting to current would silently bypass the `ProjectStore.read`
+        // upper-bound guard.
+        self.formatVersion = try c.decodeIfPresent(Int.self, forKey: .formatVersion) ?? 1
+        self.name = try c.decode(String.self, forKey: .name)
+        self.sourceVideos = try c.decodeIfPresent([SourceRef].self, forKey: .sourceVideos) ?? []
+        self.clips = try c.decodeIfPresent([Clip].self, forKey: .clips) ?? []
+        self.preferences = try c.decodeIfPresent(Preferences.self, forKey: .preferences) ?? .init()
+        self.scoreboard = try c.decodeIfPresent(ScoreboardConfig.self, forKey: .scoreboard)
+        self.matchEvents = try c.decodeIfPresent([MatchEventRecord].self, forKey: .matchEvents) ?? []
+    }
+}
+
+public extension Project {
+    /// Migration history:
+    /// - v1: original schema (no formatVersion field)
+    /// - v2: added `.zoom` event variant
+    /// - v3: added per-clip PiP visibility (`Clip.showPiP`,
+    ///   `Preferences.pipForNewRecordings`). v1/v2 files migrate via
+    ///   `ProjectStore.migrateIfNeeded` (in-blob field injection).
+    /// - v4: added `scoreboard` (TeamConfig + MatchFormat) and `matchEvents`.
+    ///   v3 files lacking these keys decode cleanly via `Project.init(from:)`'s
+    ///   `decodeIfPresent`.
+    static let currentFormatVersion: Int = 4
 }
 
 public extension Project {
@@ -109,5 +148,10 @@ public extension Project {
         var sum: Double = 0
         for k in 0..<clamped { sum += sourceVideos[k].durationSeconds }
         return sum
+    }
+
+    /// Absolute time on the virtual-concat timeline for a (sourceIndex, sourceSeconds) pair.
+    func absSeconds(sourceIndex: Int, sourceSeconds: Double) -> Double {
+        cumulativeOffset(forSourceIndex: sourceIndex) + sourceSeconds
     }
 }

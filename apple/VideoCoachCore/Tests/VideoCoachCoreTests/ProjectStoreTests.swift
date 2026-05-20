@@ -38,12 +38,13 @@ final class ProjectStoreTests: XCTestCase {
         XCTAssertEqual(try ProjectStore.read(from: tmp).name, "v2")
     }
 
-    /// Regression: encoder uses .iso8601 for dates; the decoder must match or
-    /// any saved Clip (which has a createdAt: Date) will fail to read back.
-    func test_unsupportedFormatVersionV4_isRejected() throws {
-        let v4 = """
+    /// Future format versions (beyond `currentFormatVersion`) must be
+    /// rejected — otherwise we'd silently misinterpret unknown future fields.
+    func test_unsupportedFutureFormatVersion_isRejected() throws {
+        let futureVersion = Project.currentFormatVersion + 1
+        let json = """
         {
-          "formatVersion": 4,
+          "formatVersion": \(futureVersion),
           "name": "Future",
           "sourceVideos": [],
           "clips": [],
@@ -57,12 +58,12 @@ final class ProjectStoreTests: XCTestCase {
           }
         }
         """.data(using: .utf8)!
-        try v4.write(to: tmp.appendingPathComponent("project.json"))
+        try json.write(to: tmp.appendingPathComponent("project.json"))
         XCTAssertThrowsError(try ProjectStore.read(from: tmp)) { error in
             guard case ProjectStoreError.unsupportedFormatVersion(let v) = error else {
                 XCTFail("expected .unsupportedFormatVersion, got \(error)"); return
             }
-            XCTAssertEqual(v, 4)
+            XCTAssertEqual(v, futureVersion)
         }
     }
 

@@ -308,11 +308,102 @@ final class CompilationExporterE2ETests: XCTestCase {
         )
     }
 
+    // MARK: - Scoreboard overlay end-to-end
+
+    /// Pixel-anchor integration test for the scoreboard overlay rendered
+    /// during export. Verifies the full chain: `Project.scoreboard` +
+    /// `Project.matchEvents` → `ExportSheet`-style precompute →
+    /// `CompilationExporter.export(scoreboardConfig:matchEventsAbs:…)` →
+    /// `CompilationInstruction.scoreboardConfig` → compositor's
+    /// `drawScoreboard(...)` call. A regression in any link silently strips
+    /// the overlay (export looks like the no-scoreboard baseline) — unit
+    /// tests on `scoreboardState` or `drawScoreboard` in isolation can't
+    /// catch the wiring break.
+    ///
+    /// Probes the home and away color cells inside the score bar — home is
+    /// pure red, away is pure blue. Layout (from
+    /// `Overlays/ScoreboardDraw.swift`, normalized to output size):
+    ///   bar:   leftX = 0.015, topY = 0.015, barW = 0.36, barH = 0.08
+    ///   accentH = barH * 0.08 ≈ 0.0064 (top sliver)
+    ///   scoreBarH = barH - accentH ≈ 0.0736
+    ///   scoreRowY = topY + accentH ≈ 0.0214
+    ///   homeCell x ∈ [leftX, leftX + 0.30·barW] = [0.015, 0.123]
+    ///   awayCell x ∈ [0.195, 0.303]
+    ///   both cells y ∈ [≈0.0214, ≈0.095]
+    /// Probe rects sit inside those bands and avoid the centered team-name
+    /// text (white, ~half the cell height) by sitting near the cell's left
+    /// edge.
+    func test_export_drawsScoreboard_homePrimaryAtHomeCell_awayPrimaryAtAwayCell() async throws {
+        let clip = Clip(
+            name: "scoreboard-export",
+            tags: ["test"],
+            sourceIndex: 0,
+            startSourceSeconds: 2,
+            recordingDuration: 2,
+            recordingFilename: camURL.lastPathComponent,
+            events: [
+                .init(recordTime: 0, kind: .zoom(.identity)),
+                .init(recordTime: 0, kind: .play(sourceTime: 2)),
+            ],
+            sortIndex: 0
+        )
+        let scoreboard = ScoreboardConfig(
+            home: TeamConfig(
+                name: "RED",
+                primaryColor: RGBA(r: 1, g: 0, b: 0, a: 1),
+                secondaryColor: RGBA(r: 1, g: 1, b: 1, a: 1)
+            ),
+            away: TeamConfig(
+                name: "BLU",
+                primaryColor: RGBA(r: 0, g: 0, b: 1, a: 1),
+                secondaryColor: RGBA(r: 1, g: 1, b: 1, a: 1)
+            )
+        )
+        // startStop at absoluteTime=0 — `project.sourceVideos` is empty in
+        // this fixture so `cumulativeOffset == 0` and the recorded
+        // sourceSeconds maps 1:1 to absSeconds. At output time 0.5 we're at
+        // sourceTime 2.5 → absTime 2.5, well past the game start, so
+        // `scoreboardState(...)` returns non-nil and the overlay renders.
+        let events: [MatchEventRecord] = [
+            .init(kind: .startStop, sourceIndex: 0, sourceSeconds: 0.0)
+        ]
+
+        try await runExport(clip: clip, scoreboard: scoreboard, matchEvents: events)
+        let frame = try await sampleFrame(of: outURL, atOutputTime: 0.5)
+
+        // Probe near the left edge of each cell to dodge the centered team
+        // name (white text). Width 0.03 keeps the probe inside the homeCell
+        // [0.015, 0.123] / awayCell [0.195, 0.303] horizontal bands.
+        let homeAvg = PixelSampling.averageRGB(
+            in: frame,
+            normalizedRect: CGRect(x: 0.025, y: 0.04, width: 0.03, height: 0.03)
+        )
+        XCTAssertGreaterThan(homeAvg.r, 0.5,
+            "home cell should be red-dominant; got \(homeAvg). If r≈g≈b the scoreboard overlay wasn't drawn — the precompute → exporter → compositor wiring is broken.")
+        XCTAssertLessThan(homeAvg.b, 0.3,
+            "home cell should not be blue; got \(homeAvg).")
+
+        let awayAvg = PixelSampling.averageRGB(
+            in: frame,
+            normalizedRect: CGRect(x: 0.205, y: 0.04, width: 0.03, height: 0.03)
+        )
+        XCTAssertGreaterThan(awayAvg.b, 0.5,
+            "away cell should be blue-dominant; got \(awayAvg).")
+        XCTAssertLessThan(awayAvg.r, 0.3,
+            "away cell should not be red; got \(awayAvg).")
+    }
+
     // MARK: - Helpers
 
-    private func runExport(clip: Clip) async throws {
+    private func runExport(
+        clip: Clip,
+        scoreboard: ScoreboardConfig? = nil,
+        matchEvents: [MatchEventRecord] = []
+    ) async throws {
         var project = Project(name: "export-e2e")
         project.clips = [clip]
+        project.scoreboard = scoreboard
+        project.matchEvents = matchEvents
         let plan = project.compilationPlan(
             for: "test",
             sourceDurations: [0: Self.sourceDuration]
@@ -321,6 +412,16 @@ final class CompilationExporterE2ETests: XCTestCase {
 
         let sourceAsset = AVURLAsset(url: srcURL)
         let webcamAsset = AVURLAsset(url: camURL)
+        // Mirror ExportSheet's scoreboard precompute. `sourceVideos` is empty
+        // in this lightweight test fixture (no Project.sourceVideos populated),
+        // so `project.absSeconds` collapses to `clip.startSourceSeconds`,
+        // which is exactly what we want for a one-source single-clip test.
+        let clipStartAbsSecondsByID = Dictionary(
+            uniqueKeysWithValues: project.clips.map {
+                ($0.id, project.absSeconds(sourceIndex: $0.sourceIndex, sourceSeconds: $0.startSourceSeconds))
+            }
+        )
+        let matchEventsAbs = project.absoluteMatchEvents
         let exporter = CompilationExporter()
         try await exporter.export(
             plan: plan,
@@ -331,7 +432,10 @@ final class CompilationExporterE2ETests: XCTestCase {
             resolution: .r720,
             quality: .medium,
             sourceVolume: 1.0,
-            commentaryVolume: 1.0
+            commentaryVolume: 1.0,
+            scoreboardConfig: project.scoreboard,
+            matchEventsAbs: matchEventsAbs,
+            clipStartAbsSecondsByID: clipStartAbsSecondsByID
         )
         XCTAssertTrue(FileManager.default.fileExists(atPath: outURL.path))
     }

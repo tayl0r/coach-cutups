@@ -80,7 +80,7 @@ struct ScanningTransport: View {
     /// advances.
     private var cumulativeCurrent: Double {
         guard let p = workspace.sourcePlayer, p.hasLoadedFile else { return 0 }
-        return workspace.project.cumulativeOffset(forSourceIndex: p.playlistPos) + p.timePos
+        return workspace.project.absSeconds(sourceIndex: p.playlistPos, sourceSeconds: p.timePos)
     }
     private var totalDuration: Double {
         workspace.project.totalSourceDuration

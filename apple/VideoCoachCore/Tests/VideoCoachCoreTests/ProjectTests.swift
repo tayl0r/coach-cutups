@@ -14,7 +14,7 @@ final class ProjectTests: XCTestCase {
         let data = try JSONEncoder().encode(p)
         let decoded = try JSONDecoder().decode(Project.self, from: data)
         XCTAssertEqual(decoded.name, "MyMatch")
-        XCTAssertEqual(decoded.formatVersion, 3)
+        XCTAssertEqual(decoded.formatVersion, 4)
         XCTAssertTrue(decoded.clips.isEmpty)
     }
 
@@ -117,9 +117,9 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(decodedStroke.lineWidth, 0.0125)
     }
 
-    func test_freshProjectHasShowPiPDefaultsAndFormatVersion3() throws {
+    func test_freshProjectHasShowPiPDefaultsAndFormatVersion() throws {
         let p = Project(name: "M")
-        XCTAssertEqual(p.formatVersion, 3)
+        XCTAssertEqual(p.formatVersion, 4)
         XCTAssertTrue(p.preferences.pipForNewRecordings)
         var withClip = p
         withClip.clips.append(Clip(
@@ -206,5 +206,64 @@ final class ProjectTests: XCTestCase {
         let loaded = try ProjectStore.read(from: dir)
         XCTAssertEqual(loaded.formatVersion, 3)
         XCTAssertTrue(loaded.preferences.pipForNewRecordings)
+    }
+
+    func test_v2JSON_decodesWithEmptyScoreboardDefaults() throws {
+        let json = """
+        {
+          "formatVersion": 2, "name": "x",
+          "sourceVideos": [], "clips": [],
+          "preferences": {
+            "scanVolume": 1, "previewSourceVolume": 1, "previewCommentaryVolume": 1,
+            "lastExportResolution": "r1080", "lastExportQuality": "medium",
+            "pipForNewRecordings": true
+          }
+        }
+        """.data(using: .utf8)!
+        let p = try JSONDecoder().decode(Project.self, from: json)
+        XCTAssertEqual(p.formatVersion, 2)
+        XCTAssertNil(p.scoreboard)
+        XCTAssertTrue(p.matchEvents.isEmpty)
+    }
+
+    func test_projectStore_writeBumpsFormatVersionToCurrent() throws {
+        var p = Project(name: "x")
+        p.formatVersion = 2  // simulate freshly loaded v2 project
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try ProjectStore.write(p, to: tmp)
+        let reread = try ProjectStore.read(from: tmp)
+        XCTAssertEqual(reread.formatVersion, 4, "write must bump formatVersion to current (4)")
+    }
+
+    func test_projectStore_v4RoundTripWithScoreboard() throws {
+        var p = Project(name: "x")
+        p.scoreboard = ScoreboardConfig(
+            home: TeamConfig(name: "ARS", primaryColor: .red, secondaryColor: .red),
+            away: TeamConfig(name: "BUR", primaryColor: .red, secondaryColor: .red))
+        p.appendStartStop(sourceIndex: 0, sourceSeconds: 1.0)
+        p.appendHomeGoal(sourceIndex: 0, sourceSeconds: 10.0)
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try ProjectStore.write(p, to: tmp)
+        let reread = try ProjectStore.read(from: tmp)
+        XCTAssertEqual(reread.scoreboard?.home.name, "ARS")
+        XCTAssertEqual(reread.matchEvents.count, 2)
+    }
+
+    func test_v4Scoreboard_roundTripsFontColor() throws {
+        var home = TeamConfig(name: "ARS",
+                              primaryColor: .red,
+                              secondaryColor: .red)
+        home.fontColor = RGBA(r: 0, g: 0, b: 1, a: 1)
+        var away = TeamConfig(name: "BUR",
+                              primaryColor: .red,
+                              secondaryColor: .red)
+        away.fontColor = RGBA(r: 1, g: 1, b: 0, a: 1)
+        let cfg = ScoreboardConfig(home: home, away: away)
+        let data = try JSONEncoder().encode(cfg)
+        let decoded = try JSONDecoder().decode(ScoreboardConfig.self, from: data)
+        XCTAssertEqual(decoded.home.fontColor, RGBA(r: 0, g: 0, b: 1, a: 1))
+        XCTAssertEqual(decoded.away.fontColor, RGBA(r: 1, g: 1, b: 0, a: 1))
     }
 }

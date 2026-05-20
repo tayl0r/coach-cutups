@@ -19,7 +19,10 @@ public enum ProjectStore {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let project = try decoder.decode(Project.self, from: migratedData)
-        if project.formatVersion < 1 || project.formatVersion > 3 {
+        // Upper bound is `Project.currentFormatVersion` — bump it there to
+        // widen this guard. See `Project.currentFormatVersion`'s doc for
+        // per-version migration notes.
+        if project.formatVersion < 1 || project.formatVersion > Project.currentFormatVersion {
             throw ProjectStoreError.unsupportedFormatVersion(project.formatVersion)
         }
         return project
@@ -60,6 +63,8 @@ public enum ProjectStore {
     }
 
     public static func write(_ project: Project, to folder: URL) throws {
+        var project = project
+        project.formatVersion = Project.currentFormatVersion
         let fm = FileManager.default
         try fm.createDirectory(at: folder, withIntermediateDirectories: true)
         try fm.createDirectory(
