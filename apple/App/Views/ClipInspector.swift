@@ -6,6 +6,7 @@ import VideoCoachCore
 /// so disk state matches what's on screen.
 struct ClipInspector: View {
     @Bindable var workspace: Workspace
+    let coordinator: TranscriptionCoordinator
     @Binding var selectedClipID: Clip.ID?
     @Binding var selectedTagFilter: String?
 
@@ -21,6 +22,7 @@ struct ClipInspector: View {
             if let id = selectedClipID, let binding = clipBinding(for: id) {
                 EditorView(
                     workspace: workspace,
+                    coordinator: coordinator,
                     clip: binding,
                     suggestions: tagSuggestions
                 )
@@ -198,11 +200,14 @@ private struct TagOverview: View {
 
 private struct EditorView: View {
     let workspace: Workspace
+    let coordinator: TranscriptionCoordinator
     @Binding var clip: Clip
     let suggestions: Set<String>
 
     @FocusState private var nameFocused: Bool
     @FocusState private var notesFocused: Bool
+    @FocusState private var transcriptFocused: Bool
+    @FocusState private var summaryFocused: Bool
 
     /// Per-field snapshots taken on focus-gain. Each field commits its
     /// own undo step on focus-loss. Per-spec ("each blur/Enter on a
@@ -214,6 +219,8 @@ private struct EditorView: View {
     @State private var nameSnapshot: Clip?
     @State private var tagsSnapshot: Clip?
     @State private var notesSnapshot: Clip?
+    @State private var transcriptSnapshot: Clip?
+    @State private var summarySnapshot: Clip?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
@@ -258,6 +265,37 @@ private struct EditorView: View {
             }
 
             Group {
+                Text("Summary").font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $clip.summary)
+                    .font(.body)
+                    .frame(minHeight: 40)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                    )
+                    .focused($summaryFocused)
+                    .onChange(of: summaryFocused) { _, focused in
+                        handleFocusChange(focused: focused, snapshot: $summarySnapshot)
+                    }
+            }
+
+            Group {
+                Text("Transcript").font(.caption).foregroundStyle(.secondary)
+                TextEditor(text: $clip.transcript)
+                    .font(.body)
+                    .frame(minHeight: 120)
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 4)
+                            .stroke(Color.secondary.opacity(0.3), lineWidth: 1)
+                    )
+                    .focused($transcriptFocused)
+                    .onChange(of: transcriptFocused) { _, focused in
+                        handleFocusChange(focused: focused, snapshot: $transcriptSnapshot)
+                    }
+                transcribeRow
+            }
+
+            Group {
                 Text("Notes").font(.caption).foregroundStyle(.secondary)
                 TextEditor(text: $clip.notes)
                     .font(.body)
@@ -286,6 +324,49 @@ private struct EditorView: View {
             flush(&nameSnapshot)
             flush(&tagsSnapshot)
             flush(&notesSnapshot)
+            flush(&transcriptSnapshot)
+            flush(&summarySnapshot)
+        }
+    }
+
+    @ViewBuilder
+    private var transcribeRow: some View {
+        let state = coordinator.state(for: clip.id)
+        HStack(spacing: 8) {
+            Button("Transcribe") {
+                coordinator.enqueue(clipID: clip.id)
+            }
+            .disabled(stateIsInFlight(state))
+
+            if stateIsInFlight(state) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(captionFor(state))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Spacer()
+        }
+        if case .failed(let msg) = state {
+            Text(msg)
+                .font(.callout)
+                .foregroundStyle(.red)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+    }
+
+    private func stateIsInFlight(_ state: TranscriptionState) -> Bool {
+        switch state {
+        case .transcribing, .summarizing: return true
+        default: return false
+        }
+    }
+
+    private func captionFor(_ state: TranscriptionState) -> String {
+        switch state {
+        case .transcribing: return "Transcribing…"
+        case .summarizing:  return "Summarizing…"
+        default:            return ""
         }
     }
 

@@ -17,7 +17,8 @@ struct ContentView: View {
     /// reach the capture session.
     @Bindable var deviceCatalog: DeviceCatalog
 
-    @State private var workspace = Workspace()
+    @Bindable var workspace: Workspace
+    let transcription: TranscriptionCoordinator
     @State private var skipCoordinator = SkipCoordinator(burstWindowSeconds: 0.15)
     @State private var skipDebounceTask: Task<Void, Never>?
     /// Bumped on every selectedClipID change so a late preview-mode seek
@@ -447,6 +448,7 @@ struct ContentView: View {
                 }
                 ClipInspector(
                     workspace: workspace,
+                    coordinator: transcription,
                     selectedClipID: $selectedClipID,
                     selectedTagFilter: $selectedTagFilter
                 )

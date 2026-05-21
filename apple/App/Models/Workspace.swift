@@ -817,4 +817,25 @@ final class Workspace {
         project.clips.append(clip)
         try? saveProject()
     }
+
+    // MARK: - AI-driven writes (transcript / summary)
+
+    /// Apply an AI-generated mutation to a clip and persist. Calls the
+    /// pure-data `Project.applyAIWrite` then `saveProject()`. Does NOT
+    /// push an undo entry — AI writes are not user actions and don't
+    /// participate in the undo stack.
+    ///
+    /// Why no undo push: the inspector's focus-snapshot pattern
+    /// (ClipInspector.EditorView) diffs the WHOLE Clip on focus-loss.
+    /// If we pushed undo entries from out-of-band AI writes, a
+    /// concurrent user edit's focus-loss flush would bundle the AI
+    /// write into the user's undo step — cmd-z of (say) a notes edit
+    /// would silently revert the AI write. Routing AI writes around
+    /// the undo stack avoids this. Users who want different transcript
+    /// or summary content can edit the fields directly; those edits DO
+    /// go through the standard focus-snapshot undo path.
+    func applyAIWrite(id: Clip.ID, _ mutate: (inout Clip) -> Void) {
+        project.applyAIWrite(id: id, mutate)
+        try? saveProject()
+    }
 }
