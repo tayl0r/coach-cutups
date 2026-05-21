@@ -257,8 +257,12 @@ final class ProjectTests: XCTestCase {
         p.clips[0].transcript = "okay so right here the through-ball really opens up the line"
         p.clips[0].summary = "Coach praises the through-ball that opens the line."
 
-        let data = try JSONEncoder().encode(p)
-        let decoded = try JSONDecoder().decode(Project.self, from: data)
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let data = try encoder.encode(p)
+        let decoded = try decoder.decode(Project.self, from: data)
         XCTAssertEqual(decoded.clips[0].transcript,
                        "okay so right here the through-ball really opens up the line")
         XCTAssertEqual(decoded.clips[0].summary,
