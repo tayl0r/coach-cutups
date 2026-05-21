@@ -1312,14 +1312,16 @@ private struct DeviceWiringModifier: ViewModifier {
                 catalog.lockedByRecording =
                     (newMode == .recording || newMode == .recordingStarting)
             }
+        let stepTwo = stepOne
             .onChange(of: workspaceFolder) { _, newFolder in
                 guard newFolder != nil else { return }
                 onProjectOpened()
             }
-        return stepOne
+        let stepThree = stepTwo
             .onChange(of: catalog.selectedCameraID) { _, newID in
                 onCameraChange(newID)
             }
+        return stepThree
             .onChange(of: catalog.selectedMicID) { _, newID in
                 onMicChange(newID)
             }
