@@ -14,7 +14,7 @@ final class ProjectTests: XCTestCase {
         let data = try JSONEncoder().encode(p)
         let decoded = try JSONDecoder().decode(Project.self, from: data)
         XCTAssertEqual(decoded.name, "MyMatch")
-        XCTAssertEqual(decoded.formatVersion, 4)
+        XCTAssertEqual(decoded.formatVersion, 5)
         XCTAssertTrue(decoded.clips.isEmpty)
     }
 
@@ -120,7 +120,7 @@ final class ProjectTests: XCTestCase {
 
     func test_freshProjectHasShowPiPDefaultsAndFormatVersion() throws {
         let p = Project(name: "M")
-        XCTAssertEqual(p.formatVersion, 4)
+        XCTAssertEqual(p.formatVersion, 5)
         XCTAssertTrue(p.preferences.pipForNewRecordings)
         var withClip = p
         withClip.clips.append(Clip(
@@ -169,7 +169,7 @@ final class ProjectTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try ProjectStore.write(p, to: tmp)
         let reread = try ProjectStore.read(from: tmp)
-        XCTAssertEqual(reread.formatVersion, 4, "write must bump formatVersion to current (4)")
+        XCTAssertEqual(reread.formatVersion, 5, "write must bump formatVersion to current (5)")
     }
 
     func test_projectStore_v4RoundTripWithScoreboard() throws {
@@ -201,5 +201,67 @@ final class ProjectTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ScoreboardConfig.self, from: data)
         XCTAssertEqual(decoded.home.fontColor, RGBA(r: 0, g: 0, b: 1, a: 1))
         XCTAssertEqual(decoded.away.fontColor, RGBA(r: 1, g: 1, b: 0, a: 1))
+    }
+
+    func test_v4ClipMissingTranscriptAndSummary_decodesToEmptyStrings() throws {
+        // Hand-written v4 JSON: full Clip with no `transcript` and no `summary`
+        // keys. This is the canonical regression test for additive Clip-field
+        // migrations going forward.
+        let v4JSON = """
+        {
+          "formatVersion": 4,
+          "name": "LegacyV4",
+          "sourceVideos": [],
+          "clips": [{
+            "id": "11111111-2222-3333-4444-555555555555",
+            "name": "old clip",
+            "notes": "hand-written notes",
+            "tags": ["legacy"],
+            "sourceIndex": 0,
+            "startSourceSeconds": 0,
+            "recordingDuration": 1.5,
+            "recordingFilename": "c.mov",
+            "events": [],
+            "showPiP": true,
+            "sortIndex": 0,
+            "createdAt": "2025-01-01T00:00:00Z"
+          }],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "pipForNewRecordings": true
+          },
+          "matchEvents": []
+        }
+        """.data(using: .utf8)!
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let p = try decoder.decode(Project.self, from: v4JSON)
+        XCTAssertEqual(p.clips.count, 1)
+        XCTAssertEqual(p.clips[0].transcript, "")
+        XCTAssertEqual(p.clips[0].summary, "")
+        XCTAssertEqual(p.clips[0].notes, "hand-written notes",
+                       "existing user-written notes must survive untouched")
+    }
+
+    func test_transcriptAndSummaryRoundtripThroughJSON() throws {
+        var p = Project(name: "M")
+        p.clips.append(Clip(
+            name: "c", sourceIndex: 0, startSourceSeconds: 0,
+            recordingDuration: 1, recordingFilename: "c.mov",
+            sortIndex: 0
+        ))
+        p.clips[0].transcript = "okay so right here the through-ball really opens up the line"
+        p.clips[0].summary = "Coach praises the through-ball that opens the line."
+
+        let data = try JSONEncoder().encode(p)
+        let decoded = try JSONDecoder().decode(Project.self, from: data)
+        XCTAssertEqual(decoded.clips[0].transcript,
+                       "okay so right here the through-ball really opens up the line")
+        XCTAssertEqual(decoded.clips[0].summary,
+                       "Coach praises the through-ball that opens the line.")
     }
 }
