@@ -17,6 +17,10 @@ private struct RedoActionKey: FocusedValueKey {
     typealias Value = () -> Void
 }
 
+private struct OpenMatchSettingsKey: FocusedValueKey {
+    typealias Value = () -> Void
+}
+
 extension FocusedValues {
     var deleteSelectedClip: (() -> Void)? {
         get { self[DeleteSelectedClipKey.self] }
@@ -29,6 +33,10 @@ extension FocusedValues {
     var redoAction: (() -> Void)? {
         get { self[RedoActionKey.self] }
         set { self[RedoActionKey.self] = newValue }
+    }
+    var openMatchSettings: (() -> Void)? {
+        get { self[OpenMatchSettingsKey.self] }
+        set { self[OpenMatchSettingsKey.self] = newValue }
     }
 }
 
@@ -60,6 +68,22 @@ struct ClipCommands: Commands {
             Button("Redo") { redoHandler?() }
                 .keyboardShortcut("z", modifiers: [.command, .shift])
                 .disabled(redoHandler == nil)
+        }
+    }
+}
+
+/// Top-level Project menu. ContentView publishes `openMatchSettings`
+/// via `@FocusedValue` — `nil` (menu disabled) until a project folder
+/// is opened. The handler flips the inspector to settings mode in
+/// place (was: presented a modal sheet).
+struct ProjectCommands: Commands {
+    @FocusedValue(\.openMatchSettings) private var openMatchSettings
+
+    var body: some Commands {
+        CommandMenu("Project") {
+            Button("Match Setup…") { openMatchSettings?() }
+                .keyboardShortcut("m", modifiers: [.command, .shift])
+                .disabled(openMatchSettings == nil)
         }
     }
 }

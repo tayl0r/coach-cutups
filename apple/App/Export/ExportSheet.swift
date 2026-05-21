@@ -555,6 +555,19 @@ struct ExportSheet: View {
 
         run = RunState(totalCount: chosenTags.count, completedCount: 0, currentTag: chosenTags.first)
 
+        // Per-run scoreboard precompute. Snapshot project state on the main
+        // actor before the Task so the exporter runs against a stable view —
+        // matches how `chosenTags`/`outFolder` are snapshotted above. Per-clip
+        // start time keyed by `Clip.id` so the exporter's per-clip lookup
+        // doesn't depend on sourceIndex slot collisions.
+        let scoreboardConfig = workspace.project.scoreboard
+        let clipStartAbsSecondsByID = Dictionary(
+            uniqueKeysWithValues: workspace.project.clips.map {
+                ($0.id, workspace.project.absSeconds(sourceIndex: $0.sourceIndex, sourceSeconds: $0.startSourceSeconds))
+            }
+        )
+        let matchEventsAbs = workspace.project.absoluteMatchEvents
+
         Task {
             do {
                 try FileManager.default.createDirectory(
@@ -621,7 +634,10 @@ struct ExportSheet: View {
                             Task { @MainActor in
                                 handleSampleFromActiveVideo(fraction)
                             }
-                        }
+                        },
+                        scoreboardConfig: scoreboardConfig,
+                        matchEventsAbs: matchEventsAbs,
+                        clipStartAbsSecondsByID: clipStartAbsSecondsByID
                     )
 
                     // Transition .active → .done with the measured wall

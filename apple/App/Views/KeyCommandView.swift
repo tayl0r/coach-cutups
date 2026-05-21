@@ -1,4 +1,5 @@
 import SwiftUI
+import VideoCoachCore
 
 struct KeyCommandView: NSViewRepresentable {
     let appMode: AppMode
@@ -32,6 +33,21 @@ struct KeyCommandView: NSViewRepresentable {
     /// Invoked when Esc fires in scanning mode and a filter is active.
     /// Owned by ContentView; sets selectedTagFilter = nil.
     let onClearTagFilter: () -> Void
+    /// True while the inspector is in "event mode" — `E` toggles it on
+    /// and `1`/`2`/`3` then tag home goal / away goal / start-stop
+    /// (instead of stepping zoom). Esc exits event mode before falling
+    /// through to the rest of the cascade.
+    let eventModeActive: Bool
+    /// Invoked when `E` is pressed in source-visible modes and event
+    /// mode is currently inactive. Owned by ContentView.
+    let onEnterEventMode: () -> Void
+    /// Invoked when Esc is pressed while event mode is active. Owned
+    /// by ContentView.
+    let onExitEventMode: () -> Void
+    /// Invoked for plain `1` / `2` / `3` while event mode is active. The
+    /// keyboard layer maps the key to the `MatchEventKind` here so the
+    /// callsite stays a single arrow.
+    let onTagEventInMode: (MatchEventKind) -> Void
 
     func makeNSView(context: Context) -> KeyCatchingView {
         let v = KeyCatchingView()
@@ -53,6 +69,10 @@ struct KeyCommandView: NSViewRepresentable {
         v.onZoomLevel = onZoomLevel
         v.hasTagFilter = hasTagFilter
         v.onClearTagFilter = onClearTagFilter
+        v.eventModeActive = eventModeActive
+        v.onEnterEventMode = onEnterEventMode
+        v.onExitEventMode = onExitEventMode
+        v.onTagEventInMode = onTagEventInMode
     }
 }
 
@@ -69,15 +89,25 @@ private enum KeyCode {
     static let space: UInt16 = 0x31      // kVK_Space
     static let escape: UInt16 = 0x35     // kVK_Escape
     static let zero: UInt16 = 0x1D       // kVK_ANSI_0
-    static let one: UInt16 = 0x12        // kVK_ANSI_1 — reset zoom to 1×
-    static let two: UInt16 = 0x13        // kVK_ANSI_2 — zoom out by step
-    static let three: UInt16 = 0x14      // kVK_ANSI_3 — zoom in by step
+    static let one: UInt16 = 0x12        // kVK_ANSI_1 — reset zoom to 1× / home goal in event mode
+    static let two: UInt16 = 0x13        // kVK_ANSI_2 — zoom out by step / away goal in event mode
+    static let three: UInt16 = 0x14      // kVK_ANSI_3 — zoom in by step / start-stop in event mode
+    static let e: UInt16 = 0x0E          // kVK_ANSI_E — enter event mode
 }
 
 /// Per-press zoom step for keys 2 / 3. 0.25× lands evenly on the existing
 /// snap notches (1.0, 1.25, 1.5, 2.0…) so a sequence of presses tracks the
 /// notch ladder predictably.
 private let zoomKeyStep: Double = 0.25
+
+private extension NSEvent {
+    /// True when no shortcut-relevant modifier is pressed. Capslock / function
+    /// / numeric-pad / help / device-independent bits are ignored — those don't
+    /// belong in a chord decision.
+    var hasNoSignificantModifiers: Bool {
+        modifierFlags.intersection([.command, .control, .option, .shift]).isEmpty
+    }
+}
 
 final class KeyCatchingView: NSView {
     var appMode: AppMode = .scanning
@@ -90,6 +120,10 @@ final class KeyCatchingView: NSView {
     var onZoomLevel: (Double, CGPoint) -> Void = { _, _ in }
     var hasTagFilter: Bool = false
     var onClearTagFilter: () -> Void = {}
+    var eventModeActive: Bool = false
+    var onEnterEventMode: () -> Void = {}
+    var onExitEventMode: () -> Void = {}
+    var onTagEventInMode: (MatchEventKind) -> Void = { _ in }
 
     private func isPreviewMode() -> Bool {
         switch appMode {
@@ -142,11 +176,16 @@ final class KeyCatchingView: NSView {
                     return event
                 }
             case KeyCode.escape:
-                // Esc cascade: stop recording, close preview, clear tag
-                // filter, then fall through to AppKit (close popover,
-                // dismiss sheet). Each layer unwinds one piece of view
-                // state so two Esc presses from "previewing with a
-                // filter" leave you at default scanning + no filter.
+                // Esc cascade: exit event mode, stop recording, close
+                // preview, clear tag filter, then fall through to
+                // AppKit (close popover, dismiss sheet). One layer
+                // per Esc press — e.g. Esc while (recording + event
+                // mode) exits event mode first, second Esc stops
+                // recording.
+                if self.eventModeActive {
+                    self.onExitEventMode()
+                    return nil
+                }
                 switch self.appMode {
                 case .recording:
                     self.onToggleRecord()
@@ -180,15 +219,26 @@ final class KeyCatchingView: NSView {
                 }
                 return event
             case KeyCode.one, KeyCode.two, KeyCode.three:
-                // Plain `1` / `2` / `3` set or step the source zoom. Only
-                // active in source-visible modes; preview modes have no MPV
-                // view to pivot against, so the keystrokes fall through
-                // (AppKit's default beep is fine — the user shouldn't be
-                // attempting source-zoom shortcuts mid-preview).
-                let modSignificant: NSEvent.ModifierFlags = [.command, .control, .option, .shift]
-                guard event.modifierFlags.intersection(modSignificant).isEmpty else { return event }
+                // Plain `1` / `2` / `3` set or step the source zoom.
+                // While the inspector is in event mode, the same keys
+                // tag home goal / away goal / start-stop instead.
+                // Only active in source-visible modes; preview modes
+                // have no MPV view to pivot against (and no source to
+                // tag against), so the keystrokes fall through.
+                guard event.hasNoSignificantModifiers else { return event }
                 switch self.appMode {
                 case .scanning, .recording:
+                    if self.eventModeActive {
+                        let kind: MatchEventKind
+                        switch event.keyCode {
+                        case KeyCode.one:   kind = .homeGoal
+                        case KeyCode.two:   kind = .awayGoal
+                        case KeyCode.three: kind = .startStop
+                        default:            return event
+                        }
+                        self.onTagEventInMode(kind)
+                        return nil
+                    }
                     let target: Double
                     switch event.keyCode {
                     case KeyCode.one:   target = 1.0
@@ -202,6 +252,17 @@ final class KeyCatchingView: NSView {
                 default:
                     return event
                 }
+            case KeyCode.e:
+                // `E` toggles into event mode (inspector swaps the
+                // bottom strip to a "pick an event" overlay; 1/2/3
+                // then tag instead of zooming). Re-press of `E` does
+                // nothing — Esc is the documented way out, which
+                // matches the rest of the Esc cascade.
+                guard event.hasNoSignificantModifiers,
+                      self.appMode == .scanning || self.appMode == .recording,
+                      !self.eventModeActive else { return event }
+                self.onEnterEventMode()
+                return nil
             default: return event
             }
         }

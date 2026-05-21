@@ -39,6 +39,24 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
     public var textBarLine: String = ""
     public var showPiP: Bool = true
 
+    /// All-or-nothing scoreboard context for this clip. `nil` means no scoreboard overlay is drawn.
+    public struct ScoreboardContext: Sendable {
+        public let config: ScoreboardConfig
+        public let absEvents: [AbsoluteMatchEvent]
+        public let clipStartAbsSeconds: Double
+
+        public init(
+            config: ScoreboardConfig,
+            absEvents: [AbsoluteMatchEvent],
+            clipStartAbsSeconds: Double
+        ) {
+            self.config = config
+            self.absEvents = absEvents
+            self.clipStartAbsSeconds = clipStartAbsSeconds
+        }
+    }
+    public var scoreboard: ScoreboardContext? = nil
+
     private var _requiredSourceTrackIDs: [NSValue] = []
     public override var requiredSourceTrackIDs: [NSValue] {
         get { _requiredSourceTrackIDs }
@@ -58,7 +76,8 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         segments: [PlaybackSegment],
         strokes: [Stroke],
         events: [CommentaryEvent],
-        textBarLine: String
+        textBarLine: String,
+        scoreboard: ScoreboardContext? = nil
     ) -> CompilationInstruction {
         let i = CompilationInstruction()
         i.timeRange = CMTimeRange(start: compositionStart, duration: clipDuration)
@@ -89,6 +108,7 @@ public final class CompilationInstruction: AVMutableVideoCompositionInstruction,
         i.events = events
         i.textBarLine = textBarLine
         i.showPiP = showPiP
+        i.scoreboard = scoreboard
         return i
     }
 }

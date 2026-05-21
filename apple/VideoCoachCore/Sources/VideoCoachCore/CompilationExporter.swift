@@ -90,7 +90,10 @@ public actor CompilationExporter {
         quality: Quality,
         sourceVolume: Double,
         commentaryVolume: Double,
-        onProgress: (@Sendable (Float) -> Void)? = nil
+        onProgress: (@Sendable (Float) -> Void)? = nil,
+        scoreboardConfig: ScoreboardConfig? = nil,
+        matchEventsAbs: [AbsoluteMatchEvent] = [],
+        clipStartAbsSecondsByID: [UUID: Double] = [:]
     ) async throws {
         Log.export.info("export start: entries=\(plan.entries.count) total=\(plan.totalDurationSeconds, format: .fixed(precision: 2))s resolution=\(resolution.rawValue) quality=\(quality.rawValue) output=\(outputURL.lastPathComponent)")
 
@@ -324,6 +327,13 @@ public actor CompilationExporter {
             // insertion so the instruction's timeRange aligns with the
             // underlying tracks at the bit level — no Double-conversion drift.
             let entryRange = entryRangesCMTime[entry.indexInOutput]!
+            let scoreboard: CompilationInstruction.ScoreboardContext? = scoreboardConfig.map {
+                CompilationInstruction.ScoreboardContext(
+                    config: $0,
+                    absEvents: matchEventsAbs,
+                    clipStartAbsSeconds: clipStartAbsSecondsByID[clip.id] ?? 0
+                )
+            }
             let inst = CompilationInstruction.make(
                 clipIndex: entry.indexInOutput,
                 indexInOutput: entry.indexInOutput,
@@ -336,7 +346,8 @@ public actor CompilationExporter {
                 segments: entry.segments,
                 strokes: strokes,
                 events: drawingEvents,
-                textBarLine: textBarLine
+                textBarLine: textBarLine,
+                scoreboard: scoreboard
             )
             instructions.append(inst)
             Log.export.info("instruction \(entry.indexInOutput): timeRange=[\(inst.timeRange.start.seconds, format: .fixed(precision: 3))..\((inst.timeRange.start + inst.timeRange.duration).seconds, format: .fixed(precision: 3))] required=[\(sourceVideoTrackID), \(webcamID)]")
@@ -525,3 +536,4 @@ public actor CompilationExporter {
         return CGSize(width: p.width, height: p.height)
     }
 }
+

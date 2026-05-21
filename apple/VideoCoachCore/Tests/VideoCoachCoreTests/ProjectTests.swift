@@ -14,7 +14,7 @@ final class ProjectTests: XCTestCase {
         let data = try JSONEncoder().encode(p)
         let decoded = try JSONDecoder().decode(Project.self, from: data)
         XCTAssertEqual(decoded.name, "MyMatch")
-        XCTAssertEqual(decoded.formatVersion, 3)
+        XCTAssertEqual(decoded.formatVersion, 4)
         XCTAssertTrue(decoded.clips.isEmpty)
     }
 
@@ -71,7 +71,8 @@ final class ProjectTests: XCTestCase {
             "previewSourceVolume": 1.0,
             "previewCommentaryVolume": 1.0,
             "lastExportResolution": "r1080",
-            "lastExportQuality": "medium"
+            "lastExportQuality": "medium",
+            "pipForNewRecordings": true
           }
         }
         """.data(using: .utf8)!
@@ -117,9 +118,9 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(decodedStroke.lineWidth, 0.0125)
     }
 
-    func test_freshProjectHasShowPiPDefaultsAndFormatVersion3() throws {
+    func test_freshProjectHasShowPiPDefaultsAndFormatVersion() throws {
         let p = Project(name: "M")
-        XCTAssertEqual(p.formatVersion, 3)
+        XCTAssertEqual(p.formatVersion, 4)
         XCTAssertTrue(p.preferences.pipForNewRecordings)
         var withClip = p
         withClip.clips.append(Clip(
@@ -143,68 +144,62 @@ final class ProjectTests: XCTestCase {
         XCTAssertFalse(decoded.clips[0].showPiP)
     }
 
-    func test_migrateV2ToV3_legacyJSONGetsDefaults() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("hide-pip-migrate-v2-\(UUID())")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let legacy = """
+    func test_v2JSON_decodesWithEmptyScoreboardDefaults() throws {
+        let json = """
         {
-          "formatVersion": 2,
-          "name": "Legacy",
-          "sourceVideos": [],
-          "clips": [{
-            "id": "12345678-1234-1234-1234-123456789012",
-            "name": "old",
-            "notes": "",
-            "tags": [],
-            "sourceIndex": 0,
-            "startSourceSeconds": 0,
-            "recordingDuration": 1.0,
-            "recordingFilename": "c.mov",
-            "events": [],
-            "sortIndex": 0,
-            "createdAt": "2024-01-01T00:00:00Z"
-          }],
+          "formatVersion": 2, "name": "x",
+          "sourceVideos": [], "clips": [],
           "preferences": {
-            "scanVolume": 1.0,
-            "previewSourceVolume": 1.0,
-            "previewCommentaryVolume": 1.0,
-            "lastExportResolution": "r1080",
-            "lastExportQuality": "medium"
+            "scanVolume": 1, "previewSourceVolume": 1, "previewCommentaryVolume": 1,
+            "lastExportResolution": "r1080", "lastExportQuality": "medium",
+            "pipForNewRecordings": true
           }
         }
         """.data(using: .utf8)!
-        try legacy.write(to: dir.appendingPathComponent("project.json"))
-        let loaded = try ProjectStore.read(from: dir)
-        XCTAssertEqual(loaded.formatVersion, 3)
-        XCTAssertTrue(loaded.preferences.pipForNewRecordings)
-        XCTAssertTrue(loaded.clips[0].showPiP)
+        let p = try JSONDecoder().decode(Project.self, from: json)
+        XCTAssertEqual(p.formatVersion, 2)
+        XCTAssertNil(p.scoreboard)
+        XCTAssertTrue(p.matchEvents.isEmpty)
     }
 
-    func test_migrateV1ToV3_legacyJSONGetsDefaults() throws {
-        let dir = FileManager.default.temporaryDirectory
-            .appendingPathComponent("hide-pip-migrate-v1-\(UUID())")
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        defer { try? FileManager.default.removeItem(at: dir) }
-        let legacy = """
-        {
-          "formatVersion": 1,
-          "name": "V1",
-          "sourceVideos": [],
-          "clips": [],
-          "preferences": {
-            "scanVolume": 1.0,
-            "previewSourceVolume": 1.0,
-            "previewCommentaryVolume": 1.0,
-            "lastExportResolution": "r1080",
-            "lastExportQuality": "medium"
-          }
-        }
-        """.data(using: .utf8)!
-        try legacy.write(to: dir.appendingPathComponent("project.json"))
-        let loaded = try ProjectStore.read(from: dir)
-        XCTAssertEqual(loaded.formatVersion, 3)
-        XCTAssertTrue(loaded.preferences.pipForNewRecordings)
+    func test_projectStore_writeBumpsFormatVersionToCurrent() throws {
+        var p = Project(name: "x")
+        p.formatVersion = 2  // simulate freshly loaded v2 project
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try ProjectStore.write(p, to: tmp)
+        let reread = try ProjectStore.read(from: tmp)
+        XCTAssertEqual(reread.formatVersion, 4, "write must bump formatVersion to current (4)")
+    }
+
+    func test_projectStore_v4RoundTripWithScoreboard() throws {
+        var p = Project(name: "x")
+        p.scoreboard = ScoreboardConfig(
+            home: TeamConfig(name: "ARS", primaryColor: .red, secondaryColor: .red),
+            away: TeamConfig(name: "BUR", primaryColor: .red, secondaryColor: .red))
+        p.appendStartStop(sourceIndex: 0, sourceSeconds: 1.0)
+        p.appendHomeGoal(sourceIndex: 0, sourceSeconds: 10.0)
+        let tmp = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+        try ProjectStore.write(p, to: tmp)
+        let reread = try ProjectStore.read(from: tmp)
+        XCTAssertEqual(reread.scoreboard?.home.name, "ARS")
+        XCTAssertEqual(reread.matchEvents.count, 2)
+    }
+
+    func test_v4Scoreboard_roundTripsFontColor() throws {
+        var home = TeamConfig(name: "ARS",
+                              primaryColor: .red,
+                              secondaryColor: .red)
+        home.fontColor = RGBA(r: 0, g: 0, b: 1, a: 1)
+        var away = TeamConfig(name: "BUR",
+                              primaryColor: .red,
+                              secondaryColor: .red)
+        away.fontColor = RGBA(r: 1, g: 1, b: 0, a: 1)
+        let cfg = ScoreboardConfig(home: home, away: away)
+        let data = try JSONEncoder().encode(cfg)
+        let decoded = try JSONDecoder().decode(ScoreboardConfig.self, from: data)
+        XCTAssertEqual(decoded.home.fontColor, RGBA(r: 0, g: 0, b: 1, a: 1))
+        XCTAssertEqual(decoded.away.fontColor, RGBA(r: 1, g: 1, b: 0, a: 1))
     }
 }

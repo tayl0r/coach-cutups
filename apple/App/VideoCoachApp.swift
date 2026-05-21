@@ -17,6 +17,7 @@ struct VideoCoachApp: App {
         .commands {
             DevicesCommands(catalog: deviceCatalog)
             ClipCommands()
+            ProjectCommands()
             DebugMenu()
         }
 

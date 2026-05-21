@@ -34,6 +34,9 @@ public enum UndoAction: Sendable {
     /// is missing from the snapshot are appended at the end so the
     /// action survives an add/delete between push and pop.
     case reorderClips(beforeOrder: [Clip.ID], afterOrder: [Clip.ID])
+    /// Snapshot pair of the project's `matchEvents` list around a tag/untag/replace.
+    /// The list is bounded (~10–20 entries) so per-step copy cost is negligible.
+    case editMatchEvents(before: [MatchEventRecord], after: [MatchEventRecord])
 }
 
 /// Pure-data undo machinery for `Workspace`. Owns the undo / redo

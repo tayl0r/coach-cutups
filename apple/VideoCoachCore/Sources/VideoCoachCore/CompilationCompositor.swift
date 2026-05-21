@@ -249,6 +249,12 @@ public final class CompilationCompositor: NSObject, AVVideoCompositing {
                 drawStroke(vs, into: cg, size: size)
             }
             drawTextBar(inst.textBarLine, into: cg, size: size)
+            if let sb = inst.scoreboard,
+               let s = scoreboardState(absoluteTime: sb.clipStartAbsSeconds + recordTime,
+                                       config: sb.config,
+                                       events: sb.absEvents) {
+                drawScoreboard(into: cg, size: size, state: s)
+            }
         }
 
         request.finish(withComposedVideoFrame: out)
