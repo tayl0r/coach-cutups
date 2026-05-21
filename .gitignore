@@ -28,3 +28,6 @@ target/
 
 # Local test fixtures (large video files; not tracked)
 fixtures/
+
+# Git worktrees for feature development
+.worktrees/
