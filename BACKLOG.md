@@ -79,3 +79,68 @@ Each entry: what, why deferred, when to revisit.
   memory default. If we make the picker permanent, we need a different way
   to signal that.
 - Revisit if a user reports the toggle feels noisy/redundant.
+
+## Clip transcript + summary (Apple AI)
+
+### 13. Audit `swiftLanguageModes: [.v5]` in `VideoCoachCore/Package.swift`
+- **Why deferred:** Bumping to Swift 6 mode surfaced a real
+  `AVAssetExportSession`-is-not-`Sendable` issue in `CompilationExporter.swift`
+  (`Task.detached` captures non-Sendable `AVAssetExportSession`). Fix requires
+  `nonisolated(unsafe)` wrappers or a Sendable shim — non-trivial complexity
+  for an audit that wasn't part of this feature's scope.
+- **When to revisit:** When other work touches `CompilationExporter` or when
+  Swift toolchain updates make the Sendable annotation cheaper to satisfy.
+  Inline comment on the pin explains the constraint.
+
+### 14. `DeviceWiringModifier.body` chained `.onChange` modifier split
+- **Why deferred:** The Swift 6.2 / macOS 26 toolchain can't type-check the
+  four-modifier chain in one go. Stepped `let stepOne / stepTwo / stepThree`
+  workaround documented inline. Collapsing to a single chain still triggers
+  the type-checker timeout under this SDK.
+- **When to revisit:** Whenever the SDK or compiler resolves the inference
+  budget regression. Test by trying the collapsed form and rebuilding.
+
+### 15. Verify `SpeechAnalyzer` authorization flow on macOS 26
+- **Why deferred:** `AppleClipIntelligence.requestSpeechAuthorizationIfNeeded`
+  uses the legacy `SFSpeechRecognizer.requestAuthorization` API. Public docs
+  at implementation time did not confirm whether `SpeechAnalyzer` shares this
+  auth gate or has its own. Conservative: keep the SF guard; worst case it's
+  an extra check that no-ops.
+- **When to revisit:** First manual smoke test. If granting Speech permission
+  doesn't propagate to `SpeechAnalyzer`, the guard might need replacement.
+
+### 16. Test coverage: `.transcribing` → `.summarizing` phase transition
+- **Why deferred:** `TranscriptionCoordinator` correctly sets `currentPhase`
+  after the transcript write, but no test asserts the in-flight state
+  transitions visible to the inspector. The code path is short and correct;
+  a refactor that moved the phase assignment would produce an obvious UI bug.
+- **When to revisit:** When touching coordinator state machine or adding new
+  pipeline phases. Add a test using `FakeClipIntelligence.transcribeDelaySeconds`
+  + `summarizeDelaySeconds` to observe both intermediate states.
+
+### 17. Cmd-z while focused on transcript/summary field reverts AI write too
+- **Why deferred:** Explicit spec decision (see "Edge case (accepted)" in
+  the design spec). If the user is typing in transcript or summary while an
+  AI write lands, the focus-loss flush bundles the AI write into the user's
+  undo step. Window is small (active typing during the few seconds between
+  job-start and summary-land); recovery is one Transcribe-button click. The
+  fix (per-field diff in the focus-loss flush) was judged worse than the
+  original.
+- **When to revisit:** If users actually report this in practice. Inline
+  comment on `Workspace.applyAIWrite` documents the rationale.
+
+### 18. No "queued" state in the inspector
+- **Why deferred:** When a second clip is enqueued behind an in-flight job,
+  `coordinator.state(for: queuedClip.id)` returns `.idle` — same as
+  never-transcribed. The inspector shows the Transcribe button as enabled.
+  Minor UX gap; user could re-click and would see the request silently
+  deduplicate.
+- **When to revisit:** If two-recordings-in-quick-succession becomes a common
+  workflow. Trivial fix: add a `.queued` case and surface it in the button label.
+
+### 19. First-run speech model download UX
+- **Why deferred:** Apple's `AssetInventory.assetInstallationRequest` blocks
+  transparently inside `transcribe()`. First-run UX is "Transcribing…
+  (longer than usual)" with no explicit progress. Spec accepted this; if it's
+  painful in practice, add a "Downloading speech model…" caption swap.
+- **When to revisit:** First manual smoke test on a fresh machine.
