@@ -165,9 +165,13 @@ struct AppleClipIntelligence: ClipIntelligence {
             // an `@Sendable` callback closure; instead they live entirely
             // inside the task body. The `isReadyForMoreMediaData` poll +
             // short sleep is the documented pattern for offline writers.
+            //
+            // Detached so the busy copy loop runs off MainActor. Cancellation is
+            // NOT wired: nothing currently cancels the outer transcribe Task, so
+            // routing cancellation in (e.g. via withTaskCancellationHandler) earns
+            // nothing today. Revisit if/when the coordinator gains cancel().
             try await Task.detached { [reader, writer, writerInput, output] in
                 while let sample = output.copyNextSampleBuffer() {
-                    try Task.checkCancellation()
                     while !writerInput.isReadyForMoreMediaData {
                         Thread.sleep(forTimeInterval: 0.005)
                     }

@@ -797,13 +797,6 @@ final class Workspace {
         return (last, project.sourceVideos[last].durationSeconds)
     }
 
-    /// Absolute URL of a clip's `.mov` file. The clip stores only the
-    /// basename; the full path is `<projectFolder>/recordings/<filename>`.
-    func recordingURL(for filename: String) -> URL? {
-        guard let folder else { return nil }
-        return ProjectStore.recordingsDir(in: folder).appendingPathComponent(filename)
-    }
-
     /// The directory under which new clip recordings are written. Returns
     /// nil if the project hasn't been opened yet (no folder).
     var recordingsDir: URL? {
