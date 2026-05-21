@@ -142,6 +142,10 @@ final class TranscriptionCoordinatorTests: XCTestCase {
         ws.project.clips.removeAll()
 
         await waitUntil(tc.inFlightClipID == nil)
+        XCTAssertEqual(tc.state(for: id), .idle,
+                       "deleted clip must resolve to .idle, not .failed")
+        XCTAssertEqual(fake.transcribeCalls.count, 1,
+                       "in-flight job must run to completion even after clip removed")
         XCTAssertTrue(ws.project.clips.isEmpty)
         XCTAssertNil(tc.inFlightClipID,
                      "coordinator must drain the job even when target clip vanishes")

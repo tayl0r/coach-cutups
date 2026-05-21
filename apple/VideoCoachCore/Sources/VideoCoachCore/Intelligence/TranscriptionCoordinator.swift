@@ -81,11 +81,10 @@ public final class TranscriptionCoordinator {
         // Starting a job on this clip clears its prior failure.
         if lastFailure?.clipID == id { lastFailure = nil }
 
-        Task { @MainActor [weak self] in
-            guard let self else { return }
-            await self.runJob(clipID: id)
-            self.inFlightClipID = nil
-            self.runNextIfIdle()
+        Task { @MainActor in
+            await runJob(clipID: id)
+            inFlightClipID = nil
+            runNextIfIdle()
         }
     }
 
