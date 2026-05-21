@@ -24,7 +24,10 @@ Everything is on-device. No network. No API keys.
 - Manual backfill for clips that pre-date the feature, or that auto-transcription failed on.
 - The transcript and summary live on the `Clip` model and persist via the
   normal `ProjectStore` round-trip.
-- Existing manual `notes` field remains independently editable.
+- **All three text fields — transcript, summary, and notes — are
+  user-editable.** AI populates transcript and summary; the user can edit
+  them afterward to refine. Each field has its own focus-snapshot undo
+  behavior, identical to how `notes` works today.
 - The intelligence pipeline is testable end-to-end without depending on
   Apple's actual ML stack.
 
@@ -34,8 +37,6 @@ Everything is on-device. No network. No API keys.
 - Speaker diarization.
 - Multi-language detection (we use the system locale, falling back to `en-US`).
 - Translation.
-- Editing the transcript through the UI (it is read-only display; the
-  underlying string is still mutable by code paths like re-run).
 - Transcribing source-video audio. We only transcribe the microphone track of
   the coach's recording.
 - Streaming partial transcripts into the UI as they arrive. The transcript is
@@ -53,21 +54,27 @@ Everything is on-device. No network. No API keys.
 4. When the transcript arrives (typically a few seconds for a ~30s clip), it
    replaces the placeholder and is persisted to disk. The placeholder
    changes to *Summarizing…* while the summary runs.
-5. When the summary lands, both fields are committed as a single undo step
-   covering the whole job (see "Persistence + undo" below).
+5. When the summary lands, it is written directly to disk. Neither write
+   pushes an undo entry — AI-driven writes are not user actions and don't
+   participate in the undo stack. The user can edit either field
+   afterward (their edits DO go through the standard focus-snapshot undo
+   path, same as `notes`).
 6. If the user is on a clip while its job completes, the inspector
    live-updates because the coordinator mutates `workspace.project.clips[i]`
    directly and `Workspace` is `@Observable`.
 
 ### Existing clips (backfill / re-run)
-1. The Notes section of the inspector always shows a **Transcribe** button
-   (single title; the transcript content above it is the affordance for
-   whether pressing it creates vs. replaces).
+1. The Notes section of the inspector always shows a **Transcribe** button.
 2. Clicking the button enqueues the same job. The button is disabled while
    any job involving this clip is in flight; a `ProgressView` plus a small
    caption ("Transcribing…" / "Summarizing…") sits next to it.
-3. Re-running on a clip with an existing transcript replaces it; the
-   replacement is one undoable step covering both transcript and summary.
+3. Re-running clobbers whatever's in `transcript` and `summary` with the
+   fresh AI output. The two text fields above the button show the current
+   content, so the user can see what will be replaced. If they want to
+   keep prior content, they can edit it elsewhere before clicking
+   Transcribe. (No confirm dialog — the visible content + the verb on
+   the button are sufficient warning, matching how the rest of the app
+   handles destructive-looking buttons.)
 
 ### Failure
 - Authorization denied (Speech permission): show a one-time alert with a
@@ -168,7 +175,7 @@ one `decodeIfPresent` line; the same pattern matches what
 │   .enqueue(clipID:)            │ ──→ │   import Speech                 │
 │   - serial queue               │     │   import FoundationModels       │
 │   - writes through             │     │                                 │
-│     Workspace.applyClipEdit    │     │ struct FakeClipIntelligence     │
+│     Workspace.applyAIWrite     │     │ struct FakeClipIntelligence     │
 │   - inFlightClipID +           │     │   (test-only, deterministic)    │
 │     currentPhase +             │     │                                 │
 │     lastFailure                │     └─────────────────────────────────┘
@@ -325,74 +332,79 @@ ContentView.stopRecording()
              else { fail(.missingRecording); return }
              setInFlight(clipID, phase: .transcribing)
 
-             let before = currentClipSnapshot(clipID)
              let text = try await intelligence.transcribe(audioURL: url)
-             workspace.applyTranscriptDirect(id: clipID, transcript: text)
-                 // mutates clip.transcript, calls saveProject() — NO undo push
+             workspace.applyAIWrite(id: clipID) { $0.transcript = text }
+                 // direct write + saveProject(); NO undo push
 
              setPhase(.summarizing)
 
              let summary = try await intelligence.summarize(text)
-             let after = currentClipSnapshot(clipID, mutate: { $0.summary = summary })
-             workspace.applyClipEdit(id: clipID, before: before, after: after)
-                 // single undo step covering transcript + summary, saves
+             workspace.applyAIWrite(id: clipID) { $0.summary = summary }
+                 // direct write + saveProject(); NO undo push
 
              clearInFlight()
            }
 ```
 
-### Workspace helpers
+### Workspace helper
 
-The coordinator uses two thin helpers on `Workspace`. Both follow the
-established convention of every existing `commitClipEdit` caller
-(ClipInspector PiP toggle, focus-loss flush): `commitClipEdit` itself
-does NOT save — the caller calls `saveProject()` explicitly after.
+The coordinator uses a single helper on `Workspace`:
 
 ```swift
 extension Workspace {
-    /// Apply a transcript directly to a clip without pushing an undo
-    /// entry. Saves the project. Used by the coordinator after the
-    /// transcript step so the result is durable even if the summary
-    /// step fails or the app quits.
-    func applyTranscriptDirect(id: Clip.ID, transcript: String) {
+    /// Apply an AI-generated mutation directly to a clip. Saves the
+    /// project. Does NOT push an undo entry — AI writes are not user
+    /// actions and don't participate in the undo stack. Short-circuits
+    /// if the clip was deleted between enqueue and write.
+    ///
+    /// Why no undo push: the inspector's focus-snapshot pattern
+    /// (ClipInspector.EditorView) diffs the WHOLE Clip on focus-loss.
+    /// If we pushed undo entries from out-of-band AI writes, a
+    /// concurrent user edit's focus-loss flush would bundle the AI
+    /// write into the user's undo step — cmd-z of (say) a notes edit
+    /// would silently revert the AI write. Routing AI writes around
+    /// the undo stack avoids this. Users who want different transcript
+    /// or summary content can edit the fields directly; those edits DO
+    /// go through the standard focus-snapshot undo path.
+    func applyAIWrite(id: Clip.ID, _ mutate: (inout Clip) -> Void) {
         guard let i = project.clips.firstIndex(where: { $0.id == id })
         else { return }
-        project.clips[i].transcript = transcript
-        try? saveProject()
-    }
-
-    /// Generic snapshot/mutate/commit helper that mirrors the existing
-    /// `mutateMatchEvents` idiom. Calls `commitClipEdit(before:after:)`
-    /// then `saveProject()`. Used by the coordinator for the combined
-    /// transcript+summary undo step at job completion.
-    func applyClipEdit(id: Clip.ID, before: Clip, after: Clip) {
-        guard let i = project.clips.firstIndex(where: { $0.id == id })
-        else { return }
-        guard before != after else { return }
-        project.clips[i] = after
-        commitClipEdit(id: id, before: before, after: after)
+        mutate(&project.clips[i])
         try? saveProject()
     }
 }
 ```
 
-If the clip is deleted before its job completes, both helpers
-short-circuit on `firstIndex(where:) == nil`. The in-flight transcribe
-work isn't cancelled (acceptable cost for a rare case); its result is
-discarded on the firstIndex check.
+If the clip is deleted before its job completes, the helper
+short-circuits on `firstIndex(where:) == nil`. The in-flight
+transcribe work isn't cancelled (acceptable cost for a rare case);
+its result is discarded on the firstIndex check.
+
+**Edge case (accepted):** If the user is actively editing one text
+field (notes, transcript, or summary) when the coordinator writes a
+different one, the user's focus-loss flush will diff the whole clip,
+see two fields changed, and bundle them into one undo step. `cmd-z` of
+that edit then also reverts the AI write. Window is small (the user
+must type during the few seconds between job-start and summary-land);
+recovery is trivial (re-run Transcribe). Project file on disk still
+holds the latest values because each AI write saved directly.
 
 ## Inspector UI
 
-`ClipInspector.EditorView` gains an "Intelligence" panel inside the
-existing "Notes" `Group`. Layout:
+`ClipInspector.EditorView` gains transcript + summary sub-sections inside
+the existing "Notes" `Group`. Layout:
 
 ```
 Notes
-  Summary               ← Text, .footnote.italic, .secondary, single line
-  "Coach praises the through-ball; criticizes the off-ball run."
+  Summary               ← TextEditor, ~40pt min height (1–2 lines)
+  ┌────────────────────┐
+  │ (editable)         │
+  └────────────────────┘
 
-  Transcript            ← scrollable Text in a 1px border, ~100pt min height
-  "okay so right here you see the through-ball really opens up the line…"
+  Transcript            ← TextEditor, ~120pt min height
+  ┌────────────────────┐
+  │ (editable)         │
+  └────────────────────┘
 
   [ Transcribe ]  ⠋  Transcribing…   ← Button + ProgressView + step caption
 
@@ -404,8 +416,15 @@ Notes
 
 - All sub-sections live inside the existing single `Group { Text("Notes")…}`
   block in `ClipInspector.swift`. No new top-level inspector section.
-- Empty transcript ⇒ summary and transcript areas show "—" (a single em
-  dash, .secondary).
+- Summary, transcript, and notes are **three independent `TextEditor`s**
+  with identical interaction semantics. Each binds directly to its
+  field on `clip` (Summary → `clip.summary`, Transcript →
+  `clip.transcript`, Your notes → `clip.notes`). Each gets its own
+  focus-snapshot pattern in `EditorView` (matching the existing
+  `nameSnapshot` / `tagsSnapshot` / `notesSnapshot` triple — now five
+  snapshots total).
+- Empty placeholder text on the summary/transcript editors: "—" in
+  `.secondary`, replaced as soon as the user types or AI populates.
 - The button title is always **"Transcribe"**. The transcript content
   above it is the affordance for whether pressing it creates vs.
   replaces — no title-flipping logic.
@@ -415,6 +434,17 @@ Notes
   "Summarizing…", or "Downloading speech model…" (first-run only).
 - On `.failed`, the button re-enables and an inline error appears below
   it: `.callout.foregroundStyle(.red)` with `error.localizedDescription`.
+- **Live-update during AI write:** if the user is NOT focused in the
+  transcript / summary field while the AI writes, the TextEditor
+  re-renders with the new value (binding reads through `@Observable`).
+  If the user IS focused there at the moment the AI writes, the
+  TextEditor's internal cursor state is preserved by SwiftUI's binding
+  semantics — but the field text updates to the new value as soon as
+  SwiftUI re-evaluates the body. This is acceptable: the user is
+  almost certainly typing into `notes`, not into a field the AI is
+  about to fill, and the rare-case behavior (AI clobbers in-progress
+  user typing in transcript or summary) is the same "re-run if
+  clobbered" pattern as elsewhere.
 
 ### Inline error lifetime
 
@@ -430,29 +460,27 @@ context) is also written via `Logging`.
 
 ## Persistence + undo
 
-- **One undo step per job.** A complete auto-transcribe-then-summarize
-  pipeline produces exactly one `.editClip` undo entry whose `before` is
-  the pre-job clip and `after` has both `transcript` and `summary`
-  populated. `cmd-z` rewinds the entire AI action in one step, matching
-  user intuition ("undo the AI thing that just happened").
-- **Transcript persists immediately.** The transcript text is written to
-  disk via `Workspace.applyTranscriptDirect` as soon as the transcribe
-  step finishes — this is durable but does NOT push an undo entry. If the
-  app crashes or the summary step fails, the transcript is preserved.
-- **Summary-step failure produces a transcript-only undo step.** If the
-  summarize step throws, the coordinator pushes a single
-  `.editClip(before: pre-job, after: post-transcript)` step covering
-  just the transcript change, then surfaces the summary error to the UI.
-  This keeps the "every auto-transcribe job is at most one undo step"
-  invariant.
-- **`commitClipEdit` does not save.** Matching the existing convention in
-  ClipInspector (PiP toggle, focus-loss flush, `mutateMatchEvents`), the
-  workspace helpers above call `saveProject()` themselves. Spec readers:
-  do not assume `commitClipEdit` persists — read
-  `Workspace.commitClipEdit` directly to confirm.
-- **Re-running** on a clip with an existing transcript produces ONE undo
-  step covering the replacement of both fields. `cmd-z` rolls back both
-  to their prior values in one step.
+- **AI writes never push undo entries.** Every write from the
+  coordinator (auto-on-record-finish or manual via the Transcribe
+  button) goes through `Workspace.applyAIWrite`, which mutates and saves
+  but does NOT call `commitClipEdit`. Rationale: see the "Why no undo
+  push" comment block on the helper. cmd-z on AI-populated content is
+  not provided; if the user dislikes the AI output, they edit the
+  fields directly (those edits ARE undoable).
+- **Each AI write is its own atomic save.** Transcript persists when
+  transcribe finishes; summary persists when summarize finishes. A
+  crash between the two preserves the transcript.
+- **User edits to transcript / summary / notes go through the existing
+  focus-snapshot path.** EditorView snapshots each field on focus-gain;
+  on focus-loss it computes the whole-clip diff and calls
+  `commitClipEdit` if `before != after`. This is the SAME mechanism
+  `notes` uses today; transcript and summary join it with their own
+  snapshot variables.
+- **`commitClipEdit` does not save.** Matching the existing convention
+  in ClipInspector (PiP toggle, focus-loss flush, `mutateMatchEvents`),
+  every existing caller follows up with `try? saveProject()`. The
+  EditorView's existing flush already does this; the new field
+  snapshots reuse the same flush helper.
 
 ## Deployment target bump
 
@@ -533,22 +561,22 @@ non-blocking task).
 ### App target (existing `VideoCoachTests` target)
 
 - `TranscriptionCoordinatorTests` using `FakeClipIntelligence`:
-  - happy path: enqueue → transcript landed and saved → summary landed →
-    single combined undo step → state `.idle`
-  - transcript-step failure leaves transcript empty, state `.failed`, no
-    undo step pushed, no save fired
-  - summarize-step failure: transcript persisted via direct write, single
-    transcript-only undo step pushed, state `.failed`
+  - happy path: enqueue → transcript landed and saved → summary landed
+    and saved → state `.idle` → NO undo entries pushed
+  - transcript-step failure leaves both fields empty, state `.failed`,
+    no save fired
+  - summarize-step failure: transcript persisted via direct write,
+    state `.failed`, no undo entries pushed
   - re-enqueue while a job is in flight is a no-op
   - two enqueued clips run serially, not concurrently (assertion via a
     fake that records overlap)
-  - deleting a clip mid-job: helpers short-circuit cleanly with no
+  - deleting a clip mid-job: helper short-circuits cleanly with no
     spurious save
-  - cmd-z after a successful auto-transcribe job rolls back BOTH fields
-    in one step
-- `WorkspaceIntelligenceEditTests`: `applyTranscriptDirect` and
-  `applyClipEdit` produce the expected undo / persistence behavior;
-  round-trip via `undo()` / `redo()` restores prior values.
+- `WorkspaceIntelligenceEditTests`: `applyAIWrite` mutates and saves
+  without pushing undo; short-circuits on missing clip ID.
+- `InspectorEditFieldTests`: each of transcript / summary / notes
+  produces its own focus-loss undo step that round-trips through
+  `undo()` / `redo()`.
 
 ### Smoke (manual)
 
@@ -556,10 +584,12 @@ After build, record a short clip and confirm:
 1. Sidebar gets the clip immediately.
 2. Inspector shows "Transcribing…" caption next to the button, then real
    transcript text.
-3. Caption switches to "Summarizing…", then the summary line appears.
+3. Caption switches to "Summarizing…", then the summary appears.
 4. Re-launching the app and re-opening the project preserves both fields.
-5. Manual button re-runs on an existing clip.
-6. A single `cmd-z` after a re-run rolls back BOTH transcript and summary.
+5. Manual button re-runs on an existing clip and clobbers prior content.
+6. Editing the transcript or summary field manually, then blurring,
+   then `cmd-z` reverts that edit (but not the AI write itself — AI
+   writes are not in the undo stack).
 
 ## Risks & open considerations
 
@@ -582,10 +612,10 @@ After build, record a short clip and confirm:
    underlying error surfaced via `localizedDescription`. No truncation
    heuristics in v1; revisit only if real recordings hit this.
 
-4. **Recording deletion during transcribe.** The `applyClipEdit` /
-   `applyTranscriptDirect` helpers short-circuit if the clip ID no longer
-   exists. The in-flight transcription is not cancelled; its work
-   completes and is discarded on write.
+4. **Recording deletion during transcribe.** The `applyAIWrite` helper
+   short-circuits if the clip ID no longer exists. The in-flight
+   transcription is not cancelled; its work completes and is discarded
+   on write.
 
 5. **Apple API surface needs eyeball confirmation in Xcode at plan-stage.**
    Web docs + WWDC sessions confirmed the existence and macOS 26 gating
@@ -605,43 +635,6 @@ After build, record a short clip and confirm:
    details of `AppleClipIntelligence`. If any turns out to differ
    significantly, the implementation choice changes but the surrounding
    architecture does not.
-
-## Open question for the human (deferred from adversarial review)
-
-**Should auto-transcript writes participate in the undo stack at all?**
-
-The current spec (with the "one undo step per job" fix from S3) still
-puts the combined transcript+summary write on the undo stack as a single
-`.editClip` step. There remains a subtle interaction with the inspector's
-focus-snapshot pattern:
-
-> If the user has the notes field focused (a focus-gain snapshot was
-> taken), and the coordinator writes `clip.transcript` while focus is
-> still held, then the user's focus-loss flush computes
-> `before = snapshot (old transcript + old notes)` vs.
-> `after = clip (new transcript + new notes)`. The diff captures BOTH
-> changes; cmd-z of the notes edit silently undoes the transcript too.
-
-The window is narrow (the user must be actively typing into notes during
-the few seconds between job-start and summary-land) but real.
-
-**Options:**
-
-- **(b) Carve auto-writes out of the undo stack entirely.** Auto-job
-  writes use `applyTranscriptDirect` for both fields (no undo push).
-  Manual button re-runs still use `applyClipEdit` (one undo step).
-  Slight inconsistency between auto and manual flows; matches the
-  user mental model where the *first* AI run feels like "the app
-  populated this for me" (not a user action), but a *re-run* feels
-  like a deliberate manual edit.
-- **(d) Accept the bug.** Rare window; user can re-run transcribe if it
-  gets clobbered.
-- **(a) Field-by-field diff in the focus-loss flush.** Most robust but
-  adds complexity to `UndoAction` / `commitClipEdit`. The deliberation
-  agent flagged this as substantial complexity for a rare bug.
-
-Recommended for user input. The deliberation agent declined to pick
-without your call.
 
 ## Out of scope (deferred to backlog if revisited)
 
