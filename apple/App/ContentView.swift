@@ -1078,6 +1078,7 @@ struct ContentView: View {
                         sortIndex: count
                     )
                     workspace.addClip(clip)
+                    transcription.enqueue(clipID: clip.id)
                     self.recordingController = nil
                     workspace.recordingController = nil
                     self.pendingRecording = nil
