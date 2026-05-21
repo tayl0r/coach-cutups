@@ -3,7 +3,8 @@ import Foundation
 
 /// Test fake. Returns whatever was configured. Records every call.
 /// Supports per-call delay so tests can observe in-flight state.
-final class FakeClipIntelligence: ClipIntelligence, @unchecked Sendable {
+@MainActor
+final class FakeClipIntelligence: ClipIntelligence {
     var transcriptToReturn: String = "fake transcript"
     var summaryToReturn: String = "fake summary."
     var transcribeError: Error?
@@ -11,21 +12,11 @@ final class FakeClipIntelligence: ClipIntelligence, @unchecked Sendable {
     var transcribeDelaySeconds: Double = 0
     var summarizeDelaySeconds: Double = 0
 
-    private let lock = NSLock()
-    private var _transcribeCalls: [URL] = []
-    private var _summarizeCalls: [String] = []
-
-    var transcribeCalls: [URL] {
-        lock.lock(); defer { lock.unlock() }
-        return _transcribeCalls
-    }
-    var summarizeCalls: [String] {
-        lock.lock(); defer { lock.unlock() }
-        return _summarizeCalls
-    }
+    private(set) var transcribeCalls: [URL] = []
+    private(set) var summarizeCalls: [String] = []
 
     func transcribe(audioURL: URL) async throws -> String {
-        lock.lock(); _transcribeCalls.append(audioURL); lock.unlock()
+        transcribeCalls.append(audioURL)
         if transcribeDelaySeconds > 0 {
             try await Task.sleep(nanoseconds: UInt64(transcribeDelaySeconds * 1_000_000_000))
         }
@@ -34,7 +25,7 @@ final class FakeClipIntelligence: ClipIntelligence, @unchecked Sendable {
     }
 
     func summarize(_ transcript: String) async throws -> String {
-        lock.lock(); _summarizeCalls.append(transcript); lock.unlock()
+        summarizeCalls.append(transcript)
         if summarizeDelaySeconds > 0 {
             try await Task.sleep(nanoseconds: UInt64(summarizeDelaySeconds * 1_000_000_000))
         }

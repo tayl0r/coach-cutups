@@ -376,18 +376,15 @@ private struct EditorView: View {
     private func handleFocusChange(focused: Bool, snapshot: Binding<Clip?>) {
         if focused {
             snapshot.wrappedValue = clip
-        } else {
-            flush(snapshot.wrappedValue.map { $0 }, clear: { snapshot.wrappedValue = nil })
+            return
         }
-    }
-
-    /// Two-arity flush (used by handleFocusChange — snapshot is held in
-    /// a Binding, can't be inout-passed).
-    private func flush(_ before: Clip?, clear: () -> Void) {
-        guard let before, before != clip else { clear(); return }
+        guard let before = snapshot.wrappedValue, before != clip else {
+            snapshot.wrappedValue = nil
+            return
+        }
         workspace.commitClipEdit(id: clip.id, before: before, after: clip)
         try? workspace.saveProject()
-        clear()
+        snapshot.wrappedValue = nil
     }
 
     /// One-arity flush over an inout snapshot (used by .onDisappear).

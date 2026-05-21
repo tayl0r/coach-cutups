@@ -14,9 +14,8 @@ struct AppleClipIntelligence: ClipIntelligence {
     func transcribe(audioURL: URL) async throws -> String {
         try await requestSpeechAuthorizationIfNeeded()
 
-        let locale = Self.resolvedLocale()
         let transcriber = SpeechTranscriber(
-            locale: locale,
+            locale: Locale.current,
             preset: .transcription
         )
 
@@ -74,10 +73,7 @@ struct AppleClipIntelligence: ClipIntelligence {
         case .available:
             break
         case .unavailable(let reason):
-            throw NSError(
-                domain: "AppleClipIntelligence", code: -3,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "On-device language model unavailable: \(String(describing: reason))."])
+            throw IntelligenceError.modelUnavailable(String(describing: reason))
         }
 
         let session = LanguageModelSession {
@@ -93,21 +89,13 @@ struct AppleClipIntelligence: ClipIntelligence {
 
     // MARK: - Helpers
 
-    private static func resolvedLocale() -> Locale {
-        let candidate = Locale.current
-        return candidate.identifier.isEmpty ? Locale(identifier: "en-US") : candidate
-    }
-
     private func requestSpeechAuthorizationIfNeeded() async throws {
         if SFSpeechRecognizer.authorizationStatus() == .authorized { return }
         let status = await withCheckedContinuation { (cont: CheckedContinuation<SFSpeechRecognizerAuthorizationStatus, Never>) in
             SFSpeechRecognizer.requestAuthorization { cont.resume(returning: $0) }
         }
         guard status == .authorized else {
-            throw NSError(
-                domain: "AppleClipIntelligence", code: -4,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "Speech recognition not authorized. Enable it in System Settings → Privacy & Security → Speech Recognition."])
+            throw IntelligenceError.notAuthorized
         }
     }
 
@@ -118,10 +106,7 @@ struct AppleClipIntelligence: ClipIntelligence {
         let asset = AVURLAsset(url: sourceURL)
         let tracks = try await asset.loadTracks(withMediaType: .audio)
         guard let audioTrack = tracks.first else {
-            throw NSError(
-                domain: "AppleClipIntelligence", code: -2,
-                userInfo: [NSLocalizedDescriptionKey:
-                    "Recording has no audio track."])
+            throw IntelligenceError.noAudioTrack
         }
 
         // Read as 16-bit interleaved PCM at the track's natural sample
@@ -167,14 +152,10 @@ struct AppleClipIntelligence: ClipIntelligence {
             writer.add(writerInput)
 
             guard reader.startReading() else {
-                throw reader.error ?? NSError(
-                    domain: "AppleClipIntelligence", code: -5,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to start audio extraction."])
+                throw reader.error ?? IntelligenceError.extractionFailed("Failed to start audio extraction.")
             }
             guard writer.startWriting() else {
-                throw writer.error ?? NSError(
-                    domain: "AppleClipIntelligence", code: -6,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to start audio writer."])
+                throw writer.error ?? IntelligenceError.extractionFailed("Failed to start audio writer.")
             }
             writer.startSession(atSourceTime: .zero)
 
@@ -192,10 +173,7 @@ struct AppleClipIntelligence: ClipIntelligence {
                     }
                     if !writerInput.append(sample) {
                         writerInput.markAsFinished()
-                        throw writer.error ?? NSError(
-                            domain: "AppleClipIntelligence", code: -7,
-                            userInfo: [NSLocalizedDescriptionKey:
-                                "Failed to append audio sample."])
+                        throw writer.error ?? IntelligenceError.extractionFailed("Failed to append audio sample.")
                     }
                 }
                 writerInput.markAsFinished()
@@ -204,15 +182,33 @@ struct AppleClipIntelligence: ClipIntelligence {
 
             await writer.finishWriting()
             if writer.status == .failed {
-                throw writer.error ?? NSError(
-                    domain: "AppleClipIntelligence", code: -8,
-                    userInfo: [NSLocalizedDescriptionKey: "Failed to finalize extracted audio."])
+                throw writer.error ?? IntelligenceError.extractionFailed("Failed to finalize extracted audio.")
             }
 
             return tempURL
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
             throw error
+        }
+    }
+}
+
+private enum IntelligenceError: LocalizedError {
+    case noAudioTrack
+    case modelUnavailable(String)
+    case notAuthorized
+    case extractionFailed(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .noAudioTrack:
+            return "Recording has no audio track."
+        case .modelUnavailable(let reason):
+            return "On-device language model unavailable: \(reason)."
+        case .notAuthorized:
+            return "Speech recognition not authorized. Enable it in System Settings → Privacy & Security → Speech Recognition."
+        case .extractionFailed(let detail):
+            return "Couldn't extract audio for transcription: \(detail)."
         }
     }
 }

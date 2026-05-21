@@ -37,7 +37,7 @@ public final class TranscriptionCoordinator {
 
     /// Which phase of the in-flight job is currently active. Only
     /// meaningful when `inFlightClipID != nil`.
-    private(set) var currentPhase: Phase = .transcribing
+    private var currentPhase: Phase = .transcribing
 
     /// The most recent failure: which clip it belonged to, and a
     /// localized message. In-memory only — relaunching the app starts
