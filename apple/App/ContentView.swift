@@ -17,7 +17,8 @@ struct ContentView: View {
     /// reach the capture session.
     @Bindable var deviceCatalog: DeviceCatalog
 
-    @State private var workspace = Workspace()
+    @Bindable var workspace: Workspace
+    let transcription: TranscriptionCoordinator
     @State private var skipCoordinator = SkipCoordinator(burstWindowSeconds: 0.15)
     @State private var skipDebounceTask: Task<Void, Never>?
     /// Bumped on every selectedClipID change so a late preview-mode seek
@@ -447,6 +448,7 @@ struct ContentView: View {
                 }
                 ClipInspector(
                     workspace: workspace,
+                    coordinator: transcription,
                     selectedClipID: $selectedClipID,
                     selectedTagFilter: $selectedTagFilter
                 )
@@ -1076,6 +1078,7 @@ struct ContentView: View {
                         sortIndex: count
                     )
                     workspace.addClip(clip)
+                    transcription.enqueue(clipID: clip.id)
                     self.recordingController = nil
                     workspace.recordingController = nil
                     self.pendingRecording = nil
@@ -1306,20 +1309,23 @@ private struct DeviceWiringModifier: ViewModifier {
     let onCameraChange: (String?) -> Void
     let onMicChange: (String?) -> Void
 
+    // Stepped intentionally — single chained .onChange exceeds the type checker's budget under macOS 26 SDK.
     func body(content: Content) -> some View {
         let stepOne = content
             .onChange(of: appMode) { _, newMode in
                 catalog.lockedByRecording =
                     (newMode == .recording || newMode == .recordingStarting)
             }
+        let stepTwo = stepOne
             .onChange(of: workspaceFolder) { _, newFolder in
                 guard newFolder != nil else { return }
                 onProjectOpened()
             }
-        return stepOne
+        let stepThree = stepTwo
             .onChange(of: catalog.selectedCameraID) { _, newID in
                 onCameraChange(newID)
             }
+        return stepThree
             .onChange(of: catalog.selectedMicID) { _, newID in
                 onMicChange(newID)
             }

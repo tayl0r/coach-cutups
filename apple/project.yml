@@ -2,7 +2,7 @@ name: VideoCoach
 options:
   bundleIdPrefix: com.videocoach
   deploymentTarget:
-    macOS: "14.0"
+    macOS: "26.0"
   developmentLanguage: en
 packages:
   VideoCoachCore:
@@ -29,15 +29,16 @@ targets:
       properties:
         NSCameraUsageDescription: Video Coach uses your camera to record commentary on match clips.
         NSMicrophoneUsageDescription: Video Coach uses your microphone to record commentary on match clips.
+        NSSpeechRecognitionUsageDescription: Video Coach transcribes your recorded commentary on-device so you can review and search what you said.
         CFBundleDisplayName: Video Coach
-        LSMinimumSystemVersion: "14.0"
+        LSMinimumSystemVersion: "26.0"
     settings:
       base:
         CODE_SIGN_ENTITLEMENTS: App/VideoCoach.entitlements
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
         SWIFT_VERSION: 5.9
-        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
         ARCHS: arm64
   VideoCoachUITests:
     type: bundle.ui-testing
@@ -52,7 +53,7 @@ targets:
       base:
         TEST_TARGET_NAME: VideoCoach
         SWIFT_VERSION: 5.9
-        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
         ARCHS: arm64
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachUITests
@@ -71,7 +72,7 @@ targets:
     settings:
       base:
         SWIFT_VERSION: 5.9
-        MACOSX_DEPLOYMENT_TARGET: "14.0"
+        MACOSX_DEPLOYMENT_TARGET: "26.0"
         ARCHS: arm64
         GENERATE_INFOPLIST_FILE: YES
         PRODUCT_BUNDLE_IDENTIFIER: com.videocoach.VideoCoachTests

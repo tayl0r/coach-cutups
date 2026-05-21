@@ -62,6 +62,9 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
     public var sortIndex: Int
     public var createdAt: Date
 
+    public var transcript: String
+    public var summary: String
+
     public init(
         id: UUID = UUID(),
         name: String,
@@ -74,7 +77,9 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
         events: [CommentaryEvent] = [],
         showPiP: Bool = true,
         sortIndex: Int,
-        createdAt: Date = .init()
+        createdAt: Date = .init(),
+        transcript: String = "",
+        summary: String = ""
     ) {
         self.id = id; self.name = name; self.notes = notes; self.tags = tags
         self.sourceIndex = sourceIndex; self.startSourceSeconds = startSourceSeconds
@@ -82,6 +87,38 @@ public struct Clip: Codable, Hashable, Identifiable, Sendable {
         self.events = events
         self.showPiP = showPiP
         self.sortIndex = sortIndex; self.createdAt = createdAt
+        self.transcript = transcript
+        self.summary = summary
+    }
+
+    // Custom decoder so existing v4 JSON (which lacks `transcript` /
+    // `summary`) loads cleanly with both fields defaulting to "".
+    // Swift's synthesised `Decodable` does NOT honour stored-property
+    // defaults for missing keys — it always calls `decode`. So we
+    // intercept reads here. Encoding stays synthesised via `Encodable`.
+    // Matches the pattern `Project.init(from:)` already uses below.
+    private enum CodingKeys: String, CodingKey {
+        case id, name, notes, tags, sourceIndex, startSourceSeconds,
+             recordingDuration, recordingFilename, events, showPiP,
+             sortIndex, createdAt, transcript, summary
+    }
+
+    public init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        self.id                  = try c.decode(UUID.self,              forKey: .id)
+        self.name                = try c.decode(String.self,            forKey: .name)
+        self.notes               = try c.decode(String.self,            forKey: .notes)
+        self.tags                = try c.decode([String].self,          forKey: .tags)
+        self.sourceIndex         = try c.decode(Int.self,               forKey: .sourceIndex)
+        self.startSourceSeconds  = try c.decode(Double.self,            forKey: .startSourceSeconds)
+        self.recordingDuration   = try c.decode(Double.self,            forKey: .recordingDuration)
+        self.recordingFilename   = try c.decode(String.self,            forKey: .recordingFilename)
+        self.events              = try c.decode([CommentaryEvent].self, forKey: .events)
+        self.showPiP             = try c.decode(Bool.self,              forKey: .showPiP)
+        self.sortIndex           = try c.decode(Int.self,               forKey: .sortIndex)
+        self.createdAt           = try c.decode(Date.self,              forKey: .createdAt)
+        self.transcript          = try c.decodeIfPresent(String.self, forKey: .transcript) ?? ""
+        self.summary             = try c.decodeIfPresent(String.self, forKey: .summary)    ?? ""
     }
 }
 
@@ -126,7 +163,9 @@ public extension Project {
     /// - v2: added `.zoom` event variant
     /// - v3: added per-clip PiP visibility
     /// - v4: added `scoreboard` (TeamConfig + MatchFormat) and `matchEvents`
-    static let currentFormatVersion: Int = 4
+    /// - v5: added per-clip `transcript` + `summary` (auto-populated by
+    ///       AppleClipIntelligence; user-editable)
+    static let currentFormatVersion: Int = 5
 }
 
 public extension Project {
