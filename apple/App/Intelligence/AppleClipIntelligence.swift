@@ -64,6 +64,10 @@ struct AppleClipIntelligence: ClipIntelligence {
     // MARK: - Summarization
 
     func summarize(_ transcript: String) async throws -> String {
+        guard !transcript.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return ""
+        }
+
         // Availability gate. `.available` ⇒ proceed; anything else throws
         // a localized error the inspector surfaces inline.
         switch SystemLanguageModel.default.availability {
@@ -156,53 +160,59 @@ struct AppleClipIntelligence: ClipIntelligence {
         let tempURL = FileManager.default.temporaryDirectory
             .appendingPathComponent("clip-transcribe-\(UUID().uuidString).caf")
 
-        let writer = try AVAssetWriter(outputURL: tempURL, fileType: .caf)
-        let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
-        writerInput.expectsMediaDataInRealTime = false
-        writer.add(writerInput)
+        do {
+            let writer = try AVAssetWriter(outputURL: tempURL, fileType: .caf)
+            let writerInput = AVAssetWriterInput(mediaType: .audio, outputSettings: outputSettings)
+            writerInput.expectsMediaDataInRealTime = false
+            writer.add(writerInput)
 
-        guard reader.startReading() else {
-            throw reader.error ?? NSError(
-                domain: "AppleClipIntelligence", code: -5,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to start audio extraction."])
-        }
-        guard writer.startWriting() else {
-            throw writer.error ?? NSError(
-                domain: "AppleClipIntelligence", code: -6,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to start audio writer."])
-        }
-        writer.startSession(atSourceTime: .zero)
-
-        // Drive the copy from a detached task with a tight pull loop. We
-        // avoid `requestMediaDataWhenReady` so that AVAssetReader /
-        // AVAssetWriter (which are not `Sendable`) are not captured by
-        // an `@Sendable` callback closure; instead they live entirely
-        // inside the task body. The `isReadyForMoreMediaData` poll +
-        // short sleep is the documented pattern for offline writers.
-        try await Task.detached { [reader, writer, writerInput, output] in
-            while let sample = output.copyNextSampleBuffer() {
-                while !writerInput.isReadyForMoreMediaData {
-                    Thread.sleep(forTimeInterval: 0.005)
-                }
-                if !writerInput.append(sample) {
-                    writerInput.markAsFinished()
-                    throw writer.error ?? NSError(
-                        domain: "AppleClipIntelligence", code: -7,
-                        userInfo: [NSLocalizedDescriptionKey:
-                            "Failed to append audio sample."])
-                }
+            guard reader.startReading() else {
+                throw reader.error ?? NSError(
+                    domain: "AppleClipIntelligence", code: -5,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to start audio extraction."])
             }
-            writerInput.markAsFinished()
-            if let readerError = reader.error { throw readerError }
-        }.value
+            guard writer.startWriting() else {
+                throw writer.error ?? NSError(
+                    domain: "AppleClipIntelligence", code: -6,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to start audio writer."])
+            }
+            writer.startSession(atSourceTime: .zero)
 
-        await writer.finishWriting()
-        if writer.status == .failed {
-            throw writer.error ?? NSError(
-                domain: "AppleClipIntelligence", code: -8,
-                userInfo: [NSLocalizedDescriptionKey: "Failed to finalize extracted audio."])
+            // Drive the copy from a detached task with a tight pull loop. We
+            // avoid `requestMediaDataWhenReady` so that AVAssetReader /
+            // AVAssetWriter (which are not `Sendable`) are not captured by
+            // an `@Sendable` callback closure; instead they live entirely
+            // inside the task body. The `isReadyForMoreMediaData` poll +
+            // short sleep is the documented pattern for offline writers.
+            try await Task.detached { [reader, writer, writerInput, output] in
+                while let sample = output.copyNextSampleBuffer() {
+                    try Task.checkCancellation()
+                    while !writerInput.isReadyForMoreMediaData {
+                        Thread.sleep(forTimeInterval: 0.005)
+                    }
+                    if !writerInput.append(sample) {
+                        writerInput.markAsFinished()
+                        throw writer.error ?? NSError(
+                            domain: "AppleClipIntelligence", code: -7,
+                            userInfo: [NSLocalizedDescriptionKey:
+                                "Failed to append audio sample."])
+                    }
+                }
+                writerInput.markAsFinished()
+                if let readerError = reader.error { throw readerError }
+            }.value
+
+            await writer.finishWriting()
+            if writer.status == .failed {
+                throw writer.error ?? NSError(
+                    domain: "AppleClipIntelligence", code: -8,
+                    userInfo: [NSLocalizedDescriptionKey: "Failed to finalize extracted audio."])
+            }
+
+            return tempURL
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            throw error
         }
-
-        return tempURL
     }
 }
