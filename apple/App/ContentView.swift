@@ -1306,6 +1306,7 @@ private struct DeviceWiringModifier: ViewModifier {
     let onCameraChange: (String?) -> Void
     let onMicChange: (String?) -> Void
 
+    // Stepped intentionally — single chained .onChange exceeds the type checker's budget under macOS 26 SDK.
     func body(content: Content) -> some View {
         let stepOne = content
             .onChange(of: appMode) { _, newMode in
