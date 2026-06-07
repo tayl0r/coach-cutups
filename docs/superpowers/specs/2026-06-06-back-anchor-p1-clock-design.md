@@ -99,9 +99,13 @@ for a user-tagged P1 start). Same seek/delete affordances as every other row.
   - At `t = T`: clock displays `p0Length` exactly, then transitions to
     `BREAK`/`HT` the same way it does today.
 - **Flag present, `T > p0Length`** (invalid — user tagged P1 end later than
-  one full period from recording start): the offset is clamped to 0
-  (clock counts from 00:00 normally) and the events panel surfaces a
-  one-line warning.
+  one full period from recording start): the offset is clamped to 0 and
+  the clock counts from 00:00 normally. No special warning UI — the clock
+  display itself signals the problem (it stops climbing past `p0Length`
+  and enters `BREAK` only when the user's tag fires, which they can see is
+  off). Symmetric with the existing model: a plausible-but-wrong tag
+  produces a silently misaligned clock today too; the off-by-a-period case
+  doesn't deserve special UI when off-by-five-minutes doesn't.
 
 P2 onward: untouched. The user-tagged P2 start/end events drive P2's clock
 using the existing positional interpretation.
@@ -136,9 +140,11 @@ public struct MatchEventRecord: Codable, Hashable, Identifiable, Sendable {
 }
 ```
 
-**Invariant** (enforced at the only mutation sites — see below): at most one
-event has `isAutoBackAnchor == true`, and if present it must satisfy
-`kind == .startStop && sourceIndex == 0 && sourceSeconds == 0`.
+The only site that ever sets the flag is `setAutoBackAnchorP1` (see below); it
+inserts at most one such event with `kind == .startStop`, `sourceIndex == 0`,
+`sourceSeconds == 0`. The clock-derivation helper tolerates malformed input
+(two flagged records) by reading the flag as a single boolean — no
+corruption, just no extra special-case logic.
 
 ### Decoder
 
@@ -198,22 +204,22 @@ public extension Project {
     }
 
     /// Toggle the P1 back-anchor flag.
-    /// - on=true: appends a flagged `.startStop` at (sourceIndex 0, sourceSeconds 0)
-    ///   if one isn't already present, and one wouldn't exceed the cap.
+    /// - on=true: inserts a flagged `.startStop` at `matchEvents[0]` (front of
+    ///   the array) if one isn't already present. Inserting at index 0 — not
+    ///   appending — ensures that if the user has also manually tagged a
+    ///   real `.startStop` at recording `(0, 0)`, the flagged event wins
+    ///   `interpret()`'s positional tie-break and remains `.start(0)`.
     /// - on=false: removes every event with `isAutoBackAnchor == true`.
-    /// The single-flag invariant is preserved by the existence check on insert.
+    /// Idempotent.
     mutating func setAutoBackAnchorP1(_ on: Bool) {
         if on {
             guard !hasAutoBackAnchorP1 else { return }
-            guard let cap = scoreboard?.format.expectedStartStopEvents else { return }
-            let count = matchEvents.lazy.filter { $0.kind == .startStop }.count
-            guard count < cap else { return }
-            matchEvents.append(.init(
+            matchEvents.insert(.init(
                 kind: .startStop,
                 sourceIndex: 0,
                 sourceSeconds: 0,
                 isAutoBackAnchor: true
-            ))
+            ), at: 0)
         } else {
             matchEvents.removeAll { $0.isAutoBackAnchor }
         }
@@ -222,8 +228,35 @@ public extension Project {
 ```
 
 `appendStartStop`, `appendHomeGoal`, `appendAwayGoal` are unchanged. The
-existing `appendStartStop` cap check naturally honours the flagged event
-(it's a regular `.startStop` for cap purposes).
+existing `appendStartStop` cap check naturally counts the flagged event
+toward its cap (it's a regular `.startStop`). `setAutoBackAnchorP1` itself
+does **not** re-check the cap — the UI disables the toggle at cap, and if a
+programmatic caller pushes count to cap+1, `interpret()`'s existing
+truncation handles it gracefully (the last-sorted manual event drops; the
+flagged event, sorted first, survives).
+
+### `Project.absoluteMatchEvents` threads the flag
+
+Update the existing projection in `MatchEvent.swift`:
+
+```swift
+public extension Project {
+    var absoluteMatchEvents: [AbsoluteMatchEvent] {
+        matchEvents.map {
+            .init(
+                absSeconds: absSeconds(sourceIndex: $0.sourceIndex,
+                                       sourceSeconds: $0.sourceSeconds),
+                kind: $0.kind,
+                isAutoBackAnchor: $0.isAutoBackAnchor
+            )
+        }
+    }
+}
+```
+
+This is the only call site that constructs `AbsoluteMatchEvent` from a real
+`MatchEventRecord`. Tests and exporters that construct synthetic
+`AbsoluteMatchEvent` instances rely on the default `false` parameter.
 
 ### `Project.currentFormatVersion` → 6
 
@@ -315,21 +348,15 @@ before the cap-warning text:
 
 ```swift
 Divider()
-Toggle(isOn: Binding(
+Toggle("Back-anchor P1 from end", isOn: Binding(
     get: { workspace.project.hasAutoBackAnchorP1 },
     set: { newValue in
         workspace.mutateMatchEvents { p in
             p.setAutoBackAnchorP1(newValue)
         }
     }
-)) {
-    VStack(alignment: .leading, spacing: 1) {
-        Text("Back-anchor P1 from end")
-        Text("Auto-tags P1 start at 00:00. Clock reads correct minute once you tag end of P1.")
-            .font(.caption2)
-            .foregroundStyle(.secondary)
-    }
-}
+))
+.help("Auto-tags P1 start at 00:00. Clock reads correct minute once you tag end of P1.")
 .disabled(workspace.project.scoreboard == nil || (startStopAtCap && !workspace.project.hasAutoBackAnchorP1))
 ```
 
@@ -354,17 +381,6 @@ case .start(let i):
 case .end(let i):
     return "\(format.periodName(i)) End"
 ```
-
-### Invalid-state warning
-
-When `hasAutoBackAnchorP1 == true` AND the user-tagged P1 end exists AND
-its `absSeconds > regulationPeriodSeconds(0)`, the events panel shows a
-one-line caption beneath the events list:
-
-> ⚠️ P1 end is later than one period length. Back-anchor offset disabled.
-
-This piggy-backs on the existing overcapacity-warning render pattern in
-`settingsModeView` (line 176-182) — same `.font(.caption).foregroundStyle(.orange)`.
 
 ## Persistence + format version
 
@@ -401,6 +417,16 @@ New cases in `ScoreboardStateTests.swift`:
    normal start at 00:00.
 5. **Back-anchor + P2.** P2 start/end tagged at real abs times. P2 clock
    counts from `p0Length` onward, independent of the back-anchor offset.
+6. **Back-anchor wins tie-break vs. manual tag at recording 00:00.** Build
+   a project with `matchEvents = [flagged(0,0), manual(0,0)]` (forcibly via
+   the public API by toggling back-anchor when a manual tag already sits
+   at the front of the recording). Assert the flagged event resolves to
+   `.start(0)` in `interpret()`; the manual event resolves to `.end(0)`;
+   clock at `t = 0` shows `p0Length − 0 = p0Length` (offset clamps to 0
+   because `T = 0` means `offset = p0Length − 0 = p0Length`, valid).
+   The point of the test is to assert that `interpret()`'s tie-break by
+   input order keeps the flagged event at position 0 regardless of how
+   the user tagged.
 
 ### `Project` mutation API
 
@@ -420,6 +446,14 @@ New tests in `ProjectTests.swift` (or a new
 `PersistenceTests.swift` (or wherever decoding round-trips live): a v5
 project JSON (no `isAutoBackAnchor` keys) decodes cleanly, all events get
 `isAutoBackAnchor == false`.
+
+### Existing format-version assertions
+
+Several existing tests under `apple/VideoCoachCore/Tests/` assert hard-coded
+`formatVersion == 5`. These get updated to `6` as part of this PR.
+Specifically: `ProjectTests.swift` (and any other fixture that pins the
+version). Grep for `formatVersion` in the tests directory before the
+edit pass to catch them all.
 
 ### UI
 
@@ -456,15 +490,15 @@ verification:
   p0Length`, but if `T` is *within* the valid range but still wrong, the
   clock will appear plausible. Acceptable: this is no worse than any
   user mis-tag in the existing model.
-- **Two flagged events simultaneously** would break the single-anchor
-  invariant. Prevented at the only insert site (`setAutoBackAnchorP1`).
-  No further guard on `appendStartStop` because that helper never sets the
-  flag — the only path to set it is the explicit toggle.
+- **Two flagged events simultaneously** would only arise from hand-edited
+  JSON. `p1BackAnchorOffset` reads the flag with `contains(where:)` — a
+  boolean — so two flagged events behave the same as one. No corruption,
+  no special guard needed.
 - **User toggles back-anchor on with pre-existing manual start/stop
-  events at the front.** The auto event sorts to position 0 (absSeconds 0,
-  earliest), so it becomes `.start(0)` in interp; the previously-first
-  user event becomes `.end(0)`. If the user had a manual P1 start tagged
-  later than 00:00, that tag now plays the role of P1 end. The user can
-  observe the role labels in the events list and fix by deleting the
-  stale tag. No automatic cleanup; this would be too invasive for a
-  rarely-hit corner case.
+  events.** The flagged event is inserted at `matchEvents[0]`, so it
+  sorts first in `interpret()` (`absSeconds = 0` ties broken by input
+  order). It becomes `.start(0)`; the previously-first manual event
+  becomes `.end(0)`. If the user had a manual P1 start tagged later than
+  00:00, that tag now plays the role of P1 end. The user can observe the
+  role labels in the events list and fix by deleting the stale tag. No
+  automatic cleanup; too invasive for a rarely-hit corner case.
