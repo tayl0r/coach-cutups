@@ -165,7 +165,8 @@ public extension Project {
     /// - v4: added `scoreboard` (TeamConfig + MatchFormat) and `matchEvents`
     /// - v5: added per-clip `transcript` + `summary` (auto-populated by
     ///       AppleClipIntelligence; user-editable)
-    static let currentFormatVersion: Int = 5
+    /// - v6: added `isAutoBackAnchor` flag on `MatchEventRecord`
+    static let currentFormatVersion: Int = 6
 }
 
 public extension Project {

@@ -433,13 +433,17 @@ New cases in `ScoreboardStateTests.swift`:
 New tests in `ProjectTests.swift` (or a new
 `AutoBackAnchorTests.swift`):
 
-1. `setAutoBackAnchorP1(true)` from empty: appends one flagged
-   `.startStop` at `(0, 0)`.
+1. `setAutoBackAnchorP1(true)` from empty: inserts one flagged
+   `.startStop` at `matchEvents[0]`.
 2. `setAutoBackAnchorP1(true)` when already on: no-op (one flagged event
    total).
 3. `setAutoBackAnchorP1(false)`: removes the flagged event.
-4. `setAutoBackAnchorP1(true)` at cap: no-op (cap check denies it).
-5. `setAutoBackAnchorP1(true)` with no scoreboard: no-op.
+4. `setAutoBackAnchorP1(true)` at cap: **inserts unconditionally** — the
+   API has no cap guard; the UI disables the toggle at cap. The test
+   pins this so a future reader doesn't silently add a guard inside the
+   mutator.
+5. `setAutoBackAnchorP1(true)` with no scoreboard: **inserts
+   unconditionally** — same UI-gates-it semantics as item 4.
 
 ### Decoder backwards compat
 

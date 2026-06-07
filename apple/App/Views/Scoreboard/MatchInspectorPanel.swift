@@ -90,6 +90,16 @@ struct MatchInspectorPanel: View {
                 Text("Game tagged. Delete a start/stop event to add another.")
                     .font(.caption).foregroundStyle(.secondary)
             }
+            Divider()
+            Toggle("Back-anchor P1 from end", isOn: Binding(
+                get: { workspace.project.hasAutoBackAnchorP1 },
+                set: { newValue in
+                    workspace.mutateMatchEvents { $0.setAutoBackAnchorP1(newValue) }
+                }
+            ))
+            .help("Auto-tags P1 start at 00:00. Clock reads correct minute once you tag end of P1.")
+            .disabled(workspace.project.scoreboard == nil ||
+                      (startStopAtCap && !workspace.project.hasAutoBackAnchorP1))
         }
         .controlSize(.small)
         .padding(6)
@@ -245,7 +255,9 @@ struct MatchInspectorPanel: View {
         case .startStop:
             guard let role = roles[rec.id] else { return "Start/Stop" }
             switch role {
-            case .start(let i): return "\(format.periodName(i)) Start"
+            case .start(let i):
+                let suffix = rec.isAutoBackAnchor ? " (auto)" : ""
+                return "\(format.periodName(i)) Start\(suffix)"
             case .end(let i):   return "\(format.periodName(i)) End"
             }
         }
