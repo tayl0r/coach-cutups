@@ -42,6 +42,19 @@ public struct ScoreboardState: Equatable, Sendable {
     public let clock: ClockDisplay
 }
 
+/// Shift for the period-0 displayed clock so `.end(0)` reads as
+/// `regulationPeriodSeconds`. Clamped to 0 if the user tagged `.end(0)`
+/// past one period length.
+private func p1BackAnchorOffset(
+    interp: [InterpretedEvent],
+    format: MatchFormat
+) -> Double {
+    guard let p1End = interp.first(where: {
+        if case .end(let i) = $0.role, i == 0 { return true } else { return false }
+    }) else { return 0 }
+    return max(0, Double(format.regulationPeriodSeconds) - p1End.absSeconds)
+}
+
 /// Canonical pure function. Compositors call this directly.
 ///
 /// Per-period walk: filters `events` into start/stops vs goals, runs
@@ -94,7 +107,10 @@ public func scoreboardState(
     } else {
         let elapsedInPeriod = now - currentStartAbs
         let perSec = config.format.periodSeconds(curIdx)
-        let displayedSeconds = cumulativePriorPeriods + elapsedInPeriod
+        let backAnchor = curIdx == 0 && events.contains(where: { $0.isAutoBackAnchor })
+            ? p1BackAnchorOffset(interp: interp, format: config.format)
+            : 0
+        let displayedSeconds = cumulativePriorPeriods + elapsedInPeriod + backAnchor
         if elapsedInPeriod <= perSec {
             clock = .running(seconds: displayedSeconds)
         } else {

@@ -14,7 +14,7 @@ final class ProjectTests: XCTestCase {
         let data = try JSONEncoder().encode(p)
         let decoded = try JSONDecoder().decode(Project.self, from: data)
         XCTAssertEqual(decoded.name, "MyMatch")
-        XCTAssertEqual(decoded.formatVersion, 5)
+        XCTAssertEqual(decoded.formatVersion, 6)
         XCTAssertTrue(decoded.clips.isEmpty)
     }
 
@@ -120,7 +120,7 @@ final class ProjectTests: XCTestCase {
 
     func test_freshProjectHasShowPiPDefaultsAndFormatVersion() throws {
         let p = Project(name: "M")
-        XCTAssertEqual(p.formatVersion, 5)
+        XCTAssertEqual(p.formatVersion, 6)
         XCTAssertTrue(p.preferences.pipForNewRecordings)
         var withClip = p
         withClip.clips.append(Clip(
@@ -169,7 +169,7 @@ final class ProjectTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: tmp) }
         try ProjectStore.write(p, to: tmp)
         let reread = try ProjectStore.read(from: tmp)
-        XCTAssertEqual(reread.formatVersion, 5, "write must bump formatVersion to current (5)")
+        XCTAssertEqual(reread.formatVersion, 6, "write must bump formatVersion to current (6)")
     }
 
     func test_projectStore_v4RoundTripWithScoreboard() throws {
@@ -245,6 +245,50 @@ final class ProjectTests: XCTestCase {
         XCTAssertEqual(p.clips[0].summary, "")
         XCTAssertEqual(p.clips[0].notes, "hand-written notes",
                        "existing user-written notes must survive untouched")
+    }
+
+    func test_v5MatchEventMissingIsAutoBackAnchor_decodesToFalse() throws {
+        // Hand-written pre-v6 JSON: a MatchEventRecord with no
+        // `isAutoBackAnchor` key. Must decode cleanly with the flag
+        // defaulting to false — back-compat contract for v5 projects.
+        let v5JSON = """
+        {
+          "formatVersion": 5,
+          "name": "LegacyV5",
+          "sourceVideos": [],
+          "clips": [],
+          "preferences": {
+            "scanVolume": 1.0,
+            "previewSourceVolume": 1.0,
+            "previewCommentaryVolume": 1.0,
+            "lastExportResolution": "r1080",
+            "lastExportQuality": "medium",
+            "pipForNewRecordings": true
+          },
+          "matchEvents": [{
+            "id": "11111111-2222-3333-4444-555555555555",
+            "kind": "startStop",
+            "sourceIndex": 0,
+            "sourceSeconds": 0
+          }]
+        }
+        """.data(using: .utf8)!
+        let p = try JSONDecoder().decode(Project.self, from: v5JSON)
+        XCTAssertEqual(p.matchEvents.count, 1)
+        XCTAssertFalse(p.matchEvents[0].isAutoBackAnchor)
+    }
+
+    func test_isAutoBackAnchorTrue_roundTripsThroughJSON() throws {
+        var p = Project(name: "BackAnchor")
+        p.scoreboard = ScoreboardConfig(
+            home: TeamConfig(name: "H", primaryColor: .red, secondaryColor: .red),
+            away: TeamConfig(name: "A", primaryColor: .red, secondaryColor: .red)
+        )
+        p.setAutoBackAnchorP1(true)
+        let data = try JSONEncoder().encode(p)
+        let decoded = try JSONDecoder().decode(Project.self, from: data)
+        XCTAssertEqual(decoded.matchEvents.count, 1)
+        XCTAssertTrue(decoded.matchEvents[0].isAutoBackAnchor)
     }
 
     func test_transcriptAndSummaryRoundtripThroughJSON() throws {

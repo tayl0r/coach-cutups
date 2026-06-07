@@ -277,3 +277,144 @@ final class ScoreboardStateTests: XCTestCase {
         XCTAssertEqual(s?.awayScore, 1)
     }
 }
+
+final class AutoBackAnchorMutatorTests: XCTestCase {
+    private func projectWithScoreboard() -> Project {
+        var p = Project(name: "x")
+        p.scoreboard = ScoreboardConfig(
+            home: TeamConfig(name: "H", primaryColor: .red, secondaryColor: .red),
+            away: TeamConfig(name: "A", primaryColor: .red, secondaryColor: .red)
+        )
+        return p
+    }
+
+    func test_setOn_fromEmpty_insertsFlaggedEventAtIndexZero() {
+        var p = projectWithScoreboard()
+        p.setAutoBackAnchorP1(true)
+        XCTAssertEqual(p.matchEvents.count, 1)
+        XCTAssertTrue(p.matchEvents[0].isAutoBackAnchor)
+        XCTAssertEqual(p.matchEvents[0].kind, .startStop)
+        XCTAssertEqual(p.matchEvents[0].sourceIndex, 0)
+        XCTAssertEqual(p.matchEvents[0].sourceSeconds, 0)
+    }
+
+    func test_setOn_whenAlreadyOn_isIdempotent() {
+        var p = projectWithScoreboard()
+        p.setAutoBackAnchorP1(true)
+        p.setAutoBackAnchorP1(true)
+        XCTAssertEqual(p.matchEvents.filter { $0.isAutoBackAnchor }.count, 1)
+        XCTAssertEqual(p.matchEvents.count, 1)
+    }
+
+    func test_setOff_removesFlaggedEvent() {
+        var p = projectWithScoreboard()
+        p.appendStartStop(sourceIndex: 0, sourceSeconds: 100)
+        p.setAutoBackAnchorP1(true)
+        XCTAssertEqual(p.matchEvents.count, 2)
+        p.setAutoBackAnchorP1(false)
+        XCTAssertEqual(p.matchEvents.count, 1)
+        XCTAssertFalse(p.matchEvents.contains { $0.isAutoBackAnchor })
+        XCTAssertEqual(p.matchEvents[0].sourceSeconds, 100)
+    }
+
+    // The two tests below pin the deliberate "API has no cap or scoreboard
+    // guards; the UI gates these cases" decision. Locks the contract so a
+    // future reader doesn't silently add guards inside setAutoBackAnchorP1.
+
+    func test_setOn_atCap_stillInserts_apiHasNoCapGuard() {
+        var p = projectWithScoreboard()
+        for s in stride(from: 100.0, through: 400.0, by: 100.0) {
+            p.appendStartStop(sourceIndex: 0, sourceSeconds: s)
+        }
+        XCTAssertEqual(p.matchEvents.count, 4) // == expectedStartStopEvents cap for 2-period format
+        p.setAutoBackAnchorP1(true)
+        XCTAssertEqual(p.matchEvents.count, 5, "API does not guard; UI gates the toggle at cap")
+        XCTAssertTrue(p.matchEvents[0].isAutoBackAnchor)
+    }
+
+    func test_setOn_withoutScoreboard_stillInserts_apiHasNoScoreboardGuard() {
+        var p = Project(name: "x") // no scoreboard configured
+        p.setAutoBackAnchorP1(true)
+        XCTAssertEqual(p.matchEvents.count, 1, "API does not guard; UI gates the toggle when no scoreboard")
+        XCTAssertTrue(p.matchEvents[0].isAutoBackAnchor)
+    }
+}
+
+final class AutoBackAnchorClockTests: XCTestCase {
+    private func cfg(
+        format: MatchFormat = MatchFormat(regulationPeriods: 2, regulationPeriodSeconds: 45 * 60)
+    ) -> ScoreboardConfig {
+        ScoreboardConfig(
+            home: TeamConfig(name: "H", primaryColor: .red, secondaryColor: .red),
+            away: TeamConfig(name: "A", primaryColor: .red, secondaryColor: .red),
+            format: format
+        )
+    }
+    private func flagged(at: Double) -> AbsoluteMatchEvent {
+        .init(absSeconds: at, kind: .startStop, isAutoBackAnchor: true)
+    }
+    private func ss(_ at: Double) -> AbsoluteMatchEvent {
+        .init(absSeconds: at, kind: .startStop)
+    }
+
+    func test_backAnchor_flagWithoutP1End_noOffset() {
+        let events = [flagged(at: 0)]
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 10 * 60, config: cfg(), events: events)?.clock,
+            .running(seconds: 10 * 60)
+        )
+    }
+
+    func test_backAnchor_p1EndBeforePeriodLength_appliesOffset() {
+        let events = [flagged(at: 0), ss(38 * 60)]
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 0, config: cfg(), events: events)?.clock,
+            .running(seconds: 7 * 60)
+        )
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 19 * 60, config: cfg(), events: events)?.clock,
+            .running(seconds: 26 * 60)
+        )
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 38 * 60, config: cfg(), events: events)?.clock,
+            .onBreak(label: "HT")
+        )
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 38 * 60 + 1, config: cfg(), events: events)?.clock,
+            .onBreak(label: "HT")
+        )
+    }
+
+    func test_backAnchor_p1EndAfterPeriodLength_clampsToZero() {
+        let events = [flagged(at: 0), ss(50 * 60)]
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 0, config: cfg(), events: events)?.clock,
+            .running(seconds: 0)
+        )
+    }
+
+    func test_backAnchor_withP2_offsetOnlyAffectsP1() {
+        let events = [
+            flagged(at: 0),
+            ss(38 * 60),         // P1 end
+            ss(50 * 60),         // P2 start
+            ss(95 * 60),         // P2 end
+        ]
+        XCTAssertEqual(
+            scoreboardState(absoluteTime: 60 * 60, config: cfg(), events: events)?.clock,
+            .running(seconds: 55 * 60)
+        )
+    }
+
+    func test_interpret_flaggedEventWinsTiebreakAtZero() {
+        let events: [AbsoluteMatchEvent] = [
+            AbsoluteMatchEvent(absSeconds: 0, kind: .startStop, isAutoBackAnchor: true),
+            AbsoluteMatchEvent(absSeconds: 0, kind: .startStop, isAutoBackAnchor: false),
+        ]
+        let interp = interpret(events, format: MatchFormat())
+        XCTAssertEqual(interp[0].originalIndex, 0)
+        XCTAssertEqual(interp[0].role, .start(periodIndex: 0))
+        XCTAssertEqual(interp[1].originalIndex, 1)
+        XCTAssertEqual(interp[1].role, .end(periodIndex: 0))
+    }
+}
