@@ -444,6 +444,10 @@ struct ContentView: View {
                         mode: $inspectorMode,
                         eventModeActive: $eventModeActive
                     )
+                    // In Settings mode the form claims the whole column so
+                    // its (scrollable) fields are visible without a cramped
+                    // inner scroll; the ClipInspector below flows off-screen.
+                    .frame(maxHeight: matchSettingsExpanded ? .infinity : nil, alignment: .top)
                     Divider()
                 }
                 ClipInspector(
@@ -452,6 +456,9 @@ struct ContentView: View {
                     selectedClipID: $selectedClipID,
                     selectedTagFilter: $selectedTagFilter
                 )
+                // Greedy everywhere except match Settings, where the panel
+                // above takes the full height and this drops to natural size.
+                .frame(maxHeight: matchSettingsExpanded ? nil : .infinity, alignment: .top)
             }
             .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 380)
         }
@@ -936,6 +943,14 @@ struct ContentView: View {
     private var openMatchSettingsHandler: (() -> Void)? {
         guard workspace.folder != nil else { return nil }
         return { inspectorMode = .settings }
+    }
+
+    /// True when the match Settings form should claim the full inspector
+    /// column. Gated on `.scanning` because that's the only mode where
+    /// `MatchInspectorPanel` renders; the ClipInspector below then drops its
+    /// vertical greed and flows off the bottom edge. See the detail column.
+    private var matchSettingsExpanded: Bool {
+        appMode == .scanning && inspectorMode == .settings
     }
 
     // MARK: - Recording flow

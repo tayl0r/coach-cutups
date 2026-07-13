@@ -37,7 +37,10 @@ struct ClipInspector: View {
             }
         }
         .padding(12)
-        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        // Fills width; vertical fill is decided by the caller (ContentView)
+        // so match Settings mode can claim the whole column and push this
+        // panel off the bottom edge.
+        .frame(maxWidth: .infinity, alignment: .topLeading)
     }
 
     private var placeholder: some View {
