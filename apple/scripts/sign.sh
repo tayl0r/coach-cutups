@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-APP="${1:-build/Debug/VideoCoach.app}"
+APP="${1:-build/Debug/CoachCuts.app}"
 IDENTITY="${VIDEO_COACH_IDENTITY:-Apple Development}"
 codesign --force --deep --options runtime \
   --entitlements App/VideoCoach.entitlements \

@@ -64,12 +64,12 @@ APP=$(xcodebuild \
   -scheme VideoCoach \
   -configuration "$CONFIG" \
   -showBuildSettings 2>/dev/null \
-  | awk -F' = ' '/^[[:space:]]+BUILT_PRODUCTS_DIR =/ {print $2; exit}')/VideoCoach.app
+  | awk -F' = ' '/^[[:space:]]+BUILT_PRODUCTS_DIR =/ {print $2; exit}')/CoachCuts.app
 
 # Kill any existing instance so we definitely launch the new build.
 # Brief sleep gives macOS a moment to release the camera/mic + finalize
 # the shutdown — `open` racing pkill produces error -600.
-if pkill -x VideoCoach 2>/dev/null; then
+if pkill -x CoachCuts 2>/dev/null; then
   sleep 0.4
 fi
 

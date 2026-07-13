@@ -27,13 +27,15 @@ targets:
     info:
       path: App/Info.plist
       properties:
-        NSCameraUsageDescription: Video Coach uses your camera to record commentary on match clips.
-        NSMicrophoneUsageDescription: Video Coach uses your microphone to record commentary on match clips.
-        NSSpeechRecognitionUsageDescription: Video Coach transcribes your recorded commentary on-device so you can review and search what you said.
-        CFBundleDisplayName: Video Coach
+        NSCameraUsageDescription: Coach Cuts uses your camera to record commentary on match clips.
+        NSMicrophoneUsageDescription: Coach Cuts uses your microphone to record commentary on match clips.
+        NSSpeechRecognitionUsageDescription: Coach Cuts transcribes your recorded commentary on-device so you can review and search what you said.
+        CFBundleDisplayName: Coach Cuts
         LSMinimumSystemVersion: "26.0"
     settings:
       base:
+        PRODUCT_NAME: CoachCuts
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         CODE_SIGN_ENTITLEMENTS: App/VideoCoach.entitlements
         CODE_SIGN_STYLE: Automatic
         ENABLE_HARDENED_RUNTIME: YES
